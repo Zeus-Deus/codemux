@@ -39,7 +39,7 @@ use super::parser::{
     parse_claude_wrapped_config, parse_codex_config_file, parse_mcp_config_file,
     parse_opencode_config_file,
 };
-use super::paths::{enumerate_mcp_paths, is_claude_wrapped_path};
+use super::paths::{enumerate_mcp_paths_with_home, is_claude_wrapped_path};
 use super::runtime::{McpServerHandle, McpServerStatus, McpTool};
 use super::{McpConfigSource, McpProjectScope, McpServerConfig};
 
@@ -222,6 +222,10 @@ struct RegistryInner {
     /// are skipped during `prime_for_chat` and stopped if currently
     /// running.
     disabled_ids: HashSet<String>,
+    /// Native config sources discovered in each checkout. A merged global
+    /// handle may also appear in a checkout's Claude-local or project file;
+    /// that native source must hide the handle only in that checkout.
+    native_scoped_sources: HashMap<PathBuf, HashSet<(String, McpConfigSource)>>,
 }
 
 impl Default for McpRegistry {
@@ -239,6 +243,7 @@ impl Default for McpRegistry {
                 cancel_calls: HashMap::new(),
                 calls_in_flight: HashMap::new(),
                 disabled_ids: HashSet::new(),
+                native_scoped_sources: HashMap::new(),
             })),
             status_tx,
             prime_lock: Arc::new(Mutex::new(())),
@@ -1151,11 +1156,37 @@ impl McpRegistry {
         // `Starting`/`Running` and no-ops through `ensure_started`.
         let _prime_guard = self.prime_lock.lock().await;
         let configs = discover_configs(project_root);
+        self.remember_native_scoped_sources(project_root, &configs).await;
         for cfg in configs {
             if cfg.disabled {
                 continue;
             }
             let _ = self.ensure_started(app, cfg).await;
+        }
+    }
+
+    async fn remember_native_scoped_sources(
+        &self,
+        project_root: Option<&std::path::Path>,
+        configs: &[McpServerConfig],
+    ) {
+        if let Some(root) = project_root {
+            let checkout = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
+            let native_sources = configs
+                .iter()
+                .flat_map(|config| {
+                    config.sources.iter().copied().filter_map(|source| {
+                        (super::is_project_source(source)
+                            || source == McpConfigSource::ClaudeLocal)
+                            .then(|| (config.id.clone(), source))
+                    })
+                })
+                .collect();
+            self.inner
+                .lock()
+                .await
+                .native_scoped_sources
+                .insert(checkout, native_sources);
         }
     }
 
@@ -1218,11 +1249,22 @@ impl McpRegistry {
             {
                 continue;
             }
-            let provider_native = handle
-                .config
-                .sources
-                .iter()
-                .any(|source| sources.contains(source));
+            let native_here = project
+                .and_then(|project| inner.native_scoped_sources.get(&project.checkout))
+                .is_some_and(|native| {
+                    sources.iter().any(|source| {
+                        native.contains(&(handle.config.id.clone(), *source))
+                    })
+                });
+            // The primary scoped handle is already restricted by
+            // visible_in_project. A secondary scoped source on a global
+            // handle is native only where that source was discovered.
+            let provider_native = native_here || handle.config.sources.iter().any(|source| {
+                sources.contains(source)
+                    && ((!super::is_project_source(*source)
+                        && *source != McpConfigSource::ClaudeLocal)
+                        || handle.config.primary_source() == *source)
+            });
             if handle.status.is_running() && !provider_native {
                 let is_self = handle.config.sources.contains(&McpConfigSource::Codemux);
                 tools.extend(
@@ -1604,12 +1646,19 @@ fn visible_in_project(config: &McpServerConfig, project: Option<&McpProjectScope
 /// Project-sourced entries carry the project root their approval is keyed
 /// by (see [`super::project_trust::approval_root`]).
 pub(crate) fn discover_configs(project_root: Option<&std::path::Path>) -> Vec<McpServerConfig> {
+    discover_configs_with_home(project_root, dirs::home_dir().as_deref())
+}
+
+fn discover_configs_with_home(
+    project_root: Option<&std::path::Path>,
+    home: Option<&std::path::Path>,
+) -> Vec<McpServerConfig> {
     let mut out: Vec<McpServerConfig> = vec![codemux_self_config()];
 
     let project_path: Option<PathBuf> = project_root.map(|p| p.to_path_buf());
     // Resolved only when the project defines a server: it can ask Git.
     let approval_root = std::cell::OnceCell::new();
-    let scan = enumerate_mcp_paths(project_path.as_deref());
+    let scan = enumerate_mcp_paths_with_home(project_path.as_deref(), home);
     let own = PathBuf::from(crate::mcp_server::codemux_mcp_command());
 
     for (path, source) in scan.paths {
@@ -1802,6 +1851,56 @@ mod tests {
     use super::*;
     use crate::mcp::{McpConfigSource, McpServerConfig, McpTransport, WORKSPACE_META_KEY};
     use std::collections::HashMap;
+
+    #[tokio::test]
+    async fn discovery_excludes_a_global_copy_only_where_claude_local_is_native() {
+        let home = tempfile::tempdir().unwrap();
+        let first = tempfile::tempdir().unwrap();
+        let second = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(home.path().join(".cursor")).unwrap();
+        std::fs::write(
+            home.path().join(".cursor/mcp.json"),
+            serde_json::json!({"mcpServers":{"shared":{"command":"fixture-server"}}}).to_string(),
+        ).unwrap();
+        let mut projects = serde_json::Map::new();
+        projects.insert(
+            first.path().display().to_string(),
+            serde_json::json!({"mcpServers":{"shared":{"command":"fixture-server"}}}),
+        );
+        std::fs::write(home.path().join(".claude.json"), serde_json::json!({"projects":projects}).to_string()).unwrap();
+
+        let first_configs = discover_configs_with_home(Some(first.path()), Some(home.path()));
+        let second_configs = discover_configs_with_home(Some(second.path()), Some(home.path()));
+        let global = first_configs.iter().find(|config| config.name == "shared").unwrap().clone();
+        assert_eq!(global.primary_source(), McpConfigSource::CursorUser);
+        assert!(global.sources.contains(&McpConfigSource::ClaudeLocal));
+        assert_eq!(second_configs.iter().find(|config| config.name == "shared").unwrap().sources,
+            vec![McpConfigSource::CursorUser]);
+
+        let registry = McpRegistry::new();
+        registry.remember_native_scoped_sources(Some(first.path()), &first_configs).await;
+        registry.remember_native_scoped_sources(Some(second.path()), &second_configs).await;
+        // The global handle may have started from the other checkout first,
+        // before this checkout's Claude-local source was discovered.
+        let running_global = second_configs.iter().find(|config| config.name == "shared").unwrap().clone();
+        let mut handle = McpServerHandle::discovered(running_global);
+        handle.status = McpServerStatus::Running { tool_count: 1 };
+        handle.tools.push(McpTool {
+            name: "tool".into(), prefixed_name: "mcp__shared__tool".into(),
+            description: None, input_schema: serde_json::json!({}), server_id: global.id.clone(),
+        });
+        registry.inner.lock().await.handles.insert(global.id, handle);
+        let native = &[McpConfigSource::ClaudeLocal, McpConfigSource::ClaudeUser, McpConfigSource::ClaudeProject];
+        let first_scope = McpProjectScope::new(first.path());
+        let second_scope = McpProjectScope::new(second.path());
+        assert!(registry.list_tools_for_workspace(native, None, Some(&first_scope)).await.is_empty());
+        assert_eq!(registry.list_tools_for_workspace(native, None, Some(&second_scope)).await.len(), 1);
+
+        std::fs::write(home.path().join(".claude.json"), "{}").unwrap();
+        let refreshed = discover_configs_with_home(Some(first.path()), Some(home.path()));
+        registry.remember_native_scoped_sources(Some(first.path()), &refreshed).await;
+        assert_eq!(registry.list_tools_for_workspace(native, None, Some(&first_scope)).await.len(), 1);
+    }
 
     fn make_config(id: &str, name: &str, command: &str) -> McpServerConfig {
         McpServerConfig {

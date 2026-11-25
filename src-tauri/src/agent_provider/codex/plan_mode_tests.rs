@@ -250,7 +250,7 @@ async fn a_resumed_plan_thread_continues_in_plan_until_a_send_names_a_mode() {
     let mut input = start_input(dir.path(), &thread);
     // Restart auto-resume reopens the thread, which Codex reports in Plan, and
     // sends its continuation without a mode.
-    input.resume_cursor = Some(json!({"threadId": "fixture-thread"}));
+    input.resume_cursor = Some(json!({"threadId": "fixture-thread", "toolCatalogKey": codex_tool_catalog_key(dir.path(), None)}));
     provider.start_session(input).await.unwrap();
     send(&provider, &thread, None).await;
     send(&provider, &thread, Some("danger-full-access")).await;
@@ -262,6 +262,56 @@ async fn a_resumed_plan_thread_continues_in_plan_until_a_send_names_a_mode() {
         .collect();
     assert_eq!(modes, ["plan", "default"]);
     let _ = provider.stop_session(thread).await;
+}
+
+#[tokio::test]
+async fn a_resumed_thread_with_an_out_of_scope_saved_tool_starts_fresh() {
+    let dir = tempfile::tempdir().unwrap();
+    let provider = CodexAgentProvider::new(CodexProviderConfig {
+        codex_binary: fixture_binary(dir.path()),
+        ..Default::default()
+    });
+    let thread = ThreadId("stale-tools".into());
+    let stale_tool = DynamicToolSpec::Function {
+        name: "mcp__other_checkout__secret".into(),
+        description: "out of scope".into(),
+        input_schema: json!({"type":"object"}),
+        defer_loading: None,
+    };
+    let mut input = start_input(dir.path(), &thread);
+    input.resume_cursor = Some(json!({
+        "threadId": "old-thread",
+        "toolCatalogKey": codex_tool_catalog_key(dir.path(), Some(&[stale_tool]))
+    }));
+    provider.start_session(input).await.unwrap();
+    let messages = std::fs::read_to_string(dir.path().join("wire.jsonl")).unwrap();
+    assert!(messages.contains("\"method\": \"thread/start\""));
+    assert!(!messages.contains("\"method\": \"thread/resume\""));
+    provider.stop_session(thread).await.unwrap();
+}
+
+#[tokio::test]
+async fn a_required_original_thread_with_a_stale_tool_catalog_is_rejected() {
+    let dir = tempfile::tempdir().unwrap();
+    let provider = CodexAgentProvider::new(CodexProviderConfig {
+        codex_binary: fixture_binary(dir.path()),
+        ..Default::default()
+    });
+    let thread = ThreadId("required-original-stale-tools".into());
+    let mut input = start_input(dir.path(), &thread);
+    input.resume_cursor = Some(json!({
+        "threadId": "old-thread",
+        "toolCatalogKey": codex_tool_catalog_key(dir.path().join("other-checkout").as_path(), None),
+        "requireOriginal": true
+    }));
+    let error = match provider.start_session(input).await {
+        Ok(_) => panic!("a stale required-original cursor resumed"),
+        Err(error) => error,
+    };
+    assert!(error.to_string().contains("cannot be resumed safely"));
+    let messages = std::fs::read_to_string(dir.path().join("wire.jsonl")).unwrap();
+    assert!(!messages.contains("\"method\": \"thread/start\""));
+    assert!(!messages.contains("\"method\": \"thread/resume\""));
 }
 
 #[tokio::test]
@@ -281,7 +331,7 @@ async fn a_server_that_reports_no_mode_resumes_in_the_recorded_one() {
         });
         let thread = ThreadId("recorded".into());
         let mut input = start_input(dir.path(), &thread);
-        input.resume_cursor = Some(json!({"threadId": "fixture-thread"}));
+        input.resume_cursor = Some(json!({"threadId": "fixture-thread", "toolCatalogKey": codex_tool_catalog_key(dir.path(), None)}));
         input.extra = json!({ "turnMode": recorded });
         provider.start_session(input).await.unwrap();
         send(&provider, &thread, None).await;
@@ -343,7 +393,7 @@ async fn a_resumed_thread_calls_host_tools_in_its_resumed_mode() {
         });
         let thread = ThreadId("resumed-host-tools".into());
         let mut input = start_input(dir.path(), &thread);
-        input.resume_cursor = Some(json!({"threadId": "fixture-thread"}));
+        input.resume_cursor = Some(json!({"threadId": "fixture-thread", "toolCatalogKey": codex_tool_catalog_key(dir.path(), None)}));
         input.extra = json!({ "turnMode": recorded });
         provider.start_session(input).await.unwrap();
         // Its continuation names no mode, so it runs in the resumed one.

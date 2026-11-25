@@ -7,12 +7,13 @@
 //! stream.
 
 use std::collections::{HashMap, VecDeque};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 use tokio::sync::{broadcast, Mutex, RwLock};
 #[path="managed_runtime.rs"]
 mod managed_runtime;
@@ -443,6 +444,9 @@ pub(crate) struct CodexSession {
     /// Codemux instructions for the tools listed at `thread/start`, added to
     /// every turn's developer instructions.
     guidance: Option<String>,
+    /// Hash of the checkout and exact dynamic tool catalog at thread/start.
+    /// Codex persists that catalog and thread/resume cannot replace it.
+    tool_catalog_key: String,
     /// The Plan pill: turns start in Codex's `plan` collaboration mode
     /// instead of `default`. Set by each composer send (see
     /// [`Self::select_collaboration_mode`]); the sandbox is untouched.
@@ -633,6 +637,11 @@ impl CodexSession {
             )
             .await
         };
+        let catalog_checkout = mcp_project_scope
+            .as_ref()
+            .map(|scope| scope.checkout.clone())
+            .unwrap_or_else(|| std::fs::canonicalize(&cwd).unwrap_or_else(|_| cwd.clone()));
+        let tool_catalog_key = codex_tool_catalog_key(&catalog_checkout, dynamic_tools.as_deref());
 
         let tier_models = if grant.is_some() {
             let entries = read_model_catalog(&child).await
@@ -789,6 +798,26 @@ impl CodexSession {
             .and_then(|v| v.get("requireOriginal"))
             .and_then(Value::as_bool)
             .unwrap_or(false);
+        let resume_cursor = match resume_cursor {
+            Some(cursor)
+                if codex_thread_id_from_resume_cursor(&cursor).is_some()
+                    && cursor.get("toolCatalogKey").and_then(Value::as_str)
+                        != Some(tool_catalog_key.as_str()) =>
+            {
+                if require_original {
+                    return Err(ProviderError::ValidationError {
+                        message: "The original Codex thread has a different tool catalog or checkout and cannot be resumed safely".into(),
+                    });
+                }
+                let _ = event_tx.send(ProviderRuntimeEvent::RuntimeWarning {
+                    thread_id: Some(thread_id.clone()),
+                    message: "Codex tool access changed; starting a fresh thread".into(),
+                    original_payload: None,
+                });
+                None
+            }
+            other => other,
+        };
         let thread = match &resume_cursor {
             Some(cursor) => {
                 let resume_id = codex_thread_id_from_resume_cursor(cursor);
@@ -935,6 +964,7 @@ impl CodexSession {
             managed: managed.clone(),
             host_caller,
             guidance: dynamic_tools.as_deref().and_then(developer_guidance),
+            tool_catalog_key,
             plugin_registry: mcp_registry.clone().filter(|_| managed.is_none()),
             plugin_catalog_seen: Mutex::new(plugin_snapshot.catalog_key),
             direct_tool_names: plugin_snapshot.direct_names,
@@ -1776,7 +1806,7 @@ impl CodexSession {
     pub async fn resume_cursor(&self) -> Value {
         // A known-empty snapshot still matters: plugins added while the app is
         // closed need a reminder after resume, rather than being treated as seen.
-        json!({"threadId":self.provider_session_id.0,"pluginTools":PluginToolSnapshot {
+        json!({"threadId":self.provider_session_id.0,"toolCatalogKey":self.tool_catalog_key,"pluginTools":PluginToolSnapshot {
             direct_names:self.direct_tool_names.clone(),catalog_key:self.plugin_catalog_seen.lock().await.clone(),
         }})
     }
@@ -2744,6 +2774,37 @@ pub(crate) fn codex_plan_label(plan_type: Option<&str>) -> Option<String> {
             }
         }
     })
+}
+
+/// A resumed Codex thread keeps its original dynamic tool definitions. Bind
+/// that persisted catalog to the exact checkout before deciding to resume.
+fn codex_tool_catalog_key(checkout: &Path, tools: Option<&[DynamicToolSpec]>) -> String {
+    let mut digest = Sha256::new();
+    digest.update(b"codemux-codex-tool-catalog-v1\0");
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        digest.update(checkout.as_os_str().as_bytes());
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStrExt;
+        for unit in checkout.as_os_str().encode_wide() {
+            digest.update(unit.to_le_bytes());
+        }
+    }
+    digest.update([u8::from(tools.is_some())]);
+    let mut specs = tools
+        .unwrap_or_default()
+        .iter()
+        .map(|tool| serde_json::to_vec(tool).expect("dynamic tool spec is serializable"))
+        .collect::<Vec<_>>();
+    specs.sort();
+    for spec in specs {
+        digest.update((spec.len() as u64).to_le_bytes());
+        digest.update(spec);
+    }
+    digest.finalize().iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
 fn codex_thread_id_from_resume_cursor(cursor: &Value) -> Option<String> {

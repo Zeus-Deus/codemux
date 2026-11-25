@@ -472,7 +472,7 @@ async fn chatgpt_dead_child_recovery_preserves_generic_and_managed_provider_path
             }
         }).await.expect("watchdog must expose an actually dead child as absent");
         let mut resume = input;
-        resume.resume_cursor = Some(json!({"threadId": "fixture-thread"}));
+        resume.resume_cursor = Some(old.resume_cursor().await);
         provider.start_session(resume).await.unwrap();
         let current = provider.sessions.read().await.get(&thread).unwrap().clone();
         let live = provider.has_session(&thread).await && current.child().await.is_alive();
@@ -676,7 +676,7 @@ async fn chatgpt_duplicate_start_retries_removed_binding_while_stop_waits() {
     let mut input = timeline_start_input(dir.path(), &thread);
     provider.start_session(input.clone()).await.unwrap();
     let old = provider.sessions.read().await.get(&thread).unwrap().clone();
-    input.resume_cursor = Some(json!({"threadId": "fixture-thread"}));
+    input.resume_cursor = Some(old.resume_cursor().await);
     let outbound = old.lifecycle_guard().await;
     let mut start = Box::pin(provider.start_session(input));
     assert!(matches!(futures_util::poll!(start.as_mut()), Poll::Pending));

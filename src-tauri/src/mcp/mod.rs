@@ -75,7 +75,8 @@ pub enum McpTransport {
 #[serde(rename_all = "camelCase")]
 pub struct McpServerConfig {
     /// Stable id derived from `(canonical config path | server name)`.
-    /// After dedupe, the canonical (lowest-rank) source's id wins.
+    /// After dedupe, the canonical source's id wins. A global user entry
+    /// takes priority over an identical checkout-local or project entry.
     pub id: String,
     /// User-facing alias (the key inside `mcpServers`).
     pub name: String,
@@ -205,9 +206,8 @@ impl McpServerConfig {
         self
     }
 
-    /// Lowest-rank (most canonical) source for this entry. After dedupe
-    /// `sources[0]` is always the canonical one because we sort before
-    /// merging.
+    /// Canonical source for this entry. After dedupe `sources[0]` is the
+    /// selected source, which may outrank a lower-ranked scoped copy.
     pub fn primary_source(&self) -> McpConfigSource {
         self.sources.first().copied().unwrap_or(McpConfigSource::Codemux)
     }
@@ -261,8 +261,8 @@ pub fn source_rank(s: McpConfigSource) -> u8 {
 /// always stay as their own row. This preserves the "always on" badge
 /// even when a project file references Codemux's own command.
 ///
-/// The input is expected to be sorted by `(source_rank, name)` already so
-/// the first occurrence becomes canonical.
+/// The input is expected to be sorted by `(source_rank, name)` already.
+/// A later global user entry can replace an earlier scoped entry.
 pub fn dedupe_servers(servers: Vec<McpServerConfig>) -> Vec<McpServerConfig> {
     use std::collections::HashMap as Map;
 
@@ -330,11 +330,21 @@ pub fn dedupe_servers(servers: Vec<McpServerConfig>) -> Vec<McpServerConfig> {
             // A user-owned entry outranks a project file's copy of it, so
             // the merged row keeps the user's id (Settings' off switch),
             // `disabled` flag and remaining fields, whichever ranks first.
+            // A Claude-local entry is owned by the user but remains bound to
+            // one checkout. A global user entry must stay canonical when the
+            // same definition appears in both places.
+            let global_user_owned = |sources: &[McpConfigSource]| {
+                sources.iter().any(|source| {
+                    !is_project_source(*source) && *source != McpConfigSource::ClaudeLocal
+                })
+            };
             let user_owned = |sources: &[McpConfigSource]| {
                 sources.iter().any(|source| !is_project_source(*source))
             };
             let mut srv = srv;
-            if user_owned(&srv.sources) && !user_owned(&out[idx].sources) {
+            if (global_user_owned(&srv.sources) && !global_user_owned(&out[idx].sources))
+                || (user_owned(&srv.sources) && !user_owned(&out[idx].sources))
+            {
                 std::mem::swap(&mut out[idx], &mut srv);
             }
             // Merge: append the additional source(s) onto the canonical
@@ -425,6 +435,19 @@ mod tests {
         assert_eq!(result[0].sources.len(), 2);
         assert_eq!(result[0].sources[0], McpConfigSource::ClaudeUser);
         assert_eq!(result[0].sources[1], McpConfigSource::CursorUser);
+    }
+
+    #[test]
+    fn identical_claude_local_entry_does_not_shadow_a_global_user_server() {
+        let mut local = make("shared", McpConfigSource::ClaudeLocal, "server", &[]);
+        local.project_root = Some("/checkout-a".into());
+        local.checkout_root = Some("/checkout-a".into());
+        let global = make("shared", McpConfigSource::CursorUser, "server", &[]);
+        let merged = dedupe_servers(vec![local, global.clone()]);
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].id, global.id);
+        assert_eq!(merged[0].sources, vec![McpConfigSource::CursorUser, McpConfigSource::ClaudeLocal]);
+        assert_eq!(merged[0].checkout_root, None);
     }
 
     #[test]
