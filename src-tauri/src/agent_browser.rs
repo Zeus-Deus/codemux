@@ -1052,6 +1052,102 @@ fn rollback_failed_unix_open(session: &str, before_open: Option<&BrowserPidRecor
     }
 }
 
+#[cfg(unix)]
+fn browser_process_has_open_attempt(pid: u32, attempt: &str) -> bool {
+    use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System, UpdateKind};
+
+    let process_id = Pid::from_u32(pid);
+    let mut system = System::new();
+    system.refresh_processes_specifics(
+        ProcessesToUpdate::Some(&[process_id]),
+        true,
+        ProcessRefreshKind::nothing().with_environ(UpdateKind::Always),
+    );
+    let expected = format!("CODEMUX_BROWSER_OPEN_ATTEMPT={attempt}");
+    system.process(process_id)
+        .is_some_and(|process| process.environ().iter().any(|entry| entry.to_string_lossy() == expected))
+}
+
+#[cfg(unix)]
+fn browser_daemon_for_open_attempt(session: &str, attempt: &str) -> Option<BrowserPidRecord> {
+    use sysinfo::{ProcessRefreshKind, ProcessesToUpdate, System, UpdateKind};
+
+    let (owner_pid, owner_start_time) = current_app_process_identity()?;
+    let owner = format!("CODEMUX_BROWSER_OWNER={}", browser_owner_token());
+    let session_env = format!("CODEMUX_BROWSER_SESSION={session}");
+    let attempt_env = format!("CODEMUX_BROWSER_OPEN_ATTEMPT={attempt}");
+    let mut system = System::new();
+    system.refresh_processes_specifics(
+        ProcessesToUpdate::All,
+        true,
+        ProcessRefreshKind::nothing()
+            .with_exe(UpdateKind::Always)
+            .with_environ(UpdateKind::Always),
+    );
+    system.processes().values().find_map(|process| {
+        let env = process.environ();
+        if ![&owner, &session_env, &attempt_env]
+            .iter()
+            .all(|expected| env.iter().any(|entry| entry.to_string_lossy() == expected.as_str()))
+        {
+            return None;
+        }
+        let record = BrowserPidRecord {
+            pid: process.pid().as_u32(),
+            start_time: process.start_time(),
+            token: browser_owner_token().to_owned(),
+            owner_pid,
+            owner_start_time,
+        };
+        browser_process_matches(&record, session).then_some(record)
+    })
+}
+
+#[cfg(unix)]
+fn rollback_failed_unix_stream_open(session: &str, before_open: Option<&BrowserPidRecord>, attempt: &str) {
+    rollback_failed_unix_open(session, before_open);
+
+    // The detached daemon can publish its PID after the launcher times out.
+    // Keep the launch attempt marker so a later successful retry is never
+    // mistaken for this failed start, even after the session gate reopens.
+    let session = session.to_owned();
+    let attempt = attempt.to_owned();
+    let result = std::thread::Builder::new()
+        .name("browser-failed-open-tracker".to_owned())
+        .spawn(move || {
+            let started = Instant::now();
+            let mut last_scan = Instant::now();
+            let mut first_scan = true;
+            while started.elapsed() < Duration::from_secs(5) {
+                let from_pid = read_agent_browser_daemon_pid(&session)
+                    .and_then(|pid| owned_browser_pid(&session, pid))
+                    .filter(|record| record.token == browser_owner_token()
+                        && browser_process_has_open_attempt(record.pid, &attempt));
+                let from_process = if from_pid.is_none()
+                    && (first_scan || last_scan.elapsed() >= Duration::from_millis(250))
+                {
+                    first_scan = false;
+                    last_scan = Instant::now();
+                    browser_daemon_for_open_attempt(&session, &attempt)
+                } else {
+                    None
+                };
+                if let Some(record) = from_pid.or(from_process)
+                {
+                    // Do not overwrite a later successful attempt's PID
+                    // record. The launch marker identifies this process for
+                    // a direct verified kill, even without a PID file.
+                    kill_verified_browser_pid(&record, &session);
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+        });
+    if let Err(error) = result {
+        eprintln!("[codemux::browser] could not track failed browser open: {error}");
+    }
+}
+
 #[cfg(not(windows))]
 fn output_capture_and_track_browser_daemon(
     command: std::process::Command,
@@ -1154,6 +1250,12 @@ fn stop_previous_browser_daemon_before_stream(session: &str, bin: &str) -> Resul
 fn live_owned_browser_pid(session: &str) -> Option<u32> {
     let pid = read_agent_browser_daemon_pid(session)?;
     owned_browser_pid(session, pid).map(|record| record.pid)
+}
+
+fn shutdown_record_owned_by_this_app(session: &str, removed_pid: Option<u32>) -> Option<BrowserPidRecord> {
+    let pid = removed_pid.or_else(|| read_agent_browser_daemon_pid(session))?;
+    let record = owned_browser_pid(session, pid)?;
+    (record.token == browser_owner_token()).then_some(record)
 }
 
 /// Remove our PID file once the daemon is gone. Best-effort.
@@ -3494,8 +3596,7 @@ impl AgentBrowserManager {
     #[cfg(not(test))]
     fn shutdown_session_processes(session: &str, removed: Option<StreamSession>) {
         let Some(removed) = removed else { return };
-        let Some(pid) = removed.pid.or_else(|| read_agent_browser_daemon_pid(session)) else { return };
-        let Some(record) = owned_browser_pid(session, pid) else { return };
+        let Some(record) = shutdown_record_owned_by_this_app(session, removed.pid) else { return };
         if let Ok(bin) = resolve_binary() {
             stop_owned_browser_daemon(session, &record, &bin);
         } else {
@@ -3651,7 +3752,9 @@ impl AgentBrowserManager {
             #[cfg(not(target_os = "windows"))]
             {
                 let before_open = track_current_browser_daemon(&session);
+                let attempt = uuid::Uuid::new_v4().simple().to_string();
                 let mut cmd = browser_open_command(&bin, &session, port)?;
+                cmd.env("CODEMUX_BROWSER_OPEN_ATTEMPT", &attempt);
                 if let Some(log) = log_file {
                     cmd.stderr(log);
                 }
@@ -3659,7 +3762,7 @@ impl AgentBrowserManager {
                     launch_status_with_timeout(cmd, OPEN_TIMEOUT),
                 );
                 if let Err(error) = opened {
-                    rollback_failed_unix_open(&session, before_open.as_ref());
+                    rollback_failed_unix_stream_open(&session, before_open.as_ref(), &attempt);
                     return Err(error);
                 }
             }
@@ -5339,6 +5442,15 @@ mod tests {
         session: &str,
         token: &str,
     ) -> (tempfile::TempDir, std::process::Child, BrowserPidRecord) {
+        browser_identity_fixture_with_attempt(session, token, None)
+    }
+
+    #[cfg(unix)]
+    fn browser_identity_fixture_with_attempt(
+        session: &str,
+        token: &str,
+        attempt: Option<&str>,
+    ) -> (tempfile::TempDir, std::process::Child, BrowserPidRecord) {
         let temp = tempfile::tempdir().unwrap();
         let binary = temp.path().join("agent-browser");
         std::fs::copy(which::which("bash").unwrap(), &binary).unwrap();
@@ -5346,6 +5458,9 @@ mod tests {
         command.args(["-c", "while :; do sleep 1; done"])
             .env("CODEMUX_BROWSER_OWNER", token)
             .env("CODEMUX_BROWSER_SESSION", session);
+        if let Some(attempt) = attempt {
+            command.env("CODEMUX_BROWSER_OPEN_ATTEMPT", attempt);
+        }
         let spawn_started = Instant::now();
         let mut child = loop {
             match command.spawn() {
@@ -5397,6 +5512,45 @@ mod tests {
         let _ = std::fs::remove_file(daemon_pid_path);
         clear_session_pid(&session);
         assert!(still_running, "failed open stopped another process's daemon");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pane_shutdown_does_not_stop_a_live_foreign_owner() {
+        let session = format!("browser-foreign-close-{}", uuid::Uuid::new_v4().simple());
+        let token = uuid::Uuid::new_v4().simple().to_string();
+        let (_temp, mut daemon, mut record) = browser_identity_fixture(&session, &token);
+        let daemon_pid_path = run_dir_for_session(&session)
+            .unwrap()
+            .join(format!("{session}.pid"));
+        std::fs::write(&daemon_pid_path, daemon.id().to_string()).unwrap();
+
+        let mut owner = std::process::Command::new(which::which("sleep").unwrap())
+            .arg("30")
+            .spawn()
+            .unwrap();
+        record.owner_pid = owner.id();
+        let started = Instant::now();
+        record.owner_start_time = loop {
+            if let Some(start_time) = process_start_time(owner.id()) {
+                break start_time;
+            }
+            assert!(started.elapsed() < Duration::from_secs(3));
+            std::thread::sleep(Duration::from_millis(25));
+        };
+        write_session_pid(&session, &record).unwrap();
+        assert!(!previous_app_has_exited(&record));
+        // A locally recorded PID does not authorize this pane to close a
+        // daemon that still belongs to another app instance.
+        assert!(shutdown_record_owned_by_this_app(&session, Some(daemon.id())).is_none());
+        assert!(daemon.try_wait().unwrap().is_none(), "pane shutdown targeted the foreign daemon");
+
+        let _ = daemon.kill();
+        let _ = daemon.wait();
+        let _ = owner.kill();
+        let _ = owner.wait();
+        let _ = std::fs::remove_file(daemon_pid_path);
+        clear_session_pid(&session);
     }
 
     #[cfg(unix)]
@@ -5537,6 +5691,107 @@ mod tests {
             let _ = child.wait();
             panic!("late-published daemon survived cleanup");
         }
+        let _ = std::fs::remove_file(daemon_pid_path);
+        clear_session_pid(&session);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn failed_stream_open_stops_its_daemon_after_late_pid_publication() {
+        let session = format!("browser-late-open-{}", uuid::Uuid::new_v4().simple());
+        let attempt = uuid::Uuid::new_v4().simple().to_string();
+        let (_temp, mut daemon, _record) = browser_identity_fixture_with_attempt(
+            &session,
+            browser_owner_token(),
+            Some(&attempt),
+        );
+        let daemon_pid_path = run_dir_for_session(&session)
+            .unwrap()
+            .join(format!("{session}.pid"));
+        let pid = daemon.id();
+        let path_for_writer = daemon_pid_path.clone();
+        let writer = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(300));
+            std::fs::write(path_for_writer, pid.to_string()).unwrap();
+        });
+
+        // This is the failed start_stream branch: rollback initially sees no
+        // PID, then the detached daemon publishes it after the CLI is gone.
+        assert!(!daemon_pid_path.exists());
+        rollback_failed_unix_stream_open(&session, None, &attempt);
+        writer.join().unwrap();
+        let started = Instant::now();
+        let stopped = loop {
+            if daemon.try_wait().unwrap().is_some() {
+                break true;
+            }
+            if started.elapsed() >= Duration::from_secs(3) {
+                break false;
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        };
+        if !stopped {
+            let _ = daemon.kill();
+            let _ = daemon.wait();
+        }
+        assert!(stopped, "failed stream open left a late-published daemon running");
+        assert!(read_browser_pid_record(&session_pid_path(&session).unwrap()).is_none());
+        let _ = std::fs::remove_file(daemon_pid_path);
+        clear_session_pid(&session);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn failed_stream_open_stops_daemon_without_a_pid_file() {
+        let session = format!("browser-no-pid-open-{}", uuid::Uuid::new_v4().simple());
+        let attempt = uuid::Uuid::new_v4().simple().to_string();
+        let (_temp, mut daemon, _record) = browser_identity_fixture_with_attempt(
+            &session,
+            browser_owner_token(),
+            Some(&attempt),
+        );
+        assert!(read_agent_browser_daemon_pid(&session).is_none());
+
+        rollback_failed_unix_stream_open(&session, None, &attempt);
+        let started = Instant::now();
+        let stopped = loop {
+            if daemon.try_wait().unwrap().is_some() {
+                break true;
+            }
+            if started.elapsed() >= Duration::from_secs(3) {
+                break false;
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        };
+        if !stopped {
+            let _ = daemon.kill();
+            let _ = daemon.wait();
+        }
+        assert!(stopped, "failed stream open left a daemon without a PID file");
+        clear_session_pid(&session);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn failed_stream_tracker_does_not_stop_a_new_attempt() {
+        let session = format!("browser-new-open-{}", uuid::Uuid::new_v4().simple());
+        let failed_attempt = uuid::Uuid::new_v4().simple().to_string();
+        let new_attempt = uuid::Uuid::new_v4().simple().to_string();
+        let (_temp, mut daemon, _record) = browser_identity_fixture_with_attempt(
+            &session,
+            browser_owner_token(),
+            Some(&new_attempt),
+        );
+        let daemon_pid_path = run_dir_for_session(&session)
+            .unwrap()
+            .join(format!("{session}.pid"));
+        rollback_failed_unix_stream_open(&session, None, &failed_attempt);
+        std::fs::write(&daemon_pid_path, daemon.id().to_string()).unwrap();
+        std::thread::sleep(Duration::from_millis(300));
+        assert!(daemon.try_wait().unwrap().is_none(), "failed attempt stopped a newer daemon");
+
+        let _ = daemon.kill();
+        let _ = daemon.wait();
         let _ = std::fs::remove_file(daemon_pid_path);
         clear_session_pid(&session);
     }
