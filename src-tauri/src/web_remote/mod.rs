@@ -49,8 +49,26 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
+use axum::{
+    http::{header, HeaderValue},
+    response::Response,
+};
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter, Manager, Runtime};
+
+/// Keep session-scoped file and browser-proxy responses out of browser caches
+/// and prevent their URLs from being sent as referrers.
+fn private_response(mut response: Response) -> Response {
+    response.headers_mut().insert(
+        header::CACHE_CONTROL,
+        HeaderValue::from_static("private, no-store"),
+    );
+    response.headers_mut().insert(
+        header::REFERRER_POLICY,
+        HeaderValue::from_static("no-referrer"),
+    );
+    response
+}
 
 /// Default bind port. Chosen to be memorable and unlikely to clash.
 pub const DEFAULT_PORT: u16 = 4377;
