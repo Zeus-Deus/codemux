@@ -120,7 +120,7 @@ pub(crate) fn parse_sid_marker(stdout: &str) -> Option<String> {
 /// Owner-only folder on the remote host where bundles wait between the SSH
 /// steps of one transfer. Bundles are whole transcripts, so they never go in
 /// the shared `/tmp`, where other users could read them or plant the name.
-const REMOTE_BUNDLE_DIR: &str = "~/.codemux/opencode-sync";
+const REMOTE_BUNDLE_DIR: &str = "~/.codemux-opencode-sync";
 
 /// Quote a remote bundle path, keeping its leading `~/` expandable.
 fn remote_quote(path: &str) -> String {
@@ -130,7 +130,7 @@ fn remote_quote(path: &str) -> String {
 /// The same ancestor check is run on the remote before creation, reads, and
 /// deletion. Cleanup never creates a directory if the path has changed.
 fn remote_bundle_dir_guard(create: bool) -> String {
-    crate::private_dir::shell_private_dir_guard(&[".codemux", "opencode-sync"], create)
+    crate::private_dir::shell_private_dir_guard(&[".codemux-opencode-sync"], create)
 }
 
 /// A shell command that checks the remote directory, then performs a single
@@ -683,10 +683,10 @@ mod tests {
 
     #[test]
     fn remote_import_script_cds_then_imports_then_cleans_up() {
-        let s = remote_import_script("/home/me/ws", "~/.codemux/opencode-sync/b1.json");
+        let s = remote_import_script("/home/me/ws", "~/.codemux-opencode-sync/b1.json");
         assert!(s.contains("mkdir -p '/home/me/ws' && cd '/home/me/ws' || exit 3"));
         // `~/` stays unquoted so the remote shell expands it.
-        assert!(s.contains("opencode import ~/'.codemux/opencode-sync/b1.json'"));
+        assert!(s.contains("opencode import ~/'.codemux-opencode-sync/b1.json'"));
         assert!(s.contains("rm -f \"$cmx_file\""));
         assert!(s.contains("cmx_check_ancestor"));
         // Cleanup is installed before anything can exit early.
@@ -699,7 +699,7 @@ mod tests {
     #[test]
     fn remote_import_script_removes_the_bundle_when_it_exits_early() {
         let home = tempfile::tempdir().unwrap();
-        let bundle_dir = home.path().join(".codemux/opencode-sync");
+        let bundle_dir = home.path().join(".codemux-opencode-sync");
         std::fs::create_dir_all(&bundle_dir).unwrap();
         std::fs::write(bundle_dir.join("b3.json"), "transcript").unwrap();
         // A workspace path under a regular file can't be created, so `cd`
@@ -707,7 +707,7 @@ mod tests {
         std::fs::write(home.path().join("file"), "").unwrap();
         let script = remote_import_script(
             &home.path().join("file/ws").to_string_lossy(),
-            "~/.codemux/opencode-sync/b3.json",
+            "~/.codemux-opencode-sync/b3.json",
         );
         let status = std::process::Command::new("bash")
             .arg("-c")
@@ -724,7 +724,7 @@ mod tests {
 
     #[test]
     fn remote_extract_script_queries_then_exports_with_marker() {
-        let s = remote_extract_script("/home/me/ws", "~/.codemux/opencode-sync/b2.json");
+        let s = remote_extract_script("/home/me/ws", "~/.codemux-opencode-sync/b2.json");
         // The query is built by the shared SQL helper and passed as one
         // shell-quoted argument (no raw $dir splice into the SQL literal).
         assert!(s.contains(&shell_sq(&newest_session_sql("/home/me/ws"))));
@@ -776,7 +776,7 @@ mod tests {
     #[test]
     fn remote_bundles_are_private_and_out_of_shared_tmp() {
         let bundle = unique_remote_bundle();
-        assert!(bundle.starts_with("~/.codemux/opencode-sync/codemux-opencode-"));
+        assert!(bundle.starts_with("~/.codemux-opencode-sync/codemux-opencode-"));
         // The export checks ancestors before creating the private folder.
         let s = remote_extract_script("/home/me/ws", &bundle);
         assert!(s.contains("cmx_check_ancestor"), "{s}");
@@ -791,6 +791,7 @@ mod tests {
         let home = tempfile::tempdir().unwrap();
         let elsewhere = tempfile::tempdir().unwrap();
         std::os::unix::fs::symlink(elsewhere.path(), home.path().join(".cache")).unwrap();
+        std::os::unix::fs::symlink(elsewhere.path(), home.path().join(".codemux")).unwrap();
         let bundle = unique_remote_bundle();
         let script =
             remote_bundle_command(&bundle, true, "set -C\nprintf data > \"$cmx_file\"").unwrap();
@@ -801,7 +802,7 @@ mod tests {
             .status()
             .unwrap();
         assert!(status.success());
-        let dir = home.path().join(".codemux/opencode-sync");
+        let dir = home.path().join(".codemux-opencode-sync");
         let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode(&dir), 0o700);
         let file = home.path().join(bundle.strip_prefix("~/").unwrap());
@@ -826,10 +827,9 @@ mod tests {
         let home = tempfile::tempdir().unwrap();
         let elsewhere = tempfile::tempdir().unwrap();
         std::fs::set_permissions(elsewhere.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
-        std::fs::create_dir_all(home.path().join(".codemux")).unwrap();
         std::os::unix::fs::symlink(
             elsewhere.path(),
-            home.path().join(".codemux/opencode-sync"),
+            home.path().join(".codemux-opencode-sync"),
         )
         .unwrap();
         let bundle = unique_remote_bundle();
@@ -859,9 +859,8 @@ mod tests {
     fn remote_bundle_operations_refuse_writable_parent_and_redirected_cleanup() {
         use std::os::unix::fs::PermissionsExt;
         let home = tempfile::tempdir().unwrap();
-        let app_dir = home.path().join(".codemux");
-        std::fs::create_dir(&app_dir).unwrap();
-        std::fs::set_permissions(&app_dir, std::fs::Permissions::from_mode(0o777)).unwrap();
+        let bundle_dir = home.path().join(".codemux-opencode-sync");
+        std::fs::set_permissions(home.path(), std::fs::Permissions::from_mode(0o777)).unwrap();
         let bundle = unique_remote_bundle();
         let write =
             remote_bundle_command(&bundle, true, "set -C\nprintf data > \"$cmx_file\"").unwrap();
@@ -875,20 +874,20 @@ mod tests {
         };
         assert!(!run(&write).success());
         assert!(
-            !app_dir.join("opencode-sync").exists(),
+            !bundle_dir.exists(),
             "nothing created below the writable parent"
         );
 
-        std::fs::set_permissions(&app_dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        std::fs::set_permissions(home.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
         assert!(run(&write).success());
         let file = home.path().join(bundle.strip_prefix("~/").unwrap());
-        std::fs::rename(&app_dir, home.path().join("elsewhere")).unwrap();
-        std::os::unix::fs::symlink(home.path().join("elsewhere"), &app_dir).unwrap();
+        std::fs::rename(&bundle_dir, home.path().join("elsewhere")).unwrap();
+        std::os::unix::fs::symlink(home.path().join("elsewhere"), &bundle_dir).unwrap();
         let cleanup = remote_bundle_cleanup_command(&bundle).unwrap();
         assert!(!run(&cleanup).success());
         assert!(home
             .path()
-            .join("elsewhere/opencode-sync")
+            .join("elsewhere")
             .join(file.file_name().unwrap())
             .exists());
     }
@@ -899,7 +898,7 @@ mod tests {
         // apostrophe doubled), exactly like the local-side newest_session_sql —
         // never spliced raw via a shell variable, which breaks the SQL literal.
         let cwd = "/Users/O'Brien/ws";
-        let s = remote_extract_script(cwd, "~/.codemux/opencode-sync/b.json");
+        let s = remote_extract_script(cwd, "~/.codemux-opencode-sync/b.json");
         assert!(
             s.contains(&shell_sq(&newest_session_sql(cwd))),
             "must embed the SQL-escaped query; got:\n{s}"
@@ -923,17 +922,17 @@ mod tests {
     #[test]
     fn cleanup_only_targets_bundles_inside_the_bundle_folder() {
         assert!(remote_bundle_name(&unique_remote_bundle()).is_some());
-        assert!(remote_bundle_name("~/.codemux/opencode-sync/b.json").is_some());
+        assert!(remote_bundle_name("~/.codemux-opencode-sync/b.json").is_some());
         for path in [
-            "~/.codemux/opencode-sync",
-            "~/.codemux/opencode-sync/",
-            "~/.codemux/opencode-sync/../x.json",
-            "~/.codemux/opencode-sync/a/../../x.json",
-            "~/.codemux/opencode-sync/sub/b.json",
-            "~/.codemux/opencode-syncx/b.json",
+            "~/.codemux-opencode-sync",
+            "~/.codemux-opencode-sync/",
+            "~/.codemux-opencode-sync/../x.json",
+            "~/.codemux-opencode-sync/a/../../x.json",
+            "~/.codemux-opencode-sync/sub/b.json",
+            "~/.codemux-opencode-syncx/b.json",
             "/tmp/codemux-opencode-1.json",
             "~/.ssh/authorized_keys",
-            "~/.codemux/opencode-sync/$(touch bad)",
+            "~/.codemux-opencode-sync/$(touch bad)",
             "",
         ] {
             assert!(remote_bundle_name(path).is_none(), "{path}");

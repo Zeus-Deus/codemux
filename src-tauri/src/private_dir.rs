@@ -248,7 +248,7 @@ cmx_check_owned "$cmx_dir" || exit 1
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.')));
         script.push_str(&format!("cmx_dir=\"$cmx_dir/{part}\"\n"));
         if create {
-            script.push_str("if [ ! -e \"$cmx_dir\" ] && [ ! -L \"$cmx_dir\" ]; then mkdir -m 700 \"$cmx_dir\" || exit 1; fi\n");
+            script.push_str("if [ ! -e \"$cmx_dir\" ] && [ ! -L \"$cmx_dir\" ]; then mkdir -m 700 \"$cmx_dir\" || cmx_check_owned \"$cmx_dir\" || exit 1; fi\n");
         }
         script.push_str("cmx_check_owned \"$cmx_dir\" || exit 1\n");
     }
@@ -446,5 +446,25 @@ mod tests {
         let dir = user_private_dir("private-dir-test").unwrap();
         assert!(dir.ends_with(Path::new(crate::APP_DIR_NAME).join("private-dir-test")));
         assert_eq!(mode(&dir), 0o700);
+    }
+
+    #[test]
+    fn shell_guard_accepts_a_safe_directory_created_by_a_concurrent_process() {
+        let home = tempfile::tempdir().unwrap();
+        let home_path = home.path().canonicalize().unwrap();
+        // Simulate losing the mkdir race: the directory now exists, but the
+        // mkdir command reports failure. The guard must verify that winner.
+        let script = format!(
+            "mkdir() {{ command mkdir \"$@\"; return 1; }}\n{}true\n",
+            shell_private_dir_guard(&["agent-launch"], true)
+        );
+        let status = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(&script)
+            .env("HOME", &home_path)
+            .status()
+            .unwrap();
+        assert!(status.success());
+        assert_eq!(mode(&home_path.join("agent-launch")), 0o700);
     }
 }

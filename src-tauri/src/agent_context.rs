@@ -600,11 +600,12 @@ mod tests {
         // exercised.
         use std::os::unix::fs::PermissionsExt;
         let home = tempfile::tempdir().unwrap();
+        let home_path = home.path().canonicalize().unwrap();
         let command = inject_agent_context("droid", "ws-run").replace("&& droid ", "&& echo ");
         let out = std::process::Command::new("sh")
             .arg("-c")
             .arg(&command)
-            .env("HOME", home.path().canonicalize().unwrap())
+            .env("HOME", &home_path)
             .output()
             .unwrap();
         assert!(
@@ -612,7 +613,7 @@ mod tests {
             "{}",
             String::from_utf8_lossy(&out.stderr)
         );
-        let dir = home.path().join(".codemux/agent-launch");
+        let dir = home_path.join(".codemux/agent-launch");
         let file = dir.join("codemux-ws-run-droid-settings.json");
         assert_eq!(
             String::from_utf8_lossy(&out.stdout).trim(),
