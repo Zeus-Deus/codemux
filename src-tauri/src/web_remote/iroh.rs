@@ -1848,12 +1848,98 @@ mod windows_key_security {
         result
     }
 
-    fn junction_target(link: &std::fs::File) -> Result<PathBuf, String> {
-        // FSCTL_GET_REPARSE_POINT returns an 8-byte header followed by the
-        // mount-point offsets and UTF-16 path buffer. Read only the substitute
-        // name: the print name is display text and need not identify the target.
-        const FSCTL_GET_REPARSE_POINT: u32 = 0x0009_00a8;
+    fn volume_guid_prefix(name: &OsStr) -> bool {
+        let name = name.to_string_lossy().to_ascii_lowercase();
+        let Some(guid) = name.strip_prefix("volume{").and_then(|name| name.strip_suffix('}')) else {
+            return false;
+        };
+        guid.len() == 36 && guid.bytes().enumerate().all(|(index, byte)| {
+            if matches!(index, 8 | 13 | 18 | 23) { byte == b'-' } else { byte.is_ascii_hexdigit() }
+        })
+    }
+
+    fn supported_prefix(prefix: Prefix<'_>) -> bool {
+        match prefix {
+            Prefix::Disk(_) | Prefix::VerbatimDisk(_) | Prefix::UNC(_, _) | Prefix::VerbatimUNC(_, _) => true,
+            Prefix::Verbatim(name) => volume_guid_prefix(name),
+            _ => false,
+        }
+    }
+
+    fn parse_reparse_target(buffer: &[u8], base: &Path) -> Result<PathBuf, String> {
+        // The print name is display text. Only the substitute name determines
+        // where Windows follows the link.
         const IO_REPARSE_TAG_MOUNT_POINT: u32 = 0xa000_0003;
+        const IO_REPARSE_TAG_SYMLINK: u32 = 0xa000_000c;
+        if buffer.len() < 16 {
+            return Err("iroh app directory reparse response is short".to_string());
+        }
+        let u16_at = |offset: usize| u16::from_le_bytes([buffer[offset], buffer[offset + 1]]) as usize;
+        let tag = u32::from_le_bytes(buffer[..4].try_into().unwrap());
+        let data_len = u16_at(4);
+        if buffer.len() != 8 + data_len {
+            return Err("iroh app directory reparse response has an invalid length".to_string());
+        }
+        let (path_start, relative) = match tag {
+            IO_REPARSE_TAG_MOUNT_POINT if data_len >= 8 => (16, false),
+            IO_REPARSE_TAG_SYMLINK if data_len >= 12 && buffer.len() >= 20 => {
+                let flags = u32::from_le_bytes(buffer[16..20].try_into().unwrap());
+                if flags & !1 != 0 {
+                    return Err("iroh app directory symlink has unsupported flags".to_string());
+                }
+                (20, flags == 1)
+            }
+            _ => return Err("iroh app directory has an unsupported reparse tag".to_string()),
+        };
+        let offset = u16_at(8);
+        let length = u16_at(10);
+        let end = path_start.checked_add(offset).and_then(|start| start.checked_add(length))
+            .ok_or("iroh app directory reparse target is too long")?;
+        if offset % 2 != 0 || length == 0 || length % 2 != 0 || end > buffer.len() {
+            return Err("iroh app directory reparse target is malformed".to_string());
+        }
+        let name: Vec<u16> = buffer[path_start + offset..end]
+            .chunks_exact(2)
+            .map(|unit| u16::from_le_bytes([unit[0], unit[1]]))
+            .collect();
+        if name.contains(&0) {
+            return Err("iroh app directory reparse target contains a NUL".to_string());
+        }
+        if relative {
+            let relative = PathBuf::from(OsString::from_wide(&name));
+            let mut target = base.to_path_buf();
+            for component in relative.components() {
+                match component {
+                    Component::CurDir => {}
+                    Component::ParentDir if target.pop() => {}
+                    Component::Normal(name) => target.push(name),
+                    _ => return Err("iroh app directory symlink target escapes its volume".to_string()),
+                }
+            }
+            return Ok(target);
+        }
+        if !name.starts_with(&[92, 63, 63, 92]) {
+            return Err("iroh app directory reparse target is not absolute".to_string());
+        }
+        let mut path = vec![92, 92, 63, 92]; // Convert native \??\ to Win32 \\?\.
+        path.extend_from_slice(&name[4..]);
+        let target = PathBuf::from(OsString::from_wide(&path));
+        let mut components = target.components();
+        let (Some(Component::Prefix(prefix)), Some(Component::RootDir)) =
+            (components.next(), components.next())
+        else {
+            return Err("iroh app directory reparse target is not absolute".to_string());
+        };
+        if !supported_prefix(prefix.kind()) {
+            return Err("iroh app directory reparse target uses an unsupported namespace".to_string());
+        }
+        Ok(target)
+    }
+
+    fn reparse_target(link: &std::fs::File, base: &Path) -> Result<PathBuf, String> {
+        // FSCTL_GET_REPARSE_POINT returns an 8-byte header followed by tag-
+        // specific metadata and a UTF-16 path buffer.
+        const FSCTL_GET_REPARSE_POINT: u32 = 0x0009_00a8;
         const MAX_REPARSE_DATA: usize = 16_384;
         let mut buffer = vec![0u8; MAX_REPARSE_DATA];
         let mut returned = 0u32;
@@ -1862,47 +1948,22 @@ mod windows_key_security {
                 null(), 0, buffer.as_mut_ptr().cast(), buffer.len() as u32,
                 &mut returned, null_mut())
         } == 0 {
-            return Err(format!("read iroh app directory junction: {}", std::io::Error::last_os_error()));
+            return Err(format!("read iroh app directory reparse point: {}", std::io::Error::last_os_error()));
         }
         let returned = returned as usize;
-        if returned < 16 || returned > buffer.len() {
-            return Err("iroh app directory junction has a short response".to_string());
+        if returned > buffer.len() {
+            return Err("iroh app directory reparse response is too long".to_string());
         }
-        let u16_at = |offset: usize| u16::from_le_bytes([buffer[offset], buffer[offset + 1]]) as usize;
-        let tag = u32::from_le_bytes(buffer[..4].try_into().unwrap());
-        let data_len = u16_at(4);
-        if tag != IO_REPARSE_TAG_MOUNT_POINT || data_len < 8 || returned != 8 + data_len {
-            return Err("iroh app directory is not a supported junction".to_string());
-        }
-        let offset = u16_at(8);
-        let length = u16_at(10);
-        let end = 16usize.checked_add(offset).and_then(|start| start.checked_add(length))
-            .ok_or("iroh app directory junction path is too long")?;
-        if offset % 2 != 0 || length == 0 || length % 2 != 0 || end > returned {
-            return Err("iroh app directory junction target is malformed".to_string());
-        }
-        let name: Vec<u16> = buffer[16 + offset..end]
-            .chunks_exact(2)
-            .map(|unit| u16::from_le_bytes([unit[0], unit[1]]))
-            .collect();
-        if name.contains(&0) || !name.starts_with(&[92, 63, 63, 92]) {
-            return Err("iroh app directory junction target is not absolute".to_string());
-        }
-        let target = &name[4..];
-        let disk = target.len() >= 3
-            && matches!(target[0], 65..=90 | 97..=122)
-            && target[1..3] == [58, 92];
-        let unc = target.starts_with(&[85, 78, 67, 92]);
-        if !disk && !unc {
-            return Err("iroh app directory junction target uses an unsupported namespace".to_string());
-        }
-        let mut path = vec![92, 92, 63, 92]; // Win32's \\?\ prefix.
-        path.extend_from_slice(target);
-        Ok(PathBuf::from(OsString::from_wide(&path)))
+        parse_reparse_target(&buffer[..returned], base)
+    }
+
+    struct PinnedDirectory {
+        file: std::fs::File,
+        resolved_path: PathBuf,
     }
 
     fn open_app_root(root: &Path, create: bool, security: &PrivateDacl) -> Result<std::fs::File, String> {
-        open_app_root_inner(root, create, security, true, 0)
+        Ok(open_app_root_inner(root, create, security, true, 0)?.file)
     }
 
     fn open_app_root_inner(
@@ -1911,9 +1972,9 @@ mod windows_key_security {
         security: &PrivateDacl,
         final_is_app_root: bool,
         hops: u8,
-    ) -> Result<std::fs::File, String> {
+    ) -> Result<PinnedDirectory, String> {
         if hops > 32 {
-            return Err("iroh app directory junction chain is too long".to_string());
+            return Err("iroh app directory reparse chain is too long".to_string());
         }
         let mut components = root.components();
         let (Some(Component::Prefix(prefix)), Some(Component::RootDir)) =
@@ -1921,9 +1982,7 @@ mod windows_key_security {
         else {
             return Err("iroh app directory must have an absolute Windows path".to_string());
         };
-        if !matches!(prefix.kind(), Prefix::Disk(_) | Prefix::VerbatimDisk(_)
-            | Prefix::UNC(_, _) | Prefix::VerbatimUNC(_, _))
-        {
+        if !supported_prefix(prefix.kind()) {
             return Err("iroh app directory uses an unsupported Windows path prefix".to_string());
         }
         // As with existing UNC and mapped-drive app-data paths, these ACL
@@ -1950,8 +2009,11 @@ mod windows_key_security {
         if handle == INVALID_HANDLE_VALUE {
             return Err(format!("open iroh volume root: {}", std::io::Error::last_os_error()));
         }
-        let anchor = unsafe { std::fs::File::from_raw_handle(handle) };
-        validate_app_directory(&anchor, security, names.is_empty() && final_is_app_root, false)?;
+        let anchor = PinnedDirectory {
+            file: unsafe { std::fs::File::from_raw_handle(handle) },
+            resolved_path: anchor_path,
+        };
+        validate_app_directory(&anchor.file, security, names.is_empty() && final_is_app_root, false)?;
         if names.is_empty() {
             return Ok(anchor);
         }
@@ -1962,7 +2024,7 @@ mod windows_key_security {
         for (index, name) in names.iter().enumerate() {
             let parent = held.last().unwrap();
             let file = open_relative(
-                parent, name,
+                &parent.file, name,
                 FILE_READ_ATTRIBUTES | FILE_READ_EA | READ_CONTROL | FILE_TRAVERSE,
                 FILE_SHARE_READ | FILE_SHARE_WRITE,
                 if create { FILE_OPEN_IF } else { FILE_OPEN },
@@ -1971,25 +2033,25 @@ mod windows_key_security {
             ).map_err(|status| format!("open iroh app directory component: NTSTATUS {status:#010x}"))?;
             let is_reparse = directory_attributes(&file)? & FILE_ATTRIBUTE_REPARSE_POINT != 0;
             if is_reparse {
-                // A junction can change its target through a write to the
-                // link itself. Require a strict ACL before reading it.
+                // A reparse point can change its target through a write to
+                // the link itself. Require a strict ACL before reading it.
                 validate_app_directory(&file, security, true, true)?;
-                let target_path = junction_target(&file)?;
+                let target_path = reparse_target(&file, &parent.resolved_path)?;
                 let target = open_app_root_inner(
                     &target_path, false, security,
                     final_is_app_root && index + 1 == names.len(), hops + 1,
                 )?;
                 let followed = open_relative_with_reparse(
-                    parent, name, FILE_READ_ATTRIBUTES | READ_CONTROL | FILE_TRAVERSE,
+                    &parent.file, name, FILE_READ_ATTRIBUTES | READ_CONTROL | FILE_TRAVERSE,
                     FILE_SHARE_READ | FILE_SHARE_WRITE, FILE_OPEN,
                     FILE_DIRECTORY_FILE, None, true,
-                ).map_err(|status| format!("follow iroh app directory junction: NTSTATUS {status:#010x}"))?;
-                let walked_id = crate::windows_file_id::file_id(&target)
-                    .map_err(|e| format!("identify iroh junction target: {e}"))?;
+                ).map_err(|status| format!("follow iroh app directory reparse point: NTSTATUS {status:#010x}"))?;
+                let walked_id = crate::windows_file_id::file_id(&target.file)
+                    .map_err(|e| format!("identify iroh reparse target: {e}"))?;
                 let followed_id = crate::windows_file_id::file_id(&followed)
-                    .map_err(|e| format!("identify followed iroh junction: {e}"))?;
+                    .map_err(|e| format!("identify followed iroh reparse point: {e}"))?;
                 if walked_id != followed_id {
-                    return Err("iroh app directory junction changed during validation".to_string());
+                    return Err("iroh app directory reparse target changed during validation".to_string());
                 }
                 links.push(file);
                 held.push(target);
@@ -1997,7 +2059,9 @@ mod windows_key_security {
                 validate_app_directory(
                     &file, security, final_is_app_root && index + 1 == names.len(), false,
                 )?;
-                held.push(file);
+                let mut resolved_path = parent.resolved_path.clone();
+                resolved_path.push(name);
+                held.push(PinnedDirectory { file, resolved_path });
             }
         }
         Ok(held.pop().unwrap())
@@ -2164,6 +2228,94 @@ mod windows_key_security {
         let count = if dacl.is_null() { 0 } else { unsafe { (*dacl).AceCount } };
         unsafe { LocalFree(descriptor) };
         Ok(count)
+    }
+
+    #[cfg(test)]
+    mod reparse_tests {
+        use super::*;
+
+        const MOUNT: u32 = 0xa000_0003;
+        const SYMLINK: u32 = 0xa000_000c;
+
+        fn reparse_data(tag: u32, flags: u32, substitute: &str) -> Vec<u8> {
+            let units: Vec<u16> = substitute.encode_utf16().collect();
+            let metadata = if tag == SYMLINK { 12 } else { 8 };
+            let mut bytes = vec![0u8; 8 + metadata + units.len() * 2];
+            let data_len = u16::try_from(bytes.len() - 8).unwrap();
+            bytes[..4].copy_from_slice(&tag.to_le_bytes());
+            bytes[4..6].copy_from_slice(&data_len.to_le_bytes());
+            bytes[10..12].copy_from_slice(&u16::try_from(units.len() * 2).unwrap().to_le_bytes());
+            if tag == SYMLINK {
+                bytes[16..20].copy_from_slice(&flags.to_le_bytes());
+            }
+            for (chunk, unit) in bytes[8 + metadata..].chunks_exact_mut(2).zip(units) {
+                chunk.copy_from_slice(&unit.to_le_bytes());
+            }
+            bytes
+        }
+
+        #[test]
+        fn accepts_directory_symlinks_and_volume_guid_mounts() {
+            let base = Path::new(r"\\?\D:\real\app");
+            let absolute = reparse_data(SYMLINK, 0, r"\??\C:\relocated");
+            assert_eq!(parse_reparse_target(&absolute, base).unwrap(), PathBuf::from(r"\\?\C:\relocated"));
+
+            let relative = reparse_data(SYMLINK, 1, r"..\relocated");
+            assert_eq!(parse_reparse_target(&relative, base).unwrap(), PathBuf::from(r"\\?\D:\real\relocated"));
+
+            let volume = r"\??\Volume{01234567-89ab-cdef-0123-456789abcdef}\relocated";
+            let mounted = reparse_data(MOUNT, 0, volume);
+            assert_eq!(
+                parse_reparse_target(&mounted, base).unwrap(),
+                PathBuf::from(r"\\?\Volume{01234567-89ab-cdef-0123-456789abcdef}\relocated"),
+            );
+        }
+
+        #[test]
+        fn rejects_unsafe_reparse_namespaces_and_relative_escape() {
+            let base = Path::new(r"\\?\C:\");
+            assert!(parse_reparse_target(&reparse_data(SYMLINK, 1, r"..\outside"), base).is_err());
+            assert!(parse_reparse_target(&reparse_data(SYMLINK, 2, r"target"), base).is_err());
+            assert!(parse_reparse_target(
+                &reparse_data(MOUNT, 0, r"\??\GLOBALROOT\Device\HarddiskVolume1"), base,
+            ).is_err());
+            let mut truncated = reparse_data(SYMLINK, 0, r"\??\C:\safe");
+            truncated[10..12].copy_from_slice(&u16::MAX.to_le_bytes());
+            assert!(parse_reparse_target(&truncated, base).is_err());
+        }
+
+        #[test]
+        fn walks_volume_guid_namespace_to_the_same_directory() {
+            use windows_sys::Win32::Storage::FileSystem::GetVolumeNameForVolumeMountPointW;
+
+            let temp = tempfile::tempdir().unwrap();
+            let mut components = temp.path().components();
+            let prefix = match components.next() {
+                Some(Component::Prefix(prefix)) => prefix,
+                _ => panic!("temporary directory has no Windows volume"),
+            };
+            assert!(matches!(components.next(), Some(Component::RootDir)));
+            let mut drive_root = PathBuf::from(prefix.as_os_str());
+            drive_root.push("\\");
+            let mut volume_name = vec![0u16; 256];
+            let result = unsafe {
+                GetVolumeNameForVolumeMountPointW(
+                    wide(drive_root.as_os_str()).as_ptr(), volume_name.as_mut_ptr(),
+                    volume_name.len() as u32,
+                )
+            };
+            assert_ne!(result, 0, "volume GUID lookup: {}", std::io::Error::last_os_error());
+            let end = volume_name.iter().position(|unit| *unit == 0).unwrap();
+            let volume_root = PathBuf::from(OsString::from_wide(&volume_name[..end]));
+            let by_guid = volume_root.join(temp.path().strip_prefix(&drive_root).unwrap());
+            let security = PrivateDacl::new(true).unwrap();
+            let original = open_app_root_inner(temp.path(), false, &security, false, 0).unwrap();
+            let mounted = open_app_root_inner(&by_guid, false, &security, false, 1).unwrap();
+            assert_eq!(
+                crate::windows_file_id::file_id(&original.file).unwrap(),
+                crate::windows_file_id::file_id(&mounted.file).unwrap(),
+            );
+        }
     }
 }
 
@@ -3440,6 +3592,65 @@ mod tests {
         assert_eq!(persisted_node_id_at(&path).as_deref(), Some(node_id.as_str()));
         assert!(target.join(KEY_DIR).join(KEY_FILE).exists());
         assert!(target.join(KEY_FILE).exists(), "the legacy key remains for crash recovery");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn iroh_identity_key_migrates_through_absolute_directory_symlink() {
+        let temp = tempfile::tempdir().unwrap();
+        let target = temp.path().join("relocated-app-data");
+        std::fs::create_dir(&target).unwrap();
+        let link = temp.path().join("codemux");
+        match std::os::windows::fs::symlink_dir(&target, &link) {
+            Ok(()) => {}
+            Err(error) if error.raw_os_error() == Some(1314) => return, // Symlink privilege is unavailable.
+            Err(error) => panic!("create directory symlink: {error}"),
+        }
+        windows_key_security::inherited_grant_fixture(&link, "GR").unwrap();
+        windows_key_security::inherited_grant_fixture(&target, "GR").unwrap();
+
+        let key = SecretKey::generate();
+        let node_id = key.public().to_string();
+        std::fs::write(target.join(KEY_FILE), crate::auth::encrypt_data(&key.to_bytes()).unwrap()).unwrap();
+        let path = link.join(KEY_DIR).join(KEY_FILE);
+        assert_eq!(load_or_create_secret_key_at(&path).unwrap().public(), key.public());
+        assert_eq!(persisted_node_id_at(&path).as_deref(), Some(node_id.as_str()));
+        assert!(target.join(KEY_DIR).join(KEY_FILE).exists());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn iroh_identity_key_resolves_relative_symlink_after_junction() {
+        let temp = tempfile::tempdir().unwrap();
+        let real = temp.path().join("one").join("real");
+        let target = temp.path().join("one").join("relocated");
+        std::fs::create_dir_all(&real).unwrap();
+        std::fs::create_dir(&target).unwrap();
+        let alias = temp.path().join("alias");
+        let made = std::process::Command::new("cmd")
+            .args(["/C", "mklink", "/J"])
+            .arg(&alias)
+            .arg(&real)
+            .output()
+            .unwrap();
+        assert!(made.status.success(), "{}", String::from_utf8_lossy(&made.stderr));
+        let link = real.join("codemux");
+        match std::os::windows::fs::symlink_dir(r"..\relocated", &link) {
+            Ok(()) => {}
+            Err(error) if error.raw_os_error() == Some(1314) => return, // Symlink privilege is unavailable.
+            Err(error) => panic!("create relative directory symlink: {error}"),
+        }
+        for directory in [&alias, &link, &target] {
+            windows_key_security::inherited_grant_fixture(directory, "GR").unwrap();
+        }
+
+        let key = SecretKey::generate();
+        let node_id = key.public().to_string();
+        std::fs::write(target.join(KEY_FILE), crate::auth::encrypt_data(&key.to_bytes()).unwrap()).unwrap();
+        let path = alias.join("codemux").join(KEY_DIR).join(KEY_FILE);
+        assert_eq!(load_or_create_secret_key_at(&path).unwrap().public(), key.public());
+        assert_eq!(persisted_node_id_at(&path).as_deref(), Some(node_id.as_str()));
+        assert!(target.join(KEY_DIR).join(KEY_FILE).exists());
     }
 
     #[cfg(windows)]
