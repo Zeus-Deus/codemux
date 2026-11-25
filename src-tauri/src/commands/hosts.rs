@@ -665,6 +665,17 @@ pub async fn workspace_push_to_host<R: tauri::Runtime>(
 
     #[cfg(unix)]
     {
+        // Reject a target that rsync would reinterpret before upgrading the
+        // remote binary or interrupting any local chat sessions.
+        if let Err(reason) = crate::ssh::push::rsync_ssh_target(&host.ssh_target) {
+            return Ok(WorkspacePushOutcome {
+                ok: false,
+                message: format!("rsync failed: {reason}"),
+                remote_path: None,
+                rsync_summary: None,
+            });
+        }
+
         // Auto-update the remote codemux-remote binary if our version
         // doesn't match what's installed on the host. Skipping this is
         // what made the cwd bug so painful: my fix lived in the local
@@ -1151,7 +1162,10 @@ pub async fn workspace_pull_back_impl<R: tauri::Runtime>(
         let migration = match crate::commands::agent_chat::begin_workspace_migration_checked(
             &app,
             &workspace_id,
-            || validate_pull_sources(&mut candidate_sources),
+            || {
+                crate::ssh::push::rsync_ssh_target(&host.ssh_target)?;
+                validate_pull_sources(&mut candidate_sources)
+            },
         )
         .await
         {

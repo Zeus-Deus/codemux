@@ -14250,7 +14250,7 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn rejected_pull_path_leaves_live_chat_running() {
+    async fn rejected_transfer_preflight_leaves_live_chat_running() {
         let thread = "rejected-pull-chat";
         let provider = Arc::new(PlacementProvider::default());
         let (app, workspace) = placement_app(thread, Some(1), provider.clone()).await;
@@ -14267,6 +14267,14 @@ mod tests {
         })
         .await;
         assert!(rejected.err().unwrap().contains("refusing remote path"));
+        assert!(provider.live.lock().unwrap().contains(thread));
+        assert!(provider.stopped.lock().unwrap().is_empty());
+
+        let rejected_target = begin_workspace_migration_checked(&handle, &workspace, || {
+            crate::ssh::push::rsync_ssh_target("host:").map(|_| ())
+        })
+        .await;
+        assert!(rejected_target.err().unwrap().contains("refusing SSH target"));
         assert!(provider.live.lock().unwrap().contains(thread));
         assert!(provider.stopped.lock().unwrap().is_empty());
     }
