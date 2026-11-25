@@ -828,6 +828,7 @@ function DraftChatSurfaceInner({
           markMaterialized: state.markMaterialized,
           markPromoted: state.markPromoted,
           markSendFailed: state.markSendFailed,
+          markManualPromptRequired: state.markManualPromptRequired,
           ensureThread: chat.ensureThread,
           appendUserMessage: chat.appendUserMessage,
           removeUserMessageByNonce: chat.removeUserMessageByNonce,
@@ -1476,6 +1477,9 @@ function DraftChatSurfaceInner({
       showProviderPicker={true}
       showStopButton={false}
       errorMessage={draft.lastSendError}
+      noticeMessage={draft.manualPromptRequired
+        ? "Agent opened without this prompt. Copy it into the terminal agent. Sending here starts a separate chat."
+        : null}
       // Thread Scope redesign — the headline names the project and the
       // strip below the composer carries the rest of the scope; `null`
       // hides Composer's own zone-1 slot rather than falling back to a

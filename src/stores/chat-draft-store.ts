@@ -98,6 +98,9 @@ export interface ChatDraft {
   /** Last materialise-and-send error, surfaced as an inline retry
    *  affordance on the composer. Cleared on next successful send. */
   lastSendError: string | null;
+  /** A terminal preset opened without receiving this draft's prompt.
+   *  The prompt remains here for the user to copy into the agent. */
+  manualPromptRequired?: boolean;
   /** When `true`, this draft was created by an explicit user action
    *  (clicking the sidebar "New agent" button) and should NOT be
    *  auto-redirected to the active project workspace by the mount-
@@ -207,6 +210,7 @@ export interface ChatDraftStore {
     promotedTo: NonNullable<ChatDraft["promotedTo"]>,
   ) => void;
   markSendFailed: (draftId: DraftId, error: string) => void;
+  markManualPromptRequired: (draftId: DraftId) => void;
   clearSendError: (draftId: DraftId) => void;
 
   // Removal
@@ -637,6 +641,7 @@ export const useChatDraftStore = create<ChatDraftStore>()(
                 ...existing,
                 promoting: true,
                 lastSendError: null,
+                manualPromptRequired: false,
               },
             },
           };
@@ -663,6 +668,7 @@ export const useChatDraftStore = create<ChatDraftStore>()(
             promotedTo,
             promoting: false,
             lastSendError: null,
+            manualPromptRequired: false,
           };
           const nextDraftsById = { ...s.draftsById, [draftId]: nextDraft };
 
@@ -680,6 +686,23 @@ export const useChatDraftStore = create<ChatDraftStore>()(
           return patch as ChatDraftStore;
         }),
 
+      markManualPromptRequired: (draftId) =>
+        set((s) => {
+          const existing = s.draftsById[draftId];
+          if (!existing) return s;
+          return {
+            draftsById: {
+              ...s.draftsById,
+              [draftId]: {
+                ...existing,
+                promoting: false,
+                lastSendError: null,
+                manualPromptRequired: true,
+              },
+            },
+          };
+        }),
+
       markSendFailed: (draftId, error) =>
         set((s) => {
           const existing = s.draftsById[draftId];
@@ -691,6 +714,7 @@ export const useChatDraftStore = create<ChatDraftStore>()(
                 ...existing,
                 promoting: false,
                 lastSendError: error,
+                manualPromptRequired: false,
               },
             },
           };

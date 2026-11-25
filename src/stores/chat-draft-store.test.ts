@@ -343,6 +343,22 @@ describe("chat-draft-store", () => {
       expect(next.lastSendError).toBe("git lock");
       expect(next.promotedTo).toBeNull();
     });
+
+    it("keeps a terminal prompt for manual entry without reporting a send failure", () => {
+      const draft = useChatDraftStore.getState().getOrCreateHomeDraft();
+      useChatDraftStore.getState().updateDraftInput(draft.draftId, "review this issue");
+      useChatDraftStore.getState().markPromoting(draft.draftId);
+      useChatDraftStore.getState().markManualPromptRequired(draft.draftId);
+      const saved = useChatDraftStore.getState().draftsById[draft.draftId];
+      expect(saved.inputDraft).toBe("review this issue");
+      expect(saved.promoting).toBe(false);
+      expect(saved.lastSendError).toBeNull();
+      expect(saved.manualPromptRequired).toBe(true);
+      expect(saved.promotedTo).toBeNull();
+
+      useChatDraftStore.getState().markPromoting(draft.draftId);
+      expect(useChatDraftStore.getState().draftsById[draft.draftId].manualPromptRequired).toBe(false);
+    });
   });
 
   describe("clearDraft", () => {

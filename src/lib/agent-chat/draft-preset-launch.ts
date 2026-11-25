@@ -64,6 +64,7 @@ export async function launchDraftWithPreset(
       markMaterialized: state.markMaterialized,
       markPromoted: state.markPromoted,
       markSendFailed: state.markSendFailed,
+      markManualPromptRequired: state.markManualPromptRequired,
       ensureThread: chat.ensureThread,
       appendUserMessage: chat.appendUserMessage,
       removeUserMessageByNonce: chat.removeUserMessageByNonce,

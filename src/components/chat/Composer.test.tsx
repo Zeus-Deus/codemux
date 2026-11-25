@@ -205,6 +205,15 @@ describe("Composer", () => {
     });
   });
 
+  it("renders manual-entry guidance without calling a successful launch a failure", () => {
+    const { getByRole, queryByRole } = renderComposer({
+      noticeMessage: "Agent opened. Copy this prompt into the terminal agent.",
+    });
+    expect(getByRole("status")).toHaveTextContent("Copy this prompt");
+    expect(queryByRole("alert")).toBeNull();
+    expect(getByRole("status")).not.toHaveTextContent("Press Enter to retry");
+  });
+
   describe("showStopButton (§6.5)", () => {
     it("hides the Stop button while streaming when showStopButton=false", () => {
       const { container } = renderComposer({

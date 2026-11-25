@@ -94,6 +94,7 @@ function makeActions(): SpyActions {
     markMaterialized: vi.fn(),
     markPromoted: vi.fn(),
     markSendFailed: vi.fn(),
+    markManualPromptRequired: vi.fn(),
     ensureThread: vi.fn(),
     appendUserMessage: vi.fn(),
     removeUserMessageByNonce: vi.fn(),
@@ -1592,10 +1593,8 @@ describe("materializeWithPreset", () => {
       expect(agentChatStartSession).not.toHaveBeenCalled();
       expect(agentChatSendTurn).not.toHaveBeenCalled();
       expect(actions.markPromoted).not.toHaveBeenCalled();
-      expect(actions.markSendFailed).toHaveBeenCalledWith(
-        draft.draftId,
-        expect.stringContaining("Open this draft to copy the prompt"),
-      );
+      expect(actions.markManualPromptRequired).toHaveBeenCalledWith(draft.draftId);
+      expect(actions.markSendFailed).not.toHaveBeenCalled();
     });
 
     it("empty/whitespace prompt becomes null when delegated to applyPreset", async () => {

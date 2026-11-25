@@ -245,6 +245,8 @@ interface Props {
   /** When set, renders a muted inline banner above the textarea. Used
    *  for draft-send retry affordance (§8). `null` hides the banner. */
   errorMessage?: string | null;
+  /** Informational draft notice without failure or retry wording. */
+  noticeMessage?: string | null;
   /** When false, hides the Stop button even while streaming. The draft
    *  surface uses this during materialise because there is no live
    *  session to interrupt. Defaults to true. */
@@ -537,6 +539,7 @@ export function Composer({
   hasActiveGoal = false,
   mode,
   errorMessage = null,
+  noticeMessage = null,
   showStopButton = true,
   zone1Override,
   belowComposerSlot,
@@ -2962,6 +2965,7 @@ export function Composer({
     attachOpen ||
     sendHold ||
     !!errorMessage ||
+    !!noticeMessage ||
     continueChipVisible ||
     // A strip under the card (a new chat's project · branch row) takes
     // the chin's place, so the card stays open with its settings inside.
@@ -3499,6 +3503,11 @@ export function Composer({
                   <span className="text-subtle-foreground">
                     Press Enter to retry.
                   </span>
+                </div>
+              )}
+              {noticeMessage && (
+                <div role="status" className="px-5 pt-2 text-label text-muted-foreground leading-tight">
+                  {noticeMessage}
                 </div>
               )}
               {unsupportedAcpImages && <p role="alert" className="px-5 pt-2 text-body-sm text-muted-foreground">This custom agent does not advertise image support. Remove image attachments to send a text prompt.</p>}

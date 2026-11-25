@@ -62,6 +62,8 @@ export interface MaterializeActions {
   ) => void;
   /** Records a send failure so the composer can surface retry UI. */
   markSendFailed: (id: DraftId, error: string) => void;
+  /** Keeps a successfully launched terminal preset's unsent prompt for manual entry. */
+  markManualPromptRequired: (id: DraftId) => void;
   /** Idempotent — ensures a slice exists on the agent-chat store for
    *  the pre-minted `thread_id` so the optimistic user message has a
    *  home before the live pane mounts. */
@@ -744,10 +746,7 @@ export async function materializeWithPreset(
   // foreground shell may change before the write arrives. Keep the draft
   // visible in the sidebar with its original text for the user to copy.
   if (prompt.length > 0) {
-    actions.markSendFailed(
-      draft.draftId,
-      "Agent launched without the starting prompt. Open this draft to copy the prompt into the agent.",
-    );
+    actions.markManualPromptRequired(draft.draftId);
     return {
       success: true,
       workspaceId,
