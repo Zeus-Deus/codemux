@@ -3128,7 +3128,7 @@ mod tests {
     #[test]
     fn client_fallback_lookup_creates_nothing_and_skips_foreign_dirs() {
         use std::os::unix::fs::MetadataExt;
-        let root = tempfile::tempdir().unwrap();
+        let root = private_control_test_dir();
         let uid = fs::metadata(root.path()).unwrap().uid();
         let socket_file = format!("{SOCKET_BASENAME}.sock");
         let missing = root.path().join("not-yet");
