@@ -52,8 +52,10 @@ fn fixture() -> Fixture {
     let second = git(&work, &["rev-parse", "HEAD"]);
     let origin = tmp.path().join("origin.git");
     git(tmp.path(), &["clone", "-q", "--bare", work.to_str().unwrap(), origin.to_str().unwrap()]);
-    // Allow fetching the first (non-tip) commit by id from the file remote.
+    // Serve like GitHub: any commit by id (the first is not a tip), and
+    // partial fetches, so a `--filter` git ignored would fail the tests.
     git(&origin, &["config", "uploadpack.allowAnySHA1InWant", "true"]);
+    git(&origin, &["config", "uploadpack.allowFilter", "true"]);
     let root = tmp.path().join("plugins");
     std::fs::create_dir_all(&root).unwrap();
     Fixture { url: format!("file://{}", origin.display()), first, second, root, _tmp: tmp }
@@ -127,6 +129,276 @@ fn a_tree_url_resolves_the_ref_and_folder() {
     assert_eq!(fetched.subdir.as_deref(), Some("codemux"));
     let err = install::fetch_plugin(&test_git(), &f.url, Some("nope/codemux"), None, None).err().unwrap();
     assert!(err.contains("No branch or tag"), "{err}");
+}
+
+#[test]
+fn only_commits_on_a_branch_or_tag_of_the_repository_install() {
+    let f = fixture();
+    let origin = PathBuf::from(f.url.strip_prefix("file://").unwrap());
+    let work = origin.parent().unwrap().join("work");
+    let origin = origin.to_str().unwrap();
+    let commit = |version: &str| {
+        std::fs::write(work.join("codemux").join(ENTRY_FILE), format!("export default {{ id: \"hello\", version: \"{version}\" }};\n")).unwrap();
+        git(&work, &["commit", "-q", "-am", version]);
+        git(&work, &["rev-parse", "HEAD"])
+    };
+
+    // Reachable only through an annotated tag, one commit behind its tip.
+    git(&work, &["checkout", "-q", "-b", "release", &f.first]);
+    let tagged_parent = commit("1.1.0");
+    commit("1.2.0");
+    git(&work, &["tag", "-a", "v1.2.0", "-m", "v1.2.0"]);
+    git(&work, &["push", "-q", origin, "refs/tags/v1.2.0"]);
+
+    // What GitHub serves through a parent's URL but no branch or tag holds:
+    // a pull request head, and a commit whose only ref is gone (a fork's).
+    git(&work, &["checkout", "-q", "-b", "fork", &f.second]);
+    let pull = commit("6.6.6");
+    git(&work, &["push", "-q", origin, "HEAD:refs/pull/1/head"]);
+    let fork = commit("6.6.7");
+    git(&work, &["push", "-q", origin, "HEAD:refs/heads/gone"]);
+    git(Path::new(origin), &["update-ref", "-d", "refs/heads/gone"]);
+
+    for (tree, want) in [
+        (Some(format!("{fork}/codemux")), None),
+        (None, Some(fork.clone())),
+        (None, Some(pull.clone())),
+        (None, Some("refs/pull/1/head".to_string())),
+    ] {
+        let err = install::fetch_plugin(&test_git(), &f.url, tree.as_deref(), want.as_deref(), None)
+            .err()
+            .unwrap_or_else(|| panic!("{tree:?} {want:?} installed"));
+        assert!(err.contains("isn't on any branch or tag") && err.contains("fork"), "{err}");
+    }
+
+    // Branch tips, older branch commits and tagged history still install.
+    for (want, sha) in [
+        ("main", &f.second),
+        (f.second.as_str(), &f.second),
+        (f.first.as_str(), &f.first),
+        ("v1.2.0", &git(&work, &["rev-parse", "v1.2.0^{commit}"])),
+        (tagged_parent.as_str(), &tagged_parent),
+    ] {
+        let fetched = install::fetch_plugin(&test_git(), &f.url, None, Some(want), None).unwrap();
+        assert_eq!(&fetched.sha, sha, "{want}");
+    }
+    let fetched = install::fetch_plugin(&test_git(), &f.url, Some(&format!("{tagged_parent}/codemux")), None, None).unwrap();
+    assert_eq!(fetched.sha, tagged_parent);
+}
+
+/// Commits `count` more versions on the fixture's work tree and returns
+/// their ids, oldest first.
+fn commits(work: &Path, count: usize) -> Vec<String> {
+    (0..count)
+        .map(|n| {
+            std::fs::write(work.join("codemux/README.md"), format!("readme {n}")).unwrap();
+            git(work, &["commit", "-q", "-am", &format!("c{n}")]);
+            git(work, &["rev-parse", "HEAD"])
+        })
+        .collect()
+}
+
+fn large_commit(work: &Path) {
+    let mut seed = 1u64;
+    let alphabet = b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+    let message: String = (0..3_000_000)
+        .map(|_| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            alphabet[(seed as usize) % alphabet.len()] as char
+        })
+        .collect();
+    let message_file = work.parent().unwrap().join("large-message");
+    std::fs::write(&message_file, message).unwrap();
+    git(work, &["commit", "-q", "--allow-empty", "-F", message_file.to_str().unwrap()]);
+}
+
+#[test]
+fn provenance_search_is_bounded_and_says_when_it_gave_up() {
+    let f = fixture();
+    let origin = PathBuf::from(f.url.strip_prefix("file://").unwrap());
+    let work = origin.parent().unwrap().join("work");
+    let check = |sha: &str, depths: &[u32]| {
+        let git = test_git();
+        git.check_on_branch_or_tag_within(&f.url, sha, depths)
+    };
+    let push = |refspec: &str| git(&work, &["push", "-q", "-f", origin.to_str().unwrap(), refspec]);
+
+    // On a branch, eight commits below its tip: found once the search
+    // reaches it, and refused with the budget message before then.
+    let main = commits(&work, 8);
+    push("main");
+    check(&f.second, &[2, 4, 16]).unwrap();
+    let err = check(&f.second, &[2, 4]).unwrap_err();
+    assert!(err.contains("Could not confirm") && err.contains("within the last 4 commits"), "{err}");
+
+    // Reachable only through an annotated tag (no branch ever held it).
+    git(&work, &["checkout", "-q", "-b", "release", &f.first]);
+    let release = commits(&work, 3);
+    git(&work, &["tag", "-a", "v9", "-m", "v9"]);
+    push("refs/tags/v9");
+    check(&release[0], &[1, 3, 16]).unwrap();
+    check(&release[2], &[1]).unwrap();
+
+    // On no branch or tag: every history is complete within the search, so
+    // it is refused as unreachable, not as out of budget.
+    git(&work, &["checkout", "-q", "-b", "stray", &main[7]]);
+    let stray = commits(&work, 1);
+    push("HEAD:refs/heads/stray");
+    git(&origin, &["update-ref", "-d", "refs/heads/stray"]);
+    let err = check(&stray[0], &[2, 100]).unwrap_err();
+    assert!(err.contains("isn't on any branch or tag"), "{err}");
+    // A search too short to see everything can't call it unreachable.
+    let err = check(&stray[0], &[2]).unwrap_err();
+    assert!(err.contains("within the last 2 commits"), "{err}");
+}
+
+#[test]
+fn provenance_searches_older_default_pin_before_large_unrelated_refs() {
+    let f = fixture();
+    let origin = PathBuf::from(f.url.strip_prefix("file://").unwrap());
+    let work = origin.parent().unwrap().join("work");
+    let origin = origin.to_str().unwrap();
+
+    // An unrelated branch and tag have a large, hard-to-compress commit
+    // object. Neither should consume the budget needed to deepen main.
+    git(&work, &["checkout", "-q", "-b", "zlarge"]);
+    large_commit(&work);
+    git(&work, &["push", "-q", origin, "zlarge"]);
+    git(&work, &["tag", "-a", "v99-large", "-m", "unrelated"]);
+    git(&work, &["push", "-q", origin, "refs/tags/v99-large"]);
+
+    // The pinned commit is deeper than the first round on main. Searching
+    // unrelated refs first would hit the large branch and exhaust the budget.
+    git(&work, &["checkout", "-q", "main"]);
+    commits(&work, 5);
+    git(&work, &["push", "-q", origin, "main"]);
+
+    let verifier = test_git();
+    verifier.check_on_branch_or_tag_with_budget(&f.url, &f.first, &[2, 16], 1024 * 1024).unwrap();
+
+    // A deleted ref leaves a fetchable object, but no named ref proves it.
+    // The large branch must exhaust the shared disk budget and fail closed.
+    git(&work, &["checkout", "-q", "-b", "stray", "main"]);
+    let stray = commits(&work, 1).pop().unwrap();
+    git(&work, &["push", "-q", origin, "stray"]);
+    git(Path::new(origin), &["update-ref", "-d", "refs/heads/stray"]);
+    let error = verifier.check_on_branch_or_tag_with_budget(&f.url, &stray, &[1, 2], 1024 * 1024).unwrap_err();
+    assert!(error.contains("Could not confirm commit") && error.contains("download exceeded 1 MiB"), "{error}");
+}
+
+#[test]
+fn provenance_checks_release_tags_before_costly_default_history() {
+    let f = fixture();
+    let origin = PathBuf::from(f.url.strip_prefix("file://").unwrap());
+    let work = origin.parent().unwrap().join("work");
+    let origin = origin.to_str().unwrap();
+
+    git(&work, &["checkout", "-q", "-b", "release", &f.first]);
+    commits(&work, 1);
+    git(&work, &["tag", "-a", "v9", "-m", "v9"]);
+    git(&work, &["push", "-q", origin, "refs/tags/v9"]);
+
+    // The default tip is small, but its older history has a large commit
+    // beyond the first depth. A second default fetch would exhaust 1 MiB.
+    git(&work, &["checkout", "-q", "main"]);
+    large_commit(&work);
+    commits(&work, 2);
+    git(&work, &["push", "-q", origin, "main"]);
+
+    test_git()
+        .check_on_branch_or_tag_with_budget(&f.url, &f.first, &[2, 16], 1024 * 1024)
+        .unwrap();
+}
+
+#[test]
+fn provenance_deepens_tag_only_history_after_the_default_branch_is_complete() {
+    let f = fixture();
+    let origin = PathBuf::from(f.url.strip_prefix("file://").unwrap());
+    let work = origin.parent().unwrap().join("work");
+    git(&work, &["checkout", "-q", "-b", "release", &f.first]);
+    let release = commits(&work, 4);
+    git(&work, &["tag", "-a", "v9", "-m", "v9"]);
+    git(&work, &["push", "-q", origin.to_str().unwrap(), "refs/tags/v9"]);
+
+    let verifier = test_git();
+    // Main is only two commits long, but this pin is three commits behind
+    // the tag tip and no branch contains the release commits.
+    let short = verifier.check_on_branch_or_tag_within(&f.url, &release[0], &[1]).unwrap_err();
+    assert!(short.contains("Could not confirm") && !short.contains("isn't on any branch"), "{short}");
+    verifier.check_on_branch_or_tag_within(&f.url, &release[0], &[1, 5]).unwrap();
+}
+
+#[test]
+fn initial_commit_fetch_stops_when_repository_exceeds_disk_guard() {
+    let f = fixture();
+    let origin = PathBuf::from(f.url.strip_prefix("file://").unwrap());
+    let work = origin.parent().unwrap().join("work");
+    large_commit(&work);
+    git(&work, &["push", "-q", origin.to_str().unwrap(), "main"]);
+
+    let error = install::fetch_plugin(
+        &test_git().with_disk_limit(1024 * 1024),
+        &f.url,
+        None,
+        Some("main"),
+        None,
+    )
+    .err()
+    .unwrap();
+    assert!(error.contains("Git download exceeded its disk limit"), "{error}");
+}
+
+#[test]
+fn lazy_blob_fetch_stops_when_repository_exceeds_disk_guard() {
+    let f = fixture();
+    let origin = PathBuf::from(f.url.strip_prefix("file://").unwrap());
+    let work = origin.parent().unwrap().join("work");
+    let mut seed = 1u64;
+    let large_blob: Vec<u8> = (0..2_000_000)
+        .map(|_| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed as u8
+        })
+        .collect();
+    std::fs::write(work.join("codemux/large.bin"), large_blob).unwrap();
+    git(&work, &["add", "codemux/large.bin"]);
+    git(&work, &["commit", "-q", "-m", "large plugin file"]);
+    git(&work, &["push", "-q", origin.to_str().unwrap(), "main"]);
+
+    let error = install::fetch_plugin(
+        &test_git().with_disk_limit(1024 * 1024),
+        &f.url,
+        None,
+        Some("main"),
+        None,
+    )
+    .err()
+    .unwrap();
+    assert!(error.contains("Git download exceeded its disk limit"), "{error}");
+}
+
+#[cfg(unix)]
+#[test]
+fn lazy_tree_fetch_reports_its_disk_limit_instead_of_missing_plugin() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let f = fixture();
+    let wrapper_dir = tempfile::tempdir().unwrap();
+    let wrapper = wrapper_dir.path().join("git");
+    std::fs::write(
+        &wrapper,
+        "#!/bin/sh\ncase \" $* \" in\n  *' ls-tree '*) dd if=/dev/zero of=\"$GIT_DIR/oversize\" bs=1024 count=2048 2>/dev/null ;;\nesac\nexec git \"$@\"\n",
+    ).unwrap();
+    std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+    let git = Git::with(wrapper, true).unwrap().with_disk_limit(1024 * 1024);
+    let error = install::fetch_plugin(&git, &f.url, None, Some(&f.second), None).err().unwrap();
+    assert!(error.contains("Git download exceeded its disk limit"), "{error}");
+    assert!(!error.contains("No plugin.js"), "{error}");
 }
 
 #[test]

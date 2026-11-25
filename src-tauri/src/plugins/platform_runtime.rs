@@ -918,6 +918,7 @@ fn validate_result(value: &Value) -> Result<()> {
 #[cfg(windows)]
 pub(super) mod windows_job {
     use super::*;
+    use std::os::windows::io::AsRawHandle;
     type Handle = *mut std::ffi::c_void;
     #[repr(C)]
     struct Basic {
@@ -969,6 +970,12 @@ pub(super) mod windows_job {
             let raw = child
                 .raw_handle()
                 .ok_or("Worker process handle unavailable")?;
+            Self::attach_raw(raw)
+        }
+        pub fn attach_std(child: &std::process::Child) -> std::result::Result<Self, String> {
+            Self::attach_raw(child.as_raw_handle())
+        }
+        fn attach_raw(raw: std::os::windows::io::RawHandle) -> std::result::Result<Self, String> {
             let job = unsafe { CreateJobObjectW(std::ptr::null(), std::ptr::null()) };
             if job.is_null() {
                 return Err("Cannot create plugin lifecycle job".into());

@@ -2,8 +2,9 @@
 //!
 //! Nothing from the repository runs: no checkout, no hooks, no scripts, no
 //! npm. The installer makes a private bare repository, fetches exactly one
-//! commit (shallow and blobless, over https only), lists the plugin folder's
-//! tree and reads its regular files' blobs. Those files go to
+//! commit (shallow and blobless, over https only), checks that a branch or tag
+//! of the repository contains it, lists the plugin folder's tree and reads
+//! its regular files' blobs. Those files go to
 //! `<root>/.staging-<id>.<n>`, the install marker is written, and the staging
 //! folder is renamed over `<root>/<id>`. A crash in between leaves only
 //! dot-folders, which [`recover`] tidies on the next listing.
@@ -12,14 +13,29 @@ use super::{InstallMarker, ENTRY_FILE, MARKER_FILE, MAX_SOURCE_BYTES};
 use std::{
     io::{Read, Write},
     path::{Component, Path, PathBuf},
-    process::{Command, Stdio},
+    process::{Child, Command, Stdio},
+    sync::{atomic::{AtomicBool, Ordering}, Arc},
     time::{Duration, Instant},
 };
+
+/// Start of the error when the bounded search gives up. Callers add what the
+/// user can do about it, which differs for a catalog pin and a typed commit.
+pub(crate) const PROVENANCE_UNCONFIRMED: &str = "Could not confirm commit";
 
 /// Files copied from the plugin folder (non-recursive), and their total size.
 pub const MAX_FILES: usize = 64;
 pub const MAX_TOTAL_BYTES: u64 = 32 * 1024 * 1024;
 const GIT_TIMEOUT: Duration = Duration::from_secs(90);
+// Checked during and after Git commands that can fetch objects. This is a
+// sampled guard, not a filesystem quota: an in-flight pack can exceed it.
+const MAX_GIT_REPO_BYTES: u64 = 64 * 1024 * 1024;
+const MAX_PROVENANCE_BYTES: u64 = MAX_GIT_REPO_BYTES;
+const GIT_DISK_LIMIT: &str = "Git download exceeded its disk limit";
+const GIT_DEADLINE: &str = "Git took too long; check your connection and try again";
+/// How many commits back from each branch and tag tip a pinned commit is
+/// searched for: fetch this much history (commits only), look, then go
+/// deeper, and give up after the last.
+const PROVENANCE_DEPTHS: &[u32] = &[100, 1000, 5000];
 
 // ── URLs ──────────────────────────────────────────────────────────────
 
@@ -109,8 +125,57 @@ fn is_sha(value: &str) -> bool {
 pub struct Git {
     exe: PathBuf,
     dir: tempfile::TempDir,
+    disk_limit: u64,
     /// Tests fetch from a local bare repository over `file://`.
     allow_file: bool,
+}
+
+fn stop_git_tree(child: &mut Child, #[cfg(windows)] job: &super::platform_runtime::windows_job::OwnedJob) {
+    // The child has not been reaped when this is called, so its PID still
+    // identifies the private process group and cannot have been reused.
+    #[cfg(unix)]
+    if child.id() > 1 {
+        unsafe { libc::killpg(child.id() as libc::pid_t, libc::SIGKILL) };
+    }
+    #[cfg(windows)]
+    job.terminate();
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+fn directory_budget_exceeded(root: &Path, limit: u64) -> Result<bool, String> {
+    let mut pending = vec![root.to_path_buf()];
+    let mut bytes = 0u64;
+    let mut entries_seen = 0;
+    while let Some(dir) = pending.pop() {
+        let entries = match std::fs::read_dir(&dir) {
+            Ok(entries) => entries,
+            Err(error) if dir != root && error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(format!("Cannot inspect plugin verification files: {error}")),
+        };
+        for entry in entries {
+            entries_seen += 1;
+            if entries_seen > 10_000 { return Ok(true); }
+            let entry = match entry {
+                Ok(entry) => entry,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) => return Err(format!("Cannot inspect plugin verification files: {error}")),
+            };
+            let meta = match entry.metadata() {
+                Ok(meta) => meta,
+                // Git atomically renames temporary pack files during a fetch.
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) => return Err(format!("Cannot inspect plugin verification files: {error}")),
+            };
+            if meta.is_dir() {
+                pending.push(entry.path());
+            } else {
+                bytes = bytes.saturating_add(meta.len());
+                if bytes > limit { return Ok(true); }
+            }
+        }
+    }
+    Ok(false)
 }
 
 impl Git {
@@ -120,13 +185,23 @@ impl Git {
     }
 
     pub(crate) fn with(exe: PathBuf, allow_file: bool) -> Result<Self, String> {
+        Self::with_by(exe, allow_file, Instant::now() + GIT_TIMEOUT)
+    }
+
+    fn with_by(exe: PathBuf, allow_file: bool, deadline: Instant) -> Result<Self, String> {
         let dir = tempfile::Builder::new()
             .prefix("codemux-plugin-fetch-")
             .tempdir()
             .map_err(|e| format!("Cannot create a temporary folder: {e}"))?;
-        let git = Self { exe, dir, allow_file };
-        git.run(&["init", "--bare", "-q", "--template="], None, 4096)?;
+        let git = Self { exe, dir, disk_limit: MAX_GIT_REPO_BYTES, allow_file };
+        git.run_by(&["init", "--bare", "-q", "--template="], None, 4096, deadline)?;
         Ok(git)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_disk_limit(mut self, bytes: u64) -> Self {
+        self.disk_limit = bytes;
+        self
     }
 
     fn command(&self) -> Command {
@@ -156,11 +231,44 @@ impl Git {
                 if self.allow_file { "protocol.file.allow=always" } else { "protocol.https.allow=always" },
             ])
             .args(["-c", "credential.helper=", "-c", "core.askPass=", "-c", "fetch.fsckObjects=true"]);
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::CommandExt;
+            cmd.process_group(0);
+        }
         cmd
     }
 
-    /// Run git with an overall deadline and an output cap.
+    /// Run git with a deadline, output cap, and sampled temporary disk guard.
     fn run(&self, args: &[&str], stdin: Option<&[u8]>, max_out: u64) -> Result<Vec<u8>, String> {
+        // `cat-file` and `ls-tree` may lazily fetch promisor objects. Guard
+        // the initial commit fetch and these reads, not just provenance.
+        self.run_by_limited(args, stdin, max_out, Instant::now() + GIT_TIMEOUT, Some(self.disk_limit))
+    }
+
+    /// [`Self::run`] with a deadline shared by several commands.
+    fn run_by(&self, args: &[&str], stdin: Option<&[u8]>, max_out: u64, deadline: Instant) -> Result<Vec<u8>, String> {
+        self.run_by_limited(args, stdin, max_out, deadline, None)
+    }
+
+    /// The disk limit covers the entire private repository, including packs
+    /// retained from earlier fetches in the same provenance check.
+    fn run_by_limited(
+        &self,
+        args: &[&str],
+        stdin: Option<&[u8]>,
+        max_out: u64,
+        deadline: Instant,
+        disk_limit: Option<u64>,
+    ) -> Result<Vec<u8>, String> {
+        if Instant::now() >= deadline {
+            return Err(GIT_DEADLINE.into());
+        }
+        if let Some(limit) = disk_limit {
+            if directory_budget_exceeded(self.dir.path(), limit)? {
+                return Err(GIT_DISK_LIMIT.into());
+            }
+        }
         let mut child = self
             .command()
             .args(args)
@@ -169,6 +277,15 @@ impl Git {
             .stderr(Stdio::piped())
             .spawn()
             .map_err(|e| format!("Cannot run git: {e}"))?;
+        #[cfg(windows)]
+        let job = match super::platform_runtime::windows_job::OwnedJob::attach_std(&child) {
+            Ok(job) => job,
+            Err(error) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(error);
+            }
+        };
         if let (Some(input), Some(mut pipe)) = (stdin, child.stdin.take()) {
             let input = input.to_vec();
             std::thread::spawn(move || {
@@ -177,32 +294,78 @@ impl Git {
         }
         let mut out_pipe = child.stdout.take().unwrap();
         let mut err_pipe = child.stderr.take().unwrap();
+        let output_exceeded = Arc::new(AtomicBool::new(false));
+        let output_exceeded_reader = Arc::clone(&output_exceeded);
         let out = std::thread::spawn(move || {
             let mut buf = Vec::new();
-            let _ = (&mut out_pipe).take(max_out + 1).read_to_end(&mut buf);
+            let mut chunk = [0; 8192];
+            while let Ok(n) = out_pipe.read(&mut chunk) {
+                if n == 0 { break; }
+                let room = max_out.saturating_add(1).saturating_sub(buf.len() as u64) as usize;
+                buf.extend_from_slice(&chunk[..n.min(room)]);
+                if buf.len() as u64 > max_out {
+                    output_exceeded_reader.store(true, Ordering::Relaxed);
+                    break;
+                }
+            }
             buf
         });
         let err = std::thread::spawn(move || {
             let mut buf = Vec::new();
-            let _ = (&mut err_pipe).take(16 * 1024).read_to_end(&mut buf);
+            let mut chunk = [0; 8192];
+            while let Ok(n) = err_pipe.read(&mut chunk) {
+                if n == 0 { break; }
+                let room = (16usize * 1024).saturating_sub(buf.len());
+                buf.extend_from_slice(&chunk[..n.min(room)]);
+            }
             buf
         });
-        let deadline = Instant::now() + GIT_TIMEOUT;
+        let mut next_disk_check = Instant::now();
+        let mut child_reaped = false;
         let status = loop {
-            if let Some(status) = child.try_wait().map_err(|e| e.to_string())? {
-                break status;
-            }
             if Instant::now() >= deadline {
-                let _ = child.kill();
-                let _ = child.wait();
-                return Err("Git took too long; check your connection and try again".into());
+                break Err(GIT_DEADLINE.to_string());
+            }
+            if output_exceeded.load(Ordering::Relaxed) {
+                break Err("The plugin is larger than the install limit".into());
+            }
+            if let Some(limit) = disk_limit {
+                if Instant::now() >= next_disk_check {
+                    match directory_budget_exceeded(self.dir.path(), limit) {
+                        Ok(true) => break Err(GIT_DISK_LIMIT.into()),
+                        Ok(false) => {}
+                        Err(error) => break Err(error),
+                    }
+                    next_disk_check = Instant::now() + Duration::from_millis(50);
+                }
+            }
+            match child.try_wait() {
+                Ok(Some(status)) => {
+                    child_reaped = true;
+                    if let Some(limit) = disk_limit {
+                        match directory_budget_exceeded(self.dir.path(), limit) {
+                            Ok(true) => break Err(GIT_DISK_LIMIT.into()),
+                            Ok(false) => {}
+                            Err(error) => break Err(error),
+                        }
+                    }
+                    break Ok(status);
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    child_reaped = true;
+                    break Err(error.to_string());
+                }
             }
             std::thread::sleep(Duration::from_millis(20));
         };
+        if status.is_err() && !child_reaped {
+            stop_git_tree(&mut child, #[cfg(windows)] &job);
+        }
         let out = out.join().unwrap_or_default();
         let err = String::from_utf8_lossy(&err.join().unwrap_or_default()).to_string();
+        let status = status?;
         if out.len() as u64 > max_out {
-            let _ = child.kill();
             return Err("The plugin is larger than the install limit".into());
         }
         if !status.success() {
@@ -219,14 +382,18 @@ impl Git {
     }
 
     fn set_origin(&self, url: &str) -> Result<(), String> {
+        self.set_origin_by(url, Instant::now() + GIT_TIMEOUT)
+    }
+
+    fn set_origin_by(&self, url: &str, deadline: Instant) -> Result<(), String> {
         for args in [
             ["config", "core.repositoryformatversion", "1"].as_slice(),
             &["config", "extensions.partialClone", "origin"],
             &["config", "remote.origin.url", url],
             &["config", "remote.origin.promisor", "true"],
-            &["config", "remote.origin.partialclonefilter", "blob:none"],
+            &["config", "remote.origin.partialclonefilter", "tree:0"],
         ] {
-            self.run(args, None, 4096)?;
+            self.run_by(args, None, 4096, deadline)?;
         }
         Ok(())
     }
@@ -247,7 +414,7 @@ impl Git {
         let refspec = format!("+{want}:refs/codemux/want");
         self.run(
             &[
-                "fetch", "-q", "--no-tags", "--no-write-fetch-head", "--depth", "1", "--filter=blob:none",
+                "fetch", "-q", "--no-tags", "--no-write-fetch-head", "--depth", "1", "--filter=tree:0",
                 "origin", &refspec,
             ],
             None,
@@ -264,13 +431,196 @@ impl Git {
         Ok(sha)
     }
 
-    /// `(mode, oid, name)` for the entries of one folder (non-recursive).
-    fn list_folder(&self, sha: &str, folder: Option<&str>) -> Result<Vec<(String, String, String)>, String> {
-        let spec = match folder {
-            Some(f) => format!("{sha}:{f}"),
-            None => sha.to_string(),
+    /// Refuse a commit that no branch or tag of `url` contains. GitHub serves
+    /// every commit in a fork network (and every pull request head) through
+    /// each repository's URL, so without this a fork's commit would install
+    /// as if it came from the named repository.
+    fn check_on_branch_or_tag(&self, url: &str, sha: &str) -> Result<(), String> {
+        self.check_on_branch_or_tag_within(url, sha, PROVENANCE_DEPTHS)
+    }
+
+    /// [`Self::check_on_branch_or_tag`], searching `depths` commits back from
+    /// each tip in turn. All commands share one deadline and the private
+    /// repository has one disk budget across all fetches.
+    pub(crate) fn check_on_branch_or_tag_within(&self, url: &str, sha: &str, depths: &[u32]) -> Result<(), String> {
+        self.check_on_branch_or_tag_with_budget(url, sha, depths, MAX_PROVENANCE_BYTES)
+    }
+
+    pub(crate) fn check_on_branch_or_tag_with_budget(
+        &self,
+        url: &str,
+        sha: &str,
+        depths: &[u32],
+        disk_budget: u64,
+    ) -> Result<(), String> {
+        let deadline = Instant::now() + GIT_TIMEOUT;
+        let repo = url.strip_suffix(".git").unwrap_or(url);
+        let exhausted = |cause: &str| format!("{PROVENANCE_UNCONFIRMED} {} is from {repo}: {cause}.", &sha[..12]);
+        let unreachable = || format!(
+            "Commit {} isn't on any branch or tag of {repo}. It may come from a fork or a pull request, \
+             or its branch was rewritten.",
+            &sha[..12]
+        );
+        let limit_error = |error: String| match error.as_str() {
+            GIT_DISK_LIMIT => exhausted(&format!("the verification download exceeded {} MiB", disk_budget / 1_048_576)),
+            GIT_DEADLINE => exhausted("the verification took longer than 90 seconds"),
+            "The plugin is larger than the install limit" => exhausted("the repository advertises too many refs"),
+            _ => error,
         };
-        let out = self.run(&["ls-tree", "-z", &spec], None, 4 * 1024 * 1024)?;
+        // `HEAD` gives the default branch name. Fetching that ref first lets
+        // a common pin succeed without downloading unrelated branch history.
+        let out = self.run_by(
+            &["ls-remote", "--symref", url, "HEAD", "refs/heads/*", "refs/tags/*"],
+            None,
+            8 * 1024 * 1024,
+            deadline,
+        ).map_err(&limit_error)?;
+        let listed = String::from_utf8_lossy(&out);
+        let default_head = listed.lines().find_map(|line| line.strip_prefix("ref: ")?.split_once("\tHEAD").map(|(name, _)| name.to_string()));
+        let mut refs = Vec::new();
+        for line in listed.lines() {
+            let Some((oid, name)) = line.split_once('\t') else { continue; };
+            if !(name.starts_with("refs/heads/") || name.starts_with("refs/tags/")) {
+                continue;
+            }
+            // A peeled annotated tag appears as a second line with `^{}`.
+            if oid == sha {
+                return Ok(());
+            }
+            if !name.ends_with("^{}") {
+                refs.push(name.to_string());
+            }
+        }
+        refs.sort_by(|a, b| {
+            let rank = |name: &str| {
+                if default_head.as_deref() == Some(name) { 0 }
+                else if name.starts_with("refs/tags/") { 1 }
+                else { 2 }
+            };
+            rank(a).cmp(&rank(b)).then_with(|| b.cmp(a))
+        });
+        if refs.is_empty() {
+            return Err(unreachable());
+        }
+
+        // The pin is fetched separately because GitHub also serves fork and
+        // pull-request objects by SHA through the repository URL. Only a
+        // fetched named ref that contains it can prove its provenance.
+        let check = Self::with_by(self.exe.clone(), self.allow_file, deadline).map_err(&limit_error)?;
+        check.set_origin_by(url, deadline).map_err(&limit_error)?;
+        let fetch = |verifier: &Git, depth: &str, refspec: &str, until: Instant, budget: u64| {
+            verifier.run_by_limited(
+                &["fetch", "-q", "--no-tags", "--no-write-fetch-head", "--no-auto-gc", "--keep",
+                  "--filter=tree:0", "--depth", depth, "origin", refspec],
+                None,
+                1024 * 1024,
+                until,
+                Some(budget),
+            ).map(drop)
+        };
+        fetch(&check, "1", &format!("+{sha}:refs/codemux/want"), deadline, disk_budget)
+            .map_err(&limit_error)?;
+        let search_ref = |verifier: &Git, remote_ref: &str, depth: u32, until: Instant, budget: u64| -> Result<bool, String> {
+            let local_ref = remote_ref.replacen("refs/", "refs/codemux/", 1);
+            fetch(verifier, &depth.to_string(), &format!("+{remote_ref}:{local_ref}"), until, budget)?;
+            let out = verifier.run_by(
+                &["for-each-ref", "--count=1", "--contains", sha, "--format=%(refname)",
+                  "refs/codemux/heads/", "refs/codemux/tags/"],
+                None,
+                4096,
+                until,
+            )?;
+            Ok(!String::from_utf8_lossy(&out).trim().is_empty())
+        };
+
+        // Search the default branch, then release tags, at the first depth
+        // before deepening anything. A pin near a tag should not be starved
+        // by a costly deeper default history. The second default round still
+        // precedes unrelated branches, which can be much larger.
+        let default_ref = default_head.as_ref().filter(|head| refs.contains(head));
+        if let Some(first_depth) = depths.first() {
+            if let Some(default_ref) = default_ref {
+                if search_ref(&check, default_ref, *first_depth, deadline, disk_budget).map_err(&limit_error)? {
+                    return Ok(());
+                }
+            }
+            // Try shallow release tags before deepening the default branch.
+            // A separate verifier lets a large unrelated tag exhaust only its
+            // share of the disk and time budget, then releases its files before
+            // the default branch's second pass.
+            let tag_budget = disk_budget / 2;
+            if tag_budget > 0
+                && !directory_budget_exceeded(check.dir.path(), disk_budget - tag_budget)?
+                && refs.iter().any(|name| name.starts_with("refs/tags/"))
+            {
+                let tag_start = Instant::now();
+                let tag_deadline = tag_start
+                    + (deadline.saturating_duration_since(tag_start) / 3).min(GIT_TIMEOUT / 4);
+                let tag_check = Self::with_by(self.exe.clone(), self.allow_file, tag_deadline)
+                    .map_err(&limit_error)?;
+                tag_check.set_origin_by(url, tag_deadline).map_err(&limit_error)?;
+                match fetch(&tag_check, "1", &format!("+{sha}:refs/codemux/want"), tag_deadline, tag_budget) {
+                    Ok(()) => {
+                        for tag in refs.iter().filter(|name| name.starts_with("refs/tags/")) {
+                            match search_ref(&tag_check, tag, *first_depth, tag_deadline, tag_budget) {
+                                Ok(true) => return Ok(()),
+                                Ok(false) => {}
+                                Err(error) if error == GIT_DISK_LIMIT || error == GIT_DEADLINE => break,
+                                Err(error) => return Err(limit_error(error)),
+                            }
+                        }
+                    }
+                    Err(error) if error == GIT_DISK_LIMIT || error == GIT_DEADLINE => {}
+                    Err(error) => return Err(limit_error(error)),
+                }
+            }
+        }
+        if let (Some(default_ref), Some(second_depth)) = (default_ref, depths.get(1)) {
+            if search_ref(&check, default_ref, *second_depth, deadline, disk_budget).map_err(&limit_error)? {
+                return Ok(());
+            }
+        }
+        let has_tags = refs.iter().any(|name| name.starts_with("refs/tags/"));
+        let mut searched = 0;
+        for (round, depth) in depths.iter().enumerate() {
+            for remote_ref in &refs {
+                if (round < 2 && default_ref == Some(remote_ref))
+                    || (round == 0 && remote_ref.starts_with("refs/tags/"))
+                {
+                    continue;
+                }
+                if search_ref(&check, remote_ref, *depth, deadline, disk_budget).map_err(&limit_error)? {
+                    return Ok(());
+                }
+            }
+            searched = *depth;
+            // Tags were checked in a separate verifier at the first depth.
+            // Its shallow state cannot prove anything about `check`, so a
+            // complete branch search alone must not declare a tag-only pin
+            // unreachable before tags join this verifier in round two.
+            if (round > 0 || !has_tags) && !check.shallow_besides(sha)? {
+                return Err(unreachable());
+            }
+        }
+        Err(format!(
+            "{PROVENANCE_UNCONFIRMED} {} is from {repo} within the last {searched} commits of any branch or tag.",
+            &sha[..12]
+        ))
+    }
+
+    /// Whether any commit other than `sha` has history the shallow fetches
+    /// left out (`$GIT_DIR/shallow` lists those boundary commits).
+    fn shallow_besides(&self, sha: &str) -> Result<bool, String> {
+        match std::fs::read_to_string(self.dir.path().join("shallow")) {
+            Ok(list) => Ok(list.lines().map(str::trim).any(|l| !l.is_empty() && l != sha)),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+            Err(e) => Err(format!("Cannot read the fetched history: {e}")),
+        }
+    }
+
+    /// `(mode, oid, name)` for the entries of one tree (non-recursive).
+    fn list_tree(&self, tree: &str) -> Result<Vec<(String, String, String)>, String> {
+        let out = self.run(&["ls-tree", "-z", tree], None, 4 * 1024 * 1024)?;
         Ok(out
             .split(|b| *b == 0)
             .filter(|e| !e.is_empty())
@@ -284,6 +634,24 @@ impl Git {
                 Some((mode, oid, name.to_string()))
             })
             .collect())
+    }
+
+    /// An absent path is a candidate miss. Git errors, including limits hit
+    /// while fetching a promised tree, must reach the caller unchanged.
+    fn list_folder(&self, sha: &str, folder: Option<&str>) -> Result<Vec<(String, String, String)>, String> {
+        let mut tree = sha.to_string();
+        if let Some(folder) = folder {
+            for component in folder.split('/') {
+                let entries = self.list_tree(&tree)?;
+                let Some((_, oid, _)) = entries.into_iter().find(|(mode, _, name)| {
+                    mode == "040000" && name == component
+                }) else {
+                    return Ok(Vec::new());
+                };
+                tree = oid;
+            }
+        }
+        self.list_tree(&tree)
     }
 
     fn read_blobs(&self, oids: &[String]) -> Result<Vec<Vec<u8>>, String> {
@@ -406,6 +774,7 @@ pub fn fetch_plugin(
         check_subdir(s)?;
     }
     let sha = git.fetch(&want)?;
+    git.check_on_branch_or_tag(fetch_url, &sha)?;
     let git_ref = (!is_sha(&want) && want != "HEAD").then(|| want.clone());
 
     // Which folder holds plugin.js: the given one, else root, else codemux/.
@@ -415,10 +784,7 @@ pub fn fetch_plugin(
     };
     let mut chosen = None;
     for folder in candidates {
-        let entries = match git.list_folder(&sha, folder.as_deref()) {
-            Ok(entries) => entries,
-            Err(_) => continue,
-        };
+        let entries = git.list_folder(&sha, folder.as_deref())?;
         if entries.iter().any(|(mode, _, name)| name == ENTRY_FILE && mode.starts_with("100")) {
             chosen = Some((folder, entries));
             break;
@@ -633,6 +999,30 @@ pub fn now_rfc3339() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn git_deadline_stops_helper_processes() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        let wrapper = temp.path().join("git-wrapper");
+        let ready = temp.path().join("ready");
+        let late_write = temp.path().join("late-write");
+        let real_git = which::which("git").unwrap();
+        let script = format!(
+            "#!/bin/sh\nfor arg in \"$@\"; do\n  if [ \"$arg\" = child-probe ]; then\n    touch \"{}\"\n    (sleep 2; touch \"{}\") &\n    wait\n    exit\n  fi\ndone\nexec \"{}\" \"$@\"\n",
+            ready.display(), late_write.display(), real_git.display()
+        );
+        std::fs::write(&wrapper, script).unwrap();
+        std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let git = Git::with(wrapper, true).unwrap();
+        let error = git.run_by(&["child-probe"], None, 4096, Instant::now() + Duration::from_secs(1)).unwrap_err();
+        assert_eq!(error, GIT_DEADLINE);
+        assert!(ready.exists(), "the helper must have started before the deadline");
+        std::thread::sleep(Duration::from_millis(2200));
+        assert!(!late_write.exists(), "a timed-out Git helper was still running");
+    }
 
     #[test]
     fn plugin_file_names_are_single_normal_components() {
