@@ -90,6 +90,7 @@ pub enum IncludeSource {
 #[derive(Debug, Clone, Serialize)]
 pub struct IncludeResult {
     pub copied: Vec<String>,
+    pub skipped_nested: Vec<String>,
     pub source: IncludeSource,
 }
 
@@ -121,6 +122,7 @@ pub fn process_worktree_includes(
         );
         return Ok(IncludeResult {
             copied: Vec::new(),
+            skipped_nested: Vec::new(),
             source: IncludeSource::Defaults,
         });
     }
@@ -191,6 +193,7 @@ fn copy_worktree_includes(
     }
 
     let mut copied = Vec::new();
+    let mut skipped_nested = Vec::new();
     for raw_path in output
         .stdout
         .split(|byte| *byte == 0)
@@ -209,6 +212,7 @@ fn copy_worktree_includes(
         // A nested destination directory can move outside the checkout even
         // while its handle is open. Automatic copies stay at the held root.
         if !include_nested && path.components().count() != 1 {
+            skipped_nested.push(path.to_string_lossy().into_owned());
             continue;
         }
         if copy_include(source, destination, path)
@@ -219,6 +223,7 @@ fn copy_worktree_includes(
     }
     Ok(IncludeResult {
         copied,
+        skipped_nested,
         source: pattern_source,
     })
 }
@@ -345,6 +350,7 @@ struct WorktreeIncludesApplied {
     workspace_id: String,
     source: IncludeSource,
     copied: Vec<String>,
+    skipped_nested: Vec<String>,
 }
 
 /// Run the full setup pipeline: worktree includes copy + setup scripts.
@@ -464,6 +470,7 @@ pub(crate) fn run_setup_pipeline<R: Runtime>(
                     workspace_id: workspace_id.to_string(),
                     source: result.source,
                     copied: result.copied,
+                    skipped_nested: result.skipped_nested,
                 },
             );
         }
@@ -1039,6 +1046,10 @@ mod tests {
             assert!(paths.saved_config(&db).is_none());
             let copy = ScriptLocation::Checked(&paths).copy_includes(&[]).unwrap();
             assert_eq!(copy.is_some(), allowed);
+            if let Some(result) = copy {
+                assert_eq!(result.copied, [".env"]);
+                assert_eq!(result.skipped_nested, ["settings/private.env"]);
+            }
             assert_eq!(checkout.join(".env").exists(), allowed);
             assert!(!checkout.join("settings").exists());
         }
@@ -1084,6 +1095,7 @@ mod tests {
         .unwrap();
         assert_eq!(result.source, IncludeSource::File);
         assert_eq!(result.copied, ["fixture.env"]);
+        assert!(result.skipped_nested.is_empty());
         assert_eq!(
             fs::read_to_string(moved_checkout.join("fixture.env")).unwrap(),
             "FIXTURE=sample"

@@ -1327,6 +1327,10 @@ async fn workspace_close_revoked_during_teardown_leaves_the_workspace_open() {
     let state = app.state::<AppStateStore>();
     let closing = state.create_empty_workspace_at_path(checkout.clone()).0;
     state.set_workspace_worktree(&closing, checkout.display().to_string(), "teardown-close".into());
+    crate::config::workspace_config::LifecyclePaths::resolve_fresh_worktree(&checkout, &repo)
+        .unwrap()
+        .bind_to_workspace(&app.state::<DatabaseStore>(), &closing)
+        .unwrap();
     // A chat in the workspace, which closing it would stop.
     let chat = call(&app, &ControlCaller::trusted(), "thread_launch", json!({
         "workspace_id": closing, "client_request_id": "teardown-chat", "provider": "claude", "permission_mode": "default",

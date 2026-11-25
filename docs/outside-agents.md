@@ -579,6 +579,8 @@ To control Codemux from another machine, use SSH or **Over the network**, not `c
 
 On a headless host, the `worktree_create` tool reports `setup.setup_requires_explicit_run` when setup is available. Its `workspace` result contains the worktree's `path`, `id`, `name` and `branch`.
 
+Automatic includes copy matching files at the main checkout's root into the new worktree. The tool reports nested matches under `setup.includes_skipped_nested`, and `codemux-remote worktree create` prints a warning with those paths. Copy any required nested files before running setup.
+
 If you used `codemux-remote worktree create` from a shell, run `codemux-remote workspace list` and match the returned checkout path to an entry's `path` under `workspaces`. Take the `id`, `name` and `branch` from that entry. If you passed `--state-dir` to create the worktree, use the same directory when listing. For a worktree created through the daemon, use the daemon's state directory.
 
 On the host, review the setup commands in the worktree's `.codemux/config.json`. If it is missing or invalid, setup reads `.codemux/config.json` from the main checkout. Set the shell variables from the matching workspace entry and run the setup command.

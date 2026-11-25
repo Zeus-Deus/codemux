@@ -348,23 +348,31 @@ fn provision_worktree_workspace(ws: &Workspace, paths: Result<LifecyclePaths, St
 
     // Step 1: worktree includes (file → setting is desktop-only → defaults).
     let setting_patterns = config.as_ref().map_or(&[][..], |c| &c.worktree_includes);
-    let includes_copied = match paths.and_then(|paths| {
+    let (includes_copied, includes_skipped_nested) = match paths.and_then(|paths| {
         ScriptLocation::Checked(&paths).copy_includes(setting_patterns)
     }) {
-        Ok(result) => result.map_or_else(Vec::new, |includes| includes.copied),
+        Ok(Some(includes)) => (includes.copied, includes.skipped_nested),
+        Ok(None) => (Vec::new(), Vec::new()),
         Err(e) => {
             eprintln!(
                 "[codemux-remote] worktree includes failed for workspace {}: {e}",
                 ws.id
             );
-            Vec::new()
+            (Vec::new(), Vec::new())
         }
     };
+    if !includes_skipped_nested.is_empty() {
+        eprintln!(
+            "[codemux-remote] Automatic setup copies only top-level worktree files. Skipped nested matches: {}",
+            json!(includes_skipped_nested),
+        );
+    }
 
     let setup_commands = config.as_ref().map_or(0, |config| config.setup.len());
     json!({
         "port": crate::scripts::allocate_workspace_port(&ws.id),
         "includes_copied": includes_copied,
+        "includes_skipped_nested": includes_skipped_nested,
         "setup_commands": setup_commands,
         "setup_running": false,
         "setup_requires_explicit_run": setup_commands > 0,
@@ -699,10 +707,12 @@ mod tests {
 
         let repo = TempDir::new().unwrap();
         init_repo(repo.path());
-        // Gitignored .env in the parent repo — the includes step must
-        // copy it into the worktree (defaults cover `.env`).
-        std::fs::write(repo.path().join(".gitignore"), ".env\nsetup-ran.txt\n").unwrap();
+        // The root include is copied. The nested match is reported to the caller.
+        std::fs::write(repo.path().join(".gitignore"), ".env\nconfig/local.env\nsetup-ran.txt\n").unwrap();
+        std::fs::write(repo.path().join(".codemuxinclude"), ".env\nconfig/local.env\n").unwrap();
         std::fs::write(repo.path().join(".env"), "SECRET=from-root").unwrap();
+        std::fs::create_dir_all(repo.path().join("config")).unwrap();
+        std::fs::write(repo.path().join("config/local.env"), "NESTED=fixture").unwrap();
         // Committed setup config: the script records its env into a
         // marker file inside the worktree.
         std::fs::create_dir_all(repo.path().join(".codemux")).unwrap();
@@ -731,15 +741,8 @@ mod tests {
         assert_eq!(setup["setup_requires_explicit_run"], true);
         let port = setup["port"].as_u64().expect("port") as u16;
         assert!((3100..6500).contains(&port), "port {port} out of range");
-        assert!(
-            setup["includes_copied"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .any(|v| v == ".env"),
-            "includes_copied: {}",
-            setup["includes_copied"]
-        );
+        assert_eq!(setup["includes_copied"], json!([".env"]));
+        assert_eq!(setup["includes_skipped_nested"], json!(["config/local.env"]));
 
         // Includes are copied synchronously: present as soon as the
         // tool returns.
@@ -747,6 +750,7 @@ mod tests {
             std::fs::read_to_string(wt.join(".env")).unwrap(),
             "SECRET=from-root"
         );
+        assert!(!wt.join("config/local.env").exists());
 
         let marker = wt.join("setup-ran.txt");
         assert!(!marker.exists());
@@ -801,6 +805,7 @@ mod tests {
         let out = worktree_create(&params, &store).expect("worktree_create");
         assert_eq!(out["setup"]["setup_commands"], 0);
         assert_eq!(out["setup"]["setup_running"], false);
+        assert_eq!(out["setup"]["includes_skipped_nested"], json!([]));
         assert!(out["setup"]["port"].as_u64().is_some());
 
         match prev_home {

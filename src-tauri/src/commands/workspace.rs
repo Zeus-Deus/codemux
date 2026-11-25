@@ -1371,10 +1371,10 @@ enum CloseRoute<'a> {
 /// The folder a closing workspace's teardown scripts run in. A plain close
 /// runs them in the workspace's folder; every other route only in a
 /// worktree the workspace owns, so archiving a root checkout never runs its
-/// teardown. A chat child workspace has none on any route: it borrows its
-/// parent's folder, which stays in use.
+/// teardown. A chat child borrows its parent's folder, and an attached
+/// remote workspace names a folder on another host.
 fn teardown_folder(ws: &crate::state::WorkspaceSnapshot, route: CloseRoute<'_>) -> Option<String> {
-    if ws.is_chat_child() {
+    if ws.is_chat_child() || ws.is_remote_only() {
         return None;
     }
     match route {
@@ -1840,7 +1840,7 @@ async fn close_workspace_tracked<R: tauri::Runtime>(
     // works in them: only the delegated chats that close with this one
     // are exempt. Unknown workspace ids fall through so the lookup error
     // below stays identical to today.
-    let (worktree_path, branch, ws_title, ws_host_id, teardown) = {
+    let (worktree_path, branch, ws_title, ws_host_id, project_root, teardown) = {
         let snapshot = state.snapshot();
         let ws = snapshot
             .workspaces
@@ -1869,6 +1869,7 @@ async fn close_workspace_tracked<R: tauri::Runtime>(
             ws.and_then(|w| w.git_branch.clone()),
             ws.map(|w| w.title.clone()).unwrap_or_default(),
             ws.and_then(|w| w.host_id),
+            ws.and_then(|w| w.project_root.clone()),
             ws.and_then(|w| teardown_folder(w, route)),
         )
     };
@@ -1915,10 +1916,6 @@ async fn close_workspace_tracked<R: tauri::Runtime>(
             }
         }
     }
-    // The pre-flight read git: a requester whose authority was withdrawn
-    // meanwhile does not get to stop this workspace's Hermes chats either.
-    checkpoint.check()?;
-
     // Hermes owns background work with no drain acknowledgment. Await foreground
     // cancellation, retain files and defer teardown scripts while cleanup is pending.
     let hermes_pending = db.hermes_cleanup_pending(&workspace_id)? || {
@@ -1928,6 +1925,28 @@ async fn close_workspace_tracked<R: tauri::Runtime>(
             None => false,
         }
     };
+    let prepared_teardown = match teardown {
+        Some(folder) if !force && !hermes_pending => LifecyclePaths::prepare_teardown(
+            Path::new(&folder),
+            project_root.as_deref(),
+            db,
+            &workspace_id,
+            worktree_path.is_some(),
+        )
+        .map_err(|error| {
+            let recovery = if remove_worktree {
+                "\nUse force delete to skip teardown."
+            } else {
+                ""
+            };
+            format!("The workspace is still open because teardown could not be verified. {error}{recovery}")
+        }),
+        _ => Ok(None),
+    };
+    // Git preflight and teardown verification can take time. Check authority
+    // again before stopping Hermes chats or acting on the teardown result.
+    checkpoint.check()?;
+    let teardown = prepared_teardown?;
     if let Some(registry) = app.try_state::<crate::commands::agent_chat::ProviderRegistry>() {
         if let Some(provider) = registry.get(crate::agent_provider::types::ProviderKind::Hermes).await {
             for thread in db.hermes_workspace_threads(&workspace_id)? {
@@ -1944,34 +1963,23 @@ async fn close_workspace_tracked<R: tauri::Runtime>(
     // on the blocking pool: a blocked async worker can leave nobody polling
     // the control socket to answer it. Each asks the checkpoint first.
     let mut torn_down = Ok(());
-    if !force && !hermes_pending {
-        if let Some(paths) = teardown.and_then(|folder| {
-            LifecyclePaths::resolve_for_workspace(
-                Path::new(&folder),
-                db,
-                &workspace_id,
-                worktree_path.is_some(),
-            )
-            .ok()
-        }) {
-            let commands = paths.saved_config(db).map(|config| config.teardown).unwrap_or_default();
-            let teardown = CompletedTeardown {
-                folder: paths.workspace().to_string_lossy().into_owned(),
-                commands,
-            };
-            if !teardown.commands.is_empty() && !attempt.already_ran(&teardown) {
-                let (title, id, checkpoint) = (ws_title.clone(), workspace_id.clone(), checkpoint.clone());
-                let running = attempt.clone();
-                torn_down = tokio::task::spawn_blocking(move || {
-                    crate::scripts::run_teardown_scripts(
-                        &paths, &title, &id, &teardown.commands, &checkpoint,
-                    )?;
-                    running.set_teardown(Some(teardown));
-                    Ok(())
-                })
-                .await
-                .unwrap_or_else(|error| Err(format!("teardown task failed: {error}")));
-            }
+    if let Some((paths, commands)) = teardown {
+        let teardown = CompletedTeardown {
+            folder: paths.workspace().to_string_lossy().into_owned(),
+            commands,
+        };
+        if !attempt.already_ran(&teardown) {
+            let (title, id, checkpoint) = (ws_title.clone(), workspace_id.clone(), checkpoint.clone());
+            let running = attempt.clone();
+            torn_down = tokio::task::spawn_blocking(move || {
+                crate::scripts::run_teardown_scripts(
+                    &paths, &title, &id, &teardown.commands, &checkpoint,
+                )?;
+                running.set_teardown(Some(teardown));
+                Ok(())
+            })
+            .await
+            .unwrap_or_else(|error| Err(format!("teardown task failed: {error}")));
         }
     }
     // So may teardown: a requester whose authority was withdrawn meanwhile
@@ -5105,6 +5113,21 @@ mod archive_guard_tests {
         }).unwrap();
     }
 
+    fn linked_teardown_fixture(base: &Path) -> (PathBuf, PathBuf) {
+        let project = base.join("project");
+        let checkout = base.join("checkout");
+        std::fs::create_dir(&project).unwrap();
+        for args in [
+            vec!["init", "--initial-branch=main"],
+            vec!["-c", "user.name=Test", "-c", "user.email=test@example.test", "-c", "commit.gpgsign=false", "commit", "--allow-empty", "-m", "initial"],
+            vec!["worktree", "add", "-b", "feature", checkout.to_str().unwrap()],
+        ] {
+            let result = crate::git::git_command().current_dir(&project).args(args).output().unwrap();
+            assert!(result.status.success(), "{}", String::from_utf8_lossy(&result.stderr));
+        }
+        (project, checkout)
+    }
+
     /// A chat child workspace borrows its parent's folder: closing it, by
     /// any route, never runs the folder's teardown scripts.
     #[tokio::test]
@@ -5209,12 +5232,12 @@ mod archive_guard_tests {
             return;
         }
         use tauri::Manager;
-        let root = tempfile::tempdir().unwrap();
-        let worktree = tempfile::tempdir().unwrap();
-        let ran = |dir: &tempfile::TempDir| std::fs::read_to_string(dir.path().join("teardown-ran")).ok();
+        let fixture = tempfile::tempdir().unwrap();
+        let (root, worktree) = linked_teardown_fixture(fixture.path());
+        let ran = |dir: &Path| std::fs::read_to_string(dir.join("teardown-ran")).ok();
         let store = AppStateStore::default();
         let open_root = |store: &AppStateStore, title: &str| {
-            let id = store.create_empty_workspace_at_path(root.path().to_path_buf()).0;
+            let id = store.create_empty_workspace_at_path(root.clone()).0;
             store.rename_workspace(&id, title.into());
             store.set_workspace_protected(&id, true);
             id
@@ -5222,16 +5245,19 @@ mod archive_guard_tests {
         let archived = open_root(&store, "Archived root");
         let tracked = open_root(&store, "Tracked root");
         let plain = open_root(&store, "Plain root");
-        let feature = store.create_empty_workspace_at_path(worktree.path().to_path_buf()).0;
-        store.set_workspace_worktree(&feature, worktree.path().display().to_string(), "Feature".into());
+        let feature = store.create_empty_workspace_at_path(worktree.clone()).0;
+        store.set_workspace_worktree(&feature, worktree.display().to_string(), "feature".into());
+        store.set_workspace_project_root(&feature, root.display().to_string());
         store.rename_workspace(&feature, "Feature".into());
         let app = close_test_app(store);
         let state = app.state::<AppStateStore>();
         let db = app.state::<crate::database::DatabaseStore>();
 
-        for folder in [root.path(), worktree.path()] {
-            save_teardown(&db, folder, r#"echo "$CODEMUX_WORKSPACE_NAME" >> teardown-ran"#);
-        }
+        save_teardown(&db, &root, r#"echo "$CODEMUX_WORKSPACE_NAME" >> teardown-ran"#);
+        LifecyclePaths::resolve_fresh_worktree(&worktree, &root)
+            .unwrap()
+            .bind_to_workspace(&db, &feature)
+            .unwrap();
 
         archive_workspace_impl(app.handle().clone(), &state, &db, archived).await.unwrap();
         close_workspace_with_worktree_impl(app.handle().clone(), &state, &db, tracked, false, None, None)
@@ -5246,6 +5272,49 @@ mod archive_guard_tests {
             .await
             .unwrap();
         assert_eq!(ran(&worktree).as_deref(), Some("Feature\n"), "an owned worktree runs them");
+    }
+
+    #[tokio::test]
+    async fn restored_worktree_with_unverified_teardown_requires_explicit_force_delete() {
+        if crate::state::run_with_isolated_layout(
+            "commands::workspace::archive_guard_tests::restored_worktree_with_unverified_teardown_requires_explicit_force_delete",
+        ) {
+            return;
+        }
+        use tauri::Manager;
+
+        let fixture = tempfile::tempdir().unwrap();
+        let (root, worktree) = linked_teardown_fixture(fixture.path());
+        let before_upgrade = AppStateStore::default();
+        let id = before_upgrade.create_empty_workspace_at_path(worktree.clone()).0;
+        before_upgrade.set_workspace_worktree(&id, worktree.display().to_string(), "feature".into());
+        before_upgrade.set_workspace_project_root(&id, root.display().to_string());
+        crate::state::flush_persisted_state(&before_upgrade).unwrap();
+
+        let restored = AppStateStore::default();
+        restored.replace_snapshot(crate::state::load_persisted_state().unwrap());
+        let app = close_test_app(restored);
+        let state = app.state::<AppStateStore>();
+        let db = app.state::<crate::database::DatabaseStore>();
+        save_teardown(&db, &root, "touch teardown-ran; exit 43");
+        assert!(db.lifecycle_worktree_id(&id).unwrap().is_none());
+
+        let delete = |force| {
+            close_workspace_with_worktree_impl(
+                app.handle().clone(), &state, &db, id.clone(), true, Some(false), Some(force),
+            )
+        };
+        let error = delete(false).await.unwrap_err();
+        assert!(error.contains("teardown could not be verified"), "{error}");
+        assert!(error.contains("Use force delete to skip teardown"), "{error}");
+        assert!(state.find_workspace(&id).is_some());
+        assert!(db.pending_layout_closes().unwrap().is_empty());
+        assert!(worktree.join(".git").is_file());
+        assert!(!worktree.join("teardown-ran").exists());
+
+        delete(true).await.unwrap();
+        assert!(state.find_workspace(&id).is_none());
+        assert!(!worktree.exists());
     }
 
     /// From a deletion's final check through the delete, nothing opens in

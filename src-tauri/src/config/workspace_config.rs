@@ -153,16 +153,19 @@ impl LifecyclePaths {
         expected_project: &Path,
     ) -> Result<Self, String> {
         let mut paths = Self::resolve_linked_checkout(workspace_path)?;
-        let expected_root = dunce::canonicalize(expected_project)
-            .ok()
-            .and_then(|path| resolve_project_paths(&path).ok())
-            .map(|(_, root)| root);
-        if expected_root.as_deref() != Some(paths.root()) {
+        if !paths.matches_project_root(expected_project) {
             return Err(UNVERIFIED_WORKTREE.into());
         }
         paths.worktree_id = Some(paths.verified_worktree_id().ok_or(UNVERIFIED_WORKTREE)?);
         paths.check()?;
         Ok(paths)
+    }
+
+    fn matches_project_root(&self, candidate: &Path) -> bool {
+        dunce::canonicalize(candidate)
+            .ok()
+            .and_then(|path| resolve_project_paths(&path).ok())
+            .is_some_and(|(_, root)| root == self.root)
     }
 
     pub(crate) fn resolve_for_workspace(
@@ -255,6 +258,46 @@ impl LifecyclePaths {
         }
         self.check().ok()?;
         db.get_project_scripts_at(&self.root, Some(&self.root_dir)).map(saved_workspace_config)
+    }
+
+    /// Close may proceed for a legacy linked checkout once its Git project
+    /// is verified and has no approved teardown. The legacy check never
+    /// authorizes command execution.
+    pub(crate) fn prepare_teardown(
+        workspace_path: &Path,
+        recorded_project: Option<&str>,
+        db: &DatabaseStore,
+        workspace_id: &str,
+        expects_worktree: bool,
+    ) -> Result<Option<(Self, Vec<String>)>, String> {
+        let binding = db.lifecycle_worktree_id(workspace_id)?;
+        let mut paths = match Self::resolve(workspace_path) {
+            Ok(paths) => paths,
+            Err(error) => {
+                let has_teardown = recorded_project
+                    .and_then(|root| db.get_project_scripts(root))
+                    .is_some_and(|scripts| !scripts.teardown.is_empty());
+                if expects_worktree || binding.is_some() || has_teardown {
+                    return Err(error);
+                }
+                return Ok(None);
+            }
+        };
+        paths.worktree_id = binding;
+        paths.check()?;
+        let commands = db
+            .get_project_scripts_at(&paths.root, Some(&paths.root_dir))
+            .map_or_else(Vec::new, |scripts| scripts.teardown);
+        if paths.worktree_id.is_none() && (expects_worktree || paths.checkout != paths.root) {
+            if !commands.is_empty()
+                || recorded_project.is_some_and(|root| !paths.matches_project_root(Path::new(root)))
+                || paths.verified_worktree_id().is_none()
+            {
+                return Err(UNVERIFIED_WORKTREE.into());
+            }
+            return Ok(None);
+        }
+        Ok((!commands.is_empty()).then_some((paths, commands)))
     }
 
     pub(crate) fn permits_include_copy(&self) -> bool {
