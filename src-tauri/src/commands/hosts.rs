@@ -174,22 +174,6 @@ pub async fn hosts_ssh_config_hosts() -> Vec<String> {
     .unwrap_or_default()
 }
 
-/// Assign (or clear) the host a workspace runs on. Used by the
-/// workspace header badge + the future "Push to host" action. Passes
-/// the host_id straight through to the in-memory `AppState`; the
-/// snapshot persists via the normal save path.
-#[tauri::command]
-pub fn set_workspace_host<R: tauri::Runtime>(
-    app: tauri::AppHandle<R>,
-    app_state: tauri::State<'_, crate::state::AppStateStore>,
-    workspace_id: String,
-    host_id: Option<i64>,
-) -> Result<(), String> {
-    app_state.set_workspace_host_id(&workspace_id, host_id)?;
-    crate::state::emit_app_state(&app);
-    Ok(())
-}
-
 /// Turn the host-side `git`/`gh` probe output into a human note for the
 /// connection-test message. Pure — unit-tested.
 ///
