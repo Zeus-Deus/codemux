@@ -486,6 +486,30 @@ describe("GenericToolBody edge cases", () => {
 });
 
 describe("Tool result images", () => {
+  it("keeps confirmation actions outside the scrollable long image address", () => {
+    const url = `https://private.example.test/${"a".repeat(4096)}`;
+    render(<ToolCallBody item={makeTool({ result_content: [
+      { type: "image_url", image_url: { url } },
+    ] })} />);
+
+    fireEvent.click(screen.getByRole("button", { name: "Load remote image" }));
+
+    const dialog = screen.getByRole("alertdialog");
+    const details = screen.getByRole("region", { name: "Image confirmation details" });
+    const address = screen.getByRole("region", { name: "Full image URL" });
+    expect(dialog).toHaveClass("max-h-[calc(100dvh-2rem)]", "overflow-hidden");
+    expect(details).toHaveClass("min-h-0", "overflow-y-auto");
+    expect(details).toHaveAttribute("tabindex", "0");
+    expect(screen.getByText("private.example.test")).toBeInTheDocument();
+    expect(address).toHaveTextContent(url);
+    expect(address).toHaveClass("max-h-48", "overflow-y-auto");
+    expect(address).toHaveAttribute("tabindex", "0");
+    expect(dialog.querySelector("[data-slot='alert-dialog-footer']")?.parentElement).toBe(dialog);
+    expect(screen.getByRole("button", { name: "Cancel" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Load image" })).toBeInTheDocument();
+    expect(screen.queryByRole("img")).not.toBeInTheDocument();
+  });
+
   it("requires confirmation before loading an untrusted URL image", () => {
     const url = "https://private.example.test/screenshot.png";
     render(<ToolCallBody item={makeTool({ result_content: [

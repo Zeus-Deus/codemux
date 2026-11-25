@@ -75,6 +75,28 @@ describe("ChatMarkdown selection compatibility", () => {
 });
 
 describe("ChatMarkdown rich external links", () => {
+  it("keeps confirmation actions outside the scrollable long link address", () => {
+    const url = `https://links.example.test/${"a".repeat(4096)}`;
+    const { container } = render(<ChatMarkdown>{`[Reference](${url})`}</ChatMarkdown>);
+
+    fireEvent.click(container.querySelector('[data-streamdown="link"]') as HTMLAnchorElement);
+
+    const dialog = screen.getByRole("alertdialog");
+    const details = screen.getByRole("region", { name: "Link confirmation details" });
+    const address = screen.getByRole("region", { name: "Full link URL" });
+    expect(dialog).toHaveClass("max-h-[calc(100dvh-2rem)]", "overflow-hidden");
+    expect(details).toHaveClass("min-h-0", "overflow-y-auto");
+    expect(details).toHaveAttribute("tabindex", "0");
+    expect(screen.getByText("links.example.test")).toBeInTheDocument();
+    expect(address).toHaveTextContent(url);
+    expect(address).toHaveClass("max-h-48", "overflow-y-auto");
+    expect(address).toHaveAttribute("tabindex", "0");
+    expect(dialog.querySelector("[data-slot='alert-dialog-footer']")?.parentElement).toBe(dialog);
+    expect(screen.getByRole("button", { name: "Cancel" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Open link" })).toBeInTheDocument();
+    expect(mocks.openUrl).not.toHaveBeenCalled();
+  });
+
   it("adds the destination favicon to a trusted labelled http(s) link", () => {
     const { container } = render(
       <ChatMarkdown>
@@ -467,8 +489,8 @@ describe("ChatMarkdown local image links", () => {
     ).toBeInTheDocument();
   });
 
-  // The path labels must still match the backend's retained-image planner,
-  // even though unverified originals now require a click before any read.
+  // The path labels still describe the original image, which requires a click
+  // before any read unless an existing app-owned copy is available.
   const renderedCaptions = (markdown: string) => {
     const { container } = render(
       <TooltipProvider>

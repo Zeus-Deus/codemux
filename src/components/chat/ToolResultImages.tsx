@@ -93,6 +93,12 @@ function ToolResultThumbnail({
   const [confirmationSrc, setConfirmationSrc] = useState<string | null>(null);
 
   if (!approved) {
+    let host: string;
+    try {
+      host = new URL(image.src).host || "Invalid address";
+    } catch {
+      host = "Invalid address";
+    }
     return (
       <AlertDialog
         open={confirmationSrc === image.src}
@@ -107,17 +113,25 @@ function ToolResultThumbnail({
           <ImageIcon className="size-5" aria-hidden />
           Load remote image
         </button>
-        <AlertDialogContent>
-          <AlertDialogHeader>
-            <AlertDialogTitle>Load remote image?</AlertDialogTitle>
-            <AlertDialogDescription>
-              Loading this image will contact its host. Check the address before continuing.
-            </AlertDialogDescription>
-          </AlertDialogHeader>
-          <div className="select-text break-all rounded-lg bg-muted px-3 py-2 font-mono text-label text-muted-foreground">
-            {image.src}
+        <AlertDialogContent className="flex max-h-[calc(100dvh-2rem)] flex-col overflow-hidden">
+          <div role="region" aria-label="Image confirmation details" className="thin-scrollbar min-h-0 space-y-4 overflow-y-auto" tabIndex={0}>
+            <AlertDialogHeader>
+              <AlertDialogTitle>Load remote image?</AlertDialogTitle>
+              <AlertDialogDescription>
+                Loading this image will contact its host. Check the address before continuing.
+              </AlertDialogDescription>
+            </AlertDialogHeader>
+            <p className="break-all text-label text-muted-foreground">Host: <span className="font-medium text-foreground">{host}</span></p>
+            <div
+              role="region"
+              aria-label="Full image URL"
+              tabIndex={0}
+              className="thin-scrollbar max-h-48 overflow-y-auto select-text break-all rounded-lg bg-muted px-3 py-2 font-mono text-label text-muted-foreground"
+            >
+              {image.src}
+            </div>
           </div>
-          <AlertDialogFooter>
+          <AlertDialogFooter className="shrink-0">
             <AlertDialogCancel>Cancel</AlertDialogCancel>
             <AlertDialogAction onClick={() => { onConfirm(); setConfirmationSrc(null); }}>
               Load image

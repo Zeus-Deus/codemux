@@ -54,6 +54,20 @@ afterEach(() => {
 });
 
 describe("MarkdownLocalImage", () => {
+  it("shows Load immediately for a new reply without retained images", () => {
+    const { container, getByRole } = render(
+      <RetainedImagesProvider images={[]}>
+        <MarkdownLocalImage path="/tmp/new-proof.png" caption="Proof" />
+      </RetainedImagesProvider>,
+    );
+
+    expect(getByRole("button", { name: "Load Proof" })).toHaveTextContent("/tmp/new-proof.png");
+    expect(container.querySelector("img")).toBeNull();
+    expect(convertFileSrcMock).not.toHaveBeenCalled();
+    expect(readChatImageMock).not.toHaveBeenCalled();
+    expect(readLocalChatImageMock).not.toHaveBeenCalled();
+  });
+
   it("discloses the exact original path without reading or rendering it before Load", async () => {
     const path = "/tmp/shots/proof.png";
     const { container, getByRole } = render(
