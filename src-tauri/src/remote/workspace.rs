@@ -797,6 +797,45 @@ mod tests {
     }
 
     #[test]
+    fn wal_writes_are_visible_to_a_concurrent_reader_and_survive_reopen() {
+        let dir = TempDir::new().unwrap();
+        let store = open_store(&dir);
+        let first = store
+            .create(Some("first".into()), "/tmp/first".into(), None, None)
+            .unwrap();
+
+        let reader = Connection::open(dir.path().join("codemux.db")).unwrap();
+        let journal: String = reader
+            .query_row("PRAGMA journal_mode", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(journal, "wal");
+        let first_name: String = reader
+            .query_row(
+                "SELECT name FROM workspaces WHERE id = ?1",
+                rusqlite::params![first.id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(first_name, "first");
+
+        let second = store
+            .create(Some("second".into()), "/tmp/second".into(), None, None)
+            .unwrap();
+        let second_name: String = reader
+            .query_row(
+                "SELECT name FROM workspaces WHERE id = ?1",
+                rusqlite::params![second.id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(second_name, "second");
+
+        drop(reader);
+        drop(store);
+        assert_eq!(open_store(&dir).list().unwrap().len(), 2);
+    }
+
+    #[test]
     fn create_list_close_roundtrip() {
         let dir = TempDir::new().unwrap();
         let store = open_store(&dir);
