@@ -1,15 +1,16 @@
 import { useEffect } from "react";
-import { isRemoteClient } from "@/components/remote/is-remote-client";
 import { onWorktreeIncludesApplied } from "@/tauri/events";
 import { dbGetUiState, dbSetUiState } from "@/tauri/commands";
 import { useAppStore } from "@/stores/app-store";
+import { copyToClipboard, COPY_FAILED_MESSAGE } from "@/lib/clipboard";
 import { basename } from "@/lib/path";
 import { toast } from "@/lib/toast";
-import {
-  copyMissingNestedFilesWithFeedback,
-  formatIncludeDetails,
-  reportWorktreeIncludeErrors,
-} from "@/lib/worktree-includes";
+
+function formatIncludeDetails(items: string[]): string {
+  const examples = items.slice(0, 3).join(", ");
+  const remaining = items.length > 3 ? ` and ${items.length - 3} more` : "";
+  return `${examples}${remaining}`;
+}
 
 /**
  * Reports include errors and skipped nested files, and shows a one-time hint for defaults.
@@ -36,17 +37,28 @@ import {
 export function useWorktreeIncludeToast() {
   useEffect(() => {
     const unlisten = onWorktreeIncludesApplied(async (payload) => {
-      reportWorktreeIncludeErrors(payload.errors ?? []);
+      const errors = payload.errors ?? [];
+      if (errors.length > 0) {
+        toast.warning("Some worktree includes could not be copied", {
+          description: formatIncludeDetails(errors),
+          classNames: { description: "line-clamp-3 break-words" },
+          duration: 8000,
+        });
+      }
       const skipped = payload.skipped_nested ?? [];
       if (skipped.length > 0) {
-        const remote = isRemoteClient();
         toast.warning("Nested worktree files skipped", {
-          description: `Skipped ${formatIncludeDetails(skipped)}.${remote ? " Copy missing nested files from the desktop." : ""}`,
-          action: remote ? undefined : {
-            label: "Copy missing nested files",
-            onClick: () => copyMissingNestedFilesWithFeedback(payload.workspace_id),
+          description: `Skipped ${formatIncludeDetails(skipped)}. On the worktree host, copy missing files from the main checkout.`,
+          action: {
+            label: "Copy skipped paths",
+            onClick: async (event) => {
+              event.preventDefault();
+              const copied = await copyToClipboard(JSON.stringify(skipped, null, 2));
+              if (copied) toast.success("Copied skipped paths");
+              else toast.error(COPY_FAILED_MESSAGE);
+            },
           },
-          classNames: { description: "line-clamp-3 break-words" },
+          classNames: { description: "line-clamp-4 break-words" },
           duration: 8000,
         });
         return;

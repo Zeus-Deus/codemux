@@ -3699,33 +3699,6 @@ pub fn run_workspace_setup<R: tauri::Runtime>(
     )
 }
 
-/// The desktop recovery copies only missing nested includes. It runs no
-/// project commands and does not publish over an existing file.
-#[tauri::command(async)]
-pub fn copy_missing_nested_worktree_includes(
-    state: State<'_, AppStateStore>,
-    db: State<'_, crate::database::DatabaseStore>,
-    workspace_id: String,
-) -> Result<crate::scripts::IncludeResult, String> {
-    let workspace = state
-        .find_workspace(&workspace_id)
-        .ok_or_else(|| format!("No workspace found for {workspace_id}"))?;
-    let worktree = workspace
-        .worktree_path
-        .as_deref()
-        .filter(|_| {
-            !workspace.is_remote_only() && workspace.host_id.is_none() && !workspace.attach_only
-        })
-        .ok_or("Copying nested includes requires a local worktree")?;
-    let worktree = Path::new(worktree);
-    let root = crate::scripts::resolve_root_path(worktree);
-    let config = crate::config::workspace_config::read_effective_config(worktree, &db);
-    let patterns = config
-        .as_ref()
-        .map_or(&[][..], |config| &config.worktree_includes);
-    crate::scripts::copy_missing_nested_includes(&root, worktree, patterns)
-}
-
 #[tauri::command(async)]
 pub fn run_project_dev_command<R: tauri::Runtime>(
     app: tauri::AppHandle<R>,

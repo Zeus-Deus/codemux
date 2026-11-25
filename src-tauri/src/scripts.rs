@@ -108,13 +108,6 @@ impl IncludeResult {
     }
 }
 
-#[derive(Clone, Copy)]
-enum IncludeMode {
-    Automatic,
-    ManualSetup,
-    MissingNested,
-}
-
 /// Process worktree includes: copy gitignored files matching patterns from the
 /// main worktree into the new worktree.
 ///
@@ -123,42 +116,14 @@ enum IncludeMode {
 ///   2. `worktree_includes` from project settings
 ///   3. Hardcoded defaults (`DEFAULT_WORKTREE_INCLUDES`)
 ///
-/// Automatically copy top-level files into a distinct registered checkout.
+/// Copy top-level files into a distinct registered checkout.
 pub fn process_worktree_includes(
     root_path: &Path,
     worktree_path: &Path,
     setting_patterns: &[String],
 ) -> Result<IncludeResult, String> {
-    process_registered_worktree_includes(
-        root_path,
-        worktree_path,
-        setting_patterns,
-        IncludeMode::Automatic,
-    )
-}
-
-/// Explicit desktop recovery for an existing, registered worktree root.
-pub(crate) fn copy_missing_nested_includes(
-    root_path: &Path,
-    worktree_path: &Path,
-    setting_patterns: &[String],
-) -> Result<IncludeResult, String> {
-    let (source, destination) = open_registered_include_dirs(root_path, worktree_path, false)
-        .ok_or("Copying nested includes requires a registered linked worktree")?;
-    copy_worktree_includes(&source, &destination, setting_patterns, IncludeMode::MissingNested)
-}
-
-fn process_registered_worktree_includes(
-    root_path: &Path,
-    worktree_path: &Path,
-    setting_patterns: &[String],
-    mode: IncludeMode,
-) -> Result<IncludeResult, String> {
-    let allow_subdirectory = matches!(mode, IncludeMode::ManualSetup);
-    if let Some((source, destination)) =
-        open_registered_include_dirs(root_path, worktree_path, allow_subdirectory)
-    {
-        return copy_worktree_includes(&source, &destination, setting_patterns, mode);
+    if let Some((source, destination)) = open_registered_include_dirs(root_path, worktree_path) {
+        return copy_worktree_includes(&source, &destination, setting_patterns);
     }
     Ok(IncludeResult::default())
 }
@@ -166,23 +131,17 @@ fn process_registered_worktree_includes(
 fn open_registered_include_dirs(
     root: &Path,
     workspace: &Path,
-    allow_subdirectory: bool,
 ) -> Option<(IncludeSourceDir, Dir)> {
     let root = root.canonicalize().ok()?;
     let workspace = workspace.canonicalize().ok()?;
     let checkout_path = nearest_checkout(&workspace)?;
-    if checkout_path == root {
-        return None;
-    }
-    let relative = workspace.strip_prefix(checkout_path).ok()?;
-    if !allow_subdirectory && !relative.as_os_str().is_empty() {
+    if checkout_path == root || checkout_path != workspace {
         return None;
     }
     let source = IncludeSourceDir::open(&root).ok()?;
     let checkout = Dir::open_ambient_dir(checkout_path, cap_std::ambient_authority()).ok()?;
-    let destination = open_include_parent(&checkout, relative, false).ok()?;
     verify_include_registration(&source, &checkout, checkout_path)?;
-    Some((source, destination))
+    Some((source, checkout))
 }
 
 /// A worktree's gitfile and the source's worktree registration must point
@@ -312,7 +271,6 @@ fn copy_worktree_includes(
     root: &IncludeSourceDir,
     destination: &Dir,
     setting_patterns: &[String],
-    mode: IncludeMode,
 ) -> Result<IncludeResult, String> {
     let include_file = Path::new(".codemuxinclude");
     let mut patterns = tempfile::NamedTempFile::new()
@@ -351,7 +309,7 @@ fn copy_worktree_includes(
         source,
         ..IncludeResult::default()
     };
-    copy_matching_files(root, destination, patterns.path(), mode, &mut result)?;
+    copy_matching_files(root, destination, patterns.path(), &mut result)?;
 
     if !result.copied.is_empty() {
         eprintln!(
@@ -380,7 +338,6 @@ fn copy_matching_files(
     root: &IncludeSourceDir,
     destination: &Dir,
     exclude_file: &Path,
-    mode: IncludeMode,
     result: &mut IncludeResult,
 ) -> Result<(), String> {
     let output = root
@@ -430,18 +387,13 @@ fn copy_matching_files(
             }
         };
 
-        // On Unix an open nested directory can still be moved out of the
-        // checkout. Automatic copies stay at the registered checkout root.
-        let nested = relative_path.components().count() != 1;
-        match mode {
-            IncludeMode::Automatic if nested => {
-                result.skipped_nested.push(relative_path.to_string_lossy().into_owned());
-                continue;
-            }
-            IncludeMode::MissingNested if !nested => continue,
-            _ => {}
+        // An open nested directory can move outside the checkout on Unix.
+        // Report its matches for manual copying without opening a nested parent.
+        if relative_path.components().count() != 1 {
+            result.skipped_nested.push(relative_path.to_string_lossy().into_owned());
+            continue;
         }
-        match copy_confined_include(&root.dir, destination, relative_path, mode) {
+        match copy_confined_include(&root.dir, destination, relative_path) {
             Ok(true) => result.copied.push(relative_path.to_string_lossy().into_owned()),
             Ok(false) => {}
             Err(error) => result.errors.push(format!(
@@ -454,69 +406,26 @@ fn copy_matching_files(
     Ok(())
 }
 
-fn open_include_parent(root: &Dir, path: &Path, create: bool) -> io::Result<Dir> {
-    let mut directory = root.try_clone()?;
-    for component in path.components() {
-        let Component::Normal(name) = component else {
-            return Err(ErrorKind::InvalidInput.into());
-        };
-        if create {
-            match directory.create_dir(name) {
-                Ok(()) => {}
-                Err(error) if error.kind() == ErrorKind::AlreadyExists => {}
-                Err(error) => return Err(error),
-            }
-        }
-        directory = directory.open_dir_nofollow(name)?;
-        #[cfg(windows)]
-        {
-            use cap_std::fs::MetadataExt;
-            use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT;
-            if directory.dir_metadata()?.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
-                return Err(io::Error::other("Worktree include crosses a reparse point"));
-            }
-        }
-    }
-    Ok(directory)
-}
-
-fn copy_confined_include(
-    source: &Dir,
-    destination: &Dir,
-    path: &Path,
-    mode: IncludeMode,
-) -> io::Result<bool> {
-    if !path
-        .components()
-        .all(|component| matches!(component, Component::Normal(_)))
-    {
+fn copy_confined_include(source: &Dir, destination: &Dir, path: &Path) -> io::Result<bool> {
+    let mut components = path.components();
+    let (Some(Component::Normal(name)), None) = (components.next(), components.next()) else {
         return Err(io::Error::new(
             ErrorKind::InvalidInput,
             "Invalid worktree include path",
         ));
-    }
-    let parent = path.parent().ok_or(ErrorKind::InvalidInput)?;
-    let name = Path::new(path.file_name().ok_or(ErrorKind::InvalidInput)?);
-    let Some(mut input) = open_regular_include(source, path)? else {
+    };
+    let name = Path::new(name);
+    let Some(mut input) = open_regular_include(source, name)? else {
         return Ok(false);
     };
-    let destination = open_include_parent(destination, parent, true)?;
-
-    let preserve_existing = matches!(mode, IncludeMode::MissingNested);
     match destination.symlink_metadata(name) {
-        Ok(_) if preserve_existing => return Ok(false),
         Ok(entry) if !is_regular_include(&entry) => return Ok(false),
         Ok(_) => {}
         Err(error) if error.kind() == ErrorKind::NotFound => {}
         Err(error) => return Err(error),
     }
-    let stage = stage_include(&mut input, &destination)?;
-    if preserve_existing {
-        stage.publish_missing(name)
-    } else {
-        stage.publish(name)?;
-        Ok(true)
-    }
+    stage_include(&mut input, destination)?.publish(name)?;
+    Ok(true)
 }
 
 struct StagedInclude<'a> {
@@ -530,24 +439,6 @@ impl StagedInclude<'_> {
         self.parent.rename(&self.name, self.parent, name)?;
         self.published = true;
         Ok(())
-    }
-
-    fn publish_missing(mut self, name: &Path) -> io::Result<bool> {
-        // Linking the complete stage fails atomically if the destination
-        // appeared during copying.
-        let copied = match self.parent.hard_link(&self.name, self.parent, name) {
-            Ok(()) => true,
-            Err(error) if error.kind() == ErrorKind::AlreadyExists => false,
-            Err(error) => return Err(error),
-        };
-        self.parent.remove_file(&self.name).map_err(|error| {
-            io::Error::new(
-                error.kind(),
-                format!("Remove staged include {}: {error}", self.name),
-            )
-        })?;
-        self.published = true;
-        Ok(copied)
     }
 }
 
@@ -703,12 +594,7 @@ pub fn run_setup_scripts<R: Runtime>(
     emit_worktree_include_result(
         app_handle,
         workspace_id,
-        process_registered_worktree_includes(
-            &root_path,
-            workspace_path,
-            &setting_patterns,
-            IncludeMode::ManualSetup,
-        ),
+        process_worktree_includes(&root_path, workspace_path, &setting_patterns),
     );
 
     // Step 2: Run setup commands
@@ -1077,7 +963,7 @@ mod tests {
     ) -> Result<IncludeResult, String> {
         let root = IncludeSourceDir::open(&root.canonicalize().unwrap()).unwrap();
         let destination = Dir::open_ambient_dir(destination, cap_std::ambient_authority()).unwrap();
-        super::copy_worktree_includes(&root, &destination, patterns, IncludeMode::ManualSetup)
+        super::copy_worktree_includes(&root, &destination, patterns)
     }
 
     // Bash-subprocess round-trip: spawn `sh -c 'echo -n "$VAR" > file'`, then
@@ -1334,8 +1220,8 @@ mod tests {
         let authority = cap_std::ambient_authority();
         let source = Dir::open_ambient_dir(root.path(), authority).unwrap();
         let destination = Dir::open_ambient_dir(worktree.path(), authority).unwrap();
-        assert!(!copy_confined_include(&source, &destination, Path::new(".env"), IncludeMode::ManualSetup).unwrap());
-        assert!(!copy_confined_include(&source, &destination, Path::new(".env.link"), IncludeMode::ManualSetup).unwrap());
+        assert!(!copy_confined_include(&source, &destination, Path::new(".env")).unwrap());
+        assert!(!copy_confined_include(&source, &destination, Path::new(".env.link")).unwrap());
         assert_eq!(fs::read_to_string(&external).unwrap(), "unchanged");
         assert!(!worktree.path().join(".env.link").exists());
     }
@@ -1355,7 +1241,7 @@ mod tests {
         let authority = cap_std::ambient_authority();
         let source = Dir::open_ambient_dir(root.path(), authority).unwrap();
         let destination = Dir::open_ambient_dir(worktree.path(), authority).unwrap();
-        assert!(copy_confined_include(&source, &destination, Path::new("settings/.env"), IncludeMode::ManualSetup).is_err());
+        assert!(copy_confined_include(&source, &destination, Path::new("settings/.env")).is_err());
         assert!(!outside.path().join(".env").exists());
     }
 
@@ -1371,7 +1257,7 @@ mod tests {
         let authority = cap_std::ambient_authority();
         let source = Dir::open_ambient_dir(root.path(), authority).unwrap();
         let destination = Dir::open_ambient_dir(worktree.path(), authority).unwrap();
-        assert!(copy_confined_include(&source, &destination, Path::new(".env"), IncludeMode::ManualSetup).unwrap());
+        assert!(copy_confined_include(&source, &destination, Path::new(".env")).unwrap());
         assert_eq!(fs::read_to_string(&existing).unwrap(), "old");
         assert_eq!(fs::read_to_string(worktree.path().join(".env")).unwrap(), "new");
         assert_eq!(fs::read_dir(worktree.path()).unwrap().count(), 1);
@@ -1406,76 +1292,30 @@ mod tests {
         assert!(output.status.success(), "{output:?}");
     }
 
+    #[cfg(unix)]
     #[test]
-    fn worktree_includes_recover_missing_nested_files_without_replacing_existing_ones() {
+    fn worktree_includes_skip_a_moved_nested_parent_when_the_file_is_missing() {
         let fixture = tempfile::tempdir().unwrap();
         let root = fixture.path().join("project");
         let checkout = fixture.path().join("linked");
         include_source_project(&root);
-        fs::write(root.join(".codemuxinclude"), ".env\nsettings/*.env\n").unwrap();
+        fs::write(root.join(".codemuxinclude"), ".env\nsettings/private.env\n").unwrap();
         fs::create_dir(root.join("settings")).unwrap();
-        fs::write(root.join("settings/private.env"), "from project").unwrap();
-        fs::write(root.join("settings/worktree.env"), "project value").unwrap();
+        fs::write(root.join("settings/private.env"), "include fixture").unwrap();
         register_include_fixture(&root, &checkout);
+        let settings = checkout.join("settings");
+        fs::create_dir(&settings).unwrap();
+        let (source, destination) = open_registered_include_dirs(&root, &checkout).unwrap();
 
-        let initial = process_worktree_includes(&root, &checkout, &[]).unwrap();
-        assert_eq!(initial.copied, [".env"]);
-        assert!(initial.errors.is_empty());
-        fs::write(checkout.join(".env"), "edited top-level").unwrap();
-        fs::create_dir(checkout.join("settings")).unwrap();
-        fs::write(checkout.join("settings/worktree.env"), "edited nested").unwrap();
+        let moved = fixture.path().join("moved-settings");
+        fs::rename(&settings, &moved).unwrap();
+        let result = super::copy_worktree_includes(&source, &destination, &[]).unwrap();
 
-        let recovered = copy_missing_nested_includes(&root, &checkout, &[]).unwrap();
-        assert_eq!(recovered.copied, ["settings/private.env"]);
-        assert!(recovered.errors.is_empty());
-        assert!(recovered.skipped_nested.is_empty());
-        for (path, expected) in [
-            (".env", "edited top-level"),
-            ("settings/private.env", "from project"),
-            ("settings/worktree.env", "edited nested"),
-        ] {
-            assert_eq!(fs::read_to_string(checkout.join(path)).unwrap(), expected);
-        }
-    }
-
-    #[test]
-    fn worktree_includes_preserve_a_destination_created_during_staging() {
-        let fixture = tempfile::tempdir().unwrap();
-        let parent = Dir::open_ambient_dir(fixture.path(), cap_std::ambient_authority()).unwrap();
-        fs::write(fixture.path().join("source.env"), "from project").unwrap();
-        let mut input = parent.open("source.env").unwrap();
-        let stage = stage_include(&mut input, &parent).unwrap();
-        let temporary = fixture.path().join(&stage.name);
-        fs::write(fixture.path().join(".env"), "local value").unwrap();
-
-        assert!(!stage.publish_missing(Path::new(".env")).unwrap());
-        assert!(!temporary.exists());
-        assert_eq!(fs::read_to_string(fixture.path().join(".env")).unwrap(), "local value");
-    }
-
-    #[test]
-    fn worktree_includes_publish_readonly_files_without_leaving_the_stage() {
-        let fixture = tempfile::tempdir().unwrap();
-        let parent = Dir::open_ambient_dir(fixture.path(), cap_std::ambient_authority()).unwrap();
-        let source = fixture.path().join("source.env");
-        let destination = fixture.path().join("recovered.env");
-        fs::write(&source, "fixture contents").unwrap();
-        let original = fs::metadata(&source).unwrap().permissions();
-        let mut readonly = original.clone();
-        readonly.set_readonly(true);
-        fs::set_permissions(&source, readonly).unwrap();
-        let mut input = parent.open("source.env").unwrap();
-        let stage = stage_include(&mut input, &parent).unwrap();
-        let temporary = fixture.path().join(&stage.name);
-
-        let copied = stage.publish_missing(Path::new("recovered.env"));
-        fs::set_permissions(source, original.clone()).unwrap();
-        assert!(copied.unwrap());
-        let is_readonly = fs::metadata(&destination).unwrap().permissions().readonly();
-        fs::set_permissions(&destination, original).unwrap();
-        assert!(is_readonly);
-        assert!(!temporary.exists());
-        assert_eq!(fs::read_to_string(destination).unwrap(), "fixture contents");
+        assert_eq!(result.copied, [".env"]);
+        assert_eq!(result.skipped_nested, ["settings/private.env"]);
+        assert!(result.errors.is_empty());
+        assert!(!settings.exists());
+        assert_eq!(fs::read_dir(moved).unwrap().count(), 0);
     }
 
     #[cfg(unix)]
@@ -1489,10 +1329,10 @@ mod tests {
         fs::create_dir(root.join("settings")).unwrap();
         fs::write(root.join("settings/private.env"), "from project").unwrap();
         register_include_fixture(&root, &checkout);
-        let (source, destination) = open_registered_include_dirs(&root, &checkout, false).unwrap();
+        let (source, destination) = open_registered_include_dirs(&root, &checkout).unwrap();
         fs::remove_dir_all(&checkout).unwrap();
 
-        let result = super::copy_worktree_includes(&source, &destination, &[], IncludeMode::Automatic).unwrap();
+        let result = super::copy_worktree_includes(&source, &destination, &[]).unwrap();
         assert!(result.copied.is_empty());
         assert_eq!(result.skipped_nested, ["settings/private.env"]);
         assert_eq!(result.errors.len(), 1);
@@ -1545,13 +1385,6 @@ mod tests {
             assert!(!checkout.join(".env").exists());
         }
 
-        let includes = process_registered_worktree_includes(&root, &registered, &[], IncludeMode::ManualSetup).unwrap();
-        assert!(includes.copied.iter().any(|path| path == "settings/private.env"));
-        assert!(includes.skipped_nested.is_empty());
-        assert_eq!(
-            fs::read_to_string(registered.join("settings/private.env")).unwrap(),
-            "INCLUDE_FIXTURE=nested"
-        );
         assert_eq!(fs::read_to_string(root.join(".env")).unwrap(), "INCLUDE_FIXTURE=local");
     }
 
@@ -1576,13 +1409,16 @@ mod tests {
         fs::create_dir(&subdirectory).unwrap();
         let source = resolve_root_path(&subdirectory);
         assert_eq!(source, root.canonicalize().unwrap());
-        let includes =
-            process_registered_worktree_includes(&source, &subdirectory, &[".env".into()], IncludeMode::ManualSetup)
-                .unwrap();
+        let skipped = process_worktree_includes(&source, &subdirectory, &[]).unwrap();
+        assert!(skipped.copied.is_empty());
+        assert!(!subdirectory.join("local.settings").exists());
+        assert!(!checkout.join("local.settings").exists());
+
+        let includes = process_worktree_includes(&source, &checkout, &[".env".into()]).unwrap();
         assert_eq!(includes.source, IncludeSource::File);
         assert_eq!(includes.copied, ["local.settings"]);
         assert_eq!(
-            fs::read_to_string(subdirectory.join("local.settings")).unwrap(),
+            fs::read_to_string(checkout.join("local.settings")).unwrap(),
             "INCLUDE_FIXTURE=custom"
         );
         assert!(!subdirectory.join(".env").exists());
@@ -1618,16 +1454,14 @@ mod tests {
     #[test]
     fn failed_include_publication_cleans_up_after_the_parent_moves() {
         let fixture = tempfile::tempdir().unwrap();
-        let checkout = fixture.path().join("checkout");
-        let original = checkout.join("settings");
-        let moved = fixture.path().join("moved-settings");
+        let original = fixture.path().join("checkout");
+        let moved = fixture.path().join("moved-checkout");
         fs::create_dir_all(original.join(".env")).unwrap();
         fs::write(fixture.path().join("source.env"), "INCLUDE_FIXTURE=private").unwrap();
 
         let authority = cap_std::ambient_authority();
         let source = Dir::open_ambient_dir(fixture.path(), authority).unwrap();
-        let checkout = Dir::open_ambient_dir(&checkout, authority).unwrap();
-        let parent = open_include_parent(&checkout, Path::new("settings"), false).unwrap();
+        let parent = Dir::open_ambient_dir(&original, authority).unwrap();
         let mut input = source.open("source.env").unwrap();
         let stage = stage_include(&mut input, &parent).unwrap();
         assert!(original.join(&stage.name).is_file());
@@ -1651,7 +1485,7 @@ mod tests {
         include_source_project(&root);
         register_include_fixture(&root, &checkout);
         fs::write(root.join(".codemuxinclude"), ".env\n").unwrap();
-        let (source, destination) = open_registered_include_dirs(&root, &checkout, false).unwrap();
+        let (source, destination) = open_registered_include_dirs(&root, &checkout).unwrap();
 
         fs::rename(&root, &moved_root).unwrap();
         fs::rename(&checkout, &moved_checkout).unwrap();
@@ -1660,7 +1494,7 @@ mod tests {
         fs::write(root.join(".codemuxinclude"), "different\n").unwrap();
         fs::create_dir(&checkout).unwrap();
 
-        let includes = super::copy_worktree_includes(&source, &destination, &[], IncludeMode::Automatic).unwrap();
+        let includes = super::copy_worktree_includes(&source, &destination, &[]).unwrap();
         assert_eq!(includes.source, IncludeSource::File);
         assert_eq!(includes.copied, [".env"]);
         assert_eq!(
@@ -1712,17 +1546,14 @@ mod tests {
         let result = copy_worktree_includes(root.path(), worktree.path(), &patterns).unwrap();
 
         assert_eq!(result.source, IncludeSource::File);
-        assert!(result.copied.contains(&".env".to_string()));
-        assert!(result.copied.contains(&"config/master.key".to_string()));
+        assert_eq!(result.copied, [".env"]);
+        assert_eq!(result.skipped_nested, ["config/master.key"]);
 
         assert_eq!(
             fs::read_to_string(worktree.path().join(".env")).unwrap(),
             "SECRET=abc"
         );
-        assert_eq!(
-            fs::read_to_string(worktree.path().join("config/master.key")).unwrap(),
-            "key123"
-        );
+        assert!(!worktree.path().join("config").exists());
     }
 
     #[test]

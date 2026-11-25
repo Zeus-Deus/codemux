@@ -3,21 +3,23 @@ import userEvent from "@testing-library/user-event";
 import { createElement } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
+import { copyToClipboard } from "@/lib/clipboard";
 import { toast } from "@/lib/toast";
-import { copyMissingNestedWorktreeIncludes, dbGetUiState, dbSetUiState } from "@/tauri/commands";
+import { dbGetUiState, dbSetUiState } from "@/tauri/commands";
 import { onWorktreeIncludesApplied } from "@/tauri/events";
 
 import { useWorktreeIncludeToast } from "./use-worktree-include-toast";
 
-vi.mock("@/lib/toast", () => ({ toast: { info: vi.fn(), warning: vi.fn(), success: vi.fn() } }));
+vi.mock("@/lib/clipboard", () => ({
+  copyToClipboard: vi.fn(),
+  COPY_FAILED_MESSAGE: "Couldn't copy — select and copy manually.",
+}));
+vi.mock("@/lib/toast", () => ({ toast: { info: vi.fn(), warning: vi.fn(), success: vi.fn(), error: vi.fn() } }));
 vi.mock("@/tauri/commands", () => ({
-  copyMissingNestedWorktreeIncludes: vi.fn(),
   dbGetUiState: vi.fn(),
   dbSetUiState: vi.fn(),
 }));
 vi.mock("@/tauri/events", () => ({ onWorktreeIncludesApplied: vi.fn() }));
-const remote = vi.hoisted(() => ({ value: false }));
-vi.mock("@/components/remote/is-remote-client", () => ({ isRemoteClient: () => remote.value }));
 vi.mock("@/stores/app-store", () => ({
   useAppStore: {
     getState: () => ({
@@ -32,7 +34,7 @@ function listener() {
 }
 
 beforeEach(() => {
-  remote.value = false;
+  vi.mocked(copyToClipboard).mockResolvedValue(true);
   vi.mocked(onWorktreeIncludesApplied).mockResolvedValue(vi.fn());
   vi.mocked(dbGetUiState).mockResolvedValue(null);
   vi.mocked(dbSetUiState).mockResolvedValue(undefined);
@@ -54,24 +56,21 @@ describe("useWorktreeIncludeToast", () => {
 
     expect(toast.warning).toHaveBeenCalledWith(
       "Nested worktree files skipped",
-      expect.objectContaining({ description: "Skipped config/local.env." }),
+      expect.objectContaining({
+        description: "Skipped config/local.env. On the worktree host, copy missing files from the main checkout.",
+      }),
     );
     expect(toast.info).not.toHaveBeenCalled();
   });
 
-  it("reports errors and skipped paths separately and offers desktop recovery", async () => {
-    vi.mocked(copyMissingNestedWorktreeIncludes).mockResolvedValue({
-      source: "file",
-      copied: ["config/local.env"],
-      skipped_nested: [],
-      errors: [],
-    });
+  it("reports errors and skipped paths separately and copies the complete path list", async () => {
+    const skipped = ["config/local.env", "config/db.env", "test/local.env", "test/path\nwith-newline.env"];
     await listener()({
       workspace_id: "workspace-1",
       source: "file",
       copied: [],
       errors: [".env: permission denied"],
-      skipped_nested: ["config/local.env"],
+      skipped_nested: skipped,
     });
 
     expect(toast.warning).toHaveBeenCalledTimes(2);
@@ -80,37 +79,16 @@ describe("useWorktreeIncludeToast", () => {
       expect.objectContaining({ description: ".env: permission denied" }),
     );
     const warning = vi.mocked(toast.warning).mock.calls.find(([title]) => title === "Nested worktree files skipped");
-    expect(warning?.[1]?.description).toBe("Skipped config/local.env.");
+    expect(warning?.[1]?.description).toContain("config/local.env, config/db.env, test/local.env and 1 more");
     const action = warning?.[1]?.action;
     if (!action || typeof action !== "object" || !("onClick" in action)) {
-      throw new Error("Expected a desktop recovery action");
+      throw new Error("Expected a clipboard action");
     }
     render(createElement("button", { onClick: action.onClick }, action.label));
-    await userEvent.click(screen.getByRole("button", { name: "Copy missing nested files" }));
+    await userEvent.click(screen.getByRole("button", { name: "Copy skipped paths" }));
 
-    expect(copyMissingNestedWorktreeIncludes).toHaveBeenCalledExactlyOnceWith("workspace-1");
-    await waitFor(() => expect(toast.success).toHaveBeenCalledWith(
-      "Copied missing nested worktree files",
-      expect.objectContaining({ description: "config/local.env" }),
-    ));
-  });
-
-  it("points remote clients to the desktop without offering recovery in the browser", async () => {
-    remote.value = true;
-    await listener()({
-      workspace_id: "workspace-1",
-      source: "file",
-      copied: [],
-      skipped_nested: ["config/local.env"],
-    });
-
-    expect(toast.warning).toHaveBeenCalledWith(
-      "Nested worktree files skipped",
-      expect.objectContaining({
-        action: undefined,
-        description: "Skipped config/local.env. Copy missing nested files from the desktop.",
-      }),
-    );
+    expect(copyToClipboard).toHaveBeenCalledExactlyOnceWith(JSON.stringify(skipped, null, 2));
+    await waitFor(() => expect(toast.success).toHaveBeenCalledWith("Copied skipped paths"));
   });
 
   it("keeps the default-copy hint for older events", async () => {

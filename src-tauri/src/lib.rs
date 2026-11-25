@@ -3262,7 +3262,6 @@ fn build_core_app<R: tauri::Runtime>(
             commands::get_workspace_config,
             commands::has_codemuxinclude,
             commands::run_workspace_setup,
-            commands::copy_missing_nested_worktree_includes,
             commands::run_project_dev_command,
             commands::list_directory,
             commands::search_in_files,

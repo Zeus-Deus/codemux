@@ -576,11 +576,11 @@ To control Codemux from another machine, use SSH or **Over the network**, not `c
 
 #### Worktree includes and setup on headless hosts
 
-On a headless host, `worktree_create` and `codemux-remote worktree create` copy matching top-level files from the main checkout into a new worktree before returning. Project setup commands start in the background after the include step.
+On a headless host, `worktree_create` and `codemux-remote worktree create` copy matching top-level files from the main checkout into a new worktree before returning. Project setup commands start in the background after the include step. Desktop setup also limits include copies to the registered checkout root because a nested directory can move outside the checkout while a copy is in progress.
 
-The tool lists skipped nested paths in `setup.includes_skipped_nested` and copy failures in `setup.includes_errors`. The CLI prints both to stderr. Have the setup commands provision required nested files, or copy them into the worktree yourself and rerun the commands with `codemux-remote worktree setup --path <path> --workspace-id <id> --name <name> --branch <branch>`. Get those values from `worktree_create` or `codemux-remote workspace list`.
+The tool lists skipped nested paths in `setup.includes_skipped_nested` and copy failures in `setup.includes_errors`. The CLI prints both to stderr. On the machine with the worktree, copy missing files from the main checkout to the same relative paths in the worktree, preserving existing files. The desktop warning's **Copy skipped paths** action copies the list of paths to your clipboard.
 
-On the desktop, **Copy missing nested files** in the worktree menu copies matching nested includes while preserving existing files. It runs separately from the setup commands.
+On a headless host, you can rerun setup commands with `codemux-remote worktree setup --path <path> --workspace-id <id> --name <name> --branch <branch>`. Get those values from `worktree_create` or `codemux-remote workspace list`.
 
 ### Phones and browsers
 

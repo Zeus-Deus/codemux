@@ -82,7 +82,6 @@ import type {
   TerminalStatusPayload,
   ThemeColors,
   WorkspaceConfig,
-  WorktreeIncludeResult,
   WorktreeInfo,
   ProjectScripts,
   DetectedSetup,
@@ -766,11 +765,6 @@ export const hasCodemuxinclude = (path: string) =>
 
 export const runWorkspaceSetup = (workspaceId: string) =>
   invoke<void>("run_workspace_setup", { workspaceId });
-
-export async function copyMissingNestedWorktreeIncludes(workspaceId: string): Promise<WorktreeIncludeResult> {
-  if (isRemoteClient()) throw new Error("Copy missing nested files from the desktop.");
-  return invoke<WorktreeIncludeResult>("copy_missing_nested_worktree_includes", { workspaceId });
-}
 
 export const getProjectScripts = (path: string) =>
   invoke<ProjectScripts | null>("get_project_scripts", { path });
