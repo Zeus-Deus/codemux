@@ -20,14 +20,19 @@
 
 use std::path::Path;
 
+use axum::http::HeaderMap;
 use axum::{
     extract::{Query, State},
     http::{header, StatusCode},
     response::{IntoResponse, Response},
 };
-use axum::http::HeaderMap;
+use futures_util::StreamExt as _;
 use serde::Deserialize;
 use tauri::{AppHandle, Runtime};
+
+use super::server::{require_session, session_active};
+
+const ASSET_CHUNK_SIZE: usize = 64 * 1024;
 
 #[derive(Deserialize)]
 pub struct AssetQuery {
@@ -40,15 +45,22 @@ pub async fn serve<R: Runtime>(
     headers: HeaderMap,
     Query(query): Query<AssetQuery>,
 ) -> Response {
-    if let Err(resp) = super::server::require_session(&app, &headers) {
-        return resp;
+    let session = match require_session(&app, &headers) {
+        Ok(session) => session,
+        Err(response) => return response,
+    };
+
+    let opened = open_asset(Path::new(&query.path)).await;
+    if !session_active(&app, &session.id) {
+        return StatusCode::UNAUTHORIZED.into_response();
     }
 
-    match open_asset(Path::new(&query.path)).await {
+    match opened {
         Ok(asset) => {
-            // Stream the file rather than buffering it whole — a web client
-            // may request a large image/media file.
-            let stream = tokio_util::io::ReaderStream::new(asset.file);
+            // Check after each read so a sign-out during I/O drops that
+            // chunk and ends the stream. Code pairing survives host sign-out.
+            let stream = tokio_util::io::ReaderStream::with_capacity(asset.file, ASSET_CHUNK_SIZE)
+                .take_while(move |_| std::future::ready(session_active(&app, &session.id)));
             let body = axum::body::Body::from_stream(stream);
             asset_response(asset.mime, asset.len, body)
         }
@@ -174,6 +186,65 @@ fn guess_mime(path: &Path) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn sign_out_stops_an_active_account_asset_stream_and_keeps_code_pairing() {
+        use crate::database::DatabaseStore;
+        use crate::web_remote::auth;
+        use tauri::Manager as _;
+
+        let app = tauri::test::mock_app();
+        let db = DatabaseStore::new_in_memory();
+        auth::seed_account_browser(&db, "account", "account-browser");
+        db.web_remote_insert_session(
+            "paired",
+            None,
+            None,
+            &auth::sha256_hex("paired-browser"),
+            true,
+        )
+        .unwrap();
+        app.manage(db);
+
+        let fixture = tempfile::tempdir().unwrap();
+        let path = fixture.path().join("asset.txt");
+        let contents = vec![b'a'; ASSET_CHUNK_SIZE * 3];
+        tokio::fs::write(&path, &contents).await.unwrap();
+
+        let request = |token: &'static str| {
+            let mut headers = HeaderMap::new();
+            headers.insert(header::AUTHORIZATION, token.parse().unwrap());
+            serve(
+                State(app.handle().clone()),
+                headers,
+                Query(AssetQuery {
+                    path: path.to_string_lossy().into_owned(),
+                }),
+            )
+        };
+        let account = request("Bearer account-browser").await;
+        let paired = request("Bearer paired-browser").await;
+        assert_eq!(account.status(), StatusCode::OK);
+        assert_eq!(paired.status(), StatusCode::OK);
+        let mut account = account.into_body().into_data_stream();
+        let mut paired = paired.into_body().into_data_stream();
+        let account_first = account.next().await.unwrap().unwrap();
+        assert!(!account_first.is_empty() && account_first.len() < contents.len());
+        let mut paired_bytes = paired.next().await.unwrap().unwrap().to_vec();
+        assert!(!paired_bytes.is_empty() && paired_bytes.len() < contents.len());
+
+        app.state::<DatabaseStore>().clear_auth_token().unwrap();
+
+        assert!(account.next().await.is_none());
+        while let Some(chunk) = paired.next().await {
+            paired_bytes.extend(chunk.unwrap());
+        }
+        assert_eq!(paired_bytes, contents);
+        assert_eq!(
+            request("Bearer account-browser").await.status(),
+            StatusCode::UNAUTHORIZED
+        );
+    }
 
     #[tokio::test]
     async fn serves_regular_file_with_guessed_mime_and_length() {
