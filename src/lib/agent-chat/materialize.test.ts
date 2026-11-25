@@ -11,6 +11,7 @@ vi.mock("@/tauri/commands", () => ({
   agentChatSendTurn: vi.fn().mockResolvedValue({ turn_id: "turn-1", queued_id: null }),
   agentChatStartSession: vi.fn().mockResolvedValue("thread-echoed"),
   applyPreset: vi.fn().mockResolvedValue(undefined),
+  createTab: vi.fn().mockResolvedValue("tab-cli"),
   // `createEmptyWorkspace` is called with either `/home/user` (home
   // targets since Stage C) or a project path. Return ids that
   // reflect the caller so assertions can distinguish the two.
@@ -72,6 +73,7 @@ import {
   agentChatSendTurn,
   agentChatStartSession,
   applyPreset,
+  createTab,
   createEmptyWorkspace,
   createWorkspaceOnHost,
   createWorktreeWorkspaceResult,
@@ -148,6 +150,7 @@ describe("materializeAndSend", () => {
       .mockClear()
       .mockResolvedValue("thread-echoed");
     vi.mocked(applyPreset).mockClear().mockResolvedValue(undefined);
+    vi.mocked(createTab).mockClear().mockResolvedValue("tab-cli");
     vi.mocked(createEmptyWorkspace)
       .mockClear()
       .mockImplementation((cwd: string) =>
@@ -1559,6 +1562,7 @@ describe("materializeWithPreset", () => {
       .mockClear()
       .mockResolvedValue("thread-echoed");
     vi.mocked(applyPreset).mockClear().mockResolvedValue(undefined);
+    vi.mocked(createTab).mockClear().mockResolvedValue("tab-cli");
     vi.mocked(createEmptyWorkspace)
       .mockClear()
       .mockImplementation((cwd: string) =>
@@ -1583,6 +1587,7 @@ describe("materializeWithPreset", () => {
       expect(result).toMatchObject({ success: true, manualPromptRequired: true });
       expect(createEmptyWorkspace).toHaveBeenCalledWith("/projects/foo", undefined);
       expect(activateWorkspace).toHaveBeenCalledWith("ws-project");
+      expect(createTab).toHaveBeenCalledWith("ws-project", "terminal");
       expect(applyPreset).toHaveBeenCalledWith(
         "ws-project",
         "builtin-claude",
@@ -1590,6 +1595,7 @@ describe("materializeWithPreset", () => {
         null,
         undefined,
         true,
+        "tab-cli",
       );
       // CLI path does not mint its own chat pane / session / turn.
       expect(agentChatCreatePane).not.toHaveBeenCalled();
@@ -1616,7 +1622,7 @@ describe("materializeWithPreset", () => {
       expect(actions.markPromptRetained).toHaveBeenCalledWith(draft.draftId);
       expect(actions.markManualPromptRequired).not.toHaveBeenCalled();
       expect(actions.markPromoted).not.toHaveBeenCalled();
-      expect(applyPreset).toHaveBeenCalledWith("ws-project", "builtin-shell", "current_terminal", null, undefined, true);
+      expect(applyPreset).toHaveBeenCalledWith("ws-project", "builtin-shell", "current_terminal", null, undefined, true, "tab-cli");
     });
 
     it("empty/whitespace prompt becomes null when delegated to applyPreset", async () => {
@@ -1635,6 +1641,7 @@ describe("materializeWithPreset", () => {
         null,
         undefined,
         true,
+        "tab-cli",
       );
       expect(result.success).toBe(true);
       expect(actions.markPromoted).toHaveBeenCalled();

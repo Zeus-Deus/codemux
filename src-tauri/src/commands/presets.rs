@@ -338,6 +338,7 @@ pub fn apply_preset<R: tauri::Runtime>(
     model_selection: Option<crate::agent_capability::ModelSelection>,
     select: Option<bool>,
     fresh_terminal: Option<bool>,
+    target_tab_id: Option<String>,
 ) -> Result<(), String> {
     // Look up the preset
     let store = presets.inner.lock().unwrap_or_else(|e| e.into_inner());
@@ -405,12 +406,19 @@ pub fn apply_preset<R: tauri::Runtime>(
         .as_deref()
         .is_some_and(|prompt| !prompt.trim().is_empty());
     let fresh_terminal = fresh_terminal.unwrap_or(false);
+    if fresh_terminal && target_tab_id.is_none() {
+        return Err("A fresh terminal launch requires its tab ID".to_string());
+    }
+    if target_tab_id.is_some() && effective_mode != "current_terminal" {
+        return Err("A target tab can only be used with current_terminal".to_string());
+    }
 
     match effective_mode {
         "current_terminal" => {
-            // Write commands to the active terminal session
-            let session_id = active_session_for_workspace(&state, &workspace_id)
-                .ok_or_else(|| "No active terminal session in workspace".to_string())?;
+            // Pin both the writer and metadata to one tab before any wait.
+            // Selection may change while a daemon-backed PTY starts.
+            let (session_id, tab_id) =
+                current_terminal_target(&state, &workspace_id, target_tab_id.as_deref())?;
 
             if initial_prompt.is_some() || fresh_terminal {
                 // A promptless current-terminal launch used to send one
@@ -446,18 +454,8 @@ pub fn apply_preset<R: tauri::Runtime>(
                         report_prompt_requires_manual_entry(&app, &session_id, &preset.name);
                     }
                 }
-                // Keep the new tab generic when a confirmed fresh write
-                // fails. A named agent tab would imply it opened.
-                let snap = state.snapshot();
-                if let Some(ws) = snap
-                    .workspaces
-                    .iter()
-                    .find(|w| w.workspace_id.0 == workspace_id)
-                {
-                    let _ = state.rename_tab(&workspace_id, &ws.active_tab_id, preset.name.clone());
-                    let _ =
-                        state.set_tab_icon(&workspace_id, &ws.active_tab_id, preset.icon.clone());
-                }
+                // Keep the tab generic when a confirmed fresh write fails.
+                let _ = set_preset_tab_metadata(&state, &workspace_id, &tab_id, &preset.name, &preset.icon);
             } else {
                 let combined = commands
                     .iter()
@@ -631,18 +629,64 @@ pub fn open_provider_install_terminal<R: tauri::Runtime>(
     Ok(())
 }
 
-/// Get the active terminal session ID for a specific workspace.
-fn active_session_for_workspace(state: &AppStateStore, workspace_id: &str) -> Option<String> {
+/// Resolve the terminal session and tab together. An explicit tab uses that
+/// tab's first terminal session, regardless of subsequent selection changes.
+fn current_terminal_target(
+    state: &AppStateStore,
+    workspace_id: &str,
+    target_tab_id: Option<&str>,
+) -> Result<(String, String), String> {
     let snapshot = state.snapshot();
     let workspace = snapshot
         .workspaces
         .iter()
-        .find(|w| w.workspace_id.0 == workspace_id)?;
+        .find(|w| w.workspace_id.0 == workspace_id)
+        .ok_or_else(|| format!("No workspace found for {workspace_id}"))?;
+    if let Some(tab_id) = target_tab_id {
+        let tab = workspace
+            .tabs
+            .iter()
+            .find(|tab| tab.tab_id == tab_id)
+            .ok_or_else(|| format!("No tab {tab_id} in workspace {workspace_id}"))?;
+        if !matches!(&tab.kind, crate::state::TabKind::Terminal) {
+            return Err(format!("Tab {tab_id} is not a terminal"));
+        }
+        let surface_id = tab
+            .surface_id
+            .as_ref()
+            .ok_or_else(|| format!("Tab {tab_id} has no terminal surface"))?;
+        let surface = workspace
+            .surfaces
+            .iter()
+            .find(|surface| &surface.surface_id == surface_id)
+            .ok_or_else(|| format!("Tab {tab_id} has no terminal surface"))?;
+        let session_id = crate::state::collect_terminal_sessions(std::slice::from_ref(surface))
+            .into_iter()
+            .next()
+            .ok_or_else(|| format!("Tab {tab_id} has no terminal session"))?;
+        return Ok((session_id, tab_id.to_string()));
+    }
+
+    // Preserve the active-surface behavior for ordinary preset launches.
     let surface = workspace
         .surfaces
         .iter()
-        .find(|s| s.surface_id == workspace.active_surface_id)?;
-    crate::state::session_id_for_pane(&surface.root, &surface.active_pane_id).map(|sid| sid.0)
+        .find(|surface| surface.surface_id == workspace.active_surface_id)
+        .ok_or_else(|| "No active terminal session in workspace".to_string())?;
+    let session_id = crate::state::session_id_for_pane(&surface.root, &surface.active_pane_id)
+        .ok_or_else(|| "No active terminal session in workspace".to_string())?;
+    Ok((session_id.0, workspace.active_tab_id.clone()))
+}
+
+fn set_preset_tab_metadata(
+    state: &AppStateStore,
+    workspace_id: &str,
+    tab_id: &str,
+    name: &str,
+    icon: &Option<String>,
+) -> Result<(), String> {
+    state.rename_tab(workspace_id, tab_id, name.to_string())?;
+    state.set_tab_icon(workspace_id, tab_id, icon.clone())
 }
 
 /// Get the active pane ID for a specific workspace.
@@ -1410,6 +1454,124 @@ mod tests {
         producer.join().unwrap();
 
         assert_eq!(result, Ok(()));
+        assert_eq!(*calls.lock().unwrap(), vec![b"agent --flag\r".to_vec()]);
+    }
+
+    #[test]
+    fn explicit_tab_target_survives_selection_change_before_dispatch() {
+        let state = AppStateStore::default();
+        let workspace = state.create_workspace_at_path(std::path::PathBuf::from("/tmp"));
+        let first_tab = state
+            .snapshot()
+            .workspaces
+            .iter()
+            .find(|item| item.workspace_id.0 == workspace.0)
+            .unwrap()
+            .tabs[0]
+            .tab_id
+            .clone();
+        let (expected_session, _) =
+            current_terminal_target(&state, &workspace.0, Some(&first_tab)).unwrap();
+        let (other_tab, _) = state
+            .create_tab(&workspace.0, crate::state::TabKind::Terminal)
+            .unwrap();
+
+        let (session, tab) =
+            current_terminal_target(&state, &workspace.0, Some(&first_tab)).unwrap();
+        assert_eq!(session, expected_session);
+        assert_eq!(tab, first_tab);
+        assert_eq!(
+            state
+                .snapshot()
+                .workspaces
+                .iter()
+                .find(|item| item.workspace_id.0 == workspace.0)
+                .unwrap()
+                .active_tab_id,
+            other_tab
+        );
+
+        let other_workspace =
+            state.create_workspace_at_path(std::path::PathBuf::from("/tmp/other"));
+        assert!(current_terminal_target(&state, &other_workspace.0, Some(&first_tab)).is_err());
+        let (browser_tab, _) = state
+            .create_tab(&workspace.0, crate::state::TabKind::Browser)
+            .unwrap();
+        assert!(current_terminal_target(&state, &workspace.0, Some(&browser_tab))
+            .unwrap_err()
+            .contains("not a terminal"));
+    }
+
+    #[test]
+    fn explicit_tab_target_keeps_metadata_when_selection_changes_during_write() {
+        let state = std::sync::Arc::new(AppStateStore::default());
+        let workspace = state.create_workspace_at_path(std::path::PathBuf::from("/tmp"));
+        let first_tab = state
+            .snapshot()
+            .workspaces
+            .iter()
+            .find(|item| item.workspace_id.0 == workspace.0)
+            .unwrap()
+            .tabs[0]
+            .tab_id
+            .clone();
+        let (session_id, tab_id) =
+            current_terminal_target(&state, &workspace.0, Some(&first_tab)).unwrap();
+        let (other_tab, _) = state
+            .create_tab(&workspace.0, crate::state::TabKind::Terminal)
+            .unwrap();
+        state.activate_tab(&workspace.0, &first_tab).unwrap();
+
+        let sessions = make_sessions();
+        sessions
+            .lock()
+            .unwrap()
+            .insert(session_id.clone(), SessionRuntime::new(&session_id));
+        let calls = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let producer_state = state.clone();
+        let producer_sessions = sessions.clone();
+        let producer_calls = calls.clone();
+        let producer_workspace = workspace.0.clone();
+        let producer_tab = other_tab.clone();
+        let producer_session = session_id.clone();
+        let producer = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(150));
+            producer_state
+                .activate_tab(&producer_workspace, &producer_tab)
+                .unwrap();
+            let mut guard = producer_sessions.lock().unwrap();
+            let runtime = guard.get_mut(&producer_session).unwrap();
+            runtime.writer = Some(Box::new(RecordingWriter {
+                calls: producer_calls,
+            }));
+            runtime.pending_output.push_back(b"$ ".to_vec());
+        });
+
+        write_current_terminal_command(&sessions, &session_id, "agent --flag", true).unwrap();
+        producer.join().unwrap();
+        set_preset_tab_metadata(&state, &workspace.0, &tab_id, "Agent", &Some("agent".into()))
+            .unwrap();
+
+        let snapshot = state.snapshot();
+        let target_workspace = snapshot
+            .workspaces
+            .iter()
+            .find(|item| item.workspace_id.0 == workspace.0)
+            .unwrap();
+        assert_eq!(target_workspace.active_tab_id, other_tab);
+        let first = target_workspace
+            .tabs
+            .iter()
+            .find(|tab| tab.tab_id == first_tab)
+            .unwrap();
+        let other = target_workspace
+            .tabs
+            .iter()
+            .find(|tab| tab.tab_id == other_tab)
+            .unwrap();
+        assert_eq!(first.title, "Agent");
+        assert_eq!(first.icon.as_deref(), Some("agent"));
+        assert_ne!(other.title, "Agent");
         assert_eq!(*calls.lock().unwrap(), vec![b"agent --flag\r".to_vec()]);
     }
 

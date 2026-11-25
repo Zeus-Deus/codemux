@@ -5,7 +5,7 @@ vi.mock("@/lib/clipboard", () => ({
   COPY_FAILED_MESSAGE: "Couldn't copy",
 }));
 vi.mock("@/lib/toast", () => ({
-  toast: { success: vi.fn(), error: vi.fn() },
+  toast: { success: vi.fn(), warning: vi.fn(), error: vi.fn() },
 }));
 
 import { copyToClipboard } from "@/lib/clipboard";
@@ -36,4 +36,17 @@ it("saves and copies the exact prepared prompt", async () => {
   action.onClick({ preventDefault } as never);
   await vi.waitFor(() => expect(copyToClipboard).toHaveBeenCalledWith(prompt));
   expect(preventDefault).toHaveBeenCalledOnce();
+});
+
+it("warns and retains the prompt when a terminal command was not confirmed", () => {
+  saveWorkspacePrompt("ws-92", "Fix the app", false, "Agent could not start", "warning");
+
+  const saved = Object.values(useChatDraftStore.getState().draftsById)[0];
+  expect(saved.inputDraft).toBe("Fix the app");
+  expect(saved.manualPromptRequired).toBe(false);
+  expect(toast.warning).toHaveBeenCalledWith(
+    "Agent could not start",
+    expect.objectContaining({ action: expect.objectContaining({ label: "Copy prompt" }) }),
+  );
+  expect(toast.success).not.toHaveBeenCalled();
 });

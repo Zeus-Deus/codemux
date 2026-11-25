@@ -1432,6 +1432,8 @@ export const applyPreset = async (
   modelSelection?: ModelSelection | null,
   /** Confirm the command reaches a terminal tab the caller just created. */
   freshTerminal?: boolean,
+  /** Pin the command and tab metadata to this tab even if selection changes. */
+  targetTabId?: string,
 ) => {
   const sequence = beginRemoteNavigation();
   await invoke("apply_preset", {
@@ -1441,6 +1443,7 @@ export const applyPreset = async (
     initialPrompt,
     modelSelection: modelSelection ?? null,
     ...(freshTerminal !== undefined ? { freshTerminal } : {}),
+    ...(targetTabId !== undefined ? { targetTabId } : {}),
   });
   if (isRemoteClient()) await refreshRemoteWorkspaceView(workspaceId, undefined, undefined, sequence);
 };

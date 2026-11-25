@@ -20,6 +20,10 @@ vi.mock("@/tauri/commands", () => ({
   createWorktreeWorkspaceResult: vi
     .fn()
     .mockResolvedValue({ workspaceId: "ws-new", adopted: false }),
+  getAppState: vi.fn().mockResolvedValue({
+    workspaces: [{ workspace_id: "ws-new", tabs: [{ tab_id: "tab-default", kind: "terminal" }] }],
+  }),
+  applyPreset: vi.fn().mockResolvedValue(undefined),
   importWorktreeWorkspace: vi.fn().mockResolvedValue("ws-new"),
   activateWorkspace: vi.fn().mockResolvedValue(undefined),
   closeWorkspace: vi.fn().mockResolvedValue(undefined),
@@ -39,8 +43,10 @@ vi.mock("@/lib/toast", () => ({
 }));
 
 import {
+  applyPreset,
   closeWorkspace,
   createWorktreeWorkspaceResult,
+  getAppState,
   getPresets,
   importWorktreeWorkspace,
   listWorktrees,
@@ -53,6 +59,8 @@ import type { TerminalPreset, WorktreeInfo } from "@/tauri/types";
 
 const mockCloseWorkspace = vi.mocked(closeWorkspace);
 const mockCreate = vi.mocked(createWorktreeWorkspaceResult);
+const mockApplyPreset = vi.mocked(applyPreset);
+const mockGetAppState = vi.mocked(getAppState);
 const mockGetPresets = vi.mocked(getPresets);
 const mockImport = vi.mocked(importWorktreeWorkspace);
 const mockListWorktrees = vi.mocked(listWorktrees);
@@ -108,6 +116,9 @@ beforeEach(() => {
   vi.clearAllMocks();
   useUIStore.setState({ lastSelectedAgentId: null });
   useChatDraftStore.setState({ draftsById: {}, activeDraftId: null });
+  mockGetAppState.mockResolvedValue({
+    workspaces: [{ workspace_id: "ws-new", tabs: [{ tab_id: "tab-default", kind: "terminal" }] }],
+  } as Awaited<ReturnType<typeof getAppState>>);
 });
 
 async function goToSetupStep(task = "Add dark mode") {
@@ -144,7 +155,10 @@ describe("ProjectOnboarding — task and agent", () => {
       "single",
       "main",
       null,
-      "builtin-claude",
+      null,
+    );
+    expect(mockApplyPreset).toHaveBeenCalledWith(
+      "ws-new", "builtin-claude", "current_terminal", null, null, true, "tab-default",
     );
     const saved = Object.values(useChatDraftStore.getState().draftsById)[0];
     expect(saved.target).toEqual({ kind: "existing_workspace", workspaceId: "ws-new" });
@@ -155,6 +169,25 @@ describe("ProjectOnboarding — task and agent", () => {
       expect.objectContaining({ action: expect.objectContaining({ label: "Copy prompt" }) }),
     );
     expect(onComplete).toHaveBeenCalledTimes(1);
+  });
+
+  it("keeps the task and warns if the new worktree's preset write fails", async () => {
+    mockApplyPreset.mockRejectedValueOnce(new Error("Terminal shell is not writable"));
+    const { onComplete } = renderOnboarding();
+    await flushMountEffects();
+    await goToSetupStep();
+
+    fireEvent.click(screen.getByRole("button", { name: "Create & start Claude Code" }));
+    await vi.waitFor(() => expect(onComplete).toHaveBeenCalledOnce());
+
+    const saved = Object.values(useChatDraftStore.getState().draftsById)[0];
+    expect(saved.inputDraft).toBe("Add dark mode");
+    expect(saved.manualPromptRequired).toBe(false);
+    expect(vi.mocked(toast.warning)).toHaveBeenCalledWith(
+      expect.stringContaining("could not start"),
+      expect.objectContaining({ action: expect.objectContaining({ label: "Copy prompt" }) }),
+    );
+    expect(toast.success).not.toHaveBeenCalled();
   });
 
   it("starts the agent the user last picked when it is still pinned", async () => {

@@ -48,6 +48,7 @@ import {
   generateBranchName,
   generateRandomBranchName,
   createWorktreeWorkspaceResult,
+  applyPreset,
   importWorktreeWorkspace,
   activateWorkspace,
   closeWorkspace,
@@ -67,6 +68,7 @@ import { autoNameWorkspace } from "@/lib/agent-chat/materialize";
 import { utilitySelectionFromStores } from "@/lib/utility-agent";
 import { toast, errorMessage } from "@/lib/toast";
 import { saveWorkspacePrompt } from "@/lib/workspace-prompt-handoff";
+import { firstTerminalTabId } from "@/lib/terminal-preset-target";
 import { Eyebrow } from "@/components/ui/eyebrow";
 import { PresetIcon } from "@/components/icons/preset-icon";
 
@@ -355,20 +357,35 @@ export function ProjectOnboarding({ projectDir, tempWorkspaceId, onComplete, onC
           "single",
           baseBranch || null,
           null,
-          selectedAgentId,
+          null,
         );
+        let launchError: string | null = null;
+        if (!created.adopted && selectedAgentId) {
+          try {
+            const tabId = await firstTerminalTabId(created.workspaceId);
+            await applyPreset(created.workspaceId, selectedAgentId, "current_terminal", null, null, true, tabId);
+          } catch (error) {
+            launchError = errorMessage(error);
+          }
+        }
         if (prompt) {
           const agentOpened =
+            !launchError &&
             !created.adopted &&
             !!selectedAgent?.commands.some((command) => command.trim());
           saveWorkspacePrompt(
             created.workspaceId,
             prompt,
             agentOpened,
-            agentOpened
+            launchError
+              ? `Workspace opened, but ${selectedAgent?.name ?? "Agent"} could not start. The task is saved in Drafts.`
+              : agentOpened
               ? `${selectedAgent?.name ?? "Agent"} opened without this task. Copy the prompt to start it.`
               : "Workspace opened without sending this task. It is saved for later.",
+            launchError ? "warning" : "success",
           );
+        } else if (launchError) {
+          toast.error(`Workspace opened, but ${selectedAgent?.name ?? "Agent"} could not start: ${launchError}`);
         }
         // Title the new workspace from the task, separately from its branch.
         if (!created.adopted && task.trim()) {

@@ -5,6 +5,7 @@ import {
   agentChatSendTurn,
   agentChatStartSession,
   applyPreset,
+  createTab,
   createEmptyWorkspace,
   createWorkspaceOnHost,
   createWorktreeWorkspaceResult,
@@ -730,10 +731,10 @@ export async function materializeWithPreset(
   }
 
   // ── CLI dispatch ──
-  // Delegate to the existing Rust `apply_preset`, which spawns a
-  // terminal pane and runs the preset's commands. Terminal presets ask
-  // the user to enter `initialPrompt` in the agent after launch.
+  // Empty workspaces have no terminal yet. Create one and pin the preset
+  // to its tab so another selection cannot redirect the command.
   try {
+    const tabId = await createTab(workspaceId, "terminal");
     await applyPreset(
       workspaceId,
       preset.id,
@@ -741,6 +742,7 @@ export async function materializeWithPreset(
       null,
       undefined,
       true,
+      tabId,
     );
   } catch (err) {
     const message = errorMessage(err);

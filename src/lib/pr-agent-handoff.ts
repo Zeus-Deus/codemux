@@ -25,6 +25,8 @@ import { useAppStore } from "@/stores/app-store";
 import { useUIStore } from "@/stores/ui-store";
 import { usePrAgentRunsStore } from "@/stores/pr-agent-runs-store";
 import { saveWorkspacePrompt } from "@/lib/workspace-prompt-handoff";
+import { firstTerminalTabId } from "@/lib/terminal-preset-target";
+import { useChatDraftStore } from "@/stores/chat-draft-store";
 
 // ── Task shapes ───────────────────────────────────────────────────────
 
@@ -321,7 +323,7 @@ async function startThreadIn(
   // The id is kept so the timeline's "Open thread" can land on this
   // conversation rather than merely on the workspace containing it.
   const tabId = await createTab(workspaceId, "terminal");
-  await applyPreset(workspaceId, presetId, "current_terminal", null, modelSelection, true);
+  await applyPreset(workspaceId, presetId, "current_terminal", null, modelSelection, true, tabId);
   return tabId ?? null;
 }
 
@@ -438,9 +440,9 @@ export async function handOffToAgent(req: HandoffRequest): Promise<HandoffOutcom
     "single",
     null,
     null,
-    presetId,
+    null,
     pr.number,
-    modelSelection,
+    null,
   );
 
   // Adoption skips the preset. Start it in a new tab and retain the task.
@@ -449,7 +451,14 @@ export async function handOffToAgent(req: HandoffRequest): Promise<HandoffOutcom
     return finish("adopted", result.workspaceId, tabId);
   }
 
-  // The backend created the worktree and launched the preset. It does not
-  // return a tab id for the timeline's "Open thread" action.
-  return finish("worktree", result.workspaceId, null);
+  // Creating a worktree starts its terminal but no agent command. Confirm
+  // delivery to that terminal before recording a successful handoff.
+  try {
+    const tabId = await firstTerminalTabId(result.workspaceId);
+    await applyPreset(result.workspaceId, presetId, "current_terminal", null, modelSelection, true, tabId);
+    return finish("worktree", result.workspaceId, tabId);
+  } catch (error) {
+    useChatDraftStore.getState().saveWorkspacePrompt(result.workspaceId, prompt, false);
+    throw new Error(`Workspace created, but ${presetName} did not open. The PR task is saved in Drafts. ${String(error)}`);
+  }
 }

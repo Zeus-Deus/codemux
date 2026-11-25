@@ -42,6 +42,9 @@ vi.mock("@/tauri/commands", () => ({
   }),
   pickFolderDialog: vi.fn().mockResolvedValue(null),
   createWorkspace: vi.fn().mockResolvedValue("ws-new"),
+  getAppState: vi.fn().mockResolvedValue({
+    workspaces: [{ workspace_id: "ws-new", tabs: [{ tab_id: "tab-default", kind: "terminal" }] }],
+  }),
   createWorktreeWorkspaceResult: vi
     .fn()
     .mockResolvedValue({ workspaceId: "ws-new", cwd: null, adopted: false }),
@@ -133,6 +136,7 @@ import {
   getPresets,
   listChatProviderCapabilities,
   createWorkspace,
+  getAppState,
   applyPreset,
   listBranchesDetailed,
   listWorktrees,
@@ -291,6 +295,9 @@ beforeEach(() => {
     workspaceId: "ws-new",
     cwd: null,
     adopted: false,
+  });
+  (getAppState as Mock).mockResolvedValue({
+    workspaces: [{ workspace_id: "ws-new", tabs: [{ tab_id: "tab-default", kind: "terminal" }] }],
   });
   // useDefaultBranch keeps a module-level cache so the same project_root
   // only fetches once per session. Clear it between tests so a previous
@@ -602,10 +609,9 @@ describe("Submit flow", () => {
         "single",
         expect.any(String),
         null,
-        "builtin-claude",
         null,
-        // 9th arg = launch-time model selection at the agent defaults.
-        { model: null, reasoning: null, context: null },
+        null,
+        null,
       );
     });
 
@@ -613,7 +619,33 @@ describe("Submit flow", () => {
     expect(generateRandomBranchName).not.toHaveBeenCalled();
   });
 
-  it("threads a remembered model selection through to workspace creation", async () => {
+  it("keeps a new worktree prompt without claiming the agent opened when its write fails", async () => {
+    setAppState("/path/to/project");
+    (applyPreset as Mock).mockRejectedValueOnce("Terminal shell is not writable");
+    renderDialog(true);
+
+    const dialog = await screen.findByRole("dialog");
+    fireEvent.change(within(dialog).getByPlaceholderText("What do you want to do?"), {
+      target: { value: "Fix the login bug" },
+    });
+    fireEvent.click(within(dialog).getByRole("button", { name: /Create/i }));
+
+    await waitFor(() => expect(toast.warning).toHaveBeenCalledWith(
+      expect.stringContaining("could not start"),
+      expect.objectContaining({ action: expect.objectContaining({ label: "Copy prompt" }) }),
+    ));
+    expect((createWorktreeWorkspaceResult as Mock).mock.calls[0][6]).toBeNull();
+    expect(applyPreset).toHaveBeenCalledWith(
+      "ws-new", "builtin-claude", "current_terminal", null,
+      { model: null, reasoning: null, context: null }, true, "tab-default",
+    );
+    const saved = Object.values(useChatDraftStore.getState().draftsById)[0];
+    expect(saved.inputDraft).toBe("Fix the login bug");
+    expect(saved.manualPromptRequired).toBe(false);
+    expect(toast.success).not.toHaveBeenCalled();
+  });
+
+  it("threads a remembered model selection through to the confirmed preset launch", async () => {
     // A cli-kind preset so the model-selection wiring actually engages
     // (the shared mock preset omits `kind` and is filtered out of the
     // cli-preset list, leaving the model picker absent).
@@ -654,14 +686,16 @@ describe("Submit flow", () => {
     await waitFor(() => {
       expect(createWorktreeWorkspaceResult).toHaveBeenCalled();
     });
-    // 9th arg is the launch-time ModelSelection — the remembered pick,
-    // intact (not dropped despite capabilities never loading).
+    // Workspace creation starts only the terminal. The confirmed preset
+    // write receives the remembered model pick, even without a prompt.
     const call = (createWorktreeWorkspaceResult as Mock).mock.calls[0];
-    expect(call[8]).toEqual({
-      model: "claude-sonnet-4-6",
-      reasoning: "high",
-      context: null,
-    });
+    expect(call[6]).toBeNull();
+    expect(call[8]).toBeNull();
+    await waitFor(() => expect(applyPreset).toHaveBeenCalledWith(
+      "ws-new", "builtin-claude", "current_terminal", null,
+      { model: "claude-sonnet-4-6", reasoning: "high", context: null },
+      true, "tab-default",
+    ));
     // And the stored preference is not corrupted by the launch.
     expect(useUIStore.getState().lastModelSelections.claude).toEqual({
       model: "claude-sonnet-4-6",
@@ -1576,11 +1610,12 @@ describe("Failure recovery", () => {
     fireEvent.click(within(dialog).getByRole("button", { name: /Create/i }));
 
     await waitFor(() => expect(createWorktreeWorkspaceResult).toHaveBeenCalled());
-    expect((createWorktreeWorkspaceResult as Mock).mock.calls[0][8]).toEqual({
-      model: "claude-sonnet-4-6",
-      reasoning: null,
-      context: null,
-    });
+    expect((createWorktreeWorkspaceResult as Mock).mock.calls[0][8]).toBeNull();
+    await waitFor(() => expect(applyPreset).toHaveBeenCalledWith(
+      "ws-new", "builtin-claude", "current_terminal", null,
+      { model: "claude-sonnet-4-6", reasoning: null, context: null },
+      true, "tab-default",
+    ));
   });
 
   it("blocks submit on an invalid branch name and says why", async () => {
@@ -1715,6 +1750,7 @@ describe("Non-git project", () => {
         null,
         { model: null, reasoning: null, context: null },
         true,
+        "tab-default",
       );
     });
     expect(Object.values(useChatDraftStore.getState().draftsById)[0].inputDraft).toBe("Tidy the notes");
@@ -1736,12 +1772,14 @@ describe("Non-git project", () => {
     );
     fireEvent.click(within(dialog).getByRole("button", { name: /Create/i }));
 
-    await waitFor(() => {
-      expect(useUIStore.getState().pendingWorkspaces[0]?.status).toBe("failed");
-    });
-    expect(useUIStore.getState().pendingWorkspaces[0].draft?.prompt).toBe("Tidy the notes");
+    await waitFor(() => expect(toast.warning).toHaveBeenCalledWith(
+      expect.stringContaining("could not start"),
+      expect.objectContaining({ action: expect.objectContaining({ label: "Copy prompt" }) }),
+    ));
     expect(toast.success).not.toHaveBeenCalled();
-    expect(Object.values(useChatDraftStore.getState().draftsById)).toEqual([]);
+    const saved = Object.values(useChatDraftStore.getState().draftsById)[0];
+    expect(saved.inputDraft).toBe("Tidy the notes");
+    expect(saved.manualPromptRequired).toBe(false);
   });
 });
 
@@ -1784,9 +1822,9 @@ describe("Detected default branch routing", () => {
         "single",
         null,
         null,
-        "builtin-claude",
         null,
-        { model: null, reasoning: null, context: null },
+        null,
+        null,
       );
     });
     expect(createWorkspace).not.toHaveBeenCalled();

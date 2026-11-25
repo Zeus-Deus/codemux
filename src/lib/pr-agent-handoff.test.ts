@@ -9,6 +9,9 @@ const mockCreateWorktree = vi
   .fn()
   .mockResolvedValue({ workspaceId: "ws-new", adopted: false });
 const mockGetCheckLogExcerpt = vi.fn().mockResolvedValue("");
+const mockGetAppState = vi.fn().mockResolvedValue({
+  workspaces: [{ workspace_id: "ws-new", tabs: [{ tab_id: "tab-default", kind: "terminal" }] }],
+});
 const mockGetPresets = vi.fn().mockResolvedValue({
   presets: [
     {
@@ -36,6 +39,7 @@ vi.mock("@/tauri/commands", () => ({
   createTab: (...a: unknown[]) => mockCreateTab(...a),
   createWorktreeWorkspaceResult: (...a: unknown[]) => mockCreateWorktree(...a),
   getCheckLogExcerpt: (...a: unknown[]) => mockGetCheckLogExcerpt(...a),
+  getAppState: (...a: unknown[]) => mockGetAppState(...a),
   getPresets: (...a: unknown[]) => mockGetPresets(...a),
 }));
 
@@ -114,6 +118,9 @@ beforeEach(() => {
   vi.clearAllMocks();
   mockCreateWorktree.mockResolvedValue({ workspaceId: "ws-new", adopted: false });
   mockGetCheckLogExcerpt.mockResolvedValue("");
+  mockGetAppState.mockResolvedValue({
+    workspaces: [{ workspace_id: "ws-new", tabs: [{ tab_id: "tab-default", kind: "terminal" }] }],
+  });
   workspaces = [];
   lastSelectedAgentId = null;
   useChatDraftStore.setState({ draftsById: {}, activeDraftId: null });
@@ -266,12 +273,13 @@ describe("handOffToAgent — routes", () => {
     expect(out.route).toBe("current");
     expect(mockCreateTab).toHaveBeenCalledWith("ws-here", "terminal");
     expect(mockApplyPreset).toHaveBeenCalledTimes(1);
-    const [wsId, presetId, mode, prompt, , freshTerminal] = mockApplyPreset.mock.calls[0];
+    const [wsId, presetId, mode, prompt, , freshTerminal, targetTabId] = mockApplyPreset.mock.calls[0];
     expect(wsId).toBe("ws-here");
     expect(presetId).toBe("builtin-claude");
     expect(mode).toBe("current_terminal");
     expect(prompt).toBeNull();
     expect(freshTerminal).toBe(true);
+    expect(targetTabId).toBe("tab-1");
     expect(mockCreateWorktree).not.toHaveBeenCalled();
     expect(mockToastSuccess).toHaveBeenCalledWith(
       expect.stringContaining("without the PR task"),
@@ -348,11 +356,26 @@ describe("handOffToAgent — routes", () => {
     expect(args[2]).toBe(false);
     expect(args[3]).toBe("single");
     expect(args[5]).toBeNull(); // no prompt in the terminal launch
-    expect(args[6]).toBe("builtin-claude"); // agentPresetId
+    expect(args[6]).toBeNull(); // the command is sent only after workspace creation
     expect(args[7]).toBe(285); // prNumber
     expect(Object.values(useChatDraftStore.getState().draftsById)[0].inputDraft).toBe(out.prompt);
-    // Nothing to apply on top — the backend launched the preset.
-    expect(mockApplyPreset).not.toHaveBeenCalled();
+    expect(mockApplyPreset).toHaveBeenCalledWith(
+      "ws-new", "builtin-claude", "current_terminal", null, null, true, "tab-default",
+    );
+    expect(mockCreateTab).not.toHaveBeenCalled();
+  });
+
+  it("keeps the PR task without claiming a new-worktree agent opened when its write fails", async () => {
+    mockApplyPreset.mockRejectedValueOnce(new Error("Terminal shell is not writable"));
+
+    await expect(handOffToAgent(req(CHECK_TASK))).rejects.toThrow(/saved in Drafts/);
+
+    const saved = Object.values(useChatDraftStore.getState().draftsById)[0];
+    expect(saved.target).toEqual({ kind: "existing_workspace", workspaceId: "ws-new" });
+    expect(saved.inputDraft).toContain("rust (ubuntu-latest)");
+    expect(saved.manualPromptRequired).toBe(false);
+    expect(mockToastSuccess).not.toHaveBeenCalled();
+    expect(usePrAgentRunsStore.getState().runs).toEqual([]);
   });
 
   it("(c') an adopted workspace opens the preset and saves the prompt", async () => {
@@ -369,6 +392,7 @@ describe("handOffToAgent — routes", () => {
     expect(mode).toBe("current_terminal");
     expect(prompt).toBeNull();
     expect(mockApplyPreset.mock.calls[0][5]).toBe(true);
+    expect(mockApplyPreset.mock.calls[0][6]).toBe("tab-1");
     expect(Object.values(useChatDraftStore.getState().draftsById)[0].inputDraft).toBe(out.prompt);
   });
 

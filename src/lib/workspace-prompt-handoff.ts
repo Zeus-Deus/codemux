@@ -9,10 +9,11 @@ export function saveWorkspacePrompt(
   prompt: string,
   agentOpened: boolean,
   message: string,
+  tone: "success" | "warning" = "success",
 ): void {
   if (!prompt) return;
   useChatDraftStore.getState().saveWorkspacePrompt(workspaceId, prompt, agentOpened);
-  toast.success(message, {
+  toast[tone](message, {
     description: "The exact prompt is saved in Drafts.",
     duration: 10_000,
     action: {
