@@ -1063,27 +1063,64 @@ fn kill_verified_browser_handle(handle: &std::os::windows::io::OwnedHandle, pid:
     }
 }
 
+#[cfg(target_os = "linux")]
+fn verified_browser_pidfd(record: &BrowserPidRecord, session: &str) -> Option<std::os::fd::OwnedFd> {
+    use std::os::fd::FromRawFd;
+
+    let pid = i32::try_from(record.pid).ok()?;
+    // Open the process handle before checking identity. If the process
+    // exits after that check, the handle still targets the original
+    // process; a later occupant of the numeric PID cannot be signalled.
+    let raw = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) };
+    if raw < 0 {
+        return None;
+    }
+    let pidfd = unsafe { std::os::fd::OwnedFd::from_raw_fd(raw as i32) };
+    browser_process_matches(record, session).then_some(pidfd)
+}
+
+#[cfg(target_os = "linux")]
+fn signal_browser_pidfd(pidfd: &std::os::fd::OwnedFd, signal: libc::c_int) -> std::io::Result<()> {
+    use std::os::fd::AsRawFd;
+
+    let result = unsafe {
+        libc::syscall(
+            libc::SYS_pidfd_send_signal,
+            pidfd.as_raw_fd(),
+            signal,
+            std::ptr::null::<libc::siginfo_t>(),
+            0,
+        )
+    };
+    if result < 0 { Err(std::io::Error::last_os_error()) } else { Ok(()) }
+}
+
 #[cfg(not(windows))]
 fn kill_verified_browser_pid(record: &BrowserPidRecord, session: &str) {
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
     {
-        let Ok(pid) = i32::try_from(record.pid) else { return };
-        if browser_process_matches(record, session) {
-            // The PID is positive and its identity was checked just before
-            // signalling. On Unix this check cannot close the race if that
-            // process exits and the PID is reused before kill runs.
-            unsafe { libc::kill(pid, libc::SIGTERM) };
-        }
+        let Some(pidfd) = verified_browser_pidfd(record, session) else {
+            eprintln!("[codemux::browser] Cannot safely signal browser session {session}: pidfd or process identity unavailable");
+            return;
+        };
+        let _ = signal_browser_pidfd(&pidfd, libc::SIGTERM);
         std::thread::sleep(Duration::from_millis(200));
         if browser_process_matches(record, session) {
-            // Recheck after the grace period to narrow the same reuse race
-            // before sending the escalation signal.
-            unsafe { libc::kill(pid, libc::SIGKILL) };
+            let _ = signal_browser_pidfd(&pidfd, libc::SIGKILL);
         }
         let started = Instant::now();
         while browser_process_matches(record, session) && started.elapsed() < Duration::from_secs(1) {
             std::thread::sleep(Duration::from_millis(25));
         }
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        // macOS has no ordinary process handle that can be used to send a
+        // signal after verifying this daemon. Some callers already attempted
+        // CLI close; failed-start and app-exit cleanup may leave an owned
+        // daemon alive rather than race a numeric PID signal into reuse.
+        eprintln!("[codemux::browser] Cannot safely force-stop browser session {session} on this platform");
+        let _ = record;
     }
 }
 
@@ -5907,6 +5944,22 @@ mod tests {
         (temp, child, record)
     }
 
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn pidfd_signal_stays_bound_to_the_verified_browser_process() {
+        let session = format!("browser-pidfd-{}", uuid::Uuid::new_v4().simple());
+        let (_temp, mut daemon, record) = browser_identity_fixture(&session, browser_owner_token());
+        let pidfd = verified_browser_pidfd(&record, &session).expect("verified daemon has a pidfd");
+        let stale = BrowserPidRecord { start_time: record.start_time + 1, ..record.clone() };
+        assert!(verified_browser_pidfd(&stale, &session).is_none());
+        assert!(daemon.try_wait().unwrap().is_none());
+
+        daemon.kill().unwrap();
+        daemon.wait().unwrap();
+        let error = signal_browser_pidfd(&pidfd, libc::SIGKILL).unwrap_err();
+        assert_eq!(error.raw_os_error(), Some(libc::ESRCH));
+    }
+
     #[cfg(unix)]
     #[test]
     fn foreign_daemon_survives_stream_start_and_failed_open() {
@@ -5970,7 +6023,7 @@ mod tests {
         clear_session_pid(&session);
     }
 
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
     #[test]
     fn daemon_from_an_exited_app_can_be_reclaimed() {
         let session = format!("browser-dead-owner-{}", uuid::Uuid::new_v4().simple());
@@ -6025,7 +6078,7 @@ mod tests {
         assert!(stopped, "daemon survived reclaim from an exited app");
     }
 
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
     #[test]
     fn failed_first_command_tracks_daemon_for_app_exit_cleanup() {
         let session = format!("browser-failed-command-{}", uuid::Uuid::new_v4().simple());
@@ -6628,7 +6681,7 @@ mod tests {
         clear_session_pid(&session);
     }
 
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
     #[test]
     fn post_open_wrong_listener_rolls_back_its_daemon() {
         let session = format!("browser-wrong-port-{}", uuid::Uuid::new_v4().simple());
@@ -6680,7 +6733,7 @@ mod tests {
         clear_session_pid(&session);
     }
 
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn pane_close_retries_unconfirmed_failed_stream_daemon() {
         let session = format!("browser-close-failed-{}", uuid::Uuid::new_v4().simple());
@@ -6713,7 +6766,7 @@ mod tests {
         clear_session_pid(&session);
     }
 
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
     #[test]
     fn timed_out_command_tracks_daemon_after_late_pid_publication() {
         let session = format!("browser-late-pid-{}", uuid::Uuid::new_v4().simple());
@@ -6755,7 +6808,7 @@ mod tests {
         clear_session_pid(&session);
     }
 
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
     #[test]
     fn failed_stream_open_stops_its_daemon_after_late_pid_publication() {
         let session = format!("browser-late-open-{}", uuid::Uuid::new_v4().simple());
@@ -6800,7 +6853,7 @@ mod tests {
         clear_session_pid(&session);
     }
 
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn failed_stream_rollback_blocks_queued_work_until_late_daemon_is_gone() {
         let session = format!("browser-queued-late-open-{}", uuid::Uuid::new_v4().simple());
@@ -6855,7 +6908,7 @@ mod tests {
         clear_session_pid(&session);
     }
 
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
     #[test]
     fn failed_stream_open_stops_daemon_without_a_pid_file() {
         let session = format!("browser-no-pid-open-{}", uuid::Uuid::new_v4().simple());
@@ -6911,7 +6964,7 @@ mod tests {
         clear_session_pid(&session);
     }
 
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
     #[test]
     fn app_exit_finds_owned_daemon_without_a_pid_file() {
         let session = format!("browser-untracked-{}", uuid::Uuid::new_v4().simple());
