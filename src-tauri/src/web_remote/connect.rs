@@ -996,6 +996,21 @@ pub async fn run_connect(opts: ConnectOptions) -> Result<(), String> {
         .to_string();
 
     let instance_running = crate::control::control_server_reachable();
+    let host = default_host();
+    let host_ref = host.as_ref().map(|host| host as &dyn ServiceHost);
+    let unsupported = if instance_running {
+        None
+    } else {
+        unsupported_reason(host_ref)
+    };
+    // Validate the service unit before changing remote-access settings. A
+    // path the unit cannot represent must leave the previous config intact.
+    let prepared_unit = if !instance_running && unsupported.is_none() {
+        let exec = resolve_exec_path()?;
+        Some(systemd_unit(&exec.display().to_string(), api_override.as_deref())?)
+    } else {
+        None
+    };
 
     // Step 2 — configuration. Exactly one of the two write paths, per the
     // module note: the running instance owns its in-memory config, so with one
@@ -1009,23 +1024,20 @@ pub async fn run_connect(opts: ConnectOptions) -> Result<(), String> {
     };
 
     // Step 3 — keep it running.
-    let host = default_host();
     let service = if instance_running {
         // `serve` refuses to start alongside another instance, so a unit here
         // would fail on every start. The running instance is already serving.
         ServiceReport::RunningInstance
     } else {
-        let host_ref = host.as_ref().map(|h| h as &dyn ServiceHost);
-        match unsupported_reason(host_ref) {
+        match unsupported {
             Some(reason) => ServiceReport::Unsupported {
                 reason,
                 fallback: manual_fallback(),
             },
             None => {
                 let host_ref = host_ref.expect("a supported host exists");
-                let exec = resolve_exec_path()?;
-                let unit = systemd_unit(&exec.display().to_string(), api_override.as_deref())?;
-                ServiceReport::Installed(install_service(host_ref, &unit)?)
+                let unit = prepared_unit.as_deref().expect("the supported service unit was prepared");
+                ServiceReport::Installed(install_service(host_ref, unit)?)
             }
         }
     };
@@ -1321,6 +1333,8 @@ mod tests {
         }
         assert!(systemd_unit("/tmp/codemux\nExecStartPre=/bin/false", None).is_err());
         assert!(systemd_unit("relative/codemux", None).is_err());
+        assert!(systemd_unit("/tmp/code\\mux", None).is_err());
+        assert!(systemd_unit("/tmp/code\"mux", None).is_err());
     }
 
     #[test]
