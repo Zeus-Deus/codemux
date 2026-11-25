@@ -419,19 +419,25 @@ fn list_project_folders_blocking(
 pub struct FolderAttachmentInfo {
     pub absolute_path: String,
     pub relative_path: Option<String>,
-    /// Pre-rendered unicode tree, depth-bounded by the caller's
-    /// `max_depth`. Truncated at FOLDER_TREE_MAX_ENTRIES with a
-    /// trailing marker. `item_count` is a lower bound when the walk cap
-    /// stops enumeration.
+    /// Pre-rendered unicode tree, bounded by the caller's `max_depth` and
+    /// the hard depth cap. Truncated at FOLDER_TREE_MAX_ENTRIES with a
+    /// trailing marker. `item_count` is a lower bound when the walk stops
+    /// early or encounters an error.
     pub tree: String,
     pub item_count: usize,
     pub item_count_lower_bound: bool,
 }
 
-/// Read a folder for attachment. Walks the directory depth-bounded
-/// (caller-supplied `max_depth`), respects `.gitignore` via the same
-/// `ignore` walker as the file list, renders a unicode-tree preview,
-/// and reports the item count seen before the bounded walk stops.
+struct FolderWalkFilter {
+    matcher: ignore::IncrementalIgnore,
+    raw_visits: usize,
+    exhausted: bool,
+    had_error: bool,
+}
+
+/// Read a folder for attachment. Walks the directory with depth and raw-entry
+/// caps, applies the same ignore rules as the file list, renders a unicode
+/// tree preview, and reports the item count seen before the walk stops.
 #[tauri::command]
 pub async fn read_folder_for_attachment(
     absolute_path: String,
@@ -465,10 +471,11 @@ fn read_folder_for_attachment_with_limit(
     }
     let depth = max_depth.clamp(1, FOLDER_WALK_MAX_DEPTH);
 
-    let mut entries: Vec<(PathBuf, bool)> = Vec::new();
-    let mut item_count_lower_bound = false;
-    let mut visits = 0;
-    let walker = WalkBuilder::new(path)
+    // The normal ignore walker hides ignored files before yielding them. A
+    // directory with millions of ignored files would therefore evade a
+    // limit on yielded results. Match ignore rules ourselves while the raw
+    // walker charges every candidate before deciding whether to yield it.
+    let matcher = WalkBuilder::new(path)
         .hidden(false)
         .git_ignore(true)
         .git_exclude(true)
@@ -477,16 +484,68 @@ fn read_folder_for_attachment_with_limit(
         .parents(true)
         .follow_links(false)
         .max_depth(Some(depth))
-        .build();
-    for result in walker {
-        // Count every yielded visit, including the root and errors. A hostile
-        // folder must not make a 100-entry preview enumerate millions of paths.
-        if visits >= max_visits {
+        .build_matchers()
+        .into_iter()
+        .next()
+        .expect("one ignore matcher for the attached folder");
+    let filter = Arc::new(Mutex::new(FolderWalkFilter {
+        matcher,
+        raw_visits: 0,
+        exhausted: false,
+        had_error: false,
+    }));
+    let filter_for_walk = Arc::clone(&filter);
+    let root_for_filter = path.to_path_buf();
+    // Keep filesystem iteration order here: sorting before the visit cap
+    // would materialize every entry in a wide directory.
+    let mut raw_walker = WalkBuilder::new(path);
+    raw_walker
+        .hidden(false)
+        .git_ignore(false)
+        .git_exclude(false)
+        .git_global(false)
+        .ignore(false)
+        .parents(false)
+        .follow_links(false)
+        .max_depth(Some(depth))
+        .filter_entry(move |entry| {
+            let mut state = filter_for_walk.lock().expect("folder walk filter lock");
+            if state.raw_visits >= max_visits {
+                // Yield one sentinel entry so the caller can stop the walk
+                // without scanning the rest of this directory.
+                state.exhausted = true;
+                return true;
+            }
+            state.raw_visits += 1;
+            let Ok(relative) = entry.path().strip_prefix(&root_for_filter) else {
+                state.had_error = true;
+                return false;
+            };
+            if relative.components().any(|component| {
+                matches!(component, std::path::Component::Normal(name) if name == ".git")
+            }) {
+                return false;
+            }
+            let is_dir = entry.file_type().map(|kind| kind.is_dir()).unwrap_or(false);
+            let (matched, error) = state.matcher.matched_with_errors(relative, is_dir);
+            state.had_error |= error.is_some();
+            !matched.is_ignore()
+        });
+
+    let mut entries: Vec<(PathBuf, bool)> = Vec::new();
+    let mut item_count_lower_bound = false;
+    for result in raw_walker.build() {
+        if filter.lock().expect("folder walk filter lock").exhausted {
             item_count_lower_bound = true;
             break;
         }
-        visits += 1;
         let Ok(entry) = result else {
+            let mut state = filter.lock().expect("folder walk filter lock");
+            if state.raw_visits >= max_visits {
+                item_count_lower_bound = true;
+                break;
+            }
+            state.raw_visits += 1;
             item_count_lower_bound = true;
             continue;
         };
@@ -497,16 +556,9 @@ fn read_folder_for_attachment_with_limit(
         }
         let is_dir = entry.file_type().map(|ft| ft.is_dir()).unwrap_or(false);
         let p = entry.path().to_path_buf();
-        // Skip nested .git contents defensively (gitignore catches the
-        // top-level case, but not always the inner objects on bare repos).
-        let rel = p.strip_prefix(path).unwrap_or(&p);
-        if rel.components().any(|c| {
-            matches!(c, std::path::Component::Normal(s) if s == ".git")
-        }) {
-            continue;
-        }
         entries.push((p, is_dir));
     }
+    item_count_lower_bound |= filter.lock().expect("folder walk filter lock").had_error;
 
     // Sort: directories first, then files; alphabetical within each
     // group at every depth level.
@@ -1982,7 +2034,29 @@ mod tests {
             4,
         ).unwrap();
         assert!(info.item_count_lower_bound);
-        assert!(info.item_count <= 3, "the root counts against the visit budget");
+        assert!(info.item_count <= 4);
+        assert!(info.tree.contains("additional entries may be omitted"));
+    }
+
+    #[test]
+    fn ignored_files_still_consume_the_folder_visit_budget() {
+        let dir = tempdir().unwrap();
+        fs::create_dir(dir.path().join(".git")).unwrap();
+        fs::write(dir.path().join(".gitignore"), "*.tmp\n").unwrap();
+        for i in 0..20 {
+            fs::write(dir.path().join(format!("ignored_{i:03}.tmp")), "x").unwrap();
+        }
+        fs::write(dir.path().join("visible.txt"), "x").unwrap();
+        let info = read_folder_for_attachment_with_limit(
+            dir.path().to_string_lossy().into_owned(),
+            None,
+            1,
+            5,
+        )
+        .unwrap();
+        assert!(info.item_count_lower_bound);
+        assert!(info.item_count <= 5);
+        assert!(!info.tree.contains("ignored_"));
         assert!(info.tree.contains("additional entries may be omitted"));
     }
 

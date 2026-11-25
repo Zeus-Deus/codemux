@@ -238,7 +238,9 @@ import {
   type HostView,
   listSkills,
   listChatSlashCommands,
+  listProjectFiles,
   openProviderLoginTerminal,
+  readFileForAttachment,
   type Skill,
 } from "@/tauri/commands";
 import { emptyHealthSlot, useProviderHealth } from "@/stores/provider-health-store";
@@ -629,6 +631,46 @@ describe("DraftChatSurface", () => {
       expect(chip).toBeInTheDocument();
       expect(chip.textContent).toBe("@Composer.tsx");
       expect(chip).toHaveAttribute("data-tint", "neutral");
+    });
+
+    it("retains the bounded preview state when a draft attaches a file", async () => {
+      vi.mocked(listProjectFiles).mockResolvedValueOnce([{
+        path: "src/huge.ts",
+        absolute_path: "/projects/foo/src/huge.ts",
+        score: 0,
+      }]);
+      vi.mocked(readFileForAttachment).mockResolvedValueOnce({
+        absolutePath: "/projects/foo/src/huge.ts",
+        relativePath: "src/huge.ts",
+        lineCount: 240,
+        lineCountLowerBound: true,
+        bytes: 10_000_000,
+        language: "ts",
+        isText: true,
+        content: "preview",
+        truncated: true,
+        outline: [],
+      });
+      const draftStore = useChatDraftStore.getState();
+      const draft = draftStore.getOrCreateHomeDraft();
+      draftStore.updateDraftTarget(draft.draftId, {
+        kind: "project",
+        projectPath: "/projects/foo",
+      });
+      draftStore.setActiveDraft(draft.draftId);
+      const { getByTestId, findByText } = renderSurface();
+      fireEvent.click(getByTestId("composer-attach-button"));
+      fireEvent.click(getByTestId("slash-item-attach:file"));
+      fireEvent.click(await findByText("src/huge.ts"));
+      await vi.waitFor(() => {
+        const attachment = useAgentChatStore.getState().threads[draft.threadId]
+          ?.stagedAttachments[0];
+        expect(attachment?.metadata).toMatchObject({
+          lineCount: 240,
+          lineCountLowerBound: true,
+          isTruncated: true,
+        });
+      });
     });
 
     it("the inline mirror chip vanishes when the file token is removed from the draft text", () => {
