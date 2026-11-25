@@ -111,7 +111,7 @@ impl TaskTransport for SshTransport {
 }
 
 async fn ssh_command(target: &str, remote: &str) -> Result<tokio::process::Command, TransportError> {
-    let mut command = tokio::process::Command::new("ssh");
+    let mut command = crate::ssh_policy::pinned_native_ssh();
     command.args(crate::ssh_policy::verified_command_args()).args([
         "-o",
         "ConnectTimeout=10",

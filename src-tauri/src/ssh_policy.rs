@@ -1,7 +1,7 @@
 //! OpenSSH policy for unattended, application-managed connections.
 
 // A reused multiplex connection would skip host-key verification for this
-// invocation. Leave OpenSSH's identity, host trust, and jump-host config in use.
+// invocation. Leave OpenSSH's identity and host trust configuration in use.
 pub(crate) const VERIFIED_HOST_ARGS: [&str; 9] = [
     "-T",
     "-o",
@@ -20,58 +20,28 @@ pub(crate) fn verified_command_args() -> impl Iterator<Item = &'static str> {
         .chain(["-o", "ClearAllForwardings=yes"])
 }
 
-// OpenSSH starts its ProxyJump clients without the application's command
-// flags. Ask OpenSSH for the actual effective configuration of each implicit
-// hop, including the user, port, forwarding target, and earlier jump chain.
-// Keep the original argument list intact for the eventual exec.
+// The live command must carry this flag. OpenSSH reads its configuration
+// again at connect time and starts implicit jump clients without our flags.
+const NO_PROXY_JUMP: [&str; 2] = ["-o", "ProxyJump=none"];
+const PROXY_JUMP_ERROR: &str =
+    "Codemux cannot verify implicit SSH ProxyJump clients. Configure a user-managed ProxyCommand instead.";
+
 const CHECKED_SSH: &str = r#"
+config=$(ssh -G "$@" </dev/null) || exit 255
 cr=$(printf "\r")
-ssh_setting() {
-    while IFS= read -r setting; do
-        setting=${setting%"$cr"}
-        case $setting in "$1 "*) printf "%s\n" "${setting#* }"; return;; esac
-    done <<CODEMUX_SSH_CONFIG
+while IFS= read -r setting; do
+    setting=${setting%"$cr"}
+    case $setting in
+        "proxyjump none"|"proxyjump ") ;;
+        "proxyjump "*)
+            echo "Codemux cannot verify implicit SSH ProxyJump clients. Configure a user-managed ProxyCommand instead." >&2
+            exit 255
+            ;;
+    esac
+done <<CODEMUX_SSH_CONFIG
 $config
 CODEMUX_SSH_CONFIG
-}
-verify_proxy_jumps() {
-    config=$(ssh -G "$@" </dev/null) || return 1
-    count=0
-    while :; do
-        jumps=$(ssh_setting proxyjump)
-        case $jumps in ""|none) return 0;; esac
-        count=$((count + 1))
-        if [ "$count" -gt 16 ]; then
-            echo "Codemux: too many SSH jump hops or a jump loop" >&2
-            return 1
-        fi
-        host=$(ssh_setting hostname)
-        port=$(ssh_setting port)
-        hop=${jumps##*,}
-        case $jumps in *,*) set -- -J "${jumps%,*}";; *) set --;; esac
-        address=${hop#ssh://}
-        case $address in
-            *@*) set -- "$@" -l "${address%@*}"; address=${address##*@};;
-        esac
-        case $address in
-            \[*\]:*) set -- "$@" -p "${address##*]:}"; address=${address%%]*}; address=${address#\[};;
-            \[*\]) address=${address#\[}; address=${address%\]};;
-            *:*) set -- "$@" -p "${address##*:}"; address=${address%:*};;
-        esac
-        config=$(ssh -G "$@" -W "[$host]:$port" -- "$address" </dev/null) || return 1
-        strict=$(ssh_setting stricthostkeychecking)
-        control=$(ssh_setting controlpath)
-        if { [ "$strict" != true ] && [ "$strict" != yes ]; } ||
-            [ "$(ssh_setting batchmode)" != yes ] ||
-            [ "$(ssh_setting forwardagent)" != no ] ||
-            { [ -n "$control" ] && [ "$control" != none ]; }; then
-            printf "Codemux: SSH jump %s requires StrictHostKeyChecking yes, BatchMode yes, ForwardAgent no, and ControlPath none\n" "$hop" >&2
-            return 1
-        fi
-    done
-}
-verify_proxy_jumps "$@" || exit 255
-exec ssh "$@"
+exec ssh -o ProxyJump=none "$@"
 "#;
 
 #[cfg(unix)]
@@ -90,103 +60,62 @@ pub(crate) fn checked_ssh_tokio() -> tokio::process::Command {
     #[cfg(unix)]
     return checked_ssh().into();
     #[cfg(windows)]
-    return tokio::process::Command::new("ssh");
+    return pinned_native_ssh();
 }
 
-/// Used by native Windows clients and dispatches that must check the route
-/// before the guarded SSH spawn.
+/// Take the direct OpenSSH path used by native clients and guarded dispatch.
+/// Preflight reports configured implicit routes, while the actual argv
+/// independently forbids them even if configuration changes afterward.
+pub(crate) fn pinned_native_ssh() -> tokio::process::Command {
+    let mut command = tokio::process::Command::new("ssh");
+    command.args(NO_PROXY_JUMP);
+    command
+}
+
 pub(crate) async fn check_native_jumps(command: &tokio::process::Command) -> std::io::Result<()> {
-    use std::ffi::{OsStr, OsString};
+    use std::ffi::OsStr;
     use std::io::{Error, ErrorKind};
     use std::process::Stdio;
 
-    async fn config(args: impl IntoIterator<Item = impl AsRef<OsStr>>) -> std::io::Result<String> {
-        let output = tokio::time::timeout(
-            std::time::Duration::from_secs(5),
-            tokio::process::Command::new("ssh")
-                .arg("-G")
-                .args(args)
-                .stdin(Stdio::null())
-                .kill_on_drop(true)
-                .output(),
-        )
-        .await
-        .map_err(|_| Error::new(ErrorKind::TimedOut, "SSH configuration check timed out"))??;
-        if !output.status.success() {
-            return Err(Error::other(
-                String::from_utf8_lossy(&output.stderr).into_owned(),
-            ));
-        }
-        String::from_utf8(output.stdout).map_err(Error::other)
+    let command = command.as_std();
+    let args: Vec<_> = command.get_args().collect();
+    let args = args
+        .strip_prefix(&NO_PROXY_JUMP.map(OsStr::new))
+        .ok_or_else(|| Error::other("SSH command must disable implicit jump clients"))?;
+    let mut probe = tokio::process::Command::new(command.get_program());
+    if let Some(directory) = command.get_current_dir() {
+        probe.current_dir(directory);
     }
-
-    fn setting<'a>(config: &'a str, key: &str) -> &'a str {
-        config
-            .lines()
-            .find_map(|line| {
-                let (name, value) = line.split_once(' ')?;
-                (name == key).then_some(value)
-            })
-            .unwrap_or_default()
-    }
-
-    let args: Vec<OsString> = command.as_std().get_args().map(OsStr::to_owned).collect();
-    let mut effective = config(args).await?;
-    for depth in 0..=16 {
-        let jumps = setting(&effective, "proxyjump");
-        if matches!(jumps, "" | "none") {
-            return Ok(());
-        }
-        if depth == 16 {
-            break;
-        }
-        let forward = format!(
-            "[{}]:{}",
-            setting(&effective, "hostname"),
-            setting(&effective, "port")
-        );
-        let (prior, hop) = jumps.rsplit_once(',').unwrap_or(("", jumps));
-        let address = hop.strip_prefix("ssh://").unwrap_or(hop);
-        let mut args = Vec::new();
-        if !prior.is_empty() {
-            args.extend(["-J", prior]);
-        }
-        let address = match address.rsplit_once('@') {
-            Some((user, address)) => {
-                args.extend(["-l", user]);
-                address
-            }
-            None => address,
+    for (key, value) in command.get_envs() {
+        match value {
+            Some(value) => probe.env(key, value),
+            None => probe.env_remove(key),
         };
-        let (host, port) = if let Some(bracketed) = address.strip_prefix('[') {
-            let (host, suffix) = bracketed
-                .split_once(']')
-                .ok_or_else(|| Error::other("Invalid SSH jump host"))?;
-            (host, suffix.strip_prefix(':'))
-        } else {
-            address
-                .rsplit_once(':')
-                .map_or((address, None), |(host, port)| (host, Some(port)))
-        };
-        if let Some(port) = port {
-            args.extend(["-p", port]);
-        }
-        args.extend(["-W", &forward, "--", host]);
-        let hop_config = config(args).await?;
-        if !matches!(
-            setting(&hop_config, "stricthostkeychecking"),
-            "true" | "yes"
-        ) || setting(&hop_config, "batchmode") != "yes"
-            || setting(&hop_config, "forwardagent") != "no"
-            || !matches!(setting(&hop_config, "controlpath"), "" | "none")
-        {
-            return Err(Error::other(format!(
-                "SSH jump {hop} requires StrictHostKeyChecking yes, BatchMode yes, ForwardAgent no, and ControlPath none"
-            )));
-        }
-        effective = hop_config;
     }
-    Err(Error::other("Too many SSH jump hops or a jump loop"))
+    let output = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        probe
+            .arg("-G")
+            .args(args)
+            .stdin(Stdio::null())
+            .kill_on_drop(true)
+            .output(),
+    )
+    .await
+    .map_err(|_| Error::new(ErrorKind::TimedOut, "SSH configuration check timed out"))??;
+    if !output.status.success() {
+        return Err(Error::other(
+            String::from_utf8_lossy(&output.stderr).into_owned(),
+        ));
+    }
+    let config = String::from_utf8(output.stdout).map_err(Error::other)?;
+    if config.lines().any(|line| {
+        line.strip_prefix("proxyjump ")
+            .is_some_and(|jump| !matches!(jump, "" | "none"))
+    }) {
+        return Err(Error::other(PROXY_JUMP_ERROR));
+    }
+    Ok(())
 }
 
 /// rsync parses its remote-shell string itself. It escapes quotes by
@@ -200,65 +129,217 @@ pub(crate) fn verified_shell_command() -> String {
     )
 }
 
-fn git_ssh_wrapper() -> String {
+fn shell_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\\''"))
+}
+
+fn git_ssh_command() -> String {
     format!(
-        "#!/bin/sh\nset -- {} \"$@\"\n{CHECKED_SSH}",
+        "sh -c {} codemux-ssh {}",
+        shell_quote(CHECKED_SSH),
         verified_command_args().collect::<Vec<_>>().join(" ")
     )
 }
 
-/// Set the unattended Git default and keep its executable alive through the
-/// Git operation. Git reads `GIT_SSH` after `core.sshCommand` and
-/// `GIT_SSH_COMMAND`, so checkout-specific overrides also work during clone.
+fn command_env(command: &std::process::Command, key: &str) -> Option<std::ffi::OsString> {
+    if let Some((_, value)) = command.get_envs().find(|(name, _)| *name == key) {
+        return value.map(std::ffi::OsStr::to_owned);
+    }
+    std::env::var_os(key)
+}
+
+fn config_command(command: &std::process::Command) -> std::process::Command {
+    let mut git = crate::git::git_command();
+    if let Some(dir) = command.get_current_dir() {
+        git.current_dir(dir);
+    }
+    // Some callers select the checkout with a leading Git -C.
+    let mut args = command.get_args();
+    while args.next().is_some_and(|arg| arg == "-C") {
+        if let Some(directory) = args.next() {
+            git.arg("-C").arg(directory);
+        }
+    }
+    for (key, value) in command.get_envs() {
+        match value {
+            Some(value) => {
+                git.env(key, value);
+            }
+            None => {
+                git.env_remove(key);
+            }
+        }
+    }
+    git.env_remove("GIT_CONFIG");
+    git
+}
+
+fn git_config_error(output: &std::process::Output) -> std::io::Error {
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    std::io::Error::other(format!(
+        "Git config exited with {}: {}",
+        output.status,
+        stderr.trim()
+    ))
+}
+
+fn system_git_config(
+    command: &std::process::Command,
+) -> std::io::Result<Option<std::path::PathBuf>> {
+    use std::io::{Error, ErrorKind};
+    use std::path::PathBuf;
+
+    if let Some(disabled) = command_env(command, "GIT_CONFIG_NOSYSTEM") {
+        let disabled = disabled.to_string_lossy().to_ascii_lowercase();
+        let skip = match disabled.as_str() {
+            "" | "false" | "no" | "off" => false,
+            "true" | "yes" | "on" => true,
+            value => value.parse::<i64>().map(|value| value != 0).map_err(|_| {
+                Error::new(
+                    ErrorKind::InvalidInput,
+                    "Invalid Git GIT_CONFIG_NOSYSTEM setting",
+                )
+            })?,
+        };
+        if skip {
+            return Ok(None);
+        }
+    }
+
+    // Ask Git which file it actually read. --no-includes keeps the first
+    // origin at the system file itself, including on older Git versions.
+    let output = config_command(command)
+        .env("LC_ALL", "C")
+        .args([
+            "config",
+            "--system",
+            "--no-includes",
+            "--show-origin",
+            "--null",
+            "--list",
+        ])
+        .output()?;
+    if !output.status.success() {
+        if String::from_utf8_lossy(&output.stderr).contains("No such file or directory") {
+            return Ok(None);
+        }
+        return Err(git_config_error(&output));
+    }
+    if output.stdout.is_empty() {
+        return Ok(None);
+    }
+    let Some(path) = output
+        .stdout
+        .split(|byte| *byte == 0)
+        .next()
+        .and_then(|origin| origin.strip_prefix(b"file:"))
+    else {
+        return Err(Error::new(
+            ErrorKind::InvalidData,
+            "Git did not report a system config file",
+        ));
+    };
+    #[cfg(unix)]
+    let path = {
+        use std::os::unix::ffi::OsStrExt;
+        PathBuf::from(std::ffi::OsStr::from_bytes(path))
+    };
+    #[cfg(not(unix))]
+    let path = PathBuf::from(std::str::from_utf8(path).map_err(Error::other)?);
+    if path.has_root() {
+        return Ok(Some(path));
+    }
+    let mut base = command
+        .get_current_dir()
+        .map_or_else(std::env::current_dir, |dir| std::path::absolute(dir))?;
+    let mut args = command.get_args();
+    while args.next().is_some_and(|arg| arg == "-C") {
+        if let Some(directory) = args.next().filter(|directory| !directory.is_empty()) {
+            base = base.join(directory);
+        }
+    }
+    Ok(Some(base.join(path)))
+}
+
+/// Add a system-scope default before the user's system config. Git can
+/// still resolve higher-priority config in the destination during clone.
+/// Only the data file is temporary; Git invokes the policy through its shell.
 pub(crate) fn unattended_git(
     command: &mut std::process::Command,
 ) -> std::io::Result<Option<tempfile::TempDir>> {
-    use std::io::Write;
-
     command.env("GIT_TERMINAL_PROMPT", "0");
-    if std::env::var_os("GIT_SSH").is_some() || std::env::var_os("GIT_SSH_COMMAND").is_some() {
+    if command_env(command, "GIT_SSH").is_some()
+        || command_env(command, "GIT_SSH_COMMAND").is_some()
+    {
         return Ok(None);
     }
+    let system = system_git_config(command)?;
     let temp_root = std::path::absolute(std::env::temp_dir())?;
     let mut builder = tempfile::Builder::new();
-    builder.prefix("codemux-git-ssh-");
+    builder.prefix("codemux-git-config-");
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
         builder.permissions(std::fs::Permissions::from_mode(0o700));
     }
     let directory = builder.tempdir_in(temp_root)?;
-    // The filename tells Git this is OpenSSH, including on Git for Windows,
-    // which launches an extensionless shebang script through its own shell.
-    let wrapper = directory.path().join("ssh");
-    let mut options = std::fs::OpenOptions::new();
-    options.write(true).create_new(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o700);
+    let config = directory.path().join("config");
+    let write_config = |name: &str, value: &std::ffi::OsStr| -> std::io::Result<()> {
+        let output = config_command(command)
+            .arg("config")
+            .arg("--file")
+            .arg(&config)
+            .arg("--add")
+            .arg(name)
+            .arg(value)
+            .output()?;
+        if !output.status.success() {
+            return Err(git_config_error(&output));
+        }
+        Ok(())
+    };
+    let transport = git_ssh_command();
+    write_config("core.sshCommand", transport.as_ref())?;
+    if let Some(system) = system {
+        write_config("include.path", system.as_os_str())?;
     }
-    options
-        .open(&wrapper)?
-        .write_all(git_ssh_wrapper().as_bytes())?;
-    command.env("GIT_SSH", wrapper);
+    // Older Git versions can ignore GIT_CONFIG_SYSTEM. Confirm the
+    // fallback is active before starting an unattended operation.
+    let check = config_command(command)
+        .env("GIT_CONFIG_SYSTEM", &config)
+        .env_remove("GIT_CONFIG_NOSYSTEM")
+        .args([
+            "config",
+            "--system",
+            "--no-includes",
+            "--get",
+            "core.sshCommand",
+        ])
+        .output()?;
+    if !check.status.success() || String::from_utf8_lossy(&check.stdout).trim_end() != transport {
+        return Err(std::io::Error::other(
+            "Git could not load the unattended SSH policy through GIT_CONFIG_SYSTEM",
+        ));
+    }
+    command
+        .env("GIT_CONFIG_SYSTEM", config)
+        .env_remove("GIT_CONFIG_NOSYSTEM");
     Ok(Some(directory))
 }
 
-/// Apply the same Git default to a probe on the device that will run the
-/// automation. Owner configuration on that device retains precedence.
+/// The probe runs in its current directory, so it can ask that Git
+/// directly whether an owner-supplied command already applies there.
 pub(crate) fn unattended_git_script(command: &str) -> String {
-    let wrapper = git_ssh_wrapper();
+    let transport = shell_quote(&git_ssh_command());
     format!(
         r#"export GIT_TERMINAL_PROMPT=0
 if [ "${{GIT_SSH+x}}" != x ] && [ "${{GIT_SSH_COMMAND+x}}" != x ]; then
-    ssh_dir=$(mktemp -d "${{TMPDIR:-/tmp}}/codemux-git-ssh.XXXXXXXX") || exit 1
-    trap 'rm -f "$ssh_dir/ssh"; rmdir "$ssh_dir"' EXIT
-    trap 'exit 1' HUP INT TERM
-    (umask 077; cat >"$ssh_dir/ssh" <<'CODEMUX_GIT_SSH'
-{wrapper}CODEMUX_GIT_SSH
-    ) && chmod 700 "$ssh_dir/ssh" || exit 1
-    export GIT_SSH="$ssh_dir/ssh"
+    (unset GIT_CONFIG; git config --get core.sshCommand >/dev/null)
+    case $? in
+        0) ;;
+        1) export GIT_SSH_COMMAND={transport} ;;
+        *) exit 1 ;;
+    esac
 fi
 {command}
 "#
@@ -274,34 +355,22 @@ mod unattended_git_tests {
     use std::process::Command;
 
     #[test]
-    fn checked_ssh_requires_strict_config_on_each_jump() {
+    fn implicit_jumps_are_rejected_and_disabled_in_the_live_client() {
         let root = tempfile::tempdir().unwrap();
         let ssh = root.path().join("ssh");
         fs::write(
             &ssh,
             r#"#!/bin/sh
-if [ "$1" != -G ]; then
-    printf 'transfer started\n'
+if [ "$1" = -G ]; then
+    if [ "$FIXTURE_ROUTE" = jump ]; then
+        printf 'proxyjump relay-fixture\n'
+    else
+        printf 'proxycommand user-fixture\n'
+    fi
     exit 0
 fi
-case "$*" in
-    *2001:db8::2)
-        case "$*" in *'-J jump-one -l alice -p 2222 -W [destination.test]:22 '*) ;; *) exit 2;; esac
-        printf 'hostname 2001:db8::2\nport 2222\nproxyjump jump-one\n'
-        ;;
-    *'-- jump-one')
-        case "$*" in *'-W [2001:db8::2]:2222 '*) ;; *) exit 2;; esac
-        if [ "${WEAK_JUMP:-}" = yes ]; then
-            printf 'stricthostkeychecking accept-new\n'
-            exit 0
-        fi
-        ;;
-    *)
-        printf 'hostname destination.test\nport 22\nproxyjump jump-one,alice@[2001:db8::2]:2222\n'
-        exit 0
-        ;;
-esac
-printf 'stricthostkeychecking true\nbatchmode yes\nforwardagent no\n'
+[ "$1" = -o ] && [ "$2" = ProxyJump=none ] || exit 2
+printf 'transport started\n'
 "#,
         )
         .unwrap();
@@ -311,22 +380,67 @@ printf 'stricthostkeychecking true\nbatchmode yes\nforwardagent no\n'
                 .chain(std::env::split_paths(&std::env::var_os("PATH").unwrap())),
         )
         .unwrap();
-        let run = |weak| {
+        let run = |route| {
             checked_ssh()
                 .env("PATH", &path)
-                .env("WEAK_JUMP", weak)
+                .env("FIXTURE_ROUTE", route)
                 .args(verified_command_args())
                 .args(["--", "destination", "fixture"])
                 .output()
                 .unwrap()
         };
-        let allowed = run("no");
+        let allowed = run("command");
         assert!(allowed.status.success(), "{allowed:?}");
-        assert_eq!(allowed.stdout, b"transfer started\n");
-        let denied = run("yes");
+        assert_eq!(allowed.stdout, b"transport started\n");
+        let denied = run("jump");
         assert_eq!(denied.status.code(), Some(255), "{denied:?}");
         assert!(denied.stdout.is_empty());
-        assert!(String::from_utf8_lossy(&denied.stderr).contains("requires StrictHostKeyChecking"));
+        assert!(String::from_utf8_lossy(&denied.stderr).contains(PROXY_JUMP_ERROR));
+    }
+
+    #[tokio::test]
+    async fn native_checks_the_route_before_using_a_pinned_command() {
+        let root = tempfile::tempdir().unwrap();
+        let fixture = root.path().join("ssh");
+        fs::write(
+            &fixture,
+            r#"#!/bin/sh
+if [ "$1" = -G ]; then
+    shift
+    for arg do
+        [ "$arg" != ProxyJump=none ] || exit 2
+    done
+    [ "$FIXTURE_ROUTE" != jump ] || printf 'proxyjump relay-fixture\n'
+    exit 0
+fi
+[ "$1" = -o ] && [ "$2" = ProxyJump=none ] || exit 2
+printf 'transport started\n'
+"#,
+        )
+        .unwrap();
+        fs::set_permissions(&fixture, fs::Permissions::from_mode(0o700)).unwrap();
+        let path = std::env::join_paths(
+            std::iter::once(root.path().to_owned())
+                .chain(std::env::split_paths(&std::env::var_os("PATH").unwrap())),
+        )
+        .unwrap();
+        let build = |route| {
+            let mut command = pinned_native_ssh();
+            command
+                .env("PATH", &path)
+                .env("FIXTURE_ROUTE", route)
+                .args(verified_command_args())
+                .args(["--", "destination", "fixture"]);
+            command
+        };
+        let denied = check_native_jumps(&build("jump")).await.unwrap_err();
+        assert_eq!(denied.to_string(), PROXY_JUMP_ERROR);
+
+        let mut allowed = build("direct");
+        check_native_jumps(&allowed).await.unwrap();
+        let output = allowed.output().await.unwrap();
+        assert!(output.status.success(), "{output:?}");
+        assert_eq!(output.stdout, b"transport started\n");
     }
 
     #[test]
@@ -359,12 +473,21 @@ printf 'stricthostkeychecking true\nbatchmode yes\nforwardagent no\n'
         git.current_dir(root.path())
             .env("PATH", &path)
             .args(["ls-remote", "--", remote]);
-        let _wrapper = unattended_git(&mut git).unwrap();
+        let config = unattended_git(&mut git).unwrap().unwrap();
+        assert_eq!(
+            fs::metadata(config.path().join("config"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o111,
+            0
+        );
         let output = git.output().unwrap();
         assert!(!output.status.success());
         let stderr = String::from_utf8_lossy(&output.stderr);
         assert!(stderr.contains("default "), "{stderr}");
         assert!(stderr.contains("StrictHostKeyChecking=yes"), "{stderr}");
+        assert!(stderr.contains("ProxyJump=none"), "{stderr}");
 
         let script = unattended_git_script(&format!("git ls-remote -- '{remote}'"));
         let output = Command::new("sh")
@@ -378,6 +501,7 @@ printf 'stricthostkeychecking true\nbatchmode yes\nforwardagent no\n'
         let stderr = String::from_utf8_lossy(&output.stderr);
         assert!(stderr.contains("default "), "{stderr}");
         assert!(stderr.contains("StrictHostKeyChecking=yes"), "{stderr}");
+        assert!(stderr.contains("ProxyJump=none"), "{stderr}");
 
         let scoped_config = root.path().join("scoped-config");
         let configure = |options: &[&str], key: &str, value: &str| {
@@ -395,6 +519,30 @@ printf 'stricthostkeychecking true\nbatchmode yes\nforwardagent no\n'
             "core.sshCommand",
             &crate::ssh::exec::sh_quote(scoped_ssh.to_str().unwrap()),
         );
+
+        let mut git = crate::git::git_command();
+        git.current_dir(root.path())
+            .env("PATH", &path)
+            .env("GIT_CONFIG_NOSYSTEM", "0")
+            .env("GIT_CONFIG_SYSTEM", &scoped_config)
+            .args(["ls-remote", "--", remote]);
+        let _config = unattended_git(&mut git).unwrap().unwrap();
+        let output = git.output().unwrap();
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(stderr.contains("scoped "), "{stderr}");
+        assert!(!stderr.contains("default "), "{stderr}");
+
+        let output = Command::new("sh")
+            .current_dir(root.path())
+            .env("PATH", &path)
+            .env("GIT_CONFIG_GLOBAL", &scoped_config)
+            .args(["-c", &script])
+            .output()
+            .unwrap();
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(stderr.contains("scoped "), "{stderr}");
+        assert!(!stderr.contains("default "), "{stderr}");
+
         configure(
             &["--global"],
             "includeIf.gitdir:**/scoped-clone/.git.path",
@@ -409,7 +557,7 @@ printf 'stricthostkeychecking true\nbatchmode yes\nforwardagent no\n'
             remote,
             "scoped-clone",
         ]);
-        let _wrapper = unattended_git(&mut git).unwrap();
+        let _config = unattended_git(&mut git).unwrap();
         let output = git.output().unwrap();
         assert!(!output.status.success());
         let stderr = String::from_utf8_lossy(&output.stderr);
