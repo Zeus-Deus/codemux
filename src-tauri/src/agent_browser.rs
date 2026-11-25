@@ -1790,6 +1790,7 @@ fn output_capture_and_track_browser_daemon(
 }
 
 #[cfg(not(windows))]
+#[derive(Debug)]
 struct UnixBrowserLaunchFailure {
     error: std::io::Error,
     may_have_launched: bool,
