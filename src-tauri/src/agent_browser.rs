@@ -2554,8 +2554,21 @@ fn extract_eval_result(stdout: &str) -> String {
 /// and npx are deliberately excluded so an older installation cannot reopen
 /// the unauthenticated v0.24 stream endpoint.
 fn resolve_binary() -> Result<String, String> {
-    static BINARY: OnceLock<Result<String, String>> = OnceLock::new();
-    BINARY.get_or_init(resolve_binary_uncached).clone()
+    static BINARY: OnceLock<String> = OnceLock::new();
+    resolve_cached_browser_binary(&BINARY, resolve_binary_uncached)
+}
+
+fn resolve_cached_browser_binary(
+    cache: &OnceLock<String>,
+    resolve: impl FnOnce() -> Result<String, String>,
+) -> Result<String, String> {
+    if let Some(binary) = cache.get() {
+        return Ok(binary.clone());
+    }
+    // An absent or outdated sidecar may be installed while the app is open.
+    // Cache only paths that passed the native version check.
+    let binary = resolve()?;
+    Ok(cache.get_or_init(|| binary).clone())
 }
 
 fn resolve_binary_uncached() -> Result<String, String> {
@@ -6422,6 +6435,24 @@ mod tests {
         if let Ok(path) = resolve_binary() {
             assert!(std::path::Path::new(&path).is_file());
         }
+    }
+
+    #[test]
+    fn resolver_retries_a_failed_probe_and_keeps_a_verified_success() {
+        let cache = OnceLock::new();
+        assert_eq!(
+            resolve_cached_browser_binary(&cache, || Err("sidecar unavailable".into())),
+            Err("sidecar unavailable".into()),
+        );
+        assert!(cache.get().is_none());
+        assert_eq!(
+            resolve_cached_browser_binary(&cache, || Ok("verified-sidecar".into())),
+            Ok("verified-sidecar".into()),
+        );
+        assert_eq!(
+            resolve_cached_browser_binary(&cache, || panic!("a successful path should stay cached")),
+            Ok("verified-sidecar".into()),
+        );
     }
 
     #[test]
