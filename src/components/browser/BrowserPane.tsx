@@ -387,13 +387,45 @@ export const BrowserPane = memo(function BrowserPane({ browserId, focused, visib
       let retries = 0;
       const maxRetries = 15;
 
-      function connectWS() {
+      function scheduleReconnect(message = "Stream disconnected") {
+        retries++;
+        if (retries < maxRetries) {
+          if (statusRef.current === "live") {
+            setStatus("connecting");
+          }
+          setTimeout(connectWS, 1500);
+        } else {
+          setStatus("error");
+          setErrorMsg(message);
+          setRetryAt(Date.now() + SLOW_RETRY_MS);
+          slowRetryTimer = setTimeout(connectWS, SLOW_RETRY_MS);
+        }
+      }
+
+      async function connectWS() {
         if (!active) return;
         setRetryAt(null);
         if (retries === 0) setStatus("connecting");
         else if (retries < maxRetries) setStatus("waiting");
         // Past the fast budget: stay in "error" while slow-retrying so
         // the pill/overlay keeps showing the disconnect honestly.
+
+        // A restarted daemon can reuse its old port while the bridge rotates
+        // its capability. Refresh on each scheduled reconnect so the pane
+        // cannot retry a revoked URL forever. The existing retry cadence
+        // bounds these IPC calls to 1.5s, then 10s.
+        if (!remoteClient && retries > 0) {
+          try {
+            const endpoints = await browserStreamBridgeEndpoints(streamSessionId);
+            if (!active) return;
+            connectUrl = endpoints.ws_url;
+            httpBaseRef.current = endpoints.http_base;
+          } catch {
+            if (!active) return;
+            scheduleReconnect("Browser bridge unavailable");
+            return;
+          }
+        }
 
         ws = new WebSocket(connectUrl);
         wsRef.current = ws;
@@ -534,18 +566,7 @@ export const BrowserPane = memo(function BrowserPane({ browserId, focused, visib
           if (!active) return;
           // Auto-reconnect regardless of current status — handles both
           // initial connection failures and mid-stream disconnects.
-          retries++;
-          if (retries < maxRetries) {
-            if (statusRef.current === "live") {
-              setStatus("connecting");
-            }
-            setTimeout(connectWS, 1500);
-          } else {
-            setStatus("error");
-            setErrorMsg("Stream disconnected");
-            setRetryAt(Date.now() + SLOW_RETRY_MS);
-            slowRetryTimer = setTimeout(connectWS, SLOW_RETRY_MS);
-          }
+          scheduleReconnect();
         };
       }
 

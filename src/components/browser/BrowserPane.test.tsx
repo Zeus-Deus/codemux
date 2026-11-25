@@ -43,6 +43,7 @@ class FakeWebSocket {
   static urls: string[] = [];
   static opened = 0;
   static lastUrl: string | null = null;
+  static lastSocket: FakeWebSocket | null = null;
   readyState = 0;
   onopen: (() => void) | null = null;
   onmessage: ((ev: { data: string }) => void) | null = null;
@@ -51,6 +52,7 @@ class FakeWebSocket {
   constructor(public url: string) {
     FakeWebSocket.urls.push(url);
     FakeWebSocket.lastUrl = url;
+    FakeWebSocket.lastSocket = this;
     setTimeout(() => {
       this.readyState = FakeWebSocket.OPEN;
       FakeWebSocket.opened++;
@@ -83,6 +85,7 @@ beforeEach(() => {
   FakeWebSocket.urls = [];
   FakeWebSocket.opened = 0;
   FakeWebSocket.lastUrl = null;
+  FakeWebSocket.lastSocket = null;
   vi.stubGlobal("WebSocket", FakeWebSocket);
   useAppStore.setState({ appState: null });
 });
@@ -214,6 +217,32 @@ describe("BrowserPane keyboard", () => {
     await renderLive();
     expect(mocks.browserStreamBridgeEndpoints).toHaveBeenCalledWith("browser-1");
     expect(FakeWebSocket.lastUrl).toBe("ws://127.0.0.1:9777/private/browser/9999/ws");
+  });
+
+  it("gets a fresh bridge capability after a daemon restart on the same port", async () => {
+    vi.useFakeTimers();
+    mocks.startBrowserStream.mockResolvedValue("ws://127.0.0.1:9999");
+    mocks.browserStreamBridgeEndpoints
+      .mockResolvedValueOnce({
+        ws_url: "ws://127.0.0.1:9777/old/ws",
+        http_base: "http://127.0.0.1:9777/old",
+      })
+      .mockResolvedValueOnce({
+        ws_url: "ws://127.0.0.1:9777/new/ws",
+        http_base: "http://127.0.0.1:9777/new",
+      });
+    renderPane();
+    await act(async () => {});
+    expect(FakeWebSocket.lastUrl).toBe("ws://127.0.0.1:9777/old/ws");
+
+    act(() => FakeWebSocket.lastSocket?.onclose?.());
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(1500);
+    });
+
+    expect(mocks.startBrowserStream).toHaveBeenCalledTimes(1);
+    expect(mocks.browserStreamBridgeEndpoints).toHaveBeenCalledTimes(2);
+    expect(FakeWebSocket.lastUrl).toBe("ws://127.0.0.1:9777/new/ws");
   });
 
   it("keeps browser shortcuts, press and release, away from the page", async () => {
