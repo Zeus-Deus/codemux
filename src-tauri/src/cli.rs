@@ -175,12 +175,12 @@ pub enum CommandSet {
     },
     /// Set this machine up for remote access in one command: sign in, turn on
     /// from-anywhere (relay) access, and install a background service so
-    /// Codemux stays reachable after you log out. Safe to re-run — it reports
-    /// the steps that were already done instead of undoing them.
+    /// Codemux stays reachable after you log out. Run it while no backend owns
+    /// this machine's configuration.
     ///
-    /// With a Codemux instance already running here it drives that instance
-    /// over the control socket instead of installing a service (two backends
-    /// on one machine would fight over the port and the database).
+    /// If a desktop or manually started server is running, change access in
+    /// desktop Settings or stop that server before running this command.
+    /// `connect off` can stop a managed headless service itself.
     Connect {
         #[command(subcommand)]
         command: Option<ConnectCommand>,

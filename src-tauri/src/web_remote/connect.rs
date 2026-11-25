@@ -613,11 +613,10 @@ pub fn service_state(host: &dyn ServiceHost) -> ServiceState {
 /// Fold a `codemux connect` request into the persisted config: remote access
 /// on, relay mode on, plus any explicit scope/port.
 ///
-/// `connect` is about the relay, so an explicit relay-only setup stays
-/// relay-only — even one whose kill switch was off — unless a `--scope` /
-/// `--port` flag asks for the listener. Anything else, a fresh config
-/// included, gets the listener too (see [`super::keeps_relay_only`], decided
-/// here before relay mode is forced on).
+/// `connect` is about the relay, so a saved LAN-off choice stays off — even
+/// after the relay or kill switch was off — unless a `--scope` / `--port` flag
+/// asks for the listener. A fresh config gets the listener too (see
+/// [`super::keeps_lan_disabled`], decided before relay mode is forced on).
 ///
 /// Rejects an unknown scope before touching anything — the caller persists
 /// only on `Ok`, so a typo can never leave a config the bind logic refuses to
@@ -628,21 +627,28 @@ pub fn apply_connect_request(
     scope: Option<String>,
     port: Option<u16>,
 ) -> Result<(), String> {
-    let keep_relay_only = super::keeps_relay_only(
+    let keep_lan_disabled = super::keeps_lan_disabled(
         cfg.relay_mode_enabled,
         cfg.lan_enabled,
+        cfg.lan_explicitly_disabled,
         scope.is_some() || port.is_some(),
     );
     super::apply_enable_request(cfg, scope, port)?;
-    cfg.lan_enabled = !keep_relay_only;
+    cfg.lan_enabled = !keep_lan_disabled;
+    cfg.lan_explicitly_disabled = keep_lan_disabled;
     cfg.relay_mode_enabled = true;
     Ok(())
 }
 
 /// Turn the from-anywhere transport off while leaving the local server's
-/// configuration (scope, port, and whether it binds at all) untouched. Sign-in
-/// state is likewise untouched — `codemux connect off` is not a sign-out.
+/// configuration (scope, port, and whether it binds at all) untouched. Record
+/// a legacy relay-only LAN-off choice before clearing the relay switch so a
+/// retained unit's next bare `serve` cannot mistake it for a first run.
+/// Sign-in state is likewise untouched — `codemux connect off` is not a sign-out.
 pub fn apply_disconnect_request(cfg: &mut WebRemoteConfig) {
+    if cfg.relay_mode_enabled && !cfg.lan_enabled {
+        cfg.lan_explicitly_disabled = true;
+    }
     cfg.relay_mode_enabled = false;
 }
 
@@ -1032,9 +1038,10 @@ async fn configure_via_control_socket(
     .await
     {
         Ok(resp) if resp.ok => resp.data.is_some_and(|s| {
-            super::keeps_relay_only(
+            super::keeps_lan_disabled(
                 s["relay_mode_enabled"].as_bool().unwrap_or(false),
                 s["lan_enabled"].as_bool().unwrap_or(true),
+                false,
                 scope.is_some() || port.is_some(),
             )
         }),
@@ -1775,7 +1782,9 @@ mod tests {
     fn connect_off_disables_relay_when_an_installed_unit_has_no_user_bus() {
         let db = crate::database::init_test_database();
         let mut config = WebRemoteConfig::default();
+        config.enabled = true;
         config.relay_mode_enabled = true;
+        assert!(!config.lan_enabled && !config.lan_explicitly_disabled);
         super::super::save_config_to_db(&db, &config).unwrap();
         let host = FakeHost::new()
             .with_unit_installed()
@@ -1791,7 +1800,10 @@ mod tests {
         .unwrap_err();
 
         assert!(layout_checked.get(), "exclusive layout ownership was checked");
-        assert!(!super::super::load_config_from_db(&db).relay_mode_enabled);
+        let persisted = super::super::load_config_from_db(&db);
+        assert!(!persisted.relay_mode_enabled);
+        assert!(!persisted.lan_enabled);
+        assert!(persisted.lan_explicitly_disabled, "a retained unit must remember LAN-off across restart");
         assert!(error.contains("From-anywhere access is off"), "{error}");
         assert!(error.contains("remains installed"), "{error}");
         assert!(host.unit_exists());
@@ -1901,6 +1913,12 @@ mod tests {
         apply_connect_request(&mut cfg, None, None).unwrap();
         assert!(cfg.enabled && cfg.relay_mode_enabled);
         assert!(!cfg.lan_enabled, "the kill switch off doesn't make it a first run");
+
+        // A retained service may restart after `connect off` cleared relay.
+        let mut cfg = relay_only.clone();
+        apply_disconnect_request(&mut cfg);
+        apply_connect_request(&mut cfg, None, None).unwrap();
+        assert!(cfg.relay_mode_enabled && !cfg.lan_enabled);
 
         // Neither way in (whatever the kill switch says) is not relay-only:
         // connect adds the listener along with the relay, as on a fresh config.

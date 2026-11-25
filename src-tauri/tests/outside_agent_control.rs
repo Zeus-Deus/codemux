@@ -1237,7 +1237,8 @@ fn token_revoked_mid_wait_ends_the_wait_with_grant_revoked() {
     let t = tag();
     let mut cleanup = Cleanup::default();
     let label = format!("rev-{t}");
-    let mut door = w.http(&w.issue(&label, ControlAccess::FullAccess));
+    let issued = w.issue(&label, ControlAccess::FullAccess);
+    let mut door = w.http(&issued);
     let workspace = w.repo_workspace.clone();
     let (thread, turn) = launch(&mut door, &workspace, "agent", "await-cancel", &format!("launch-{t}"));
     cleanup.threads.push((workspace.clone(), thread.clone()));
@@ -1259,8 +1260,8 @@ fn token_revoked_mid_wait_ends_the_wait_with_grant_revoked() {
         door.call("thread_wait", probe.clone()).err().is_some_and(|error| error.code == "wait_budget_exhausted")
     });
     let revoked_at = Instant::now();
-    let revoked = w.cli(&["connector", "revoke", &label, "--json"], &[]);
-    assert_eq!(exit_code(&revoked), 0, "{}", describe(&revoked));
+    mcp_connector::agent_connector_revoke(w.handle.clone(), issued.client_id)
+        .expect("the trusted app revokes the token");
     for waiter in waiters {
         let (result, returned_at) = waiter.join().unwrap();
         assert_eq!(result.expect_err("the wait ends with the grant").code, "grant_revoked");

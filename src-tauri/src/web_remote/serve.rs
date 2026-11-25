@@ -151,13 +151,16 @@ pub fn run_serve(opts: ServeOptions) -> Result<(), String> {
         // 4. Startup banner + pairing code. Relay-only has no pairing link:
         //    nothing listens on the network for it to point at.
         print_banner(&handle, &result);
-        let relay_only = !result.status.lan_enabled;
-        let pairing_ready = if relay_only {
+        let pairing_ready = if !result.status.lan_enabled && result.status.relay_mode_enabled {
             println!();
             println!(
                 "Open https://app.codemux.org in a browser signed into your Codemux account \
                  and pick this machine."
             );
+            false
+        } else if !result.status.lan_enabled {
+            println!();
+            println!("No remote transport is enabled. Stop this server and use desktop Settings to change access.");
             false
         } else {
             match web_remote::control_pair(&handle, None) {
@@ -283,18 +286,18 @@ pub async fn serve_startup<R: tauri::Runtime>(
 ) -> Result<web_remote::ControlEnableResult, String> {
     // `restore_on_boot` may already have bound the server (GUI mode); under
     // serve it only hydrates, and `control_enable` handles both (`already_running`).
-    let persisted = web_remote::web_remote_status(handle.clone());
-    // Decide relay-only on the switches as persisted, BEFORE `--relay` below
-    // turns relay mode on (which would make a fresh config look relay-only).
-    // An explicit relay-only setup stays relay-only even with the kill switch
-    // off, and then keeps its persisted scope too — the first-run `all`
-    // default below exists to open a listener.
-    let keep_relay_only = web_remote::keeps_relay_only(
+    let persisted = web_remote::config_snapshot(handle);
+    // Decide whether LAN stays off from the persisted switches BEFORE `--relay`
+    // below turns relay mode on (which would make a fresh config look
+    // relay-only). The choice survives the kill switch and a later relay-off.
+    // The first-run `all` default below exists to open a listener.
+    let keep_lan_disabled = web_remote::keeps_lan_disabled(
         persisted.relay_mode_enabled,
         persisted.lan_enabled,
+        persisted.lan_explicitly_disabled,
         opts.scope.is_some() || opts.port.is_some(),
     );
-    let scope = if keep_relay_only {
+    let scope = if keep_lan_disabled {
         None
     } else {
         resolve_scope(opts.scope.clone(), persisted.enabled)
@@ -313,10 +316,10 @@ pub async fn serve_startup<R: tauri::Runtime>(
         }
     }
 
-    // As configured, not "open the listener": a relay-only setup (the user
-    // switched "On my network" off) must not come back listening on the LAN
-    // after a restart. Explicit `--scope` / `--port` still turn it on.
-    web_remote::control_enable_as_configured(handle, scope, opts.port, keep_relay_only)
+    // A saved LAN-off choice must not come back listening on the network after
+    // a restart, even if relay mode was turned off. Explicit `--scope` /
+    // `--port` still turn the listener on.
+    web_remote::control_enable_as_configured(handle, scope, opts.port, keep_lan_disabled)
         .await
         .map_err(|e| format!("could not enable the web-remote server: {e}"))
 }
@@ -342,13 +345,17 @@ fn print_banner<R: tauri::Runtime>(
         println!("Codemux headless server started.");
     }
     if !result.status.lan_enabled {
-        // An explicit relay-only setup, kept as configured: there is no port
-        // or scope to report, and no address to list.
-        println!("  Mode:         relay only — nothing listens on your network");
-        println!(
-            "  Relay:        {}",
-            if result.status.relay_running { "up" } else { "starting" }
-        );
+        // There is no listener address to report. Relay may also be off after
+        // a relay-only setup was disconnected while its unit remained installed.
+        if result.status.relay_mode_enabled {
+            println!("  Mode:         relay only — nothing listens on your network");
+            println!(
+                "  Relay:        {}",
+                if result.status.relay_running { "up" } else { "starting" }
+            );
+        } else {
+            println!("  Mode:         no remote transport enabled");
+        }
         return;
     }
     println!("  Port:         {port}");
