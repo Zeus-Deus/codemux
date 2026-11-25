@@ -1222,64 +1222,20 @@ fn thread_start_wait_completes_with_a_fixture_provider() {
 }
 
 #[test]
-fn connector_status_enable_and_disable_round_trip() {
+fn connector_administration_is_refused_over_the_socket() {
     let serve = Serve::start();
-    let status = serve.ok(&["connector", "status", "--json"]);
-    assert_eq!((status["tool"].clone(), status["result"]["enabled"].clone()), (json!("agent_connector_status"), json!(false)));
-    // Integration builds default to the real 4378; never take it here.
-    let port = free_loopback_port();
-    let enabled = serve.ok(&["connector", "enable", "--port", &port.to_string(), "--json"]);
-    assert_eq!(enabled["result"]["enabled"], true, "{enabled}");
-    assert_eq!(enabled["result"]["port"], port, "{enabled}");
-    assert_eq!(enabled["result"]["localUrl"], format!("http://127.0.0.1:{port}/mcp"), "{enabled}");
-    let listed = serve.ok(&["connector", "list", "--json"]);
-    assert!(listed["result"]["clients"].is_array(), "{listed}");
-    let pending = serve.ok(&["connector", "pending", "--json"]);
-    assert!(pending["result"]["pending"].is_array(), "{pending}");
-    let disabled = serve.ok(&["connector", "disable", "--json"]);
-    assert_eq!(disabled["result"]["enabled"], false, "{disabled}");
-
-    // Revoking a name that matches nothing is refused, not a silent success.
-    let unknown = serve.cli(&["connector", "revoke", "nobody", "--json"]);
-    assert_eq!(exit_code(&unknown), 1);
-    assert_eq!(stdout_json(&unknown)["error"]["code"], "invalid_arguments");
-}
-
-#[test]
-fn connector_tokens_issue_list_and_revoke() {
-    let serve = Serve::start();
-    // Its own port, so the door never touches the default 4378.
-    serve.ok(&["connector", "enable", "--port", &free_loopback_port().to_string(), "--json"]);
-    let issued = serve.ok(&["connector", "issue", "--label", "itest-bot", "--expires", "1d", "--json"]);
-    let token = issued["result"]["token"].as_str().expect("a token");
-    assert!(token.starts_with("cmcp_"), "{issued}");
-    assert_eq!(issued["result"]["access"], "supervised", "tokens default to supervised");
-
-    let text = serve.cli(&["connector", "list"]);
-    assert!(String::from_utf8_lossy(&text.stdout).contains("itest-bot"), "{}", String::from_utf8_lossy(&text.stdout));
-    serve.ok(&["connector", "revoke", "ITEST-BOT", "--json"]);
-    let listed = serve.ok(&["connector", "list", "--json"]);
-    assert!(!listed.to_string().contains("itest-bot"), "{listed}");
-
-    serve.ok(&["connector", "issue", "--label", "second-bot", "--access", "read-only", "--json"]);
-    serve.ok(&["connector", "issue", "--label", "third-bot", "--json"]);
-    assert_eq!(serve.ok(&["connector", "list", "--json"])["result"]["clients"].as_array().map(Vec::len), Some(2));
-    serve.ok(&["connector", "revoke", "--all", "--json"]);
-    let status = serve.ok(&["connector", "status", "--json"]);
-    assert_eq!(status["result"]["clients"], json!([]), "{status}");
-    assert_eq!(status["result"]["enabled"], true, "revoke --all leaves the door on: {status}");
-}
-
-/// Settings and the guide print setup commands from these two fields.
-#[test]
-fn connector_status_names_the_executable_outside_assistants_launch() {
-    let serve = Serve::start();
-    let status = serve.ok(&["connector", "status", "--json"])["result"].clone();
-    let executable = status["localExecutable"].as_str().expect("localExecutable");
-    // PATH reaches no codemux, or another install, never this test build, so
-    // it names the binary itself.
-    assert!(Path::new(executable).is_absolute(), "{status}");
-    assert_eq!(std::fs::canonicalize(executable).unwrap(), std::fs::canonicalize(CODEMUX).unwrap());
-    let command = status["localCommand"].as_str().expect("localCommand");
-    assert!(command.ends_with(" mcp") && command.contains(executable), "{status}");
+    for args in [
+        vec!["connector", "status", "--json"],
+        vec!["connector", "enable", "--json"],
+        vec!["connector", "list", "--json"],
+        vec!["connector", "pending", "--json"],
+        vec!["connector", "issue", "--label", "itest-bot", "--json"],
+        vec!["connector", "revoke", "nobody", "--json"],
+        vec!["connector", "revoke", "--all", "--json"],
+        vec!["connector", "disable", "--json"],
+    ] {
+        let output = serve.cli(&args);
+        assert_eq!(exit_code(&output), 1, "{args:?}");
+        assert_eq!(stdout_json(&output)["error"]["code"], "admin_refused", "{args:?}");
+    }
 }

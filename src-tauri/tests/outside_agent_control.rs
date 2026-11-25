@@ -1514,7 +1514,8 @@ fn refresh_token_rotation_keeps_receipts_and_rejects_replay() {
             .unwrap()
     };
     assert_eq!(complete().status(), 202, "the sign-in waits for the owner");
-    w.cli_ok(&["json", "agent_connector_approve", &json!({"request_id": request_id, "access": "supervised"}).to_string()]);
+    mcp_connector::agent_connector_approve(w.handle.clone(), request_id.clone(), ControlAccess::Supervised)
+        .expect("the trusted app approves the OAuth request");
     let redirect = complete();
     assert_eq!(redirect.status(), 303);
     let location = url::Url::parse(redirect.headers()["location"].to_str().unwrap()).unwrap();
@@ -1600,13 +1601,16 @@ fn agent_processes_are_refused_admin_and_native_tools() {
     let marked = w.cli(&["call", "thread_list", &list], &marker);
     assert_eq!(stdout_json(&marked)["error"]["code"], "agent_identity_required", "{}", describe(&marked));
 
-    // The refusals are about the caller: the owner runs the same administration command.
+    // No socket peer can administer the connector, including a same-user CLI.
     let owner_label = format!("owner-{t}");
-    let issued = w.cli(&["connector", "issue", "--label", &owner_label, "--access", "read-only", "--json"], &[]);
-    assert_eq!(exit_code(&issued), 0, "{}", describe(&issued));
-    assert!(text(&stdout_json(&issued)["result"]["token"]).starts_with("cmcp_"), "{}", describe(&issued));
-    let revoked = w.cli(&["connector", "revoke", &owner_label, "--json"], &[]);
-    assert_eq!(exit_code(&revoked), 0, "{}", describe(&revoked));
+    let refused = w.cli(&["connector", "issue", "--label", &owner_label, "--access", "read-only", "--json"], &[]);
+    assert_eq!(exit_code(&refused), 1, "{}", describe(&refused));
+    assert_eq!(stdout_json(&refused)["error"]["code"], "admin_refused");
+    let issued = mcp_connector::agent_connector_issue(w.handle.clone(), owner_label, ControlAccess::ReadOnly, None)
+        .expect("the trusted app issues a connector token");
+    assert!(issued.token.starts_with("cmcp_"));
+    mcp_connector::agent_connector_revoke(w.handle.clone(), issued.client_id)
+        .expect("the trusted app revokes the token");
 
     #[cfg(target_os = "linux")]
     refused_by_ancestry(w, &mut owner, &workspace, &thread, &t);

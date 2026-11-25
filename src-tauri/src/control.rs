@@ -1217,15 +1217,20 @@ fn socket_admin_request(request: &ControlRequest) -> bool {
     if crate::control_identity::command_access(&request.command, &request.params) == Access::Admin {
         return true;
     }
-    let tool = if request.command == "tool_call" {
-        request.params.get("name").and_then(Value::as_str)
+    let (tool, arguments) = if request.command == "tool_call" {
+        (request.params.get("name").and_then(Value::as_str), request.params.get("arguments"))
     } else if crate::agent_control::registry::is_socket_alias(&request.command) {
-        Some(request.command.as_str())
+        (Some(request.command.as_str()), Some(&request.params))
     } else {
-        None
+        (None, None)
     };
-    tool.and_then(crate::agent_control::registry::lookup)
-        .is_some_and(|(_, spec)| spec.access() == Access::Admin)
+    tool.is_some_and(|name| {
+        crate::agent_control::registry::lookup(name).is_some_and(|(_, spec)| spec.access() == Access::Admin)
+            || (name == "worktree_create"
+                && arguments
+                    .and_then(|args| args.get("agent_preset_id"))
+                    .is_some_and(|preset| !preset.is_null()))
+    })
 }
 
 /// Absent or null params read as `{}`.
@@ -2850,6 +2855,12 @@ mod tests {
                 .is_some_and(|(_, spec)| spec.access() == crate::agent_control::Access::Admin);
             assert_eq!(socket_admin_request(&nested), expected, "{name}");
         }
+        assert!(socket_admin_request(&request("tool_call", serde_json::json!({
+            "name": "worktree_create", "arguments": {"agent_preset_id": "p"}
+        }))));
+        assert!(!socket_admin_request(&request("tool_call", serde_json::json!({
+            "name": "worktree_create", "arguments": {"branch": "feature"}
+        }))));
         for (command, params) in [
             ("status", serde_json::json!({})),
             ("notify", serde_json::json!({"message":"hi"})),
@@ -3108,7 +3119,9 @@ mod tests {
         tokio::io::WriteHalf<tokio::io::DuplexStream>,
     ) {
         let (client, server) = tokio::io::duplex(1 << 16);
-        let served = tokio::spawn(handle_client(app.handle().clone(), server, None));
+        // A duplex stream has no kernel peer credentials. Supply this test
+        // process as the verified peer so wait behavior reaches the handler.
+        let served = tokio::spawn(handle_client(app.handle().clone(), server, Some(std::process::id())));
         let (reader, writer) = tokio::io::split(client);
         (served, BufReader::new(reader).lines(), writer)
     }
@@ -3135,6 +3148,19 @@ mod tests {
             writer.write_all(format!("{line}\n").as_bytes()).await.unwrap();
             assert!(refused_with(&reply(&mut replies).await, "admin_refused"), "{command}");
         }
+        let preset = serde_json::json!({
+            "command":"tool_call",
+            "params":{"name":"worktree_create","arguments":{"agent_preset_id":"p"}}
+        });
+        writer.write_all(format!("{preset}\n").as_bytes()).await.unwrap();
+        assert!(refused_with(&reply(&mut replies).await, "admin_refused"));
+        let ordinary = serde_json::json!({
+            "command":"tool_call",
+            "params":{"name":"worktree_create","arguments":{"repo_path":"relative","branch":"feature"}}
+        });
+        writer.write_all(format!("{ordinary}\n").as_bytes()).await.unwrap();
+        let ordinary = reply(&mut replies).await;
+        assert!(ordinary.ok, "ordinary worktree creation reaches its own validation: {:?}", ordinary.error);
         writer.write_all(b"{\"command\":\"status\",\"params\":{}}\n").await.unwrap();
         assert!(reply(&mut replies).await.ok, "the socket still serves ordinary reads");
         drop((writer, replies));
