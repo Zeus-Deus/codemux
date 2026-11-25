@@ -4,6 +4,7 @@ import { KeyRound, ShieldCheck } from "lucide-react";
 import { isRemoteClient } from "@/components/remote/is-remote-client";
 import { useEaseInOnce } from "@/hooks/use-ease-in-once";
 import { cn } from "@/lib/utils";
+import { useRemoteConnectionStore } from "@/remote/remote-connection-store";
 import { agentSecretRequestAnswer } from "@/tauri/commands";
 import type { SecretRequest } from "@/tauri/types";
 import { Button } from "../ui/button";
@@ -16,32 +17,8 @@ import { COMPOSER_OVERLAY_CARD } from "./composer-overlay";
 export const SECRET_PRIVACY_NOTE =
   "Kept out of chat, in a private file this agent's commands can read for 24 hours";
 
-/** Shown instead of the field where typing the secret would send it across
- *  the network unencrypted. */
-export const UNENCRYPTED_NOTE =
-  "This connection isn't encrypted, so the secret can't be entered here. Use the Codemux desktop app, or connect over HTTPS or the relay.";
-
-/**
- * Whether a remote page reaches Codemux over plain HTTP across the network.
- * A LAN client talks to its own origin, so the page's address decides. Only
- * HTTPS (the relay, or a TLS proxy) or this machine prove the value stays
- * private: an address range, a VPN's included, says nothing about whether
- * the link is encrypted. The desktop app never sends it over a network.
- */
-export function unencryptedConnection(
-  remote: boolean,
-  location: Pick<Location, "protocol" | "hostname">,
-): boolean {
-  if (!remote || location.protocol === "https:") return false;
-  const host = location.hostname
-    .toLowerCase()
-    .replace(/^\[|\]$/g, "")
-    .replace(/\.$/, "");
-  const v4 = /^(\d+)\.(\d+)\.\d+\.\d+$/.exec(host);
-  const loopback =
-    host === "localhost" || host === "::1" || (v4 !== null && v4[1] === "127");
-  return !loopback;
-}
+const SECRET_SUBMISSION_UNAVAILABLE =
+  "Secret entry is unavailable on this connection. Use the Codemux desktop app, or connect over HTTPS or the relay.";
 
 // Masking a text field keeps password managers from offering to save a
 // secret that is not a login. Without the property, fall back to a password
@@ -81,13 +58,17 @@ function SecretRequestCard({
   const [error, setError] = useState<string | null>(null);
   // Enter and a click can both submit before a render.
   const inFlight = useRef(false);
-  const unencrypted = unencryptedConnection(isRemoteClient(), window.location);
+  const remoteCanSubmit = useRemoteConnectionStore((state) => state.canSubmitSecrets);
+  const canSubmit = !isRemoteClient() || remoteCanSubmit;
 
   const send = async (
     answer: { type: "save"; secret: string } | { type: "decline" },
   ) => {
     if (inFlight.current) return;
-    if (answer.type === "save" && (unencrypted || !answer.secret.trim())) return;
+    if (answer.type === "save") {
+      if (isRemoteClient() && !useRemoteConnectionStore.getState().canSubmitSecrets) return;
+      if (!answer.secret.trim()) return;
+    }
     inFlight.current = true;
     setSubmitting(true);
     setError(null);
@@ -162,12 +143,12 @@ function SecretRequestCard({
               data-bwignore
               placeholder={request.placeholder ?? "Paste the secret"}
               value={secret}
-              disabled={submitting || unencrypted}
+              disabled={submitting || !canSubmit}
               aria-invalid={error !== null || undefined}
               aria-describedby={error !== null ? `${privacyId} ${errorId}` : privacyId}
               onChange={(event) => setSecret(event.currentTarget.value)}
             />
-            <Button type="submit" disabled={submitting || unencrypted || !secret.trim()}>
+            <Button type="submit" disabled={submitting || !canSubmit || !secret.trim()}>
               Save securely
             </Button>
           </div>
@@ -182,7 +163,7 @@ function SecretRequestCard({
               className="flex min-w-0 items-center gap-1.5 text-caption text-muted-foreground"
             >
               <ShieldCheck className="size-3.5 shrink-0" aria-hidden />
-              {unencrypted ? UNENCRYPTED_NOTE : SECRET_PRIVACY_NOTE}
+              {canSubmit ? SECRET_PRIVACY_NOTE : SECRET_SUBMISSION_UNAVAILABLE}
             </p>
             <Button
               type="button"

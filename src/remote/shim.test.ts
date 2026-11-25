@@ -1,6 +1,7 @@
 import { describe, it, expect, afterEach } from "vitest";
 import { Channel } from "@tauri-apps/api/core";
 import { releaseRemoteChannel } from "./channel";
+import { useRemoteConnectionStore } from "./remote-connection-store";
 import { installShim, type ShimHandle } from "./shim";
 import { FakeWebSocket, createFakeFetch, buildBinaryFrame, flushMicrotasks } from "./testing";
 
@@ -27,10 +28,10 @@ function eventInternals(): EventInternals {
 
 const handles: ShimHandle[] = [];
 
-async function setup(): Promise<{ ws: FakeWebSocket }> {
+async function setup(baseUrl = "http://desk.local:4377"): Promise<{ ws: FakeWebSocket }> {
   const fetch = createFakeFetch();
   const handle = installShim({
-    baseUrl: "http://desk.local:4377",
+    baseUrl,
     getToken: () => "session-token",
     appVersion: "9.9.9",
     deps: {
@@ -69,6 +70,22 @@ describe("shim install", () => {
     expect(internals().convertFileSrc("/home/u/x.png")).toBe(
       "http://desk.local:4377/api/assets?path=%2Fhome%2Fu%2Fx.png",
     );
+  });
+
+  it("publishes secret submission only from the installed transport", async () => {
+    const { ws: oldSocket } = await setup("http://localhost:4377");
+    const { ws } = await setup("http://localhost:4378");
+
+    oldSocket.recvText({ t: "ok", id: oldSocket.lastSent().id, data: true });
+    await flushMicrotasks();
+    expect(useRemoteConnectionStore.getState().canSubmitSecrets).toBe(false);
+
+    ws.recvText({ t: "ok", id: ws.lastSent().id, data: true });
+    await flushMicrotasks();
+    expect(useRemoteConnectionStore.getState().canSubmitSecrets).toBe(true);
+
+    ws.drop();
+    expect(useRemoteConnectionStore.getState().canSubmitSecrets).toBe(false);
   });
 });
 

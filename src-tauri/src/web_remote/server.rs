@@ -60,6 +60,8 @@ const PING_INTERVAL_SECS: u64 = 30;
 /// in `src/remote/transport.ts`). Answered in [`handle_text_frame`], never
 /// dispatched.
 const LIVENESS_PROBE_CMD: &str = "__codemux_ping";
+/// Per-socket confirmation needed before the browser can send a secret.
+const SECRET_SUBMISSION_PROBE_CMD: &str = "__codemux_can_submit_secrets";
 
 /// Most outbound bytes one connection may have queued but not yet written.
 ///
@@ -223,8 +225,7 @@ struct ConnInfo {
 pub struct ConnectionRegistry {
     conns: Mutex<HashMap<u64, ConnInfo>>,
     next: AtomicU64,
-    /// LAN sockets from peers other than this machine, whose traffic may
-    /// cross the network unencrypted ([`super::endpoints::is_local_peer`]).
+    /// WebSockets whose transport did not qualify for secret submission.
     plaintext: Mutex<std::collections::HashSet<u64>>,
 }
 
@@ -293,9 +294,13 @@ impl ConnectionRegistry {
         self.plaintext.lock().unwrap().insert(id);
     }
 
-    /// Whether the socket's traffic crosses the network unencrypted.
-    pub(super) fn is_plaintext(&self, id: u64) -> bool {
-        self.plaintext.lock().unwrap().contains(&id)
+    /// Whether this live, approved socket can carry secrets.
+    pub(super) fn allows_secret_submission(&self, id: u64) -> bool {
+        let conns = self.conns.lock().unwrap();
+        conns
+            .get(&id)
+            .is_some_and(|conn| conn.out.is_some() && !*conn.close.borrow())
+            && !self.plaintext.lock().unwrap().contains(&id)
     }
 
     pub(super) fn session_for_connection(&self, id: u64) -> Option<String> {
@@ -1119,6 +1124,13 @@ pub(super) fn handle_text_frame<R: Runtime>(
                 let _ = out.send(Message::Text(json!({ "t": "ok", "id": id, "data": null }).to_string()));
                 return;
             }
+            if cmd == SECRET_SUBMISSION_PROBE_CMD {
+                let allowed = shared.connections.allows_secret_submission(conn_id);
+                let _ = out.send(Message::Text(
+                    json!({ "t": "ok", "id": id, "data": allowed }).to_string(),
+                ));
+                return;
+            }
             // Ordered commands (terminal input) go through the per-connection
             // serial lane so their client-send order is preserved; the send
             // is synchronous here, inside the in-order reader loop, so frames
@@ -1314,6 +1326,29 @@ mod tests {
         headers.insert("x-forwarded-proto", "https".parse().unwrap());
         headers.insert(header::ORIGIN, "http://remote.example".parse().unwrap());
         assert_eq!(classify(&headers), Insecure);
+    }
+
+    #[test]
+    fn secret_submission_probe_follows_the_live_socket_policy() {
+        let app = tauri::test::mock_app();
+        let shared = Arc::new(Shared::default());
+        let (out, mut replies) = test_outbound();
+        let (ordered, _ordered_rx) = mpsc::unbounded_channel();
+        let (close, _close_rx) = watch::channel(false);
+        let conn = shared.connections.register("fixture", Transport::Lan, out.clone(), close);
+        let probe = json!({ "t": "invoke", "cmd": SECRET_SUBMISSION_PROBE_CMD, "id": 1 }).to_string();
+        let mut secret_allowed = || {
+            handle_text_frame(app.handle(), &shared, conn, &out, &ordered, &probe);
+            let Message::Text(reply) = replies.try_recv().unwrap() else {
+                panic!("expected a capability response");
+            };
+            serde_json::from_str::<Value>(&reply).unwrap()["data"] == true
+        };
+        assert!(secret_allowed());
+        shared.connections.mark_plaintext(conn);
+        assert!(!secret_allowed());
+        shared.connections.unregister(conn);
+        assert!(!secret_allowed());
     }
 
     #[test]
