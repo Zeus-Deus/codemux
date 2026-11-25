@@ -1,19 +1,37 @@
 /// <reference types="@testing-library/jest-dom/vitest" />
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { cleanup, fireEvent, render } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
 
 const mockOpenExternalUrl = vi.hoisted(() => vi.fn().mockResolvedValue("browser"));
+const mockOpenUrl = vi.hoisted(() => vi.fn().mockResolvedValue(undefined));
+const mockTauri = vi.hoisted(() => ({ enabled: false, assetPrefix: "mock-asset:" }));
 
 vi.mock("@tauri-apps/api/core", () => ({
-  convertFileSrc: (path: string) => `mock-asset:${path}`,
+  convertFileSrc: (path: string) => `${mockTauri.assetPrefix}${path}`,
+  isTauri: () => mockTauri.enabled,
 }));
 vi.mock("@/lib/open-url", () => ({ openExternalUrl: mockOpenExternalUrl }));
+vi.mock("@tauri-apps/plugin-opener", () => ({ openUrl: mockOpenUrl }));
 
 import { MarkdownRendered } from "./MarkdownRendered";
+
+function loadLocalImage(container: HTMLElement): HTMLImageElement {
+  expect(container.querySelector('[data-testid="markdown-image"]')).toBeNull();
+  const button = container.querySelector<HTMLButtonElement>('[data-testid="markdown-image-load"]');
+  expect(button).not.toBeNull();
+  fireEvent.click(button!);
+  const image = container.querySelector<HTMLImageElement>('[data-testid="markdown-image"]');
+  expect(image).not.toBeNull();
+  return image!;
+}
 
 afterEach(() => {
   cleanup();
   mockOpenExternalUrl.mockClear();
+  mockOpenUrl.mockClear();
+  mockTauri.enabled = false;
+  mockTauri.assetPrefix = "mock-asset:";
 });
 
 describe("MarkdownRendered", () => {
@@ -24,12 +42,29 @@ describe("MarkdownRendered", () => {
         filePath="/repo/docs/guide.md"
       />,
     );
-    const img = container.querySelector("img");
-    expect(img).not.toBeNull();
-    expect(img!.getAttribute("src")).toBe(
+    expect(container).toHaveTextContent("/repo/docs/assets/img.png");
+    const img = loadLocalImage(container);
+    expect(img.getAttribute("src")).toBe(
       "mock-asset:/repo/docs/assets/img.png",
     );
-    expect(img!.getAttribute("alt")).toBe("alt");
+    expect(img.getAttribute("alt")).toBe("alt");
+  });
+
+  it.each([
+    ["/README.md", "mock-asset:/logo.png"],
+    ["C:\\README.md", "mock-asset:C:\\logo.png"],
+  ])("converts a root-level document image from %s", (filePath, expected) => {
+    const { container } = render(
+      <MarkdownRendered content="![Logo](./logo.png)" filePath={filePath} />,
+    );
+    expect(loadLocalImage(container).getAttribute("src")).toBe(expected);
+  });
+
+  it("keeps a relative image inert when the document path is relative", () => {
+    const { container } = render(
+      <MarkdownRendered content="![Logo](./logo.png)" filePath="README.md" />,
+    );
+    expect(container.querySelector("img, [data-testid='markdown-image-load']")).toBeNull();
   });
 
   it("rewrites absolute image paths via convertFileSrc", () => {
@@ -39,8 +74,8 @@ describe("MarkdownRendered", () => {
         filePath="/repo/docs/guide.md"
       />,
     );
-    const img = container.querySelector("img");
-    expect(img!.getAttribute("src")).toBe("mock-asset:/abs/x.png");
+    const img = loadLocalImage(container);
+    expect(img.getAttribute("src")).toBe("mock-asset:/abs/x.png");
   });
 
   it.each([
@@ -56,7 +91,7 @@ describe("MarkdownRendered", () => {
     const { container } = render(
       <MarkdownRendered content={content} filePath="/repo/docs/guide.md" />,
     );
-    expect(container.querySelector("img")?.getAttribute("src")).toBe(
+    expect(loadLocalImage(container).getAttribute("src")).toBe(
       `mock-asset:${path}`,
     );
   });
@@ -65,29 +100,136 @@ describe("MarkdownRendered", () => {
     const { container } = render(
       <MarkdownRendered content="![](my%20diagram.png)" filePath="/repo/literal%20/guide.md" />,
     );
-    expect(container.querySelector("img")?.getAttribute("src")).toBe(
+    expect(loadLocalImage(container).getAttribute("src")).toBe(
       "mock-asset:/repo/literal%20/my diagram.png",
     );
   });
 
-  it.each([
-    ["![](https://example.com/my%20diagram.png)", "/repo/guide.md", "https://example.com/my%20diagram.png"],
-    ["![](./my%20diagram.png)", null, "./my%20diagram.png"],
-    ["![](/my%20diagram.png)", null, "mock-asset:/my diagram.png"],
-  ])("resolves %s with base %s", (content, filePath, expected) => {
-    const { container } = render(<MarkdownRendered content={content} filePath={filePath} />);
-    expect(container.querySelector("img")?.getAttribute("src")).toBe(expected);
+  it("keeps a relative image inert without a document path", () => {
+    const { container } = render(<MarkdownRendered content="![](./my%20diagram.png)" />);
+    expect(container.querySelector("img, button")).toBeNull();
   });
 
-  it("leaves remote URLs alone", () => {
-    const { container } = render(
+  it("loads an absolute image without a document path only after a click", () => {
+    const content = "![](/my%20diagram.png)";
+    const filePath = null;
+    const { container } = render(<MarkdownRendered content={content} filePath={filePath} />);
+    expect(loadLocalImage(container).getAttribute("src")).toBe("mock-asset:/my diagram.png");
+  });
+
+  it("requires a fresh load click when a document changes the image path", () => {
+    const { container, rerender } = render(
+      <MarkdownRendered content="![Photo](./first.png)" filePath="/repo/README.md" />,
+    );
+    expect(loadLocalImage(container).getAttribute("src")).toBe("mock-asset:/repo/first.png");
+    rerender(<MarkdownRendered content="![Photo](./second.png)" filePath="/repo/README.md" />);
+    expect(container.querySelector("img")).toBeNull();
+    expect(loadLocalImage(container).getAttribute("src")).toBe("mock-asset:/repo/second.png");
+  });
+
+  it.each([
+    ["![Diagram](https://example.com/x.png)", "https://example.com/x.png"],
+    ['<img src="https://example.com/x.png" alt="Diagram">', "https://example.com/x.png"],
+    ["![Diagram](http://127.0.0.1:4141/status)", "http://127.0.0.1:4141/status"],
+    ["![Diagram](https%3A%2F%2Fevil.example%2Fpixel)", "https://evil.example/pixel"],
+    ['<img src="https%3A%2F%2Fevil.example%2Fpixel" alt="Diagram">', "https://evil.example/pixel"],
+    ["![Diagram](%2F%2Fevil.example%2Fpixel)", "https://evil.example/pixel"],
+  ])("requires confirmation before opening a remote image from %s", (content, src) => {
+    const { container, getByRole } = render(
       <MarkdownRendered
-        content={`![](https://example.com/x.png)`}
+        content={content}
         filePath="/repo/docs/guide.md"
       />,
     );
-    const img = container.querySelector("img");
-    expect(img!.getAttribute("src")).toBe("https://example.com/x.png");
+    expect(container.querySelector("img, picture, source")).toBeNull();
+    expect(mockOpenUrl).not.toHaveBeenCalled();
+    fireEvent.click(getByRole("button", { name: /diagram/i }));
+    expect(screen.getByText(src)).toBeInTheDocument();
+    expect(mockOpenUrl).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByRole("button", { name: "Open image" }));
+    expect(mockOpenUrl).toHaveBeenCalledExactlyOnceWith(src);
+  });
+
+  it("removes raw picture sources that would fetch remotely", () => {
+    const { container, getByRole } = render(
+      <MarkdownRendered
+        content={'<picture><source srcset="https://example.com/secret.png 2x"><img src="https://example.com/fallback.png" alt="Fallback"></picture>'}
+        filePath="/repo/README.md"
+      />,
+    );
+    expect(container.querySelector("img, picture, source, [srcset]")).toBeNull();
+    expect(getByRole("button", { name: /fallback/i })).toBeInTheDocument();
+    expect(mockOpenUrl).not.toHaveBeenCalled();
+  });
+
+  it("does not follow a wrapping link when an image asks for confirmation", () => {
+    const { container, getByRole } = render(
+      <MarkdownRendered
+        content="[![Diagram](https://example.com/x.png)](https://example.com/page)"
+        filePath="/repo/README.md"
+      />,
+    );
+    expect(container.querySelector("img")).toBeNull();
+    fireEvent.click(getByRole("button", { name: /diagram/i }));
+    expect(mockOpenExternalUrl).not.toHaveBeenCalled();
+    expect(mockOpenUrl).not.toHaveBeenCalled();
+    expect(screen.getByText("https://example.com/x.png")).toBeInTheDocument();
+    fireEvent(screen.getByRole("button", { name: "Cancel" }), new MouseEvent("auxclick", {
+      bubbles: true,
+      cancelable: true,
+      button: 1,
+    }));
+    expect(mockOpenExternalUrl).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
+    expect(mockOpenExternalUrl).not.toHaveBeenCalled();
+    expect(mockOpenUrl).not.toHaveBeenCalled();
+    fireEvent.click(getByRole("button", { name: /diagram/i }));
+    fireEvent.click(screen.getByRole("button", { name: "Open image" }));
+    expect(mockOpenUrl).toHaveBeenCalledExactlyOnceWith("https://example.com/x.png");
+    expect(mockOpenExternalUrl).not.toHaveBeenCalled();
+  });
+
+  it("does not follow a wrapping link from the image trigger or dialog backdrop", () => {
+    const { getByRole } = render(
+      <MarkdownRendered
+        content="[![Diagram](https://example.com/x.png)](https://example.com/page)"
+        filePath="/repo/README.md"
+      />,
+    );
+    const trigger = getByRole("button", { name: /diagram/i });
+    fireEvent(trigger, new MouseEvent("auxclick", {
+      bubbles: true,
+      cancelable: true,
+      button: 1,
+    }));
+    expect(mockOpenExternalUrl).not.toHaveBeenCalled();
+    fireEvent.click(trigger);
+    const overlay = document.querySelector('[data-slot="alert-dialog-overlay"]');
+    expect(overlay).not.toBeNull();
+    fireEvent(overlay!, new MouseEvent("auxclick", {
+      bubbles: true,
+      cancelable: true,
+      button: 1,
+    }));
+    fireEvent.click(overlay!);
+    expect(mockOpenExternalUrl).not.toHaveBeenCalled();
+    expect(mockOpenUrl).not.toHaveBeenCalled();
+  });
+
+  it("returns keyboard focus to the remote image after Escape and Cancel", async () => {
+    const user = userEvent.setup();
+    render(<MarkdownRendered content="![Diagram](https://example.com/x.png)" />);
+    const trigger = screen.getByRole("button", { name: /open remote image: diagram/i });
+    trigger.focus();
+    await user.keyboard("{Enter}");
+    expect(screen.getByRole("alertdialog")).toBeInTheDocument();
+    await user.keyboard("{Escape}");
+    await waitFor(() => expect(trigger).toHaveFocus());
+
+    await user.keyboard("{Enter}");
+    await user.click(screen.getByRole("button", { name: "Cancel" }));
+    await waitFor(() => expect(trigger).toHaveFocus());
+    expect(mockOpenUrl).not.toHaveBeenCalled();
   });
 
   it("leaves data URIs alone", () => {
@@ -101,14 +243,125 @@ describe("MarkdownRendered", () => {
     expect(img!.getAttribute("src")).toBe("data:image/png;base64,AAA");
   });
 
-  it("renders relative paths verbatim when no filePath is supplied", () => {
-    // No base path → can't resolve. We pass through so the browser
-    // gets a chance and the document still renders something.
+  it("preserves a Blob preview source", () => {
+    const src = "blob:https://example.com/0b4b6d96-4752-4e9b-b258-7bc7f989693b";
+    const { container } = render(<MarkdownRendered content={`![Local](${src})`} />);
+    expect(container.querySelector("img")?.getAttribute("src")).toBe(src);
+    expect(mockOpenUrl).not.toHaveBeenCalled();
+  });
+
+  it.each(["asset://localhost", "tauri://localhost"])(
+    "defers a registered native asset source: %s",
+    (assetPrefix) => {
+      mockTauri.enabled = true;
+      mockTauri.assetPrefix = assetPrefix;
+      const src = `${assetPrefix}/tmp/screenshot.png`;
+      const { container } = render(<MarkdownRendered content={`![Local](${src})`} />);
+      expect(loadLocalImage(container).getAttribute("src")).toBe(src);
+      expect(mockOpenUrl).not.toHaveBeenCalled();
+    },
+  );
+
+  it("defers the exact Windows asset host in Tauri", () => {
+    mockTauri.enabled = true;
+    mockTauri.assetPrefix = "http://asset.localhost";
+    const src = "http://asset.localhost/tmp/screenshot.png";
+    const { container } = render(<MarkdownRendered content={`![Local](${src})`} />);
+    expect(loadLocalImage(container).getAttribute("src")).toBe(src);
+    expect(mockOpenUrl).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ["asset://localhost", "asset://localhost/%2Ftmp%2Fscreenshot.png"],
+    ["http://asset.localhost", "http://asset.localhost/C%3A%5CUsers%5Cme%5Cscreenshot.png"],
+  ])("defers a real convertFileSrc URL from %s", (assetPrefix, src) => {
+    mockTauri.enabled = true;
+    mockTauri.assetPrefix = assetPrefix;
+    const { container } = render(<MarkdownRendered content={`![Local](${src})`} />);
+    expect(loadLocalImage(container).getAttribute("src")).toBe(src);
+    expect(mockOpenUrl).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    "http://asset.localhost/%5C%5Cattacker.example%5Cshare%5Cpixel.png",
+    "http://asset.localhost/%255C%255Cattacker.example%255Cshare%255Cpixel.png",
+    "asset://localhost/%5C%5Cattacker.example%5Cshare%5Cpixel.png",
+    "asset://localhost/%2F%2Fattacker.example%2Fshare%2Fpixel.png",
+  ])("keeps a network-backed native asset inert: %s", (src) => {
+    mockTauri.enabled = true;
+    mockTauri.assetPrefix = src.startsWith("http") ? "http://asset.localhost" : "asset://localhost";
+    const { container } = render(<MarkdownRendered content={`![Network](${src})`} />);
+    expect(container.querySelector("img, [data-testid='markdown-image-load']")).toBeNull();
+    expect(container).toHaveTextContent("Network");
+    expect(mockOpenUrl).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    String.raw`\\attacker.example\share\pixel.png`,
+    String.raw`\\?\UNC\attacker.example\share\pixel.png`,
+    "//attacker.example/share/pixel.png",
+  ])("keeps a direct network path inert: %s", (src) => {
+    const { container } = render(<MarkdownRendered content={`<img src="${src}" alt="Network">`} />);
+    expect(container.querySelector("img, [data-testid='markdown-image-load']")).toBeNull();
+    expect(container).toHaveTextContent("Network");
+  });
+
+  it("defers a mapped drive path and a relative path before any native lookup", () => {
+    const { container } = render(
+      <MarkdownRendered
+        content={'<img src="Z:\\share\\pixel.png" alt="Mapped">\n\n![Relative](./local.png)'}
+        filePath="C:\\repo\\README.md"
+      />,
+    );
+    expect(container.querySelector("img")).toBeNull();
+    const buttons = container.querySelectorAll<HTMLButtonElement>('[data-testid="markdown-image-load"]');
+    expect(buttons).toHaveLength(2);
+    expect(buttons[0]).toHaveTextContent(String.raw`Z:\share\pixel.png`);
+    expect(buttons[1]).toHaveTextContent("local.png");
+  });
+
+  it.each(["asset://localhost", "tauri://localhost"])(
+    "keeps the Windows asset URL inert when the native endpoint is %s",
+    (assetPrefix) => {
+      mockTauri.enabled = true;
+      mockTauri.assetPrefix = assetPrefix;
+      const src = "http://asset.localhost/tmp/screenshot.png";
+      const { container } = render(<MarkdownRendered content={`![Local](${src})`} />);
+      expect(container.querySelector("img")).toBeNull();
+      expect(screen.getByRole("button", { name: /local/i })).toBeInTheDocument();
+    },
+  );
+
+  it("keeps the Windows asset host inert in a hosted browser", () => {
+    const src = "http://asset.localhost/tmp/screenshot.png";
+    const { container, getByRole } = render(<MarkdownRendered content={`![Local](${src})`} />);
+    expect(container.querySelector("img")).toBeNull();
+    fireEvent.click(getByRole("button", { name: /local/i }));
+    expect(screen.getByText(src)).toBeInTheDocument();
+    expect(mockOpenUrl).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    "http://asset.localhost:80/tmp/screenshot.png",
+    "http://asset.localhost:4141/tmp/screenshot.png",
+    "http://sub.asset.localhost/tmp/screenshot.png",
+    "http://asset.localhost.evil/tmp/screenshot.png",
+    "http://asset.localhost./tmp/screenshot.png",
+    "https://asset.localhost/tmp/screenshot.png",
+  ])("keeps asset host lookalikes inert in Tauri: %s", (src) => {
+    mockTauri.enabled = true;
+    mockTauri.assetPrefix = "http://asset.localhost";
+    const { container } = render(<MarkdownRendered content={`![Remote](${src})`} />);
+    expect(container.querySelector("img")).toBeNull();
+    expect(screen.getByRole("button", { name: /remote/i })).toBeInTheDocument();
+    expect(mockOpenUrl).not.toHaveBeenCalled();
+  });
+
+  it("keeps relative paths inert when no filePath is supplied", () => {
     const { container } = render(
       <MarkdownRendered content={`![](./x.png)`} filePath={null} />,
     );
-    const img = container.querySelector("img");
-    expect(img!.getAttribute("src")).toBe("./x.png");
+    expect(container.querySelector("img, [data-testid='markdown-image-load']")).toBeNull();
   });
 
   it("still renders headings, code, and other markdown around images", () => {
@@ -120,8 +373,7 @@ describe("MarkdownRendered", () => {
     );
     expect(getByText("Title")).toBeInTheDocument();
     expect(getByText("Text")).toBeInTheDocument();
-    const img = container.querySelector("img");
-    expect(img!.getAttribute("src")).toBe("mock-asset:/r/x.png");
+    expect(loadLocalImage(container).getAttribute("src")).toBe("mock-asset:/r/x.png");
   });
 
   it("skips re-render when parent re-renders with reference-equal props", () => {
@@ -165,8 +417,8 @@ describe("MarkdownRendered", () => {
     const { rerender, container } = render(
       <Harness content={content} filePath={filePath} tick={0} />,
     );
-    const initialImg = container.querySelector("img");
-    expect(initialImg).not.toBeNull();
+    const initialButton = container.querySelector('[data-testid="markdown-image-load"]');
+    expect(initialButton).not.toBeNull();
     imgCalls.mockClear();
 
     // Re-render the parent with reference-equal props. The memo should
@@ -176,11 +428,11 @@ describe("MarkdownRendered", () => {
     // will reuse the existing fiber when the memo skips, so the node
     // identity is preserved.
     rerender(<Harness content={content} filePath={filePath} tick={1} />);
-    const afterImg = container.querySelector("img");
-    expect(afterImg).toBe(initialImg);
+    const afterButton = container.querySelector('[data-testid="markdown-image-load"]');
+    expect(afterButton).toBe(initialButton);
 
     rerender(<Harness content={content} filePath={filePath} tick={2} />);
-    expect(container.querySelector("img")).toBe(initialImg);
+    expect(container.querySelector('[data-testid="markdown-image-load"]')).toBe(initialButton);
   });
 
   it("renders raw HTML blocks instead of escaping them as text", () => {
@@ -206,11 +458,10 @@ describe("MarkdownRendered", () => {
         filePath="/repo/README.md"
       />,
     );
-    const img = container.querySelector("img");
-    expect(img).not.toBeNull();
-    expect(img!.getAttribute("src")).toBe("mock-asset:/repo/assets/logo.svg");
-    expect(img!.getAttribute("alt")).toBe("Logo");
-    expect(img!.getAttribute("width")).toBe("80");
+    const img = loadLocalImage(container);
+    expect(img.getAttribute("src")).toBe("mock-asset:/repo/assets/logo.svg");
+    expect(img.getAttribute("alt")).toBe("Logo");
+    expect(img.getAttribute("width")).toBe("80");
   });
 
   it("renders a README-style centered header with mixed HTML and markdown", () => {
@@ -230,6 +481,10 @@ describe("MarkdownRendered", () => {
         filePath="/repo/README.md"
       />,
     );
+    expect(container.querySelector("img")).toBeNull();
+    const buttons = container.querySelectorAll<HTMLButtonElement>('[data-testid="markdown-image-load"]');
+    expect(buttons).toHaveLength(2);
+    buttons.forEach((button) => fireEvent.click(button));
     const imgs = container.querySelectorAll("img");
     expect(imgs).toHaveLength(2);
     expect(imgs[0].getAttribute("src")).toBe(
@@ -268,7 +523,8 @@ describe("MarkdownRendered", () => {
       />,
     );
     expect(container.querySelector("iframe, script, style")).toBeNull();
-    expect(container.querySelector("img")?.hasAttribute("onerror")).toBe(false);
+    expect(container.querySelector("img")).toBeNull();
+    expect(loadLocalImage(container).hasAttribute("onerror")).toBe(false);
     expect(container.textContent).toContain("still here");
   });
 
@@ -279,9 +535,14 @@ describe("MarkdownRendered", () => {
         filePath={"C:\\repo\\README.md"}
       />,
     );
-    const imgs = container.querySelectorAll("img");
-    expect(imgs[0].getAttribute("src")).toBe("mock-asset:C:\\repo\\logo.png");
-    expect(imgs[1].getAttribute("src")).toBe("data:image/png;base64,AAAA");
+    expect(container.querySelectorAll("img")).toHaveLength(1);
+    const loadButton = container.querySelector<HTMLButtonElement>('[data-testid="markdown-image-load"]');
+    expect(loadButton).not.toBeNull();
+    fireEvent.click(loadButton!);
+    const localImage = container.querySelector<HTMLImageElement>('img[src^="mock-asset:"]');
+    expect(localImage).not.toBeNull();
+    expect(localImage!.getAttribute("src")).toBe("mock-asset:C:\\repo\\logo.png");
+    expect(container.querySelectorAll("img")[1].getAttribute("src")).toBe("data:image/png;base64,AAAA");
   });
 
   it("renders forge image descriptions without fetching image URLs", () => {

@@ -60,10 +60,16 @@ describe("isAbsoluteFsPath", () => {
 describe("dirname", () => {
   it("returns the parent directory for POSIX paths", () => {
     expect(dirname("/a/b/c.md")).toBe("/a/b");
+    expect(dirname("/README.md")).toBe("/");
+    expect(dirname("/docs/report\\draft.md")).toBe("/docs");
+    expect(resolveAssetSrc("./image.png", "/docs/report\\draft.md")).toBe(
+      "mock-asset:/docs/image.png",
+    );
   });
 
   it("returns the parent directory for Windows paths", () => {
     expect(dirname("C:\\a\\b\\c.md")).toBe("C:\\a\\b");
+    expect(dirname("C:\\README.md")).toBe("C:\\");
   });
 
   it("returns empty string when there is no separator", () => {
@@ -88,9 +94,21 @@ describe("joinPath", () => {
     expect(joinPath("C:\\a\\b", "c.png")).toBe("C:\\a\\b\\c.png");
   });
 
+  it("treats a trailing backslash in a POSIX directory as part of its name", () => {
+    expect(joinPath("/tmp/folder\\", "image.png")).toBe("/tmp/folder\\/image.png");
+    expect(resolveAssetSrc("./image.png", "/tmp/folder\\/notes.md")).toBe(
+      "mock-asset:/tmp/folder\\/image.png",
+    );
+  });
+
   it("returns the relative path verbatim when dir is empty", () => {
     expect(joinPath("", "c.png")).toBe("c.png");
     expect(joinPath("", "./c.png")).toBe("c.png");
+  });
+
+  it("keeps root directories absolute without doubling the separator", () => {
+    expect(joinPath("/", "./logo.png")).toBe("/logo.png");
+    expect(joinPath("C:\\", "./logo.png")).toBe("C:\\logo.png");
   });
 });
 
