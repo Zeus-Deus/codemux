@@ -340,7 +340,7 @@ fn read_archive_text<R: Read + std::io::Seek>(
         let lower = path.to_ascii_lowercase();
         let found = (0..archive.len()).find_map(|i| {
             let entry = archive.by_index_raw(i).ok()?;
-            let name = entry.name().to_string();
+            let name = entry.name().ok()?.into_owned();
             (name.to_ascii_lowercase() == lower).then_some(name)
         });
         found.ok_or_else(|| format!("The extension archive has no \"{path}\"."))?

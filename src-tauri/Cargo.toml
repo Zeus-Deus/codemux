@@ -62,7 +62,7 @@ tokio-tungstenite = "0.26"
 futures-util = "0.3"
 libc = "0.2"
 tauri-plugin-single-instance = "2.4.5"
-tauri-plugin-updater = "2"
+tauri-plugin-updater = "2.14.1"
 tauri-plugin-process = "2"
 # Persistent native-side logging (file in the app log dir + stderr).
 # Without an installed logger every `log::error!` from dependencies —
@@ -79,7 +79,7 @@ log = "0.4"
 tauri-plugin-clipboard-manager = "2"
 rand = "0.8"
 jsonwebtoken = "=9.3.1"
-rusqlite = { version = "0.31", features = ["bundled", "backup"] }
+rusqlite = { version = "0.41", features = ["bundled", "backup", "fallible_uint"] }
 aes-gcm = "0.10"
 chacha20poly1305 = "0.10"
 sha2 = "0.10"
@@ -171,14 +171,13 @@ iroh = "1"
 # rpassword is the small, widely-used crate for exactly that and pulls in
 # nothing beyond libc / windows-sys, both already in the tree.
 rpassword = "7"
-# ZIP reader for the VS Code Marketplace theme import (`vscode_marketplace.rs`).
+# ZIP reader for marketplace theme and plugin theme imports.
 # A `.vsix` is a plain deflate ZIP, so the optional bzip2/lzma/zstd/AES codecs
 # are switched off — `deflate-flate2` reuses the `flate2` crate already in the
 # tree, keeping this a pure-Rust addition with no new C toolchain deps.
-# Pinned to the 4.x line so it unifies with the copy tauri-plugin-updater
-# already pulls in on Windows/macOS instead of adding a second zip build.
-zip = { version = "4", default-features = false, features = ["deflate-flate2"] }
-web-push = { version = "0.11", default-features = false }
+zip = { version = "9.0.5", default-features = false, features = ["deflate-flate2"] }
+# RFC 8291 payload encryption for browser notifications.
+ece = { version = "2.4", default-features = false, features = ["backend-openssl"] }
 openssl = "0.10"
 
 [target.'cfg(windows)'.dependencies.keyring]
@@ -222,7 +221,7 @@ tauri-plugin-dialog = { version = "2" }
 # WebView2 key and renderer-failure events for native reload recovery
 # (`webview_recovery.rs`). Pinned to the version wry builds so
 # `PlatformWebview::controller()` hands back a type from this same crate.
-webview2-com = "=0.38.2"
+webview2-com = "=0.39.1"
 # Used by host input injection and Hermes profile filesystem identity.
 # Already in the transitive tree; the explicit dep lets us call the functions.
 windows-sys = { version = "0.59", features = [
