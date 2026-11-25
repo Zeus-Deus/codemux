@@ -2,6 +2,7 @@ import { useCallback, useEffect, useRef } from "react";
 import { useTauriEvent } from "./use-tauri-event";
 import {
   onAuthStateChanged,
+  onAuthStorageErrorCleared,
   onSettingsSynced,
   onSyncStateChanged,
   type SyncStateChangedPayload,
@@ -41,11 +42,15 @@ export function useAuthEvents() {
         useSyncedSettingsStore
           .getState()
           .replaceSessionSettings(DEFAULT_SETTINGS);
+        // A definitive 401 signs out locally even if its SQLite revocation
+        // needs a retry. The refresh response can be discarded by the event's
+        // identity transition, so carry the storage warning on this event.
+        useAuthStore.setState({ error: payload.storageError ?? null });
         // A callback can persist a valid OAuth token while its immediate user
         // lookup times out. Re-read local state so it becomes
         // `pending-verification`; App will retry verification only after the
         // login frame has painted. Definitive sign-out events skip this path.
-        if (oauthCallbackExpected) {
+        if (oauthCallbackExpected && payload.pendingVerification) {
           void useAuthStore.getState().bootstrapSession();
         }
       }
@@ -56,6 +61,14 @@ export function useAuthEvents() {
   );
 
   useTauriEvent(onAuthStateChanged, handleAuthEvent, [handleAuthEvent]);
+
+  const handleAuthStorageErrorCleared = useCallback((clearedError: string) => {
+    if (useAuthStore.getState().error === clearedError) {
+      useAuthStore.setState({ error: null });
+    }
+  }, []);
+
+  useTauriEvent(onAuthStorageErrorCleared, handleAuthStorageErrorCleared, [handleAuthStorageErrorCleared]);
 
   // Handle settings-synced events from the Rust backend
   const handleSettingsSynced = useCallback(

@@ -613,19 +613,43 @@ mod tests {
         deliver_notice(app.handle(), notice.clone()).await;
         assert_eq!(take_delivered_sessions(), ["account", "paired"]);
 
-        crate::auth::save_auth(&db, "expired-token", "2000-01-01T00:00:00Z", Some(&owner)).unwrap();
+        // An update to the current credential can expire without revoking its
+        // browser sessions. A separate sign-in below must revoke them.
+        let expired_db = DatabaseStore::new_in_memory();
+        crate::auth::save_auth(&expired_db, "expired-token", "2000-01-01T00:00:00Z", Some(&owner))
+            .unwrap();
+        let current_record = db.load_auth_token().unwrap();
+        let expired_record = expired_db.load_auth_token().unwrap();
+        assert!(db
+            .save_auth_token_if_current(&current_record, &expired_record, Some(&owner.id))
+            .unwrap());
         deliver_notice(app.handle(), notice.clone()).await;
         assert_eq!(take_delivered_sessions(), ["paired"]);
         assert!(db.mobile_push_device("account").unwrap().is_some());
+        assert!(!db.web_remote_get_session("account").unwrap().revoked);
 
         crate::auth::save_auth(&db, "refreshed-token", active_expiry, Some(&owner)).unwrap();
         deliver_notice(app.handle(), notice.clone()).await;
-        assert_eq!(take_delivered_sessions(), ["account", "paired"]);
+        assert_eq!(take_delivered_sessions(), ["paired"]);
+        assert!(db.web_remote_get_session("account").unwrap().revoked);
+        assert!(db.mobile_push_device("account").unwrap().is_none());
+
+        db.web_remote_insert_account_session("new-account", None, None, "new-account-hash", true, &owner.id)
+            .unwrap();
+        db.upsert_mobile_push_device(&MobilePushDevice {
+            session_id: "new-account".into(),
+            relay_url: relay.clone(),
+            device_id: "CCCCCCCCCCCCCCCCCCCCCC".into(),
+            ..device()
+        })
+        .unwrap();
+        deliver_notice(app.handle(), notice.clone()).await;
+        assert_eq!(take_delivered_sessions(), ["new-account", "paired"]);
 
         db.clear_auth_token().unwrap();
         deliver_notice(app.handle(), notice).await;
         assert_eq!(take_delivered_sessions(), ["paired"]);
-        assert!(db.mobile_push_device("account").unwrap().is_none());
+        assert!(db.mobile_push_device("new-account").unwrap().is_none());
     }
 
     #[test]

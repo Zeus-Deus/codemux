@@ -37,12 +37,13 @@ use std::io::{BufRead, IsTerminal, Write};
 use serde::Deserialize;
 
 use crate::auth::{
-    api_base_url, clear_token, derive_auth_secret, is_token_expired, load_auth_record,
+    api_base_url, derive_auth_secret, is_token_expired, load_auth_record,
     login_email_api, save_auth_at_revision, AuthUser, SIGN_IN_SESSION_CHANGED,
 };
 #[cfg(test)]
 use crate::auth::{
-    load_cached_user, load_stored_auth_method, load_token, save_auth, save_auth_with_method,
+    clear_token, load_cached_user, load_stored_auth_method, load_token, save_auth,
+    save_auth_with_method,
 };
 use crate::database::DatabaseStore;
 
@@ -352,8 +353,15 @@ pub(crate) fn status_exit_code(report: &AuthStatusReport) -> i32 {
 /// resolves through `dirs::data_dir()` with no test seam, so calling it
 /// from a unit test would clobber the running developer's cache.
 pub(crate) fn clear_session_record(db: &DatabaseStore) -> Result<bool, String> {
+    clear_session_record_at(db, &crate::auth::token_file_path())
+}
+
+fn clear_session_record_at(
+    db: &DatabaseStore,
+    legacy_token_path: &std::path::Path,
+) -> Result<bool, String> {
     let had_session = db.load_auth_token().is_some();
-    clear_token(db)?;
+    crate::auth::clear_token_for_sign_out_at(db, legacy_token_path)?;
     Ok(had_session)
 }
 
@@ -1115,7 +1123,10 @@ mod tests {
             .await;
         let _guard = ApiUrlGuard::set(&server.url());
 
-        let db = test_db();
+        let dir = tempfile::tempdir().unwrap();
+        let db = DatabaseStore::test_file(&dir.path().join("auth.sqlite"));
+        let legacy_token = dir.path().join("auth-token.enc");
+        std::fs::write(&legacy_token, b"legacy fixture").unwrap();
         sign_in(&db, email, "pw".to_string()).await.unwrap();
         assert!(load_token(&db).is_some());
 
@@ -1124,16 +1135,17 @@ mod tests {
         // with no test seam. The session record is the part that matters
         // here — everything `codemux login` wrote.
         assert!(
-            clear_session_record(&db).unwrap(),
+            clear_session_record_at(&db, &legacy_token).unwrap(),
             "reports that a session was cleared"
         );
         assert!(load_token(&db).is_none());
         assert!(load_cached_user(&db).is_none());
         assert!(load_stored_auth_method(&db).is_none());
         assert!(matches!(auth_status(&db), AuthStatusReport::SignedOut));
+        assert!(!legacy_token.exists());
 
         assert!(
-            !clear_session_record(&db).unwrap(),
+            !clear_session_record_at(&db, &legacy_token).unwrap(),
             "second logout reports nothing to clear"
         );
     }
@@ -1143,6 +1155,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("auth.sqlite");
         let db = DatabaseStore::test_file(&path);
+        let legacy_token = dir.path().join("auth-token.enc");
+        std::fs::write(&legacy_token, b"legacy fixture").unwrap();
         save_auth(&db, "tok", "2099-01-01T00:00:00Z", None).unwrap();
         rusqlite::Connection::open(&path)
             .unwrap()
@@ -1152,9 +1166,10 @@ mod tests {
             )
             .unwrap();
 
-        let error = clear_session_record(&db).unwrap_err();
+        let error = clear_session_record_at(&db, &legacy_token).unwrap_err();
         assert!(error.contains("fixture rejected logout"));
         assert_eq!(load_token(&db).unwrap().0, "tok");
+        assert!(legacy_token.exists());
     }
 
     // ── Status / whoami ──────────────────────────────────────────

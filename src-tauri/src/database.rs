@@ -266,11 +266,20 @@ use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Mutex;
+use std::time::{Duration, Instant};
 
 const SCHEMA_VERSION: u32 = 25;
+/// An already-running host must renew its account proof. If another process
+/// rejects the token while SQLite cannot write, its browser access expires.
+pub(crate) const ACCOUNT_AUTH_VERIFICATION_TTL: Duration = Duration::from_secs(60);
 
 pub struct DatabaseStore {
     conn: Mutex<Connection>,
+    rejected_auth_records: Mutex<HashSet<Vec<u8>>>,
+    // Browser sessions cannot trust a cached account merely because its
+    // encrypted token survived a prior process. Proof is process-local and
+    // expires, so failed durable 401 revocation also suspends running peers.
+    verified_account_auth_records: Mutex<HashMap<Vec<u8>, Instant>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -632,6 +641,58 @@ fn database_path() -> Option<PathBuf> {
     Some(config.join(crate::APP_DIR_NAME).join("codemux.db"))
 }
 
+/// Keep the persisted conversations, auth token and other account data out of
+/// reach of other local users. SQLite creates the database and its WAL files
+/// with the process umask, which is commonly 022. Tighten the directory first
+/// so newly created files are private even before their own modes are fixed.
+fn ensure_private_database_storage(db_path: &std::path::Path) -> Result<(), String> {
+    let parent = db_path
+        .parent()
+        .ok_or_else(|| "Database path has no parent directory".to_string())?;
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(parent)
+            .map_err(|e| format!("Failed to create config directory: {e}"))?;
+    }
+    #[cfg(not(unix))]
+    std::fs::create_dir_all(parent)
+        .map_err(|e| format!("Failed to create config directory: {e}"))?;
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+        let dir = std::fs::symlink_metadata(parent)
+            .map_err(|e| format!("Failed to inspect config directory: {e}"))?;
+        let uid = unsafe { libc::getuid() };
+        if !dir.file_type().is_dir() || dir.uid() != uid {
+            return Err("Config directory is not owned by this user in a real directory".into());
+        }
+        std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700))
+            .map_err(|e| format!("Failed to make config directory private: {e}"))?;
+        for suffix in ["", "-wal", "-shm"] {
+            let mut name = db_path.as_os_str().to_os_string();
+            name.push(suffix);
+            let path = std::path::PathBuf::from(name);
+            match std::fs::symlink_metadata(&path) {
+                Ok(meta) if meta.file_type().is_file() && meta.uid() == uid => {
+                    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
+                        .map_err(|e| format!("Failed to make database file private: {e}"))?;
+                }
+                Ok(_) => return Err(format!("Database path is not an owned regular file: {}", path.display())),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => return Err(format!("Failed to inspect database file: {e}")),
+            }
+        }
+    }
+    Ok(())
+}
+
 fn create_schema(conn: &Connection) -> Result<(), String> {
     conn.execute_batch(agent_control::SCHEMA).map_err(|e| e.to_string())?;
     mcp_connector::migrate(conn)?;
@@ -696,6 +757,10 @@ fn create_schema(conn: &Connection) -> Result<(), String> {
             id INTEGER PRIMARY KEY CHECK (id = 1),
             encrypted_data BLOB NOT NULL,
             updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+        );
+
+        CREATE TABLE IF NOT EXISTS legacy_auth_token_import (
+            id INTEGER PRIMARY KEY CHECK (id = 1)
         );
 
         CREATE TABLE IF NOT EXISTS auth_session_revision (
@@ -1478,23 +1543,18 @@ fn open_connection(path: &std::path::Path) -> Result<Connection, String> {
 pub fn init_database() -> Result<DatabaseStore, String> {
     let db_path = database_path().ok_or("Could not determine config directory")?;
 
-    // Ensure parent directory exists
-    if let Some(parent) = db_path.parent() {
-        std::fs::create_dir_all(parent)
-            .map_err(|e| format!("Failed to create config directory: {e}"))?;
-    }
-
+    ensure_private_database_storage(&db_path)?;
     let conn = open_connection(&db_path)?;
     create_schema(&conn)?;
+    // WAL and shared-memory files may have been created by the connection.
+    ensure_private_database_storage(&db_path)?;
 
     eprintln!(
         "[codemux::database] SQLite initialized at {}",
         db_path.display()
     );
 
-    Ok(DatabaseStore {
-        conn: Mutex::new(conn),
-    })
+    Ok(DatabaseStore::from_connection(conn))
 }
 
 /// Convert arbitrary palette input into a safe FTS5 prefix query. Punctuation
@@ -1528,11 +1588,28 @@ fn conversation_fts_query(query: &str) -> Option<String> {
 }
 
 impl DatabaseStore {
+    fn from_connection(conn: Connection) -> Self {
+        Self {
+            conn: Mutex::new(conn),
+            rejected_auth_records: Mutex::new(HashSet::new()),
+            verified_account_auth_records: Mutex::new(HashMap::new()),
+        }
+    }
+
     #[cfg(test)]
     pub(crate) fn test_file(path: &std::path::Path) -> Self {
         let conn = open_connection(path).unwrap();
         create_schema(&conn).unwrap();
-        Self { conn: Mutex::new(conn) }
+        Self::from_connection(conn)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_set_query_only(&self, enabled: bool) {
+        self.conn
+            .lock()
+            .unwrap()
+            .execute_batch(if enabled { "PRAGMA query_only=ON" } else { "PRAGMA query_only=OFF" })
+            .unwrap();
     }
 
     #[cfg(all(test, unix))]
@@ -1545,9 +1622,7 @@ impl DatabaseStore {
         let conn = Connection::open_in_memory().expect("Failed to open in-memory database");
         conn.execute_batch("PRAGMA foreign_keys=ON;").unwrap();
         create_schema(&conn).unwrap();
-        Self {
-            conn: Mutex::new(conn),
-        }
+        Self::from_connection(conn)
     }
 }
 
@@ -1556,9 +1631,7 @@ pub fn init_test_database() -> DatabaseStore {
     let conn = Connection::open_in_memory().expect("Failed to open in-memory database");
     conn.execute_batch("PRAGMA foreign_keys=ON;").unwrap();
     create_schema(&conn).unwrap();
-    DatabaseStore {
-        conn: Mutex::new(conn),
-    }
+    DatabaseStore::from_connection(conn)
 }
 
 // ── Settings ──
@@ -5992,21 +6065,104 @@ impl DatabaseStore {
 
 // ── Auth Tokens ──
 
+const MARK_LEGACY_AUTH_TOKEN_HANDLED: &str =
+    "INSERT OR IGNORE INTO legacy_auth_token_import (id) VALUES (1)";
+
+/// Restrict the old token file before its contents are read. Older builds
+/// created it with the process umask, which could expose its reversible
+/// machine-ID encryption to other local users.
+fn ensure_private_legacy_auth_token_file(path: &std::path::Path) -> Result<bool, String> {
+    let meta = match std::fs::symlink_metadata(path) {
+        Ok(meta) if meta.file_type().is_file() => meta,
+        Ok(_) => return Err("Legacy auth token path is not a regular file".into()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(format!("Failed to inspect legacy auth token: {error}")),
+    };
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let parent = path.parent().ok_or("Legacy auth token path has no parent")?;
+        let dir = std::fs::symlink_metadata(parent)
+            .map_err(|e| format!("Failed to inspect legacy auth token directory: {e}"))?;
+        let uid = unsafe { libc::getuid() };
+        if !dir.file_type().is_dir() || dir.uid() != uid || meta.uid() != uid {
+            return Err("Legacy auth token is not owned by this user in a real directory".into());
+        }
+        std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700))
+            .map_err(|e| format!("Failed to make legacy auth token directory private: {e}"))?;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+            .map_err(|e| format!("Failed to make legacy auth token private: {e}"))?;
+    }
+    #[cfg(not(unix))]
+    let _ = meta;
+
+    Ok(true)
+}
+
 impl DatabaseStore {
+    /// Auth migration and sign-out must never acknowledge writes to the
+    /// startup in-memory fallback while a previous file database survives.
+    pub(crate) fn require_persistent_auth_storage(&self) -> Result<(), String> {
+        let conn = self.conn.lock().unwrap();
+        Self::require_persistent_auth_connection(&conn)
+    }
+
+    fn require_persistent_auth_connection(conn: &Connection) -> Result<(), String> {
+        let path: String = conn
+            .query_row("PRAGMA database_list", [], |row| row.get(2))
+            .map_err(|error| format!("Failed to inspect auth database storage: {error}"))?;
+        if path.is_empty() {
+            return Err("Auth changes cannot be saved while the database is in memory".into());
+        }
+        Ok(())
+    }
+
     pub fn save_auth_token(&self, encrypted_data: &[u8]) -> Result<(), String> {
-        self.replace_auth_token(encrypted_data, None, None)
+        self.replace_auth_token(encrypted_data, None)
             .map(|_| ())
     }
 
-    /// Save the verified owner and revoke another account's browser access
-    /// in the same transaction. Pairing-code sessions belong to the host.
+    /// A new sign-in revokes prior account browsers, including browsers of the
+    /// same account. A previous process may have rejected the old host token
+    /// while SQLite was unwritable, so preserving those rows could revive
+    /// them after this new token is verified. Pairing-code sessions remain.
     pub(crate) fn save_auth_token_for_account(
         &self,
         encrypted_data: &[u8],
-        account_id: &str,
     ) -> Result<(), String> {
-        self.replace_auth_token(encrypted_data, Some(account_id), None)
-            .map(|_| ())
+        self.replace_auth_token(encrypted_data, None)?;
+        self.mark_account_auth_verified_if_current(encrypted_data);
+        Ok(())
+    }
+
+    /// A successful authoritative account check may activate only the exact
+    /// record it checked. A concurrent sign-out or sign-in changes that blob.
+    pub(crate) fn mark_account_auth_verified_if_current(&self, expected: &[u8]) -> bool {
+        let conn = self.conn.lock().unwrap();
+        let current: bool = conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM auth_tokens WHERE id = 1 AND encrypted_data = ?1)",
+                params![expected],
+                |row| row.get(0),
+            )
+            .unwrap_or(false);
+        if !current || self.rejected_auth_records.lock().unwrap().contains(expected) {
+            return false;
+        }
+        let mut verified = self.verified_account_auth_records.lock().unwrap();
+        // There is only one current auth row. A successful refresh may
+        // re-encrypt it to new bytes, so do not retain old ciphertexts.
+        verified.clear();
+        verified.insert(expected.to_vec(), Instant::now() + ACCOUNT_AUTH_VERIFICATION_TTL);
+        true
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_expire_account_auth_verification(&self, expected: &[u8]) {
+        if let Some(deadline) = self.verified_account_auth_records.lock().unwrap().get_mut(expected) {
+            *deadline = Instant::now() - Duration::from_secs(1);
+        }
     }
 
     pub(crate) fn auth_session_revision(&self) -> Result<i64, String> {
@@ -6028,13 +6184,16 @@ impl DatabaseStore {
         account_id: Option<&str>,
         expected_revision: i64,
     ) -> Result<bool, String> {
-        self.replace_auth_token(encrypted_data, account_id, Some(expected_revision))
+        let saved = self.replace_auth_token(encrypted_data, Some(expected_revision))?;
+        if saved && account_id.is_some() {
+            self.mark_account_auth_verified_if_current(encrypted_data);
+        }
+        Ok(saved)
     }
 
     fn replace_auth_token(
         &self,
         encrypted_data: &[u8],
-        account_id: Option<&str>,
         expected_revision: Option<i64>,
     ) -> Result<bool, String> {
         let mut conn = self.conn.lock().unwrap();
@@ -6042,9 +6201,7 @@ impl DatabaseStore {
         if !Self::advance_auth_revision(&transaction, expected_revision)? {
             return Ok(false);
         }
-        if let Some(account_id) = account_id {
-            Self::revoke_account_sessions(&transaction, Some(account_id))?;
-        }
+        Self::revoke_account_sessions(&transaction, None)?;
         Self::write_auth_token(&transaction, encrypted_data)?;
         transaction.commit().map_err(|error| error.to_string())?;
         Ok(true)
@@ -6076,7 +6233,43 @@ impl DatabaseStore {
             params![encrypted_data],
         )
         .map_err(|e| format!("Failed to save auth token: {e}"))?;
+        conn.execute(MARK_LEGACY_AUTH_TOKEN_HANDLED, [])
+            .map_err(|error| format!("Failed to mark legacy auth token handled: {error}"))?;
         Ok(())
+    }
+
+    /// Import the pre-SQLite token at most once. The marker is committed with
+    /// the import, so a leftover file cannot restore a signed-out session.
+    pub fn migrate_legacy_auth_token(&self, old_path: &std::path::Path) -> Result<(), String> {
+        self.require_persistent_auth_storage()?;
+        let legacy_exists = ensure_private_legacy_auth_token_file(old_path)?;
+        let mut conn = self.conn.lock().unwrap();
+        let transaction = conn.transaction().map_err(|e| format!("Failed to migrate auth token: {e}"))?;
+        let handled: bool = transaction
+            .query_row("SELECT EXISTS(SELECT 1 FROM legacy_auth_token_import WHERE id = 1)", [], |row| row.get(0))
+            .map_err(|e| format!("Failed to check legacy auth token migration: {e}"))?;
+        if !handled {
+            let token_exists: bool = transaction
+                .query_row("SELECT EXISTS(SELECT 1 FROM auth_tokens WHERE id = 1)", [], |row| row.get(0))
+                .map_err(|e| format!("Failed to check stored auth token: {e}"))?;
+            if !token_exists && legacy_exists {
+                let data = std::fs::read(old_path)
+                    .map_err(|e| format!("Failed to read legacy auth token: {e}"))?;
+                transaction.execute(
+                    "INSERT INTO auth_tokens (id, encrypted_data, updated_at) VALUES (1, ?1, datetime('now'))",
+                    params![data],
+                )
+                .map_err(|e| format!("Failed to import legacy auth token: {e}"))?;
+            }
+            transaction.execute(MARK_LEGACY_AUTH_TOKEN_HANDLED, [])
+                .map_err(|e| format!("Failed to mark legacy auth token handled: {e}"))?;
+        }
+        transaction.commit().map_err(|e| format!("Failed to commit legacy auth token migration: {e}"))?;
+        match std::fs::remove_file(old_path) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(format!("Failed to remove legacy auth token: {error}")),
+        }
     }
 
     /// Persist a verification or metadata update only for the auth record
@@ -6087,13 +6280,16 @@ impl DatabaseStore {
         encrypted_data: &[u8],
         account_id: Option<&str>,
     ) -> Result<bool, String> {
-        self.with_current_auth(expected, None, |conn| {
+        let updated = self.with_current_auth(expected, None, false, |conn| {
             if let Some(account_id) = account_id {
                 Self::revoke_account_sessions(conn, Some(account_id))?;
             }
             Self::write_auth_token(conn, encrypted_data)
-        })
-        .map(|updated| updated.is_some())
+        })?.is_some();
+        if updated && account_id.is_some() {
+            self.mark_account_auth_verified_if_current(encrypted_data);
+        }
+        Ok(updated)
     }
 
     fn revoke_account_sessions(conn: &Connection, except: Option<&str>) -> Result<(), String> {
@@ -6111,6 +6307,7 @@ impl DatabaseStore {
         &self,
         expected: &[u8],
         active_account: Option<&str>,
+        allow_rejected: bool,
         operation: impl FnOnce(&Connection) -> Result<T, String>,
     ) -> Result<Option<T>, String> {
         let mut conn = self.conn.lock().unwrap();
@@ -6127,6 +6324,12 @@ impl DatabaseStore {
             )
             .map_err(|error| format!("Failed to read current auth record: {error}"))?;
         if !matches
+            || (!allow_rejected
+                && self.rejected_auth_records.lock().unwrap().contains(expected))
+            || (active_account.is_some()
+                && !self.verified_account_auth_records.lock().unwrap()
+                    .get(expected)
+                    .is_some_and(|deadline| *deadline > Instant::now()))
             || active_account.is_some_and(|account| {
                 crate::auth::active_account_id_from_record(expected).as_deref() != Some(account)
             })
@@ -6142,12 +6345,46 @@ impl DatabaseStore {
 
     pub fn load_auth_token(&self) -> Option<Vec<u8>> {
         let conn = self.conn.lock().unwrap();
-        conn.query_row(
+        let record: Vec<u8> = conn.query_row(
             "SELECT encrypted_data FROM auth_tokens WHERE id = 1",
             [],
             |row| row.get(0),
         )
-        .ok()
+        .ok()?;
+        (!self.rejected_auth_records.lock().unwrap().contains(&record)).then_some(record)
+    }
+
+    /// Inspect the persisted row even when this process has rejected it in
+    /// memory. A failed 401 cleanup must not sign out a newer CLI account.
+    pub(crate) fn load_raw_auth_token(&self) -> Result<Option<Vec<u8>>, String> {
+        self.conn
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT encrypted_data FROM auth_tokens WHERE id = 1",
+                [],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|error| format!("Failed to inspect current auth record: {error}"))
+    }
+
+    /// Settle a locally suspended row before launching another sign-in.
+    /// Automatic cleanup of an expired or rejected credential does not
+    /// invalidate a fresh sign-in already started in another process.
+    pub(crate) fn settle_rejected_auth_before_sign_in(&self) -> Result<bool, String> {
+        let current = self.load_raw_auth_token().map_err(|error| {
+            format!("Cannot start sign-in while auth storage cannot be inspected: {error}")
+        })?;
+        let Some(current) = current else {
+            return Ok(false);
+        };
+        if !self.rejected_auth_records.lock().unwrap().contains(&current) {
+            return Ok(false);
+        }
+        self.clear_auth_token_if_current(&current).map_err(|error| {
+            format!("Cannot start sign-in until rejected account cleanup is saved: {error}")
+        })
     }
 
     pub fn clear_auth_token(&self) -> Result<(), String> {
@@ -6155,6 +6392,9 @@ impl DatabaseStore {
         let transaction = conn
             .transaction()
             .map_err(|error| format!("Failed to clear auth token: {error}"))?;
+        // An explicit sign-out must invalidate sign-ins already in flight,
+        // even when no auth row remains after a rejected-session cleanup.
+        Self::advance_auth_revision(&transaction, None)?;
         Self::erase_auth_record(&transaction)?;
         transaction
             .commit()
@@ -6162,13 +6402,21 @@ impl DatabaseStore {
     }
 
     pub(crate) fn clear_auth_token_if_current(&self, expected: &[u8]) -> Result<bool, String> {
-        self.with_current_auth(expected, None, Self::erase_auth_record)
+        // Even if SQLite cannot start or commit the revocation transaction,
+        // reject this record for local and account-browser access now.
+        self.rejected_auth_records.lock().unwrap().insert(expected.to_vec());
+        self.verified_account_auth_records.lock().unwrap().remove(expected);
+        self.with_current_auth(expected, None, true, |conn| {
+            Self::require_persistent_auth_connection(conn)?;
+            Self::erase_auth_record(conn)
+        })
             .map(|cleared| cleared.is_some())
     }
 
     fn erase_auth_record(conn: &Connection) -> Result<(), String> {
-        Self::advance_auth_revision(conn, None)?;
         Self::revoke_account_sessions(conn, None)?;
+        conn.execute(MARK_LEGACY_AUTH_TOKEN_HANDLED, [])
+            .map_err(|error| format!("Failed to mark legacy auth token handled: {error}"))?;
         conn.execute("DELETE FROM auth_tokens WHERE id = 1", [])
             .map_err(|error| format!("Failed to clear auth token: {error}"))?;
         Ok(())
@@ -6255,7 +6503,7 @@ impl DatabaseStore {
         account_user_id: &str,
         verified_auth: &[u8],
     ) -> Result<bool, String> {
-        self.with_current_auth(verified_auth, Some(account_user_id), |conn| {
+        self.with_current_auth(verified_auth, Some(account_user_id), false, |conn| {
             Self::insert_web_remote_account_session(
                 conn, id, name, user_agent, token_hash, approved, account_user_id,
             )
@@ -6273,7 +6521,7 @@ impl DatabaseStore {
         account_user_id: &str,
         verified_auth: &[u8],
     ) -> Result<Option<(String, bool)>, String> {
-        self.with_current_auth(verified_auth, Some(account_user_id), |conn| {
+        self.with_current_auth(verified_auth, Some(account_user_id), false, |conn| {
             let existing = conn.query_row(
                 "SELECT id, approved FROM web_remote_sessions
                  WHERE revoked = 0 AND source = 'account' AND account_user_id = ?1
@@ -6330,7 +6578,7 @@ impl DatabaseStore {
         id: &str,
     ) -> Result<Option<(WebRemoteSessionRecord, Option<Vec<u8>>)>, String> {
         let conn = self.conn.lock().unwrap();
-        conn.query_row(
+        let result: Option<(WebRemoteSessionRecord, Option<Vec<u8>>)> = conn.query_row(
             "SELECT s.id, s.name, s.user_agent, s.token_hash, s.created_at, s.last_seen_at,
                     s.approved, s.revoked, s.source, s.account_user_id, a.encrypted_data
              FROM web_remote_sessions s
@@ -6340,7 +6588,17 @@ impl DatabaseStore {
             |row| Ok((Self::row_to_web_remote_session(row)?, row.get(10)?)),
         )
         .optional()
-        .map_err(|error| format!("Failed to read remote session: {error}"))
+        .map_err(|error| format!("Failed to read remote session: {error}"))?;
+        let rejected = self.rejected_auth_records.lock().unwrap();
+        let verified = self.verified_account_auth_records.lock().unwrap();
+        Ok(result.map(|(session, record)| {
+            let record = record.filter(|bytes| {
+                !rejected.contains(bytes)
+                    && (session.source != "account"
+                        || verified.get(bytes).is_some_and(|deadline| *deadline > Instant::now()))
+            });
+            (session, record)
+        }))
     }
 
     /// All non-revoked sessions, newest first. This is what the desktop
@@ -6449,6 +6707,69 @@ mod tests {
     use super::*;
 
     #[test]
+    fn account_browser_requires_fresh_host_verification_after_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("auth.sqlite");
+        let browser_token = "browser-token";
+        let browser_hash = crate::web_remote::auth::sha256_hex(browser_token);
+        let user = crate::auth::AuthUser {
+            id: "owner".into(),
+            email: "owner@example.test".into(),
+            name: None,
+            image: None,
+        };
+        let db = DatabaseStore::test_file(&path);
+        crate::auth::save_auth(&db, "host-token", "2099-01-01T00:00:00Z", Some(&user)).unwrap();
+        db.web_remote_insert_account_session(
+            "account-browser", None, None, &browser_hash, true, &user.id,
+        ).unwrap();
+        assert!(crate::web_remote::auth::authenticate(&db, browser_token).is_some());
+        drop(db);
+
+        let reopened = DatabaseStore::test_file(&path);
+        assert!(crate::web_remote::auth::authenticate(&reopened, browser_token).is_none());
+        let auth_record = reopened.load_auth_token().unwrap();
+        assert!(reopened.mark_account_auth_verified_if_current(&auth_record));
+        assert!(crate::web_remote::auth::authenticate(&reopened, browser_token).is_some());
+    }
+
+    #[test]
+    fn verified_account_browser_expires_when_a_peer_cannot_persist_rejection() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("auth.sqlite");
+        let host = DatabaseStore::test_file(&path);
+        let peer = DatabaseStore::test_file(&path);
+        let user = crate::auth::AuthUser {
+            id: "owner".into(),
+            email: "owner@example.test".into(),
+            name: None,
+            image: None,
+        };
+        crate::auth::save_auth(&host, "host-token", "2099-01-01T00:00:00Z", Some(&user)).unwrap();
+        let record = host.load_auth_token().unwrap();
+        let browser_token = "browser-token";
+        let browser_hash = crate::web_remote::auth::sha256_hex(browser_token);
+        host.web_remote_insert_account_session(
+            "account-browser", None, None, &browser_hash, true, &user.id,
+        ).unwrap();
+        assert!(crate::web_remote::auth::authenticate(&host, browser_token).is_some());
+
+        // The peer received a definitive 401, but SQLite could not commit
+        // revocation. The serving host has not yet learned of that rejection.
+        peer.test_set_query_only(true);
+        assert!(peer.clear_auth_token_if_current(&record).is_err());
+        assert_eq!(host.load_raw_auth_token().unwrap(), Some(record.clone()));
+        assert!(crate::web_remote::auth::authenticate(&host, browser_token).is_some());
+
+        host.test_expire_account_auth_verification(&record);
+        assert!(crate::web_remote::auth::authenticate(&host, browser_token).is_none());
+        assert!(!host.web_remote_insert_account_session_if_unchanged(
+            "new-account-browser", None, None, "new-browser-hash", true, &user.id, &record,
+        ).unwrap());
+        assert!(host.web_remote_get_session("new-account-browser").is_none());
+    }
+
+    #[test]
     fn failed_account_revocation_leaves_auth_and_sessions_intact() {
         let db = init_test_database();
         db.save_auth_token(b"sign-in fixture").unwrap();
@@ -6489,7 +6810,10 @@ mod tests {
                 );",
                 )
                 .unwrap();
-            DatabaseStore::write_auth_token(&legacy, b"legacy-token").unwrap();
+            legacy.execute(
+                "INSERT INTO auth_tokens (id, encrypted_data) VALUES (1, ?1)",
+                params![b"legacy-token".as_slice()],
+            ).unwrap();
         }
 
         let desktop = DatabaseStore::test_file(&path);
@@ -6512,11 +6836,68 @@ mod tests {
     }
 
     #[test]
+    fn rejected_cleanup_does_not_cancel_a_sign_in_started_in_another_process() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("auth.sqlite");
+        let host = DatabaseStore::test_file(&path);
+        let cli = DatabaseStore::test_file(&path);
+        host.save_auth_token(b"rejected-token").unwrap();
+        host.web_remote_insert_account_session(
+            "old-browser", None, None, "old-browser-hash", true, "old-account",
+        ).unwrap();
+        let rejected = host.load_raw_auth_token().unwrap().unwrap();
+
+        // The serving process rejects the old token while the database is
+        // unwritable. The CLI cannot see its in-memory rejection and starts a
+        // fresh sign-in before the serving process can finish cleanup.
+        host.test_set_query_only(true);
+        assert!(host.clear_auth_token_if_current(&rejected).is_err());
+        let launch_revision = cli.auth_session_revision().unwrap();
+        host.test_set_query_only(false);
+        assert!(host.clear_auth_token_if_current(&rejected).unwrap());
+        assert_eq!(cli.auth_session_revision().unwrap(), launch_revision);
+        assert!(host.load_raw_auth_token().unwrap().is_none());
+        assert!(host.web_remote_get_session("old-browser").unwrap().revoked);
+
+        assert!(cli.save_auth_token_if_revision(b"fresh-token", None, launch_revision).unwrap());
+        assert_eq!(host.load_raw_auth_token().unwrap().as_deref(), Some(b"fresh-token".as_slice()));
+
+        // Real sign-out and replacement still invalidate a sign-in launched
+        // against the previous revision, including after rejected cleanup.
+        let before_sign_out = cli.auth_session_revision().unwrap();
+        host.clear_auth_token().unwrap();
+        assert!(!cli.save_auth_token_if_revision(b"stale-after-sign-out", None, before_sign_out).unwrap());
+        let before_replacement = cli.auth_session_revision().unwrap();
+        host.save_auth_token(b"replacement-token").unwrap();
+        assert!(!cli.save_auth_token_if_revision(b"stale-after-replacement", None, before_replacement).unwrap());
+        assert_eq!(cli.load_raw_auth_token().unwrap().as_deref(), Some(b"replacement-token".as_slice()));
+    }
+
+    #[test]
+    fn failed_expiry_cleanup_preserves_pending_sign_in_after_recovery() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("auth.sqlite");
+        let host = DatabaseStore::test_file(&path);
+        let cli = DatabaseStore::test_file(&path);
+        host.save_auth_token(b"expired-token").unwrap();
+        let expired = host.load_raw_auth_token().unwrap().unwrap();
+
+        host.test_set_query_only(true);
+        assert!(host.clear_auth_token_if_current(&expired).is_err());
+        let launch_revision = cli.auth_session_revision().unwrap();
+        host.test_set_query_only(false);
+        assert!(host.settle_rejected_auth_before_sign_in().unwrap());
+        assert_eq!(cli.auth_session_revision().unwrap(), launch_revision);
+        assert!(cli.save_auth_token_if_revision(b"fresh-token", None, launch_revision).unwrap());
+        assert_eq!(host.load_raw_auth_token().unwrap().as_deref(), Some(b"fresh-token".as_slice()));
+    }
+
+    #[test]
     fn account_writes_and_admission_require_the_auth_record_from_before_verification() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("sessions.sqlite");
         let desktop = DatabaseStore::test_file(&path);
-        let cli = DatabaseStore { conn: Mutex::new(open_connection(&path).unwrap()) };
+        let cli = DatabaseStore::from_connection(open_connection(&path).unwrap());
         let owner = crate::auth::AuthUser {
             id: "owner".into(), email: "fixture@example.test".into(), name: None, image: None,
         };
@@ -6545,6 +6926,8 @@ mod tests {
         assert_eq!(admit_relay("stale-relay", &first), None);
         assert_eq!(desktop.load_auth_token(), Some(current.clone()));
         assert!(desktop.web_remote_get_session("old-relay").unwrap().revoked);
+        assert_eq!(admit_relay("new-relay", &current), None);
+        assert!(desktop.mark_account_auth_verified_if_current(&current));
         assert_eq!(admit_relay("new-relay", &current), Some(("new-relay".into(), false)));
         assert!(desktop.web_remote_insert_account_session_if_unchanged(
             "new-direct", None, None, "new-hash", true, &owner.id, &current,
@@ -7934,6 +8317,158 @@ mod tests {
 
     // ── Integration / Lifecycle ──
 
+    #[cfg(unix)]
+    #[test]
+    fn database_storage_tightens_existing_and_new_files() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let old_dir = dir.path().join("existing");
+        std::fs::create_dir(&old_dir).unwrap();
+        let old_db = old_dir.join("codemux.db");
+        for suffix in ["", "-wal", "-shm"] {
+            let path = std::path::PathBuf::from(format!("{}{suffix}", old_db.display()));
+            std::fs::write(&path, b"existing private data").unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        }
+        std::fs::set_permissions(&old_dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        ensure_private_database_storage(&old_db).unwrap();
+        assert_eq!(std::fs::metadata(&old_dir).unwrap().permissions().mode() & 0o777, 0o700);
+        for suffix in ["", "-wal", "-shm"] {
+            let path = std::path::PathBuf::from(format!("{}{suffix}", old_db.display()));
+            assert_eq!(std::fs::metadata(path).unwrap().permissions().mode() & 0o777, 0o600);
+        }
+
+        let new_db = dir.path().join("new").join("codemux.db");
+        ensure_private_database_storage(&new_db).unwrap();
+        let conn = open_connection(&new_db).unwrap();
+        create_schema(&conn).unwrap();
+        ensure_private_database_storage(&new_db).unwrap();
+        assert_eq!(
+            std::fs::metadata(new_db.parent().unwrap()).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        assert_eq!(std::fs::metadata(&new_db).unwrap().permissions().mode() & 0o777, 0o600);
+        for suffix in ["-wal", "-shm"] {
+            let path = std::path::PathBuf::from(format!("{}{suffix}", new_db.display()));
+            if path.exists() {
+                assert_eq!(std::fs::metadata(path).unwrap().permissions().mode() & 0o777, 0o600);
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn database_storage_rejects_symlinks() {
+        let dir = tempfile::tempdir().unwrap();
+        let real_dir = dir.path().join("real");
+        std::fs::create_dir(&real_dir).unwrap();
+        let linked_dir = dir.path().join("linked");
+        std::os::unix::fs::symlink(&real_dir, &linked_dir).unwrap();
+        assert!(ensure_private_database_storage(&linked_dir.join("codemux.db")).is_err());
+
+        let real_db = real_dir.join("real.db");
+        std::fs::write(&real_db, b"unrelated data").unwrap();
+        std::os::unix::fs::symlink(&real_db, real_dir.join("codemux.db")).unwrap();
+        assert!(ensure_private_database_storage(&real_dir.join("codemux.db")).is_err());
+        assert_eq!(std::fs::read(&real_db).unwrap(), b"unrelated data");
+    }
+
+    #[test]
+    fn auth_token_saves_mark_legacy_import_handled() {
+        for account_id in [None, Some("account-1")] {
+            let db = init_test_database();
+            match account_id {
+                Some(_) => db
+                    .save_auth_token_for_account(b"cached session")
+                    .unwrap(),
+                None => db.save_auth_token(b"cached session").unwrap(),
+            }
+            let conn = db.conn.lock().unwrap();
+            let handled: bool = conn
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM legacy_auth_token_import WHERE id = 1)",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert!(handled);
+        }
+    }
+
+    #[test]
+    fn clearing_auth_token_reports_database_write_failure() {
+        let db = init_test_database();
+        db.save_auth_token(b"cached session").unwrap();
+        db.conn.lock().unwrap().execute_batch("PRAGMA query_only=ON").unwrap();
+
+        assert!(db.clear_auth_token().is_err());
+        assert_eq!(db.load_auth_token().as_deref(), Some(&b"cached session"[..]));
+    }
+
+    #[test]
+    fn legacy_auth_token_cannot_return_after_sign_out() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("codemux.db");
+        let old_path = dir.path().join("auth-token.enc");
+        std::fs::write(&old_path, b"legacy session").unwrap();
+
+        {
+            let conn = open_connection(&db_path).unwrap();
+            create_schema(&conn).unwrap();
+            let db = DatabaseStore::from_connection(conn);
+            db.migrate_legacy_auth_token(&old_path).unwrap();
+            assert_eq!(db.load_auth_token().as_deref(), Some(&b"legacy session"[..]));
+            assert!(!old_path.exists());
+            db.clear_auth_token().unwrap();
+            assert!(db.load_auth_token().is_none());
+        }
+
+        // Simulate a leftover or recreated legacy file on the next startup.
+        std::fs::write(&old_path, b"legacy session").unwrap();
+        let conn = open_connection(&db_path).unwrap();
+        create_schema(&conn).unwrap();
+        let db = DatabaseStore::from_connection(conn);
+        db.migrate_legacy_auth_token(&old_path).unwrap();
+        assert!(db.load_auth_token().is_none());
+        assert!(!old_path.exists());
+    }
+
+    #[test]
+    fn in_memory_fallback_does_not_consume_the_legacy_token() {
+        let dir = tempfile::tempdir().unwrap();
+        let old_path = dir.path().join("auth-token.enc");
+        std::fs::write(&old_path, b"legacy session").unwrap();
+
+        let fallback = DatabaseStore::new_in_memory();
+        assert!(fallback.migrate_legacy_auth_token(&old_path).is_err());
+        assert_eq!(std::fs::read(&old_path).unwrap(), b"legacy session");
+        assert!(fallback.load_auth_token().is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn legacy_auth_token_is_private_before_import() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let old_dir = dir.path().join("codemux");
+        std::fs::create_dir(&old_dir).unwrap();
+        let old_path = old_dir.join("auth-token.enc");
+        std::fs::write(&old_path, b"legacy session").unwrap();
+        std::fs::set_permissions(&old_dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::set_permissions(&old_path, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        assert!(ensure_private_legacy_auth_token_file(&old_path).unwrap());
+        assert_eq!(std::fs::metadata(&old_dir).unwrap().permissions().mode() & 0o777, 0o700);
+        assert_eq!(std::fs::metadata(&old_path).unwrap().permissions().mode() & 0o777, 0o600);
+
+        let link = old_dir.join("linked-token");
+        std::os::unix::fs::symlink(&old_path, &link).unwrap();
+        assert!(ensure_private_legacy_auth_token_file(&link).is_err());
+    }
+
     #[test]
     fn lifecycle_file_persistence() {
         // Test that data survives closing and reopening the database
@@ -7944,9 +8479,7 @@ mod tests {
         {
             let conn = open_connection(&db_path).unwrap();
             create_schema(&conn).unwrap();
-            let db = DatabaseStore {
-                conn: Mutex::new(conn),
-            };
+            let db = DatabaseStore::from_connection(conn);
 
             db.set_setting("theme", "dark").unwrap();
             db.set_ui_state("window_width", "1920").unwrap();
@@ -7958,9 +8491,7 @@ mod tests {
         {
             let conn = open_connection(&db_path).unwrap();
             create_schema(&conn).unwrap(); // Should be idempotent
-            let db = DatabaseStore {
-                conn: Mutex::new(conn),
-            };
+            let db = DatabaseStore::from_connection(conn);
 
             assert_eq!(db.get_setting("theme"), Some("dark".into()));
             assert_eq!(db.get_ui_state("window_width"), Some("1920".into()));
@@ -8179,9 +8710,7 @@ mod tests {
         {
             let conn = open_connection(&db_path).unwrap();
             create_schema(&conn).unwrap();
-            let db = DatabaseStore {
-                conn: Mutex::new(conn),
-            };
+            let db = DatabaseStore::from_connection(conn);
             db.set_setting("important", "data").unwrap();
             db.set_ui_state("window_width", "1920").unwrap();
         }
@@ -8209,9 +8738,7 @@ mod tests {
                 let schema_result = create_schema(&conn);
                 if schema_result.is_ok() {
                     // Fresh DB was created — old data is gone but app works
-                    let db = DatabaseStore {
-                        conn: Mutex::new(conn),
-                    };
+                    let db = DatabaseStore::from_connection(conn);
                     assert_eq!(db.get_setting("important"), None); // Data lost, but no crash
                     db.set_setting("new_key", "works").unwrap(); // Can still write
                     assert_eq!(db.get_setting("new_key"), Some("works".into()));
@@ -10114,9 +10641,7 @@ mod tests {
         {
             let conn = open_connection(&path).unwrap();
             create_schema(&conn).unwrap();
-            let db = DatabaseStore {
-                conn: Mutex::new(conn),
-            };
+            let db = DatabaseStore::from_connection(conn);
             db.upsert_agent_chat_session("t", "ws", Some("/p"), "claude")
                 .unwrap();
             db.append_agent_chat_message("t", r#"{"i":1}"#).unwrap();
@@ -10125,9 +10650,7 @@ mod tests {
 
         let conn = open_connection(&path).unwrap();
         create_schema(&conn).unwrap();
-        let db = DatabaseStore {
-            conn: Mutex::new(conn),
-        };
+        let db = DatabaseStore::from_connection(conn);
         let rows = db.list_agent_chat_messages("t");
         assert_eq!(
             rows,
@@ -10175,9 +10698,7 @@ mod tests {
         let open = || {
             let conn = open_connection(&path).unwrap();
             create_schema(&conn).unwrap();
-            DatabaseStore {
-                conn: Mutex::new(conn),
-            }
+            DatabaseStore::from_connection(conn)
         };
         let db = open();
         db.upsert_agent_chat_session("source", "ws", Some("/repo"), "claude")
@@ -10256,9 +10777,7 @@ mod tests {
         {
             let conn = open_connection(&path).unwrap();
             create_schema(&conn).unwrap();
-            let db = DatabaseStore {
-                conn: Mutex::new(conn),
-            };
+            let db = DatabaseStore::from_connection(conn);
             db.upsert_agent_chat_session("t", "ws", Some("/p"), "claude")
                 .unwrap();
             db.set_agent_chat_title("t", "Persisted").unwrap();
@@ -10266,9 +10785,7 @@ mod tests {
 
         let conn = open_connection(&path).unwrap();
         create_schema(&conn).unwrap();
-        let db = DatabaseStore {
-            conn: Mutex::new(conn),
-        };
+        let db = DatabaseStore::from_connection(conn);
         let version: u32 = db
             .conn
             .lock()

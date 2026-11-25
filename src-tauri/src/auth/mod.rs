@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Instant, SystemTime};
 
@@ -57,6 +57,10 @@ pub struct AuthResponse {
 pub struct AuthStatePayload {
     pub authenticated: bool,
     pub user: Option<AuthUser>,
+    #[serde(rename = "storageError", skip_serializing_if = "Option::is_none")]
+    pub storage_error: Option<String>,
+    #[serde(rename = "pendingVerification", skip_serializing_if = "Option::is_none")]
+    pub pending_verification: Option<bool>,
 }
 
 /// What the API returns from /desktop/verify
@@ -108,6 +112,10 @@ pub(crate) struct AuthRecord {
 }
 
 impl AuthRecord {
+    pub(crate) fn encrypted(&self) -> &[u8] {
+        &self.encrypted
+    }
+
     fn new(
         token: &str,
         expires_at: &str,
@@ -181,6 +189,8 @@ pub struct AuthState {
     /// A remote response may arrive after sign-out or another account signs
     /// in; its generation must then be unable to rewrite that newer session.
     session_generation: Mutex<u64>,
+    #[cfg(test)]
+    test_settings_cache_dir: Option<PathBuf>,
 }
 
 impl Default for AuthState {
@@ -190,13 +200,23 @@ impl Default for AuthState {
             callback_port: Mutex::new(None),
             auth_method: Mutex::new(None),
             session_generation: Mutex::new(0),
+            #[cfg(test)]
+            test_settings_cache_dir: None,
         }
     }
 }
 
 impl AuthState {
+    #[cfg(test)]
+    pub(crate) fn with_test_settings_cache_dir(dir: PathBuf) -> Self {
+        Self {
+            test_settings_cache_dir: Some(dir),
+            ..Self::default()
+        }
+    }
+
     /// Generate a CSRF state token and store it with a timestamp.
-    pub fn generate_csrf_state(&self, db: &DatabaseStore) -> Result<String, String> {
+    pub fn generate_csrf_state(&self, db: &DatabaseStore) -> Result<(String, bool), String> {
         let mut bytes = [0u8; 32];
         rand::thread_rng().fill_bytes(&mut bytes);
         let state = base64_url_encode(&bytes);
@@ -205,6 +225,7 @@ impl AuthState {
         // generation guard until the CSRF record is installed closes the gap
         // where sign-out could otherwise happen between those two actions.
         let generation = self.session_generation.lock().unwrap();
+        let cleaned_rejection = db.settle_rejected_auth_before_sign_in()?;
         let launch = OAuthLaunch {
             generation: *generation,
             revision: db.auth_session_revision()?,
@@ -216,7 +237,7 @@ impl AuthState {
         states.retain(|_, (created_at, _)| *created_at > cutoff);
         states.insert(state.clone(), (SystemTime::now(), launch));
 
-        Ok(state)
+        Ok((state, cleaned_rejection))
     }
 
     /// Validate and consume a CSRF state token (one-time use).
@@ -329,11 +350,31 @@ impl AuthState {
     }
 
     pub(crate) fn clear_local_session(&self) {
+        #[cfg(test)]
+        if let Some(dir) = self.test_settings_cache_dir.as_deref() {
+            crate::settings_sync::clear_cache_at(dir);
+        } else {
+            crate::settings_sync::clear_cache();
+        }
+        #[cfg(not(test))]
         crate::settings_sync::clear_cache();
         self.set_local_session(None);
     }
 
+    pub(crate) fn cached_settings(&self) -> Option<crate::settings_sync::UserSettings> {
+        #[cfg(test)]
+        if let Some(dir) = self.test_settings_cache_dir.as_deref() {
+            return crate::settings_sync::load_cache_at(dir);
+        }
+        crate::settings_sync::load_cache()
+    }
+
     pub(crate) fn set_local_session(&self, stored: Option<&StoredAuth>) {
+        #[cfg(test)]
+        if self.test_settings_cache_dir.is_some() {
+            self.set_auth_method(stored.and_then(|stored| stored.auth_method.as_deref()));
+            return;
+        }
         let user = stored.and_then(|stored| stored.user.as_ref());
         crate::settings_sync::set_cache_owner(user.map(|user| user.id.as_str()));
         self.set_auth_method(stored.and_then(|stored| stored.auth_method.as_deref()));
@@ -374,6 +415,29 @@ pub(crate) fn token_file_path() -> PathBuf {
     let data_dir = dirs::data_dir()
         .unwrap_or_else(|| dirs::home_dir().unwrap_or_default().join(".local/share"));
     data_dir.join(crate::APP_DIR_NAME).join("auth-token.enc")
+}
+
+/// The database transaction revokes account browser sessions and marks the
+/// legacy import handled. A failed cleanup must not leave sign-out incomplete.
+pub(crate) fn clear_token_for_sign_out(db: &DatabaseStore) -> Result<(), String> {
+    clear_token_for_sign_out_at(db, &token_file_path())
+}
+
+fn clear_token_for_sign_out_at(db: &DatabaseStore, path: &Path) -> Result<(), String> {
+    db.require_persistent_auth_storage()?;
+    clear_token(db)?;
+    if let Err(error) = remove_legacy_token_file_at(path) {
+        eprintln!("[auth] Signed out, but could not remove legacy token file: {error}");
+    }
+    Ok(())
+}
+
+fn remove_legacy_token_file_at(path: &Path) -> Result<(), String> {
+    match fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(format!("Failed to remove legacy auth token: {error}")),
+    }
 }
 
 fn machine_id() -> &'static [u8] {
@@ -483,7 +547,7 @@ pub(crate) fn save_auth_with_method(
 ) -> Result<AuthRecord, String> {
     let record = AuthRecord::new(token, expires_at, user, method)?;
     match user {
-        Some(user) => db.save_auth_token_for_account(&record.encrypted, &user.id)?,
+        Some(_) => db.save_auth_token_for_account(&record.encrypted)?,
         None => db.save_auth_token(&record.encrypted)?,
     }
     Ok(record)
@@ -713,16 +777,14 @@ pub fn start_callback_server<R: tauri::Runtime>(
                             }
                         };
 
-                        emit_auth_state(&handle_clone, record, oauth_generation);
-
-                        let html = SUCCESS_HTML;
+                        let completion = emit_auth_state(&handle_clone, record, oauth_generation);
+                        let (status, content_type, body) = completion.response();
                         let resp = format!(
-                            "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                            html.len(),
-                            html
+                            "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                            body.len(),
                         );
                         let _ = stream.write_all(resp.as_bytes());
-                        break; // Success — shut down server
+                        break; // The one-time callback has been consumed.
                     } else {
                         let body = r#"{"error":"Missing auth params"}"#;
                         let resp = format!(
@@ -754,6 +816,37 @@ enum CallbackVerifyOutcome {
     Offline,
 }
 
+#[derive(Debug, PartialEq, Eq)]
+enum CallbackCompletion {
+    Accepted,
+    Rejected,
+    Stale,
+    Failed,
+}
+
+impl CallbackCompletion {
+    fn response(&self) -> (&'static str, &'static str, &'static str) {
+        match self {
+            Self::Accepted => ("200 OK", "text/html", SUCCESS_HTML),
+            Self::Rejected => (
+                "401 Unauthorized",
+                "application/json",
+                r#"{"error":"Account verification rejected this session"}"#,
+            ),
+            Self::Stale => (
+                "409 Conflict",
+                "application/json",
+                r#"{"error":"Authentication changed before callback"}"#,
+            ),
+            Self::Failed => (
+                "500 Internal Server Error",
+                "application/json",
+                r#"{"error":"Failed to complete sign-in"}"#,
+            ),
+        }
+    }
+}
+
 fn classify_callback_verify(
     status: reqwest::StatusCode,
     user: Option<AuthUser>,
@@ -774,6 +867,7 @@ fn emit_callback_auth_state<R: tauri::Runtime>(
     app: &tauri::AppHandle<R>,
     user: Option<AuthUser>,
     auth_method: Option<String>,
+    pending_verification: bool,
 ) {
     let authenticated = user.is_some();
     let _ = app.emit(
@@ -781,6 +875,8 @@ fn emit_callback_auth_state<R: tauri::Runtime>(
         &AuthStatePayload {
             authenticated,
             user,
+            storage_error: None,
+            pending_verification: pending_verification.then_some(true),
         },
     );
     let _ = app.emit(
@@ -796,9 +892,7 @@ fn emit_auth_state<R: tauri::Runtime>(
     app: &tauri::AppHandle<R>,
     record: AuthRecord,
     session_generation: u64,
-) {
-    let auth_state: tauri::State<'_, AuthState> = app.state();
-    let db: tauri::State<'_, DatabaseStore> = app.state();
+) -> CallbackCompletion {
     let token = &record.stored.token;
     // Fetch user data from API to populate the event
     let base = api_base_url();
@@ -834,9 +928,21 @@ fn emit_auth_state<R: tauri::Runtime>(
         Err(_) => CallbackVerifyOutcome::Offline,
     };
 
+    complete_callback_verification(app, record, session_generation, outcome)
+}
+
+fn complete_callback_verification<R: tauri::Runtime>(
+    app: &tauri::AppHandle<R>,
+    record: AuthRecord,
+    session_generation: u64,
+    outcome: CallbackVerifyOutcome,
+) -> CallbackCompletion {
+    let auth_state: tauri::State<'_, AuthState> = app.state();
+    let db: tauri::State<'_, DatabaseStore> = app.state();
+
     // The generation orders callbacks and sign-out in this process. SQLite
     // also checks the record so CLI changes invalidate outstanding callbacks.
-    let committed = match outcome {
+    match outcome {
         CallbackVerifyOutcome::Verified(user) => auth_state
             .commit_if_session_current(session_generation, || {
                 let Some(saved) = record.save_verified_user(&db, &user)? else {
@@ -846,32 +952,59 @@ fn emit_auth_state<R: tauri::Runtime>(
                     return Ok(false);
                 }
                 auth_state.set_local_session(Some(&saved.stored));
-                emit_callback_auth_state(app, Some(user), saved.stored.auth_method);
+                emit_callback_auth_state(app, Some(user), saved.stored.auth_method, false);
                 Ok(true)
             })
-            .unwrap_or(Ok(false)),
-        CallbackVerifyOutcome::Unauthorized => {
-            auth_state.clear_session_if_current(&db, session_generation, &record, || {
-                emit_callback_auth_state(app, None, None)
-            })
-        }
-        CallbackVerifyOutcome::Offline => Ok(auth_state
+            .unwrap_or(Ok(false))
+            .map_or_else(
+                |error: String| {
+                    eprintln!("[auth] Failed to persist OAuth verification result: {error}");
+                    CallbackCompletion::Failed
+                },
+                |committed| if committed { CallbackCompletion::Accepted } else { CallbackCompletion::Stale },
+            ),
+        CallbackVerifyOutcome::Unauthorized => match auth_state.clear_session_if_current(
+            &db, session_generation, &record, || {
+                emit_callback_auth_state(app, None, None, false)
+            },
+        ) {
+            Ok(true) => CallbackCompletion::Rejected,
+            Ok(false) => CallbackCompletion::Stale,
+            Err(error) => {
+                log::warn!("[auth] Could not persist rejected OAuth session cleanup: {error}");
+                match crate::commands::auth::start_rejected_auth_cleanup_retry(
+                    app,
+                    &db,
+                    &auth_state,
+                    session_generation,
+                    record.encrypted().to_vec(),
+                ) {
+                    Ok(Some(_)) => CallbackCompletion::Rejected,
+                    Ok(None) => CallbackCompletion::Stale,
+                    Err(inspect_error) => {
+                        log::warn!("[auth] Could not finish rejected OAuth sign-out: {inspect_error}");
+                        CallbackCompletion::Failed
+                    }
+                }
+            }
+        },
+        CallbackVerifyOutcome::Offline => {
+            if auth_state
             .commit_if_session_current(session_generation, || {
                 if !record.is_current(&db) {
                     return false;
                 }
                 // Report pending identity so the frontend can retry remotely.
                 auth_state.set_local_session(Some(&record.stored));
-                emit_callback_auth_state(app, None, record.stored.auth_method);
+                emit_callback_auth_state(app, None, record.stored.auth_method, true);
                 true
             })
-            .unwrap_or(false)),
-    };
-
-    match committed {
-        Ok(true) => {}
-        Ok(false) => eprintln!("[auth] Ignoring stale OAuth verification result"),
-        Err(error) => eprintln!("[auth] Failed to persist OAuth verification result: {error}"),
+            .unwrap_or(false) {
+                CallbackCompletion::Accepted
+            } else {
+                CallbackCompletion::Stale
+            }
+        }
     }
 }
 
@@ -945,6 +1078,165 @@ mod tests {
         let garbage = vec![0xdeu8; 100];
         assert!(decrypt_data(&garbage).is_err());
         assert!(decrypt_data(&[]).is_err());
+    }
+
+    #[test]
+    fn legacy_token_cleanup_reports_failures() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("auth-token.enc");
+        fs::write(&path, b"old token").unwrap();
+        remove_legacy_token_file_at(&path).unwrap();
+        assert!(!path.exists());
+        remove_legacy_token_file_at(&path).unwrap();
+
+        fs::create_dir(&path).unwrap();
+        assert!(remove_legacy_token_file_at(&path).is_err());
+    }
+
+    #[test]
+    fn legacy_cleanup_failure_does_not_keep_account_sessions_active() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = DatabaseStore::test_file(&dir.path().join("auth.sqlite"));
+        db.save_auth_token(b"cached session").unwrap();
+        db.web_remote_insert_account_session(
+            "account-browser",
+            None,
+            None,
+            "hash",
+            true,
+            "account-1",
+        )
+        .unwrap();
+        let path = dir.path().join("auth-token.enc");
+        fs::create_dir(&path).unwrap();
+
+        clear_token_for_sign_out_at(&db, &path).unwrap();
+        assert!(db.load_auth_token().is_none());
+        assert!(db.web_remote_get_session("account-browser").unwrap().revoked);
+    }
+
+    #[test]
+    fn in_memory_fallback_cannot_claim_durable_sign_out() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("auth.sqlite");
+        let disk = DatabaseStore::test_file(&db_path);
+        disk.save_auth_token(b"disk session").unwrap();
+        disk.web_remote_insert_account_session(
+            "account-browser", None, None, "hash", true, "account-1",
+        ).unwrap();
+        drop(disk);
+
+        let fallback = DatabaseStore::new_in_memory();
+        let legacy_path = dir.path().join("auth-token.enc");
+        assert!(clear_token_for_sign_out_at(&fallback, &legacy_path).is_err());
+
+        let disk = DatabaseStore::test_file(&db_path);
+        assert_eq!(disk.load_auth_token().as_deref(), Some(&b"disk session"[..]));
+        assert!(!disk.web_remote_get_session("account-browser").unwrap().revoked);
+    }
+
+    #[test]
+    fn unauthorized_clear_write_failure_keeps_the_session_active() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("auth.sqlite");
+        let db = DatabaseStore::test_file(&db_path);
+        let user = AuthUser {
+            id: "account-1".into(),
+            email: "test@example.com".into(),
+            name: None,
+            image: None,
+        };
+        let record = save_auth_with_method(
+            &db, "invalid-token", "2099-01-01T00:00:00Z", Some(&user), Some("email"),
+        ).unwrap();
+        let browser_token = "browser-token";
+        let browser_hash = crate::web_remote::auth::sha256_hex(browser_token);
+        db.web_remote_insert_account_session(
+            "account-browser", None, None, &browser_hash, true, &user.id,
+        ).unwrap();
+        assert!(crate::web_remote::auth::authenticate(&db, browser_token).is_some());
+        rusqlite::Connection::open(&db_path).unwrap().execute_batch(
+            "CREATE TRIGGER reject_auth_clear BEFORE DELETE ON auth_tokens
+             BEGIN SELECT RAISE(ABORT, 'fixture rejected clear'); END;",
+        ).unwrap();
+
+        let state = AuthState::default();
+        state.set_local_session(Some(&record.stored));
+        let (generation, _) = state.session_snapshot(|| ());
+        let mut emitted_signed_out = false;
+        let error = state.clear_session_if_current(&db, generation, &record, || {
+            emitted_signed_out = true;
+        }).unwrap_err();
+
+        assert!(error.contains("fixture rejected clear"));
+        assert!(!emitted_signed_out);
+        assert_eq!(state.session_snapshot(|| ()).0, generation);
+        assert_eq!(state.auth_method().as_deref(), Some("email"));
+        assert!(load_token(&db).is_none());
+        assert!(crate::web_remote::auth::authenticate(&db, browser_token).is_none());
+        assert!(!db.web_remote_insert_account_session_if_unchanged(
+            "new-browser", None, None, "new-hash", true, &user.id, &record.encrypted,
+        ).unwrap());
+        let persisted: Vec<u8> = rusqlite::Connection::open(&db_path).unwrap().query_row(
+            "SELECT encrypted_data FROM auth_tokens WHERE id = 1", [], |row| row.get(0),
+        ).unwrap();
+        assert_eq!(persisted, record.encrypted);
+        assert!(!db.web_remote_get_session("account-browser").unwrap().revoked);
+
+        rusqlite::Connection::open(&db_path).unwrap()
+            .execute_batch("DROP TRIGGER reject_auth_clear")
+            .unwrap();
+        save_auth_with_method(
+            &db, "new-token", "2099-01-01T00:00:00Z", Some(&user), Some("email"),
+        ).unwrap();
+        assert_eq!(load_token(&db).unwrap().0, "new-token");
+        assert!(db.web_remote_get_session("account-browser").unwrap().revoked);
+    }
+
+    #[test]
+    fn failed_unauthorized_clear_stays_suspended_after_reopen_until_retry_commits() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("auth.sqlite");
+        let user = AuthUser {
+            id: "account-1".into(),
+            email: "test@example.com".into(),
+            name: None,
+            image: None,
+        };
+        let db = DatabaseStore::test_file(&db_path);
+        let record = save_auth_with_method(
+            &db, "invalid-token", "2099-01-01T00:00:00Z", Some(&user), Some("email"),
+        ).unwrap();
+        let browser_token = "browser-token";
+        let browser_hash = crate::web_remote::auth::sha256_hex(browser_token);
+        db.web_remote_insert_account_session(
+            "account-browser", None, None, &browser_hash, true, &user.id,
+        ).unwrap();
+        rusqlite::Connection::open(&db_path).unwrap().execute_batch(
+            "CREATE TRIGGER reject_auth_clear BEFORE DELETE ON auth_tokens
+             BEGIN SELECT RAISE(ABORT, 'fixture rejected clear'); END;",
+        ).unwrap();
+        assert!(db.clear_auth_token_if_current(&record.encrypted).is_err());
+        assert!(crate::web_remote::auth::authenticate(&db, browser_token).is_none());
+        drop(db);
+
+        let reopened = DatabaseStore::test_file(&db_path);
+        assert!(!reopened.web_remote_get_session("account-browser").unwrap().revoked);
+        assert!(crate::web_remote::auth::authenticate(&reopened, browser_token).is_none());
+        assert!(!reopened.web_remote_insert_account_session_if_unchanged(
+            "new-browser", None, None, "new-hash", true, &user.id, &record.encrypted,
+        ).unwrap());
+
+        rusqlite::Connection::open(&db_path).unwrap()
+            .execute_batch("DROP TRIGGER reject_auth_clear")
+            .unwrap();
+        assert!(reopened.clear_auth_token_if_current(&record.encrypted).unwrap());
+        drop(reopened);
+
+        let recovered = DatabaseStore::test_file(&db_path);
+        assert!(recovered.load_auth_token().is_none());
+        assert!(recovered.web_remote_get_session("account-browser").unwrap().revoked);
+        assert!(crate::web_remote::auth::authenticate(&recovered, browser_token).is_none());
     }
 
     #[test]
@@ -1027,7 +1319,7 @@ mod tests {
     #[test]
     fn csrf_state_generate_and_validate() {
         let state = AuthState::default();
-        let token = state.generate_csrf_state(&test_db()).unwrap();
+        let (token, _) = state.generate_csrf_state(&test_db()).unwrap();
         assert!(!token.is_empty());
         assert!(state.validate_csrf_state(&token));
         assert!(!state.validate_csrf_state(&token));
@@ -1042,7 +1334,7 @@ mod tests {
     #[test]
     fn oauth_state_cannot_replace_a_session_that_changed_after_launch() {
         let state = AuthState::default();
-        let token = state.generate_csrf_state(&test_db()).unwrap();
+        let (token, _) = state.generate_csrf_state(&test_db()).unwrap();
         state.replace_session(|| "explicit-sign-out");
 
         let launch = state
@@ -1069,7 +1361,7 @@ mod tests {
         let expiry = "2099-01-01T00:00:00Z";
 
         assert!(desktop.load_auth_token().is_none());
-        let csrf = state.generate_csrf_state(&desktop).unwrap();
+        let (csrf, _) = state.generate_csrf_state(&desktop).unwrap();
         clear_token(&cli).unwrap();
         let launch = state.consume_csrf_state(&csrf).unwrap();
         assert!(state
@@ -1078,7 +1370,7 @@ mod tests {
             .is_none());
         assert!(desktop.load_auth_token().is_none());
 
-        let csrf = state.generate_csrf_state(&desktop).unwrap();
+        let (csrf, _) = state.generate_csrf_state(&desktop).unwrap();
         let user = AuthUser {
             id: "different-account".into(),
             email: "fixture@example.test".into(),
@@ -1094,7 +1386,7 @@ mod tests {
             .is_none());
         assert!(replacement.is_current(&desktop));
 
-        let csrf = state.generate_csrf_state(&desktop).unwrap();
+        let (csrf, _) = state.generate_csrf_state(&desktop).unwrap();
         let launch = state.consume_csrf_state(&csrf).unwrap();
         // In-place verification may update ciphertext while OAuth is pending.
         let verified = replacement
@@ -1110,6 +1402,39 @@ mod tests {
         assert_eq!(saved.stored.token, "fresh");
         assert_eq!(saved.stored.auth_method.as_deref(), Some("github"));
         assert!(state.consume_csrf_state(&csrf).is_none());
+    }
+
+    #[test]
+    fn oauth_launch_waits_for_rejected_cleanup_and_callback_installs_after_recovery() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = DatabaseStore::test_file(&dir.path().join("auth.sqlite"));
+        let state = AuthState::default();
+        let old = save_auth_with_method(
+            &db, "rejected", "2099-01-01T00:00:00Z", None, Some("github"),
+        ).unwrap();
+        let old_revision = db.auth_session_revision().unwrap();
+        db.test_set_query_only(true);
+        assert!(db.clear_auth_token_if_current(old.encrypted()).is_err());
+        assert!(state.generate_csrf_state(&db).unwrap_err().contains("cleanup is saved"));
+        assert_eq!(db.auth_session_revision().unwrap(), old_revision);
+
+        db.test_set_query_only(false);
+        let (csrf, cleaned_rejection) = state.generate_csrf_state(&db).unwrap();
+        assert!(cleaned_rejection);
+        let launch_revision = db.auth_session_revision().unwrap();
+        assert_eq!(launch_revision, old_revision);
+        assert!(db.load_raw_auth_token().unwrap().is_none());
+        // A retry that already observed the old row cannot clear a later
+        // callback's new session once this cleanup has committed.
+        assert!(!db.clear_auth_token_if_current(old.encrypted()).unwrap());
+        assert_eq!(db.auth_session_revision().unwrap(), launch_revision);
+
+        let launch = state.consume_csrf_state(&csrf).unwrap();
+        let installed = state.install_oauth_callback(
+            &db, launch, "fresh", "2099-01-01T00:00:00Z",
+        ).unwrap();
+        assert!(installed.is_some());
+        assert_eq!(load_token(&db).unwrap().0, "fresh");
     }
 
     #[test]
@@ -1137,6 +1462,48 @@ mod tests {
             classify_callback_verify(reqwest::StatusCode::OK, Some(user)),
             CallbackVerifyOutcome::Verified(_)
         ));
+    }
+
+    #[tokio::test]
+    async fn rejected_oauth_callback_signs_out_and_retries_failed_cleanup() {
+        let dir = tempfile::tempdir().unwrap();
+        let app = tauri::test::mock_app();
+        assert!(app.manage(DatabaseStore::test_file(&dir.path().join("auth.sqlite"))));
+        assert!(app.manage(AuthState::with_test_settings_cache_dir(dir.path().join("settings"))));
+        let db = app.state::<DatabaseStore>();
+        let auth_state = app.state::<AuthState>();
+        let record = save_auth_with_method(
+            &db, "rejected-oauth-token", "2099-01-01T00:00:00Z", None, Some("github"),
+        ).unwrap();
+        auth_state.set_local_session(Some(&record.stored));
+        let (generation, ()) = auth_state.session_snapshot(|| ());
+        db.web_remote_insert_account_session(
+            "account-browser", None, None, "account-browser-hash", true, "owner",
+        ).unwrap();
+
+        db.test_set_query_only(true);
+        let completion = complete_callback_verification(
+            app.handle(), record, generation, CallbackVerifyOutcome::Unauthorized,
+        );
+        assert_eq!(completion, CallbackCompletion::Rejected);
+        assert_eq!(completion.response().0, "401 Unauthorized");
+        assert!(auth_state.auth_method().is_none());
+        assert_eq!(auth_state.session_snapshot(|| ()).0, generation + 1);
+        assert!(db.load_auth_token().is_none());
+        assert!(db.load_raw_auth_token().unwrap().is_some());
+        assert!(!db.web_remote_get_session("account-browser").unwrap().revoked);
+
+        db.test_set_query_only(false);
+        tokio::time::timeout(std::time::Duration::from_secs(12), async {
+            loop {
+                if db.load_raw_auth_token().unwrap().is_none() {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        }).await.expect("callback cleanup should retry after storage recovers");
+        assert!(db.web_remote_get_session("account-browser").unwrap().revoked);
+        assert_eq!(auth_state.session_snapshot(|| ()).0, generation + 1);
     }
 
     #[test]

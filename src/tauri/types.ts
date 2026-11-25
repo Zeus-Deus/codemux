@@ -456,6 +456,10 @@ export type SessionRefresh = SessionBootstrap;
 export interface AuthStatePayload {
   authenticated: boolean;
   user: AuthUser | null;
+  /** A rejected account is inactive while durable local cleanup retries. */
+  storageError?: string | null;
+  /** The OAuth callback saved a token whose account verification is pending. */
+  pendingVerification?: boolean;
 }
 
 // ── Terminal ──

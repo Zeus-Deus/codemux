@@ -65,7 +65,7 @@ impl DatabaseStore {
     #[cfg(test)]
     pub(crate) fn control_fixture_snapshot(&self, path: &std::path::Path) -> Self {
         self.conn.lock().unwrap().execute("VACUUM INTO ?1", params![path.to_str().unwrap()]).unwrap();
-        Self { conn: std::sync::Mutex::new(super::open_connection(path).unwrap()) }
+        Self::from_connection(super::open_connection(path).unwrap())
     }
 
     /// Durable control-only queue evidence. It intentionally is NOT a

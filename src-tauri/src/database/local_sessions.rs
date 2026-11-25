@@ -74,16 +74,12 @@ mod tests {
         {
             let conn = open_connection(&path).unwrap();
             create_schema(&conn).unwrap();
-            let db = DatabaseStore {
-                conn: Mutex::new(conn),
-            };
+            let db = DatabaseStore::from_connection(conn);
             state.import_local_sessions(&db, &[a.clone()]).unwrap();
         }
         let conn = open_connection(&path).unwrap();
         create_schema(&conn).unwrap();
-        let db = DatabaseStore {
-            conn: Mutex::new(conn),
-        };
+        let db = DatabaseStore::from_connection(conn);
         let before = db.list_agent_chat_messages(&a.thread_id());
         let mut edited = a.clone();
         edited.messages = vec![("user".into(), "Do not overwrite".into())];

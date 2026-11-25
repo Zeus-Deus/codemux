@@ -697,14 +697,11 @@ mod tests {
     use super::*;
     use crate::mcp_connector::oauth::credential_hash;
     use rusqlite::Connection;
-    use std::sync::Mutex;
     fn db() -> DatabaseStore {
         let conn = Connection::open_in_memory().unwrap();
         conn.execute_batch("PRAGMA foreign_keys=ON").unwrap();
         conn.execute_batch(SCHEMA).unwrap();
-        DatabaseStore {
-            conn: Mutex::new(conn),
-        }
+        DatabaseStore::from_connection(conn)
     }
     fn client(id: &str) -> NewMcpClient {
         NewMcpClient {
@@ -788,9 +785,7 @@ mod tests {
         let path = dir.path().join("migration.db");
         let seed = super::super::open_connection(&path).unwrap();
         super::super::create_schema(&seed).unwrap();
-        let seed = DatabaseStore {
-            conn: Mutex::new(seed),
-        };
+        let seed = DatabaseStore::from_connection(seed);
         seed.mcp_register_client(client("client"), 0).unwrap();
         seed.mcp_mint_grant(grant("grant", "synthetic-migration"))
             .unwrap();
@@ -828,9 +823,7 @@ mod tests {
                     0
                 );
             }
-            let writer = DatabaseStore {
-                conn: Mutex::new(writer),
-            };
+            let writer = DatabaseStore::from_connection(writer);
             let started = start_rx.recv_timeout(Duration::from_secs(5));
             let result = if started.is_ok() {
                 writer.set_setting("web_remote.device_id", "synthetic-owned-device")
@@ -885,9 +878,7 @@ mod tests {
             "schema must acquire write authority before its WAL snapshot: {result:?}"
         );
         assert_eq!(gate.observation.as_deref(), Some("writer-blocked"));
-        let readback = DatabaseStore {
-            conn: Mutex::new(reader),
-        };
+        let readback = DatabaseStore::from_connection(reader);
         assert_eq!(
             readback.get_setting("web_remote.device_id").as_deref(),
             Some("synthetic-owned-device")
@@ -1062,9 +1053,7 @@ mod tests {
                 let conn = super::super::open_connection(&path).unwrap();
                 barrier.wait();
                 super::super::create_schema(&conn)?;
-                DatabaseStore {
-                    conn: Mutex::new(conn),
-                }
+                DatabaseStore::from_connection(conn)
                 .set_setting(&format!("synthetic.reopen.{n}"), "written")
             }));
         }
@@ -1073,9 +1062,7 @@ mod tests {
         }
         let conn = super::super::open_connection(&path).unwrap();
         super::super::create_schema(&conn).unwrap();
-        let db = DatabaseStore {
-            conn: Mutex::new(conn),
-        };
+        let db = DatabaseStore::from_connection(conn);
         for n in 0..2 {
             assert_eq!(
                 db.get_setting(&format!("synthetic.reopen.{n}")).as_deref(),
@@ -1229,9 +1216,7 @@ mod tests {
             let conn = Connection::open(file.path()).unwrap();
             conn.execute_batch("PRAGMA foreign_keys=ON").unwrap();
             conn.execute_batch(SCHEMA).unwrap();
-            DatabaseStore {
-                conn: Mutex::new(conn),
-            }
+            DatabaseStore::from_connection(conn)
         };
         let db = open();
         db.mcp_register_client(client("client"), 0).unwrap();
@@ -2096,9 +2081,7 @@ mod tests {
         drop(conn);
         let conn = super::super::open_connection(&path).unwrap();
         super::super::create_schema(&conn).unwrap();
-        let db = DatabaseStore {
-            conn: Mutex::new(conn),
-        };
+        let db = DatabaseStore::from_connection(conn);
         db.mcp_register_client(client("client"), 0).unwrap();
         sign_in(&db, "grant", "access-1", "refresh-1", 0);
         assert_eq!(

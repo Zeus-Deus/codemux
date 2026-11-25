@@ -158,6 +158,11 @@ export const onAuthStateChanged = (
 ): Promise<UnlistenFn> =>
   listen<AuthStatePayload>("auth-state-changed", (e) => cb(e.payload));
 
+export const onAuthStorageErrorCleared = (
+  cb: EventCallback<string>,
+): Promise<UnlistenFn> =>
+  listen<string>("auth-storage-error-cleared", (e) => cb(e.payload));
+
 // Stage 2 sync state changes: emitted by the backend after signin,
 // signout, sync setup, and sync repair.
 export interface SyncStateChangedPayload {
