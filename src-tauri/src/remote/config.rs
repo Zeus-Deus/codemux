@@ -32,32 +32,78 @@ pub fn default_state_dir() -> PathBuf {
     PathBuf::from(".codemux-remote")
 }
 
-/// Create `dir` (and any missing parents) owner-only, and tighten it to
-/// 0700 when it already exists. The state dir is what keeps the registry,
-/// setup logs and daemon secret away from other local users, and one-shot
-/// CLI calls create it as well as `serve`, so every entry point uses this.
-/// Only `dir` itself is chmodded; existing parents are left alone.
-///
-/// Creating the dir is fatal; tightening an existing one is best-effort, so
-/// a `--state-dir` this user does not own (or a mount that rejects chmod)
-/// still works as it did before, with a warning on stderr.
+/// Create a private state directory, or verify an existing one. An older
+/// default state directory is ours to tighten; an existing custom directory
+/// may be shared with other tools, so its mode is never changed here.
 pub fn ensure_private_dir(dir: &std::path::Path) -> std::io::Result<()> {
-    use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
-    // A bare relative file name has an empty parent: the current directory,
-    // which is not ours to chmod.
-    if dir.as_os_str().is_empty() {
-        return Ok(());
-    }
-    std::fs::DirBuilder::new().recursive(true).mode(0o700).create(dir)?;
-    tighten(dir, std::fs::Permissions::from_mode(0o700));
-    Ok(())
+    ensure_private_dir_with_default(dir, &default_state_dir())
 }
 
-/// Best-effort chmod of a state path that may predate the owner-only modes.
-pub(crate) fn tighten(path: &std::path::Path, perms: std::fs::Permissions) {
-    if let Err(e) = std::fs::set_permissions(path, perms) {
-        eprintln!("[codemux-remote] could not restrict permissions on {}: {e}", path.display());
+fn ensure_private_dir_with_default(
+    dir: &std::path::Path,
+    default: &std::path::Path,
+) -> std::io::Result<()> {
+    use cap_fs_ext::DirExt;
+    use std::io::{Error, ErrorKind};
+    use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
+
+    if dir.as_os_str().is_empty() {
+        return Err(Error::new(
+            ErrorKind::InvalidInput,
+            "state directory cannot be empty",
+        ));
     }
+
+    match std::fs::symlink_metadata(dir) {
+        Ok(_) => {}
+        Err(e) if e.kind() == ErrorKind::NotFound => {
+            std::fs::DirBuilder::new()
+                .recursive(true)
+                .mode(0o700)
+                .create(dir)?;
+        }
+        Err(e) => return Err(e),
+    }
+
+    // Check and, for the known default only, chmod the opened directory.
+    // Resolve the final component relative to its parent without following
+    // a symlink, including when the supplied path has a trailing separator.
+    let normalized: PathBuf = dir.components().collect();
+    let name = normalized.file_name().ok_or_else(|| {
+        Error::new(
+            ErrorKind::InvalidInput,
+            "state directory must name a directory",
+        )
+    })?;
+    let parent = normalized
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| std::path::Path::new("."));
+    let parent = cap_std::fs::Dir::open_ambient_dir(parent, cap_std::ambient_authority())?;
+    let opened = parent.open_dir_nofollow(name)?;
+    let meta = opened.try_clone()?.into_std_file().metadata()?;
+    if meta.uid() != unsafe { libc::geteuid() } {
+        return Err(Error::new(
+            ErrorKind::PermissionDenied,
+            format!(
+                "state directory {} is not owned by this user",
+                dir.display()
+            ),
+        ));
+    }
+    if meta.permissions().mode() & 0o077 != 0 {
+        if dir != default {
+            return Err(Error::new(ErrorKind::PermissionDenied, format!(
+                "custom state directory {} is accessible to other users; choose a private directory or chmod it to 0700",
+                dir.display()
+            )));
+        }
+        opened
+            .open(".")?
+            .into_std()
+            .set_permissions(std::fs::Permissions::from_mode(0o700))?;
+    }
+    Ok(())
 }
 
 /// Manifest file inside a given state-dir.
@@ -86,4 +132,55 @@ pub fn serve_log_path(state_dir: &std::path::Path) -> PathBuf {
 /// because no daemon was up to own them.
 pub fn logs_dir(state_dir: &std::path::Path) -> PathBuf {
     state_dir.join("logs")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    fn mode(path: &std::path::Path) -> u32 {
+        std::fs::metadata(path).unwrap().permissions().mode() & 0o777
+    }
+
+    #[test]
+    fn existing_custom_root_must_already_be_private() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("shared");
+        std::fs::create_dir(&root).unwrap();
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let error =
+            ensure_private_dir_with_default(&root, &temp.path().join("default")).unwrap_err();
+        assert!(error.to_string().contains("custom state directory"));
+        assert_eq!(mode(&root), 0o755);
+
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).unwrap();
+        ensure_private_dir_with_default(&root, &temp.path().join("default")).unwrap();
+        assert_eq!(mode(&root), 0o700);
+    }
+
+    #[test]
+    fn older_default_root_is_tightened() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("default");
+        std::fs::create_dir(&root).unwrap();
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        ensure_private_dir_with_default(&root, &root).unwrap();
+        assert_eq!(mode(&root), 0o700);
+    }
+
+    #[test]
+    fn state_dir_symlink_cannot_redirect_chmod() {
+        let temp = tempfile::tempdir().unwrap();
+        let shared = temp.path().join("shared");
+        let link = temp.path().join("default");
+        std::fs::create_dir(&shared).unwrap();
+        std::fs::set_permissions(&shared, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::os::unix::fs::symlink(&shared, &link).unwrap();
+
+        assert!(ensure_private_dir_with_default(&link, &link).is_err());
+        assert_eq!(mode(&shared), 0o755);
+    }
 }

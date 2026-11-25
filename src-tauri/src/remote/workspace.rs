@@ -613,16 +613,22 @@ fn git_remote_origin_url(dir: &str) -> Option<String> {
 /// Create the database file 0600 before SQLite opens it, and tighten one an
 /// older version left at the umask default. SQLite gives its -wal and -shm
 /// files the main file's mode, so they stay private too. Tightening an
-/// existing file is best-effort, like the state dir.
+/// existing file is best-effort and uses its handle to avoid symlinks.
 fn create_private_db_file(db_path: &Path) -> Result<(), WorkspaceError> {
     use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
-    std::fs::OpenOptions::new()
+    let file = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
         .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW)
         .open(db_path)
         .map_err(|e| WorkspaceError::Io(format!("create db file: {e}")))?;
-    super::config::tighten(db_path, std::fs::Permissions::from_mode(0o600));
+    if let Err(e) = file.set_permissions(std::fs::Permissions::from_mode(0o600)) {
+        eprintln!(
+            "[codemux-remote] could not restrict permissions on {}: {e}",
+            db_path.display()
+        );
+    }
     Ok(())
 }
 
@@ -669,21 +675,57 @@ mod tests {
         }
     }
 
-    /// Installs from before the fix left the state dir 0755 and the
-    /// database 0644. Opening the store tightens both.
+    /// A caller-supplied shared directory must not be chmodded as a side
+    /// effect of opening the registry.
     #[test]
-    fn open_tightens_an_existing_state_dir_and_database() {
+    fn open_rejects_a_shared_custom_state_dir() {
         use std::os::unix::fs::PermissionsExt;
         let dir = TempDir::new().unwrap();
-        let state = dir.path().join("codemux-remote");
+        let state = dir.path().join("shared");
         let db = state.join("codemux.db");
         drop(WorkspaceStore::open(&db, "test-host".into(), state.join("workspaces")).unwrap());
         std::fs::set_permissions(&state, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let error = WorkspaceStore::open(&db, "test-host".into(), state.join("workspaces"))
+            .err()
+            .expect("shared custom root must be rejected");
+        assert!(error.to_string().contains("custom state directory"));
+        assert_eq!(mode(&state), 0o755);
+    }
+
+    #[test]
+    fn open_tightens_an_existing_database_in_a_private_state_dir() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = TempDir::new().unwrap();
+        let state = dir.path().join("state");
+        let db = state.join("codemux.db");
+        drop(WorkspaceStore::open(&db, "test-host".into(), state.join("workspaces")).unwrap());
         std::fs::set_permissions(&db, std::fs::Permissions::from_mode(0o644)).unwrap();
 
         WorkspaceStore::open(&db, "test-host".into(), state.join("workspaces")).unwrap();
         assert_eq!(mode(&state), 0o700);
         assert_eq!(mode(&db), 0o600);
+    }
+
+    #[test]
+    fn open_does_not_chmod_through_a_database_symlink() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = TempDir::new().unwrap();
+        let state = dir.path().join("state");
+        std::fs::create_dir(&state).unwrap();
+        std::fs::set_permissions(&state, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let outside = dir.path().join("outside.db");
+        std::fs::write(&outside, b"untouched").unwrap();
+        std::fs::set_permissions(&outside, std::fs::Permissions::from_mode(0o644)).unwrap();
+        std::os::unix::fs::symlink(&outside, state.join("codemux.db")).unwrap();
+
+        assert!(WorkspaceStore::open(
+            &state.join("codemux.db"),
+            "test-host".into(),
+            state.join("workspaces")
+        )
+        .is_err());
+        assert_eq!(mode(&outside), 0o644);
+        assert_eq!(std::fs::read(&outside).unwrap(), b"untouched");
     }
 
     #[test]
