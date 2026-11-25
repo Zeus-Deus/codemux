@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState, useCallback, memo } from "react";
-import { startBrowserStream, browserStreamBridgeEndpoints, agentBrowserRun, activatePane, writeToPty } from "@/tauri/commands";
+import { startBrowserStream, browserStreamBridgeEndpoints, agentBrowserRun, agentBrowserPendingConfirmation, agentBrowserRespondConfirmation, activatePane, writeToPty, type BrowserPendingConfirmation } from "@/tauri/commands";
 import { selectActiveWorkspaceId, useAppStore } from "@/stores/app-store";
 import { useAgentChatStore } from "@/stores/agent-chat-store";
 import { toast } from "@/lib/toast";
@@ -104,6 +104,50 @@ function RetryCountdown({ at }: { at: number }) {
   return <span className="tabular-nums">Retrying in {seconds}s</span>;
 }
 
+function ConfirmationCountdown({ at }: { at: number }) {
+  const [now, setNow] = useState(() => Date.now());
+  useEffect(() => {
+    const id = setInterval(() => setNow(Date.now()), 1000);
+    return () => clearInterval(id);
+  }, []);
+  return <span className="tabular-nums">Expires in {Math.max(0, Math.ceil((at - now) / 1000))}s</span>;
+}
+
+interface PendingConfirmationState {
+  sessionId: string;
+  details: BrowserPendingConfirmation;
+}
+
+function PendingConfirmationNotice({
+  pending, busy, error, onApprove, onDeny,
+}: {
+  pending: PendingConfirmationState;
+  busy: boolean;
+  error: string | null;
+  onApprove: () => void;
+  onDeny: () => void;
+}) {
+  const canRespond = !isRemoteClient() && !!pending.details.id;
+  return (
+    <div className="max-w-sm space-y-2 text-center" role="alert">
+      <p className="text-label font-medium text-foreground">Browser confirmation required</p>
+      <p className="break-words text-label text-muted-foreground">{pending.details.description}</p>
+      <p className="text-caption text-muted-foreground"><ConfirmationCountdown at={pending.details.expires_at_ms} /></p>
+      {error && <p className="break-words text-label text-destructive">{error}</p>}
+      {canRespond ? (
+        <div className="flex items-center justify-center gap-2">
+          <Button size="sm" onClick={onApprove} disabled={busy}>Approve browser action</Button>
+          <Button variant="outline" size="sm" onClick={onDeny} disabled={busy}>Deny</Button>
+        </div>
+      ) : (
+        <p className="text-label text-muted-foreground">
+          {isRemoteClient() ? "Approve or deny this request on the host device." : "This request cannot be approved here. Wait for it to expire and retry."}
+        </p>
+      )}
+    </div>
+  );
+}
+
 // Move-forwarding cadence (ms). Drags run tight for smooth text
 // selection; hover is calmer; inspector mode stays at the old 10/s to
 // avoid frame starvation from its in-page highlight handler.
@@ -156,6 +200,10 @@ export const BrowserPane = memo(function BrowserPane({ browserId, focused, visib
   fixedViewportRef.current = fixedViewport ?? browserViewportPresetSize(viewportPreset) ?? undefined;
   const [status, setStatus] = useState<BrowserStreamStatus>("starting");
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
+  const [pendingConfirmation, setPendingConfirmation] = useState<PendingConfirmationState | null>(null);
+  const pendingConfirmationRef = useRef(false);
+  const [confirmationBusy, setConfirmationBusy] = useState(false);
+  const [confirmationError, setConfirmationError] = useState<string | null>(null);
   // Bumping this re-runs the stream effect from the top: "Retry now".
   const [retryNonce, setRetryNonce] = useState(0);
   // When the slow reconnect loop will try next; null while not waiting.
@@ -320,8 +368,11 @@ export const BrowserPane = memo(function BrowserPane({ browserId, focused, visib
     let slowRetryTimer: ReturnType<typeof setTimeout> | null = null;
 
     (async () => {
+      pendingConfirmationRef.current = false;
       setStatus("starting");
       setErrorMsg(null);
+      setPendingConfirmation(null);
+      setConfirmationError(null);
       setRetryAt(null);
       frameCountRef.current = 0;
 
@@ -338,6 +389,17 @@ export const BrowserPane = memo(function BrowserPane({ browserId, focused, visib
       } catch (err) {
         if (!active) return;
         console.error("[browser] startBrowserStream FAILED", err);
+        if (String(err).includes("Browser confirmation is pending")) {
+          pendingConfirmationRef.current = true;
+          if (!remoteClient) {
+            const details = await agentBrowserPendingConfirmation(streamSessionId).catch(() => null);
+            if (!active) return;
+            if (details) setPendingConfirmation({ sessionId: streamSessionId, details });
+          }
+          setStatus("error");
+          setErrorMsg(remoteClient ? "Browser approval is waiting on the host device" : "Browser confirmation is pending");
+          return;
+        }
         setStatus("error");
         setErrorMsg(`Failed to start browser: ${err}`);
         // Same slow cadence as the reconnect loop: the daemon may come
@@ -388,6 +450,7 @@ export const BrowserPane = memo(function BrowserPane({ browserId, focused, visib
       const maxRetries = 15;
 
       function scheduleReconnect(message = "Stream disconnected") {
+        if (pendingConfirmationRef.current) return;
         retries++;
         if (retries < maxRetries) {
           if (statusRef.current === "live") {
@@ -403,7 +466,7 @@ export const BrowserPane = memo(function BrowserPane({ browserId, focused, visib
       }
 
       async function connectWS() {
-        if (!active) return;
+        if (!active || pendingConfirmationRef.current) return;
         setRetryAt(null);
         if (retries === 0) setStatus("connecting");
         else if (retries < maxRetries) setStatus("waiting");
@@ -489,7 +552,16 @@ export const BrowserPane = memo(function BrowserPane({ browserId, focused, visib
                   if (targetUrl && targetUrl !== "about:blank") {
                     setTimeout(() => {
                       agentBrowserRun(effectiveSessionId, "open", { url: targetUrl })
-                        .then(() => setCurrentUrl(targetUrl))
+                        .then(async () => {
+                          if (!isRemoteClient()) {
+                            const pending = await agentBrowserPendingConfirmation(effectiveSessionId);
+                            if (pending) {
+                              showPendingConfirmation(effectiveSessionId, pending);
+                              return;
+                            }
+                          }
+                          setCurrentUrl(targetUrl);
+                        })
                         .catch(console.error);
                     }, 300);
                   }
@@ -615,9 +687,76 @@ export const BrowserPane = memo(function BrowserPane({ browserId, focused, visib
   }, [browserId, visible, browserSession?.agent_session_name, reactiveStreamUrl, retryNonce]);
 
   const retryNow = () => {
+    pendingConfirmationRef.current = false;
     startFailuresRef.current = 0;
     setRetryNonce((n) => n + 1);
   };
+
+  const showPendingConfirmation = (sessionId: string, details: BrowserPendingConfirmation) => {
+    pendingConfirmationRef.current = true;
+    wsRef.current?.close();
+    wsRef.current = null;
+    httpBaseRef.current = null;
+    setPendingConfirmation({ sessionId, details });
+    setConfirmationError(null);
+    setErrorMsg(null);
+    setRetryAt(null);
+    setStatus("error");
+  };
+
+  useEffect(() => {
+    if (!visible || isRemoteClient()) return;
+    let active = true;
+    let checking = false;
+    const checkPending = async () => {
+      if (checking || pendingConfirmationRef.current) return;
+      checking = true;
+      try {
+        const pending = await agentBrowserPendingConfirmation(effectiveSessionId);
+        if (active && pending && !pendingConfirmationRef.current) {
+          showPendingConfirmation(effectiveSessionId, pending);
+        }
+      } catch {
+        // The stream retry path reports backend failures to the pane.
+      } finally {
+        checking = false;
+      }
+    };
+    void checkPending();
+    const timer = setInterval(checkPending, 2000);
+    return () => {
+      active = false;
+      clearInterval(timer);
+    };
+  }, [visible, effectiveSessionId]);
+
+  const respondToConfirmation = async (approve: boolean) => {
+    const pending = pendingConfirmation;
+    if (!pending?.details.id || confirmationBusy || isRemoteClient()) return;
+    setConfirmationBusy(true);
+    setConfirmationError(null);
+    try {
+      await agentBrowserRespondConfirmation(pending.sessionId, pending.details.id, approve);
+      setPendingConfirmation(null);
+      if (approve) retryNow();
+      else setErrorMsg("Browser action denied");
+    } catch (err) {
+      setConfirmationError(String(err));
+    } finally {
+      setConfirmationBusy(false);
+    }
+  };
+
+  useEffect(() => {
+    if (!pendingConfirmation) return;
+    const timer = setTimeout(() => {
+      setPendingConfirmation(null);
+      setConfirmationError(null);
+      setErrorMsg("Browser confirmation expired. Retry to request it again.");
+      setStatus("error");
+    }, Math.max(0, pendingConfirmation.details.expires_at_ms - Date.now()) + 150);
+    return () => clearTimeout(timer);
+  }, [pendingConfirmation]);
 
   const copyErrorDetails = async () => {
     const details = [
@@ -1073,6 +1212,7 @@ export const BrowserPane = memo(function BrowserPane({ browserId, focused, visib
           sessionId={effectiveSessionId}
           currentUrl={currentUrl}
           onUrlChange={setCurrentUrl}
+          onPendingConfirmation={showPendingConfirmation}
           loading={status === "starting" || status === "connecting"}
           inspectorActive={inspectorActive}
           onInspectorToggle={toggleInspector}
@@ -1096,7 +1236,15 @@ export const BrowserPane = memo(function BrowserPane({ browserId, focused, visib
             and surface a corner pill instead of blanking the pane. */}
         {status !== "live" && !hasFrame && (
           <div className="absolute inset-0 flex flex-col items-center justify-center bg-card z-10 px-4 text-center">
-            {status === "error" ? (
+            {pendingConfirmation ? (
+              <PendingConfirmationNotice
+                pending={pendingConfirmation}
+                busy={confirmationBusy}
+                error={confirmationError}
+                onApprove={() => respondToConfirmation(true)}
+                onDeny={() => respondToConfirmation(false)}
+              />
+            ) : status === "error" ? (
               <>
                 <Globe className="size-8 text-subtle-foreground mb-2" />
                 <p className="max-w-sm text-label text-destructive">{errorMsg || "Connection failed"}</p>
@@ -1130,10 +1278,20 @@ export const BrowserPane = memo(function BrowserPane({ browserId, focused, visib
         )}
         {status !== "live" && hasFrame && (
           <div
-            className="absolute right-2 top-2 z-10 flex items-center gap-1.5 rounded-full border border-border bg-card/90 px-2.5 py-1 shadow-sm backdrop-blur-sm animate-in fade-in duration-250"
+            className={pendingConfirmation
+              ? "absolute right-2 top-2 z-10 rounded-md border border-border bg-card/95 p-3 shadow-sm backdrop-blur-sm"
+              : "absolute right-2 top-2 z-10 flex items-center gap-1.5 rounded-full border border-border bg-card/90 px-2.5 py-1 shadow-sm backdrop-blur-sm animate-in fade-in duration-250"}
             style={{ animationDelay: "400ms", animationFillMode: "backwards" }}
           >
-            {status === "error" ? (
+            {pendingConfirmation ? (
+              <PendingConfirmationNotice
+                pending={pendingConfirmation}
+                busy={confirmationBusy}
+                error={confirmationError}
+                onApprove={() => respondToConfirmation(true)}
+                onDeny={() => respondToConfirmation(false)}
+              />
+            ) : status === "error" ? (
               <>
                 <Globe className="size-3 text-destructive" />
                 <span className="text-label text-destructive">{errorMsg || "Stream disconnected"}</span>

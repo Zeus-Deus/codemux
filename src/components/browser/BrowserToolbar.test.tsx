@@ -8,11 +8,13 @@ import type { AppStateSnapshot } from "@/tauri/types";
 
 const mocks = vi.hoisted(() => ({
   agentBrowserRun: vi.fn(),
+  agentBrowserPendingConfirmation: vi.fn(),
   openUrl: vi.fn().mockResolvedValue(undefined),
 }));
 
 vi.mock("@/tauri/commands", () => ({
   agentBrowserRun: (...a: unknown[]) => mocks.agentBrowserRun(...a),
+  agentBrowserPendingConfirmation: (...a: unknown[]) => mocks.agentBrowserPendingConfirmation(...a),
 }));
 
 vi.mock("@tauri-apps/plugin-opener", () => ({
@@ -40,6 +42,7 @@ function renderToolbar(props: Partial<Parameters<typeof BrowserToolbar>[0]> = {}
 
 beforeEach(() => {
   mocks.agentBrowserRun.mockReset().mockResolvedValue(null);
+  mocks.agentBrowserPendingConfirmation.mockReset().mockResolvedValue(null);
   mocks.openUrl.mockClear();
   useAppStore.setState({ appState: null });
 });
@@ -47,6 +50,18 @@ beforeEach(() => {
 afterEach(() => cleanup());
 
 describe("BrowserToolbar", () => {
+  it("surfaces a pending navigation without claiming the page opened", async () => {
+    const onPendingConfirmation = vi.fn();
+    const pending = { id: "c_123", description: "navigation: example.com", expires_at_ms: Date.now() + 60_000 };
+    mocks.agentBrowserPendingConfirmation.mockResolvedValue(pending);
+    const { input, onUrlChange } = renderToolbar({ onPendingConfirmation });
+
+    await userEvent.clear(input);
+    await userEvent.type(input, "example.com{Enter}");
+    await vi.waitFor(() => expect(onPendingConfirmation).toHaveBeenCalledWith("ws-abc", pending));
+    expect(onUrlChange).not.toHaveBeenCalled();
+  });
+
   it("opens a local dev server over http", async () => {
     const { input, onUrlChange } = renderToolbar();
     await userEvent.clear(input);

@@ -1324,6 +1324,18 @@ export const agentBrowserSpawn = (browserId: string) =>
 export const agentBrowserRun = (browserId: string, action: string, params: unknown) =>
   invoke("agent_browser_run", { browserId, action, params });
 
+export interface BrowserPendingConfirmation {
+  id: string | null;
+  description: string;
+  expires_at_ms: number;
+}
+
+export const agentBrowserPendingConfirmation = (browserId: string) =>
+  invoke<BrowserPendingConfirmation | null>("agent_browser_pending_confirmation", { browserId });
+
+export const agentBrowserRespondConfirmation = (browserId: string, id: string, approve: boolean) =>
+  invoke<void>("agent_browser_respond_confirmation", { browserId, id, approve });
+
 export const agentBrowserClose = (browserId: string) =>
   invoke("agent_browser_close", { browserId });
 

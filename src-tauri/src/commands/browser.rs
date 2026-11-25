@@ -1,4 +1,4 @@
-use crate::agent_browser::{AgentBrowserManager, BrowserAutomationResult};
+use crate::agent_browser::{AgentBrowserManager, BrowserAutomationResult, BrowserPendingConfirmation};
 use crate::browser_stream_bridge::{BrowserStreamBridge, BrowserStreamBridgeEndpoints};
 use crate::state::AppStateStore;
 use std::path::PathBuf;
@@ -207,6 +207,24 @@ pub async fn agent_browser_run(
     params: serde_json::Value,
 ) -> Result<BrowserAutomationResult, String> {
     manager.run_command(&browser_id, &action, params).await
+}
+
+#[tauri::command]
+pub async fn agent_browser_pending_confirmation(
+    manager: State<'_, AgentBrowserManager>,
+    browser_id: String,
+) -> Result<Option<BrowserPendingConfirmation>, String> {
+    manager.pending_confirmation(&browser_id).await
+}
+
+#[tauri::command]
+pub async fn agent_browser_respond_confirmation(
+    manager: State<'_, AgentBrowserManager>,
+    browser_id: String,
+    id: String,
+    approve: bool,
+) -> Result<(), String> {
+    manager.respond_confirmation(&browser_id, &id, approve).await
 }
 
 #[tauri::command]

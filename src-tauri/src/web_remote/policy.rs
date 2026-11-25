@@ -405,6 +405,18 @@ mod tests {
     }
 
     #[test]
+    fn browser_confirmation_and_local_bridge_stay_on_the_host() {
+        assert!(allowed("agent_browser_run"));
+        for cmd in [
+            "agent_browser_pending_confirmation",
+            "agent_browser_respond_confirmation",
+            "browser_stream_bridge_endpoints",
+        ] {
+            assert!(!allowed(cmd), "{cmd} grants host-only browser authority");
+        }
+    }
+
+    #[test]
     fn chatgpt_private_metadata_and_mutations_are_denied_to_web_remote() {
         for cmd in [
             "get_chatgpt_status", "start_chatgpt_login", "cancel_chatgpt_login",
