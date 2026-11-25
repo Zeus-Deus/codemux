@@ -1302,8 +1302,7 @@ pub fn restore_on_boot<R: Runtime>(app: &AppHandle<R>) {
     // when the GUI is absent (as in `codemux serve`).
     let verifying_app = app.clone();
     tauri::async_runtime::spawn(async move {
-        let db = verifying_app.state::<crate::database::DatabaseStore>();
-        crate::commands::auth::verify_stored_account_for_remote(&db).await;
+        crate::commands::auth::verify_stored_account_for_remote(&verifying_app).await;
     });
     let enabled = shared.config.lock().unwrap().enabled;
     // `codemux serve` performs an awaited enable after the full headless app

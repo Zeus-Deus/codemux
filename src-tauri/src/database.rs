@@ -266,16 +266,20 @@ use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Mutex;
+use std::time::{Duration, Instant};
 
 const SCHEMA_VERSION: u32 = 25;
+/// An already-running host must renew its account proof. If another process
+/// rejects the token while SQLite cannot write, its browser access expires.
+pub(crate) const ACCOUNT_AUTH_VERIFICATION_TTL: Duration = Duration::from_secs(60);
 
 pub struct DatabaseStore {
     conn: Mutex<Connection>,
     rejected_auth_records: Mutex<HashSet<Vec<u8>>>,
     // Browser sessions cannot trust a cached account merely because its
-    // encrypted token survived a prior process. Verification is process-local
-    // so a failed durable 401 revocation never revives on restart.
-    verified_account_auth_records: Mutex<HashSet<Vec<u8>>>,
+    // encrypted token survived a prior process. Proof is process-local and
+    // expires, so failed durable 401 revocation also suspends running peers.
+    verified_account_auth_records: Mutex<HashMap<Vec<u8>, Instant>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1588,7 +1592,7 @@ impl DatabaseStore {
         Self {
             conn: Mutex::new(conn),
             rejected_auth_records: Mutex::new(HashSet::new()),
-            verified_account_auth_records: Mutex::new(HashSet::new()),
+            verified_account_auth_records: Mutex::new(HashMap::new()),
         }
     }
 
@@ -6146,11 +6150,19 @@ impl DatabaseStore {
         if !current || self.rejected_auth_records.lock().unwrap().contains(expected) {
             return false;
         }
-        self.verified_account_auth_records
-            .lock()
-            .unwrap()
-            .insert(expected.to_vec());
+        let mut verified = self.verified_account_auth_records.lock().unwrap();
+        // There is only one current auth row. A successful refresh may
+        // re-encrypt it to new bytes, so do not retain old ciphertexts.
+        verified.clear();
+        verified.insert(expected.to_vec(), Instant::now() + ACCOUNT_AUTH_VERIFICATION_TTL);
         true
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_expire_account_auth_verification(&self, expected: &[u8]) {
+        if let Some(deadline) = self.verified_account_auth_records.lock().unwrap().get_mut(expected) {
+            *deadline = Instant::now() - Duration::from_secs(1);
+        }
     }
 
     pub(crate) fn auth_session_revision(&self) -> Result<i64, String> {
@@ -6315,7 +6327,9 @@ impl DatabaseStore {
             || (!allow_rejected
                 && self.rejected_auth_records.lock().unwrap().contains(expected))
             || (active_account.is_some()
-                && !self.verified_account_auth_records.lock().unwrap().contains(expected))
+                && !self.verified_account_auth_records.lock().unwrap()
+                    .get(expected)
+                    .is_some_and(|deadline| *deadline > Instant::now()))
             || active_account.is_some_and(|account| {
                 crate::auth::active_account_id_from_record(expected).as_deref() != Some(account)
             })
@@ -6560,7 +6574,8 @@ impl DatabaseStore {
         Ok(result.map(|(session, record)| {
             let record = record.filter(|bytes| {
                 !rejected.contains(bytes)
-                    && (session.source != "account" || verified.contains(bytes))
+                    && (session.source != "account"
+                        || verified.get(bytes).is_some_and(|deadline| *deadline > Instant::now()))
             });
             (session, record)
         }))
@@ -6696,6 +6711,42 @@ mod tests {
         let auth_record = reopened.load_auth_token().unwrap();
         assert!(reopened.mark_account_auth_verified_if_current(&auth_record));
         assert!(crate::web_remote::auth::authenticate(&reopened, browser_token).is_some());
+    }
+
+    #[test]
+    fn verified_account_browser_expires_when_a_peer_cannot_persist_rejection() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("auth.sqlite");
+        let host = DatabaseStore::test_file(&path);
+        let peer = DatabaseStore::test_file(&path);
+        let user = crate::auth::AuthUser {
+            id: "owner".into(),
+            email: "owner@example.test".into(),
+            name: None,
+            image: None,
+        };
+        crate::auth::save_auth(&host, "host-token", "2099-01-01T00:00:00Z", Some(&user)).unwrap();
+        let record = host.load_auth_token().unwrap();
+        let browser_token = "browser-token";
+        let browser_hash = crate::web_remote::auth::sha256_hex(browser_token);
+        host.web_remote_insert_account_session(
+            "account-browser", None, None, &browser_hash, true, &user.id,
+        ).unwrap();
+        assert!(crate::web_remote::auth::authenticate(&host, browser_token).is_some());
+
+        // The peer received a definitive 401, but SQLite could not commit
+        // revocation. The serving host has not yet learned of that rejection.
+        peer.test_set_query_only(true);
+        assert!(peer.clear_auth_token_if_current(&record).is_err());
+        assert_eq!(host.load_raw_auth_token().unwrap(), Some(record.clone()));
+        assert!(crate::web_remote::auth::authenticate(&host, browser_token).is_some());
+
+        host.test_expire_account_auth_verification(&record);
+        assert!(crate::web_remote::auth::authenticate(&host, browser_token).is_none());
+        assert!(!host.web_remote_insert_account_session_if_unchanged(
+            "new-account-browser", None, None, "new-browser-hash", true, &user.id, &record,
+        ).unwrap());
+        assert!(host.web_remote_get_session("new-account-browser").is_none());
     }
 
     #[test]

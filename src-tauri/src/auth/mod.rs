@@ -187,6 +187,8 @@ pub struct AuthState {
     /// A remote response may arrive after sign-out or another account signs
     /// in; its generation must then be unable to rewrite that newer session.
     session_generation: Mutex<u64>,
+    #[cfg(test)]
+    test_settings_cache_dir: Option<PathBuf>,
 }
 
 impl Default for AuthState {
@@ -196,11 +198,21 @@ impl Default for AuthState {
             callback_port: Mutex::new(None),
             auth_method: Mutex::new(None),
             session_generation: Mutex::new(0),
+            #[cfg(test)]
+            test_settings_cache_dir: None,
         }
     }
 }
 
 impl AuthState {
+    #[cfg(test)]
+    pub(crate) fn with_test_settings_cache_dir(dir: PathBuf) -> Self {
+        Self {
+            test_settings_cache_dir: Some(dir),
+            ..Self::default()
+        }
+    }
+
     /// Generate a CSRF state token and store it with a timestamp.
     pub fn generate_csrf_state(&self, db: &DatabaseStore) -> Result<String, String> {
         let mut bytes = [0u8; 32];
@@ -335,11 +347,31 @@ impl AuthState {
     }
 
     pub(crate) fn clear_local_session(&self) {
+        #[cfg(test)]
+        if let Some(dir) = self.test_settings_cache_dir.as_deref() {
+            crate::settings_sync::clear_cache_at(dir);
+        } else {
+            crate::settings_sync::clear_cache();
+        }
+        #[cfg(not(test))]
         crate::settings_sync::clear_cache();
         self.set_local_session(None);
     }
 
+    pub(crate) fn cached_settings(&self) -> Option<crate::settings_sync::UserSettings> {
+        #[cfg(test)]
+        if let Some(dir) = self.test_settings_cache_dir.as_deref() {
+            return crate::settings_sync::load_cache_at(dir);
+        }
+        crate::settings_sync::load_cache()
+    }
+
     pub(crate) fn set_local_session(&self, stored: Option<&StoredAuth>) {
+        #[cfg(test)]
+        if self.test_settings_cache_dir.is_some() {
+            self.set_auth_method(stored.and_then(|stored| stored.auth_method.as_deref()));
+            return;
+        }
         let user = stored.and_then(|stored| stored.user.as_ref());
         crate::settings_sync::set_cache_owner(user.map(|user| user.id.as_str()));
         self.set_auth_method(stored.and_then(|stored| stored.auth_method.as_deref()));

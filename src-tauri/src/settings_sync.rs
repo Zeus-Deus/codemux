@@ -2,7 +2,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
 use std::sync::{Arc, LazyLock, Mutex};
 use tokio::sync::Notify;
@@ -597,7 +597,11 @@ fn install_fetched_settings(
 }
 
 pub fn load_cache() -> Option<UserSettings> {
-    let data = fs::read_to_string(cache_file_path()).ok()?;
+    load_cache_at(&cache_dir())
+}
+
+pub(crate) fn load_cache_at(dir: &Path) -> Option<UserSettings> {
+    let data = fs::read_to_string(dir.join("settings-cache.json")).ok()?;
     let owner = CACHE_OWNER.lock().ok()?;
     settings_from_cache_data(&data, &owner)
 }
@@ -637,8 +641,12 @@ fn load_dirty_cache_for_scope(scope: &CacheScope) -> Result<(u64, Option<UserSet
 }
 
 pub fn clear_cache() {
-    let _ = fs::remove_file(cache_file_path());
-    let _ = fs::remove_file(dirty_flag_path());
+    clear_cache_at(&cache_dir());
+}
+
+pub(crate) fn clear_cache_at(dir: &Path) {
+    let _ = fs::remove_file(dir.join("settings-cache.json"));
+    let _ = fs::remove_file(dir.join("settings-dirty"));
     set_cached_checkpoints_enabled(false);
 }
 
