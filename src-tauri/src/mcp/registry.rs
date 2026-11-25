@@ -1155,6 +1155,8 @@ impl McpRegistry {
     /// Used by:
     ///   1. `agent_chat_start_session` — first chat session triggers spawn.
     ///   2. Settings → MCP Servers mount — so users can inspect status.
+    /// Returns false only while a discovered server has not reached a
+    /// terminal state; a failed server has a settled, empty tool surface.
     pub async fn prime_for_chat<R: Runtime>(
         &self,
         app: Option<&AppHandle<R>>,
@@ -1171,20 +1173,21 @@ impl McpRegistry {
         let configs = self.inner.lock().await.prime_configs_for_test.clone()
             .unwrap_or_else(|| discover_configs(project_root));
         self.remember_native_scoped_sources(project_root, &configs).await;
-        let mut ready = true;
+        let mut settled = true;
         for cfg in configs {
             if cfg.disabled {
                 continue;
             }
             let disabled = self.is_disabled(&cfg.id).await;
             let row = self.ensure_started(app, cfg).await;
-            // A previous prime may still be starting this server. A failed
-            // handshake also leaves its prior tool catalog unverified.
-            if !disabled && !matches!(row.status, McpServerStatus::Running { .. } | McpServerStatus::NeedsApproval { .. }) {
-                ready = false;
+            // A previous prime may still be discovering this server. Terminal
+            // failures are settled: the adapter's catalog hash decides
+            // whether their absent tools change a saved Codex thread.
+            if !disabled && matches!(row.status, McpServerStatus::Discovered | McpServerStatus::Starting | McpServerStatus::Stopping) {
+                settled = false;
             }
         }
-        ready
+        settled
     }
 
     #[cfg(test)]

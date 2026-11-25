@@ -1543,6 +1543,7 @@ pub async fn agent_chat_start_session_guarded<R: Runtime>(
     //
     // Skipped when no registry is managed (headless tests): priming spawns
     // the `codemux mcp` child from the current executable.
+    let mut mcp_catalog_settled = true;
     if let Some(mcp_registry) = app
         .try_state::<crate::mcp::registry::McpRegistry>()
         .filter(|_| device.is_none())
@@ -1562,13 +1563,22 @@ pub async fn agent_chat_start_session_guarded<R: Runtime>(
         .await
         {
             Ok(Ok(true)) => eprintln!("[codemux::agent_chat] mcp prime_for_chat completed within budget"),
-            Ok(Ok(false)) => eprintln!("[codemux::agent_chat] mcp prime_for_chat finished with unavailable tools"),
-            Ok(Err(error)) => eprintln!("[codemux::agent_chat] mcp prime_for_chat failed: {error}"),
-            Err(_) => eprintln!(
-                "[codemux::agent_chat] mcp prime_for_chat exceeded {}s budget — \
-                 continuing startup in the background with whatever tools are ready",
-                MCP_PRIME_BUDGET.as_secs()
-            ),
+            Ok(Ok(false)) => {
+                mcp_catalog_settled = false;
+                eprintln!("[codemux::agent_chat] mcp prime_for_chat has servers still starting");
+            }
+            Ok(Err(error)) => {
+                mcp_catalog_settled = false;
+                eprintln!("[codemux::agent_chat] mcp prime_for_chat failed: {error}");
+            }
+            Err(_) => {
+                mcp_catalog_settled = false;
+                eprintln!(
+                    "[codemux::agent_chat] mcp prime_for_chat exceeded {}s budget — \
+                     continuing startup in the background with whatever tools are ready",
+                    MCP_PRIME_BUDGET.as_secs()
+                );
+            }
         }
     }
     // Overlay the chat pane's workspace env onto `input.env` BEFORE the
@@ -1600,6 +1610,17 @@ pub async fn agent_chat_start_session_guarded<R: Runtime>(
     .and_then(|_| match &control {
         Some(control) => control.verify_start(&app, &input),
         None => Ok(()),
+    })
+    .and_then(|_| {
+        if provider == ProviderKind::Codex
+            && !input.fresh_session
+            && !mcp_catalog_settled
+            && input.resume_cursor.as_ref().and_then(extract_sdk_session_id).is_some()
+        {
+            Err("MCP tools are still starting; retry this chat when discovery completes.".into())
+        } else {
+            Ok(())
+        }
     });
     if let Err(error) = validation {
         let state = app.state::<AppStateStore>();
@@ -3327,7 +3348,7 @@ async fn ensure_live_session_locked<R: Runtime>(
             Ok(Ok(true))
         );
         if !ready && provider_kind == ProviderKind::Codex && rebuild.native.is_some() {
-            return Err("MCP tools are still starting or unavailable; retry when they are ready.".into());
+            return Err("MCP tools are still starting; retry this chat when discovery completes.".into());
         }
     }
 
@@ -13409,6 +13430,95 @@ mod tests {
         assert_eq!(
             *provider.started_cursors.lock().unwrap(),
             vec![Some(json!({"resume": "native-codex", "toolCatalogKey": key}))]
+        );
+    }
+
+    #[tokio::test]
+    async fn codex_history_reopen_waits_for_pending_checkout_tools() {
+        let prior = "history-prior";
+        let key = "a".repeat(64);
+        let provider = Arc::new(PlacementProvider {
+            returned_cursor: Some(json!({"threadId": "native-codex", "toolCatalogKey": key})),
+            ..Default::default()
+        });
+        let (app, _) = placement_app(prior, None, provider.clone()).await;
+        app.manage(ObservabilityStore::default());
+        app.manage(SubagentTracker::default());
+        app.manage(RunActivityTracker::default());
+        let mcp = crate::mcp::registry::McpRegistry::default();
+        let self_config = crate::mcp::codemux_self::codemux_self_config();
+        mcp.set_prime_configs_for_test(vec![self_config.clone()]).await;
+        mcp.insert_starting_server_for_test(self_config).await;
+        app.manage(mcp.clone_handle());
+        let handle = app.handle().clone();
+        let pane = handle.state::<AppStateStore>()
+            .agent_chat_pane_id_for_thread(prior).unwrap();
+        let input = || serde_json::from_value::<StartSessionInput>(json!({
+            "thread_id": "history-new",
+            "cwd": "/tmp",
+            "resume_cursor": {"resume": "native-codex", "toolCatalogKey": key},
+            "additional_directories": [],
+        })).unwrap();
+
+        let pending = agent_chat_start_session(
+            handle.clone(), pane.clone(), ProviderKind::Codex, input(), Some(prior.into()),
+        ).await;
+        assert!(pending.unwrap_err().contains("MCP tools are still starting"));
+        assert!(provider.started_cursors.lock().unwrap().is_empty());
+        assert_eq!(
+            handle.state::<AppStateStore>().agent_chat_pane_thread(&pane),
+            Some((ProviderKind::Codex, prior.into())),
+        );
+
+        mcp.insert_native_delegation_tools_for_test().await;
+        agent_chat_start_session(
+            handle.clone(), pane, ProviderKind::Codex, input(), Some(prior.into()),
+        ).await.unwrap();
+        assert_eq!(
+            *provider.started_cursors.lock().unwrap(),
+            vec![Some(json!({"resume": "native-codex", "toolCatalogKey": key}))],
+        );
+    }
+
+    #[tokio::test]
+    async fn codex_rebuild_allows_a_settled_server_without_saved_tools() {
+        let thread = "unavailable-catalog-chat";
+        let key = "a".repeat(64);
+        let provider = Arc::new(PlacementProvider {
+            returned_cursor: Some(json!({"threadId": "native-codex", "toolCatalogKey": key})),
+            ..Default::default()
+        });
+        let (app, _) = placement_app(thread, None, provider.clone()).await;
+        let mcp = crate::mcp::registry::McpRegistry::default();
+        let missing = tempfile::tempdir().unwrap();
+        mcp.set_prime_configs_for_test(vec![crate::mcp::McpServerConfig {
+            id: "unavailable-catalog-server".into(),
+            name: "unavailable-catalog-server".into(),
+            sources: vec![crate::mcp::McpConfigSource::CodemuxUser],
+            command: missing.path().join("does-not-exist").to_string_lossy().into_owned(),
+            args: Vec::new(),
+            env: std::collections::HashMap::new(),
+            disabled: false,
+            transport: crate::mcp::McpTransport::Stdio,
+            raw: serde_json::Value::Null,
+            project_root: None,
+            checkout_root: None,
+        }]).await;
+        app.manage(mcp.clone_handle());
+        let handle = app.handle().clone();
+        handle.state::<DatabaseStore>()
+            .set_agent_chat_native_cursor(thread, "native-codex", Some(&key))
+            .unwrap();
+
+        ensure_live_session(&handle, ProviderKind::Codex, &ThreadId(thread.into()))
+            .await.unwrap();
+        assert!(matches!(
+            mcp.list_runtime().await[0].status,
+            crate::mcp::runtime::McpServerStatus::Errored { .. },
+        ));
+        assert_eq!(
+            *provider.started_cursors.lock().unwrap(),
+            vec![Some(json!({"resume": "native-codex", "toolCatalogKey": key}))],
         );
     }
 
