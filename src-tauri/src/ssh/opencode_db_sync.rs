@@ -550,16 +550,25 @@ esac
 
     #[tokio::test]
     async fn remote_export_cleans_up_after_disconnect_during_stall() {
-        assert_remote_export_cleanup(&remote_extract_script("/home/me/ws", 2)).await;
+        // GNU timeout can report the deadline (124) or SIGKILL (137).
+        assert_remote_export_cleanup(
+            &remote_extract_script("/home/me/ws", 2),
+            &[124, 128 + libc::SIGKILL],
+        )
+        .await;
     }
 
     #[tokio::test]
     async fn perl_export_deadline_works_with_a_blocked_alarm_signal() {
         let script = remote_extract_script("/home/me/ws", 2);
-        assert_remote_export_cleanup(&force_perl_with_blocked_alarm(&script)).await;
+        assert_remote_export_cleanup(
+            &force_perl_with_blocked_alarm(&script),
+            &[128 + libc::SIGKILL],
+        )
+        .await;
     }
 
-    async fn assert_remote_export_cleanup(script: &str) {
+    async fn assert_remote_export_cleanup(script: &str, timeout_statuses: &[i32]) {
         let fake_opencode = r#"
 case "$1" in
     db) printf 'id\nses_fixture\n' ;;
@@ -600,14 +609,18 @@ esac
         // A disconnected SSH client can close the pipe without signaling
         // the waiting shell. Leave stderr open to observe worker exit.
         drop(child.stdout.take().unwrap());
-        tokio::time::timeout(Duration::from_secs(15), async {
+        let status = tokio::time::timeout(Duration::from_secs(15), async {
             let status = child.wait().await.unwrap();
-            assert_eq!(status.code(), Some(128 + libc::SIGKILL));
             while diagnostics.next_line().await.unwrap().is_some() {}
+            status
         })
         .await
         .expect("the remote transfer and its children exited");
         assert!(!directory.exists(), "scratch remains at {directory:?}");
+        assert!(
+            status.code().is_some_and(|code| timeout_statuses.contains(&code)),
+            "unexpected timeout status: {status}"
+        );
     }
 
     #[test]
