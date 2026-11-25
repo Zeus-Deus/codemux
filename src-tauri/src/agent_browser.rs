@@ -3366,11 +3366,13 @@ mod tests {
     fn browser_process_identity_requires_session_token_and_start_time() {
         let temp = tempfile::tempdir().unwrap();
         let binary = temp.path().join("agent-browser");
-        std::fs::copy(which::which("sleep").unwrap(), &binary).unwrap();
+        // Some coreutils binaries dispatch by argv[0] and exit when copied
+        // under a different name, so keep a shell process alive instead.
+        std::fs::copy(which::which("bash").unwrap(), &binary).unwrap();
         let session = "browser-identity-test";
         let token = "a".repeat(32);
         let mut child = std::process::Command::new(&binary)
-            .arg("30")
+            .args(["-c", "while :; do sleep 1; done"])
             .env("CODEMUX_BROWSER_OWNER", &token)
             .env("CODEMUX_BROWSER_SESSION", session)
             .spawn()
