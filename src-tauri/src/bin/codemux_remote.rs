@@ -188,6 +188,10 @@ enum WorktreeSubcommand {
     /// `--base`, default the repo's default branch. Repository setup
     /// commands run only when requested separately with `worktree setup`.
     ///
+    /// To get the workspace ID and name for setup, match the returned path
+    /// to an entry in `codemux-remote workspace list`. Use the same
+    /// `--state-dir` for both commands when selecting a custom registry.
+    ///
     /// Stable contract: the last stdout line is one JSON object
     /// `{"path","branch","repo_root","created"}`. On failure: non-zero
     /// exit and a one-line message on stderr.
@@ -207,6 +211,8 @@ enum WorktreeSubcommand {
         state_dir: Option<PathBuf>,
     },
     /// Run an existing worktree's repository setup commands after reviewing them.
+    ///
+    /// Use the ID and name from the matching `workspace list` entry.
     Setup {
         #[arg(long)]
         path: PathBuf,

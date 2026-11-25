@@ -18,6 +18,8 @@ pub mod turn_diffs;
 pub mod mobile_push;
 pub mod queued_turns;
 pub mod restart_resumes;
+#[cfg(windows)]
+mod project_script_paths;
 #[cfg(unix)]
 pub(crate) mod daemon_closes;
 mod layout_closes;
@@ -264,7 +266,7 @@ fn agent_chat_session(conn: &Connection, thread_id: &str) -> Option<AgentChatSes
 use rusqlite::{params, params_from_iter, types::Value, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 const SCHEMA_VERSION: u32 = 24;
@@ -590,7 +592,7 @@ pub struct AgentChatSessionCleanup {
     pub checkpoint_refs: Vec<(String, String)>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
 pub struct ProjectScripts {
     #[serde(default)]
     pub setup: Vec<String>,
@@ -1666,9 +1668,33 @@ impl DatabaseStore {
     // ── Project Scripts ──
 
     pub fn get_project_scripts(&self, project_root: &str) -> Option<ProjectScripts> {
-        let key = format!("project.scripts:{project_root}");
-        self.get_setting(&key)
-            .and_then(|v| serde_json::from_str(&v).ok())
+        match dunce::canonicalize(project_root) {
+            Ok(path) => self.get_project_scripts_at(&path),
+            Err(_) => self
+                .get_setting(&format!("project.scripts:{project_root}"))
+                .and_then(|value| serde_json::from_str(&value).ok()),
+        }
+    }
+
+    /// Load settings for a root already resolved and validated by the caller.
+    pub(crate) fn get_project_scripts_at(&self, project_root: &Path) -> Option<ProjectScripts> {
+        let key = format!("project.scripts:{}", project_root.to_str()?);
+        let conn = self.conn.lock().unwrap();
+        let saved: Option<String> = conn
+            .query_row(
+                "SELECT value FROM settings WHERE user_id = 'local' AND key = ?1",
+                params![key],
+                |row| row.get(0),
+            )
+            .optional()
+            .ok()?;
+        if let Some(value) = saved {
+            return serde_json::from_str(&value).ok();
+        }
+        #[cfg(windows)]
+        return project_script_paths::read_legacy(&conn, project_root);
+        #[cfg(not(windows))]
+        None
     }
 
     pub fn set_project_scripts(
@@ -1676,6 +1702,11 @@ impl DatabaseStore {
         project_root: &str,
         scripts: &ProjectScripts,
     ) -> Result<(), String> {
+        let canonical = dunce::canonicalize(project_root).ok();
+        let project_root = match canonical.as_ref() {
+            Some(path) => path.to_str().ok_or("Project root is not valid Unicode")?,
+            None => project_root,
+        };
         let key = format!("project.scripts:{project_root}");
         let value = serde_json::to_string(scripts).map_err(|e| e.to_string())?;
         self.set_setting(&key, &value)

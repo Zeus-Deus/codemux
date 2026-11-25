@@ -103,7 +103,8 @@ GOT_ENV="$(docker exec "$CONTAINER" cat "$WS_PATH/.env")"
 [ "$GOT_ENV" = "SECRET=docker-host" ] || { err ".env not copied"; exit 1; }
 
 log "running explicit setup for the worktree at $WS_PATH"
-docker exec "$CONTAINER" codemux-remote worktree setup +  --path "$WS_PATH" --workspace-id "$WS_ID" --name "$WS_NAME" --branch feature/provision
+docker exec "$CONTAINER" codemux-remote worktree setup \
+  --path "$WS_PATH" --workspace-id "$WS_ID" --name "$WS_NAME" --branch feature/provision
 docker exec "$CONTAINER" test -f "$MARKER" || {
   err "explicit setup did not create its marker"; exit 1;
 }

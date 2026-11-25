@@ -18,34 +18,31 @@ pub struct WorkspaceConfig {
 /// For worktrees (where `.git` is a file pointing to the main repo),
 /// this follows the pointer to return the actual repo root.
 pub fn find_git_root(path: &Path) -> Option<PathBuf> {
-    let mut current = path.to_path_buf();
-    loop {
-        let git_path = current.join(".git");
-        if git_path.is_dir() {
-            // Real repo root
-            return Some(current);
-        }
-        if git_path.is_file() {
-            // Worktree: .git file contains "gitdir: /path/to/main/.git/worktrees/<name>"
-            if let Some(repo_root) = resolve_worktree_git_file(&git_path) {
-                return Some(repo_root);
-            }
-            // If we can't parse it, treat this directory as the root
-            return Some(current);
-        }
-        if !current.pop() {
-            return None;
-        }
-    }
+    let checkout = find_git_checkout(path)?;
+    Some(resolve_worktree_git_file(&checkout.join(".git")).unwrap_or_else(|| checkout.to_path_buf()))
+}
+
+/// The nearest checkout's own directory, before resolving a linked worktree.
+fn find_git_checkout(path: &Path) -> Option<&Path> {
+    path.ancestors().find(|dir| {
+        let marker = dir.join(".git");
+        marker.is_dir() || marker.is_file()
+    })
 }
 
 /// Parse a worktree `.git` file and resolve to the main repo root.
 fn resolve_worktree_git_file(git_file: &Path) -> Option<PathBuf> {
+    if !git_file.is_file() {
+        return None;
+    }
     let content = std::fs::read_to_string(git_file).ok()?;
     let gitdir = content.strip_prefix("gitdir: ")?.trim();
+    if gitdir.is_empty() {
+        return None;
+    }
     // gitdir is like "/path/to/main/.git/worktrees/<name>"
     // Walk up: worktrees/ -> .git/ -> repo root
-    PathBuf::from(gitdir)
+    git_file.parent()?.join(gitdir)
         .parent() // worktrees/
         .and_then(|p| p.parent()) // .git/
         .and_then(|p| p.parent()) // repo root
@@ -83,8 +80,7 @@ pub fn read_effective_config(
         return Some(config);
     }
 
-    let root = find_git_root(workspace_path).unwrap_or_else(|| workspace_path.to_path_buf());
-    db.get_project_scripts(&root.to_string_lossy()).map(saved_workspace_config)
+    read_saved_config(workspace_path, db)
 }
 
 /// Lifecycle events may be triggered by opening an untrusted checkout.
@@ -102,21 +98,24 @@ pub fn read_automatic_lifecycle_config(
 }
 
 pub(crate) fn read_saved_config(workspace_path: &Path, db: &DatabaseStore) -> Option<WorkspaceConfig> {
-    let root = find_git_root(workspace_path).unwrap_or_else(|| workspace_path.to_path_buf());
-    let checkout = workspace_path.canonicalize().ok()?;
-    let resolved_root = root.canonicalize().ok()?;
-    let scripts = db
-        .get_project_scripts(&resolved_root.to_string_lossy())
-        .or_else(|| db.get_project_scripts(&root.to_string_lossy()))?;
-    // A checkout can contain a .git file that points anywhere. A directory
-    // outside the saved project only inherits its commands when Git has
-    // actually registered that directory as one of the project's worktrees.
-    if !checkout.starts_with(&resolved_root)
-        && !crate::git::git_list_worktrees(&resolved_root)
+    let cwd = dunce::canonicalize(workspace_path).ok()?;
+    if !cwd.is_dir() {
+        return None;
+    }
+    let checkout = find_git_checkout(&cwd).unwrap_or(&cwd);
+    let Some(root) = resolve_worktree_git_file(&checkout.join(".git")) else {
+        return db.get_project_scripts_at(checkout).map(saved_workspace_config);
+    };
+    let root = dunce::canonicalize(root).ok()?;
+    let scripts = db.get_project_scripts_at(&root)?;
+    // A .git file is untrusted. Even a linked directory inside the main
+    // tree must be registered as this project's worktree to inherit consent.
+    if checkout != root
+        && !crate::git::git_list_worktrees(&root)
             .ok()?
             .into_iter()
             .filter(|worktree| !worktree.is_bare)
-            .any(|worktree| Path::new(&worktree.path).canonicalize().ok().as_ref() == Some(&checkout))
+            .any(|worktree| dunce::canonicalize(&worktree.path).is_ok_and(|path| path == checkout))
     {
         return None;
     }
@@ -341,6 +340,71 @@ mod tests {
 
         let explicit = read_effective_config(dir.path(), &db).unwrap();
         assert_eq!(explicit.setup, ["repo-setup"]);
+    }
+
+    #[test]
+    fn saved_commands_follow_registered_worktree_subdirectories() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path().join("project");
+        fs::create_dir(&project).unwrap();
+        let project = dunce::canonicalize(project).unwrap();
+        let run_git = |args: &[&str]| {
+            let output = crate::git::git_command()
+                .arg("-C")
+                .arg(&project)
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&output.stderr));
+        };
+        run_git(&["init", "--initial-branch=main"]);
+        run_git(&[
+            "-c", "user.name=Fixture", "-c", "user.email=fixture@example.test", "-c", "commit.gpgsign=false",
+            "commit", "--allow-empty", "-m", "initial",
+        ]);
+        // Put the linked checkout inside the main tree so registration, not
+        // lexical containment, decides whether it can inherit local scripts.
+        let linked = project.join("linked");
+        run_git(&["worktree", "add", "-b", "fixture", linked.to_str().unwrap()]);
+        let nested = linked.join("src").join("feature");
+        fs::create_dir_all(&nested).unwrap();
+
+        let db = crate::database::init_test_database();
+        let scripts = crate::database::ProjectScripts {
+            setup: vec!["fixture-setup".into()],
+            teardown: vec!["fixture-teardown".into()],
+            ..Default::default()
+        };
+        #[cfg(windows)]
+        {
+            let native = project.to_str().unwrap();
+            let git_style = native.replace('\\', "/");
+            let verbatim = project.canonicalize().unwrap();
+            let verbatim = verbatim.to_str().unwrap();
+            let legacy = serde_json::to_string(&scripts).unwrap();
+            db.set_setting(&format!("project.scripts:{verbatim}"), &legacy).unwrap();
+            assert_eq!(db.get_project_scripts(&git_style), Some(scripts.clone()));
+            assert_eq!(read_saved_config(&nested, &db).unwrap().setup, scripts.setup);
+
+            let conflicting = serde_json::to_string(&crate::database::ProjectScripts::default()).unwrap();
+            db.set_setting(&format!("project.scripts:{git_style}"), &conflicting).unwrap();
+            assert!(read_saved_config(&nested, &db).is_none());
+            db.set_project_scripts(verbatim, &scripts).unwrap();
+            assert_eq!(db.get_project_scripts(&git_style), Some(scripts.clone()));
+            assert_eq!(db.get_project_scripts(native), Some(scripts.clone()));
+        }
+        #[cfg(not(windows))]
+        db.set_project_scripts(project.to_str().unwrap(), &scripts).unwrap();
+
+        let inherited = read_saved_config(&nested, &db).unwrap();
+        assert_eq!(inherited.setup, scripts.setup);
+        assert_eq!(inherited.teardown, scripts.teardown);
+
+        // Moving the checkout by hand leaves Git's registration at its old
+        // path, so it cannot use the main project's automatic commands.
+        let moved = project.join("relocated");
+        fs::rename(&linked, &moved).unwrap();
+        assert!(read_saved_config(&moved.join("src/feature"), &db).is_none());
     }
 }
 

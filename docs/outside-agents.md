@@ -535,7 +535,7 @@ Exit codes: `0` done, `1` failed or error, `2` needs input, `3` timed out, `64` 
 
 - Supervised permission modes are the ones that ask before acting, such as Claude's `default`, `acceptEdits` and `plan`, or Codex's `read-only`, `workspace-write` and `plan`. `agent_capabilities` lists the ones you may use as `allowed_permission_modes`.
 - Opening a workspace, cloning a project or creating a worktree can run setup commands saved in local Project Settings. Closing or archiving a worktree workspace can run its saved teardown commands, even when the worktree stays. These operations and deleting threads need full access.
-- Repository commands in `.codemux/config.json` are available through the desktop's **Re-run setup** and **Run** actions. Review the commands before starting them. On a headless host, `worktree_create` reports `setup_requires_explicit_run` when setup is available. Review it on the host, then use `codemux-remote worktree setup --path <path> --workspace-id <id> --name <name> [--branch <branch>]`. The worktree response provides these values under `workspace`.
+- Repository commands in `.codemux/config.json` are available through the desktop's **Re-run setup** and **Run** actions. Review the commands before starting them. On a headless host, see [Run a worktree's setup](#run-a-worktrees-setup).
 - `allow_always`, `force_delete`, and `worktree_create` with a terminal preset (`agent_preset_id`) are only for assistants on this computer.
 - Assistants on this computer at full access also get the older administration tools of `codemux mcp`, such as `automation_create`, `terminal_write` and `preset_apply`. Network assistants never do.
 - Approving connections, Remote Access and pairing devices are never MCP tools. Use Settings or the `codemux` CLI.
@@ -574,6 +574,21 @@ Older versions of `codemux-remote serve` added `codemux-remote mcp` to `~/.claud
 Outside agents see workspaces on your devices in `workspace_list` with `native_control_available: false`. Thread tools can't target them yet.
 
 To control Codemux from another machine, use SSH or **Over the network**, not `codemux-remote`: `codemux-remote` listens only on its own server and manages that server, not your desktop.
+
+#### Run a worktree's setup
+
+On a headless host, the `worktree_create` tool reports `setup.setup_requires_explicit_run` when setup is available. Its `workspace` result contains the worktree's `path`, `id`, `name` and `branch`.
+
+If you used `codemux-remote worktree create` from a shell, run `codemux-remote workspace list` and match the returned checkout path to an entry's `path` under `workspaces`. Take the `id`, `name` and `branch` from that entry. If you passed `--state-dir` to create the worktree, use the same directory when listing. For a worktree created through the daemon, use the daemon's state directory.
+
+On the host, review the setup commands in `.codemux/config.json`. Set the shell variables from the matching workspace entry and run the setup command.
+
+```sh
+codemux-remote worktree setup --path "$WORKTREE_PATH" --workspace-id "$WORKSPACE_ID" \
+  --name "$WORKSPACE_NAME" --branch "$WORKSPACE_BRANCH"
+```
+
+Omit `--branch` when the workspace has no branch.
 
 ### Phones and browsers
 
