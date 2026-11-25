@@ -955,6 +955,11 @@ fn default_host() -> Option<SystemdUserHost> {
 
 /// `codemux connect [--email …] [--scope …] [--port N]`.
 pub async fn run_connect(opts: ConnectOptions) -> Result<(), String> {
+    // Socket administration is unavailable without independent owner proof.
+    // Refuse a live backend before login can prompt for or persist a session.
+    if crate::control::control_server_reachable() {
+        return Err("A Codemux instance is already running. Change From-anywhere access in desktop Settings, or stop the instance and run `codemux connect` again.".into());
+    }
     let db = crate::database::init_database()?;
 
     // Step 1 — account. Everything downstream (relay registration, discovery

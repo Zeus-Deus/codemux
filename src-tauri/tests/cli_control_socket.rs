@@ -300,6 +300,18 @@ fn tool_name(request: &Value) -> Option<&str> {
     (request["command"] == "tool_call").then(|| request["params"]["name"].as_str()).flatten()
 }
 
+#[test]
+fn connect_refuses_a_running_backend_before_account_login() {
+    let app = FakeApp::start(|_| ok_reply(json!({})));
+    let output = app.cli(&["connect"]);
+    assert_eq!(exit_code(&output), 1, "{}", String::from_utf8_lossy(&output.stderr));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("desktop Settings"), "{stderr}");
+    assert!(stderr.contains("stop the instance"), "{stderr}");
+    assert!(!stderr.contains("For an account with no password"), "login must not run: {stderr}");
+    assert!(app.requests().is_empty(), "the refusal needs no socket Admin call");
+}
+
 // ── Without an app ────────────────────────────────────────────────────────
 
 #[test]
