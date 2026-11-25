@@ -325,6 +325,18 @@ pub fn set_preset_bar_visible<R: tauri::Runtime>(
     Ok(())
 }
 
+/// A fresh multi-command preset can partly start before a later write fails
+/// or an earlier tab closes.
+/// Return the confirmed write count and tabs still present so callers can
+/// report partial delivery without linking to a closed tab.
+#[derive(Debug, Clone, serde::Serialize, PartialEq, Eq)]
+pub struct PartialPresetLaunch {
+    pub confirmed_tab_ids: Vec<String>,
+    pub confirmed_commands: usize,
+    pub total_commands: usize,
+    pub error: String,
+}
+
 #[tauri::command(async)]
 pub fn apply_preset<R: tauri::Runtime>(
     app: tauri::AppHandle<R>,
@@ -337,7 +349,9 @@ pub fn apply_preset<R: tauri::Runtime>(
     initial_prompt: Option<String>,
     model_selection: Option<crate::agent_capability::ModelSelection>,
     select: Option<bool>,
-) -> Result<(), String> {
+    fresh_terminal: Option<bool>,
+    target_tab_id: Option<String>,
+) -> Result<Option<PartialPresetLaunch>, String> {
     // Look up the preset
     let store = presets.inner.lock().unwrap_or_else(|e| e.into_inner());
     let preset = store
@@ -400,57 +414,90 @@ pub fn apply_preset<R: tauri::Runtime>(
     };
 
     let sessions_arc = pty_state.sessions.clone();
+    let has_starting_prompt = initial_prompt
+        .as_deref()
+        .is_some_and(|prompt| !prompt.trim().is_empty());
+    let fresh_terminal = fresh_terminal.unwrap_or(false);
+    if fresh_terminal && target_tab_id.is_none() {
+        return Err("A fresh terminal launch requires its tab ID".to_string());
+    }
+    if target_tab_id.is_some() && effective_mode != "current_terminal" {
+        return Err("A target tab can only be used with current_terminal".to_string());
+    }
 
     match effective_mode {
         "current_terminal" => {
-            // Write commands to the active terminal session
-            let session_id = active_session_for_workspace(&state, &workspace_id)
-                .ok_or_else(|| "No active terminal session in workspace".to_string())?;
-
-            if initial_prompt.is_some() {
-                // Agent launch with prompt: rename tab, embed prompt in command
-                let snap = state.snapshot();
-                if let Some(ws) = snap
-                    .workspaces
-                    .iter()
-                    .find(|w| w.workspace_id.0 == workspace_id)
-                {
-                    let _ = state.rename_tab(&workspace_id, &ws.active_tab_id, preset.name.clone());
-                    let _ =
-                        state.set_tab_icon(&workspace_id, &ws.active_tab_id, preset.icon.clone());
-                }
-
-                for command in &commands {
-                    if command.is_empty() {
-                        continue;
-                    }
-                    let shell = receiving_shell_for_agent_prompt(
-                        &state, &workspace_id, &session_id, false,
-                    );
-                    let (cmd, prompt_requires_manual_entry) =
-                        crate::branch_name::prepare_agent_command(
-                            &preset_id,
-                            command,
-                            initial_prompt.as_deref(),
-                            shell.as_deref(),
-                        );
-                    state.update_terminal_session_command(&session_id, command.clone());
-                    write_command_when_ready(sessions_arc.clone(), session_id.clone(), cmd, 120);
-                    if prompt_requires_manual_entry {
-                        report_prompt_requires_manual_entry(&app, &session_id, &preset.name);
-                    }
-                }
+            if fresh_terminal {
+                let result = launch_fresh_terminal_preset(
+                    &state,
+                    &sessions_arc,
+                    &workspace_id,
+                    target_tab_id.as_deref().expect("checked above"),
+                    select.unwrap_or(true),
+                    &commands,
+                    initial_prompt.as_deref(),
+                    &preset.name,
+                    &preset.icon,
+                    |session_id| terminal::spawn_pty_for_session(app.clone(), session_id),
+                    |session_id| {
+                        report_prompt_requires_manual_entry(&app, session_id, &preset.name)
+                    },
+                );
+                // Later tabs may exist even when their write failed. Publish
+                // the confirmed tabs and the partial result together.
+                crate::state::emit_app_state(&app);
+                return result;
             } else {
-                let combined = commands
-                    .iter()
-                    .filter(|c| !c.is_empty())
-                    .cloned()
-                    .collect::<Vec<_>>()
-                    .join(" && ");
+                // Ordinary current-terminal launches retain their existing
+                // active-pane behavior. A starting prompt is never part of
+                // the command passed to the PTY.
+                let (session_id, tab_id) =
+                    current_terminal_target(&state, &workspace_id, target_tab_id.as_deref())?;
+                if initial_prompt.is_some() {
+                    for command in &commands {
+                        if command.is_empty() {
+                            continue;
+                        }
+                        let (cmd, prompt_requires_manual_entry) =
+                            crate::branch_name::prepare_agent_command(
+                                command,
+                                initial_prompt.as_deref(),
+                            );
+                        state.update_terminal_session_command(&session_id, command.clone());
+                        write_command_when_ready(
+                            sessions_arc.clone(),
+                            session_id.clone(),
+                            cmd,
+                            120,
+                        );
+                        if prompt_requires_manual_entry {
+                            report_prompt_requires_manual_entry(&app, &session_id, &preset.name);
+                        }
+                    }
+                    let _ = set_preset_tab_metadata(
+                        &state,
+                        &workspace_id,
+                        &tab_id,
+                        &preset.name,
+                        &preset.icon,
+                    );
+                } else {
+                    let combined = commands
+                        .iter()
+                        .filter(|c| !c.is_empty())
+                        .cloned()
+                        .collect::<Vec<_>>()
+                        .join(" && ");
 
-                if !combined.is_empty() {
-                    state.update_terminal_session_command(&session_id, combined.clone());
-                    write_command_to_pty(&sessions_arc, &session_id, &combined);
+                    if !combined.is_empty() {
+                        write_current_terminal_command(
+                            &sessions_arc,
+                            &session_id,
+                            &combined,
+                            false,
+                        )?;
+                        state.update_terminal_session_command(&session_id, combined);
+                    }
                 }
             }
         }
@@ -484,6 +531,9 @@ pub fn apply_preset<R: tauri::Runtime>(
                     let sid = session_id.0.clone();
                     let cmd = command.clone();
                     write_command_when_ready(sessions, sid, cmd, 120);
+                    if has_starting_prompt {
+                        report_prompt_requires_manual_entry(&app, &session_id.0, &preset.name);
+                    }
                 }
             }
         }
@@ -509,7 +559,10 @@ pub fn apply_preset<R: tauri::Runtime>(
                     state.update_terminal_session_command(&sid, combined.clone());
                     let sessions = sessions_arc.clone();
                     let cmd = combined.clone();
-                    write_command_when_ready(sessions, sid, cmd, 120);
+                    write_command_when_ready(sessions, sid.clone(), cmd, 120);
+                    if has_starting_prompt {
+                        report_prompt_requires_manual_entry(&app, &sid, &preset.name);
+                    }
                 }
             }
         }
@@ -532,6 +585,9 @@ pub fn apply_preset<R: tauri::Runtime>(
                         let sid = session_id.0.clone();
                         let cmd = command.clone();
                         write_command_when_ready(sessions, sid, cmd, 120);
+                        if has_starting_prompt {
+                            report_prompt_requires_manual_entry(&app, &session_id.0, &preset.name);
+                        }
                     }
                 }
             }
@@ -539,7 +595,7 @@ pub fn apply_preset<R: tauri::Runtime>(
     }
 
     crate::state::emit_app_state(&app);
-    Ok(())
+    Ok(None)
 }
 
 /// Open a terminal tab in `workspace_id` that runs `provider`'s login
@@ -595,25 +651,181 @@ pub fn open_provider_install_terminal<R: tauri::Runtime>(
         let sessions = pty_state.sessions.clone();
         let command = command.to_string();
         std::thread::spawn(move || {
-            wait_and_write(&sessions, &session_id.0, &command, 120, b"");
+            if let Err(error) = wait_and_write(&sessions, &session_id.0, &command, 120, b"") {
+                eprintln!("[codemux::presets] cannot type install command: {error}");
+            }
         });
     }
     crate::state::emit_app_state(&app);
     Ok(())
 }
 
-/// Get the active terminal session ID for a specific workspace.
-fn active_session_for_workspace(state: &AppStateStore, workspace_id: &str) -> Option<String> {
+/// Resolve the terminal session and tab together. An explicit tab uses that
+/// tab's first terminal session, regardless of subsequent selection changes.
+fn current_terminal_target(
+    state: &AppStateStore,
+    workspace_id: &str,
+    target_tab_id: Option<&str>,
+) -> Result<(String, String), String> {
     let snapshot = state.snapshot();
     let workspace = snapshot
         .workspaces
         .iter()
-        .find(|w| w.workspace_id.0 == workspace_id)?;
+        .find(|w| w.workspace_id.0 == workspace_id)
+        .ok_or_else(|| format!("No workspace found for {workspace_id}"))?;
+    if let Some(tab_id) = target_tab_id {
+        let tab = workspace
+            .tabs
+            .iter()
+            .find(|tab| tab.tab_id == tab_id)
+            .ok_or_else(|| format!("No tab {tab_id} in workspace {workspace_id}"))?;
+        if !matches!(&tab.kind, crate::state::TabKind::Terminal) {
+            return Err(format!("Tab {tab_id} is not a terminal"));
+        }
+        let surface_id = tab
+            .surface_id
+            .as_ref()
+            .ok_or_else(|| format!("Tab {tab_id} has no terminal surface"))?;
+        let surface = workspace
+            .surfaces
+            .iter()
+            .find(|surface| &surface.surface_id == surface_id)
+            .ok_or_else(|| format!("Tab {tab_id} has no terminal surface"))?;
+        let session_id = crate::state::collect_terminal_sessions(std::slice::from_ref(surface))
+            .into_iter()
+            .next()
+            .ok_or_else(|| format!("Tab {tab_id} has no terminal session"))?;
+        return Ok((session_id, tab_id.to_string()));
+    }
+
+    // Preserve the active-surface behavior for ordinary preset launches.
     let surface = workspace
         .surfaces
         .iter()
-        .find(|s| s.surface_id == workspace.active_surface_id)?;
-    crate::state::session_id_for_pane(&surface.root, &surface.active_pane_id).map(|sid| sid.0)
+        .find(|surface| surface.surface_id == workspace.active_surface_id)
+        .ok_or_else(|| "No active terminal session in workspace".to_string())?;
+    let session_id = crate::state::session_id_for_pane(&surface.root, &surface.active_pane_id)
+        .ok_or_else(|| "No active terminal session in workspace".to_string())?;
+    Ok((session_id.0, workspace.active_tab_id.clone()))
+}
+
+fn set_preset_tab_metadata(
+    state: &AppStateStore,
+    workspace_id: &str,
+    tab_id: &str,
+    name: &str,
+    icon: &Option<String>,
+) -> Result<(), String> {
+    state.rename_tab(workspace_id, tab_id, name.to_string())?;
+    state.set_tab_icon(workspace_id, tab_id, icon.clone())
+}
+
+/// A previously confirmed tab can close while a later terminal is starting.
+fn surviving_confirmed_tab_ids(
+    state: &AppStateStore,
+    workspace_id: &str,
+    confirmed_tabs: &[(String, String)],
+) -> Vec<String> {
+    let snapshot = state.snapshot();
+    let Some(workspace) = snapshot
+        .workspaces
+        .iter()
+        .find(|workspace| workspace.workspace_id.0 == workspace_id)
+    else {
+        return Vec::new();
+    };
+    confirmed_tabs
+        .iter()
+        .filter_map(|(tab_id, session_id)| {
+            let tab = workspace.tabs.iter().find(|tab| &tab.tab_id == tab_id)?;
+            let surface_id = tab.surface_id.as_ref()?;
+            let surface = workspace
+                .surfaces
+                .iter()
+                .find(|surface| &surface.surface_id == surface_id)?;
+            crate::state::collect_terminal_sessions(std::slice::from_ref(surface))
+                .iter()
+                .any(|current| current == session_id)
+                .then(|| tab_id.clone())
+        })
+        .collect()
+}
+
+/// Reuse the caller's exact tab for the first command and open one tab per
+/// remaining command. A confirmed write precedes metadata and success.
+#[allow(clippy::too_many_arguments)]
+fn launch_fresh_terminal_preset(
+    state: &AppStateStore,
+    sessions: &Arc<std::sync::Mutex<std::collections::HashMap<String, terminal::SessionRuntime>>>,
+    workspace_id: &str,
+    target_tab_id: &str,
+    select_new_tabs: bool,
+    commands: &[String],
+    initial_prompt: Option<&str>,
+    preset_name: &str,
+    preset_icon: &Option<String>,
+    mut spawn_new_session: impl FnMut(String),
+    mut report_prompt: impl FnMut(&str),
+) -> Result<Option<PartialPresetLaunch>, String> {
+    let first = current_terminal_target(state, workspace_id, Some(target_tab_id))?;
+    let mut confirmed_tabs = Vec::new();
+    for (index, command) in commands.iter().enumerate() {
+        let step = (|| -> Result<(), String> {
+            let (session_id, tab_id) = if index == 0 {
+                first.clone()
+            } else {
+                let (tab_id, session_id) = state.create_tab_with_selection(
+                    workspace_id,
+                    crate::state::TabKind::Terminal,
+                    select_new_tabs,
+                )?;
+                let session_id = session_id
+                    .ok_or_else(|| format!("Tab {tab_id} has no terminal session"))?
+                    .0;
+                spawn_new_session(session_id.clone());
+                (session_id, tab_id)
+            };
+            let mut prompt_requires_manual_entry = false;
+            if !command.is_empty() {
+                let (cmd, needs_manual_entry) =
+                    crate::branch_name::prepare_agent_command(command, initial_prompt);
+                write_current_terminal_command(sessions, &session_id, &cmd, true)?;
+                confirmed_tabs.push((tab_id.clone(), session_id.clone()));
+                state.update_terminal_session_command(&session_id, command.clone());
+                prompt_requires_manual_entry = needs_manual_entry;
+            }
+            set_preset_tab_metadata(state, workspace_id, &tab_id, preset_name, preset_icon)?;
+            if prompt_requires_manual_entry {
+                report_prompt(&session_id);
+            }
+            Ok(())
+        })();
+        if let Err(error) = step {
+            let confirmed_tab_ids =
+                surviving_confirmed_tab_ids(state, workspace_id, &confirmed_tabs);
+            if confirmed_tabs.is_empty() {
+                return Err(error);
+            }
+            return Ok(Some(PartialPresetLaunch {
+                confirmed_tab_ids,
+                confirmed_commands: confirmed_tabs.len(),
+                total_commands: commands.len(),
+                error,
+            }));
+        }
+    }
+    if !confirmed_tabs.is_empty() {
+        let confirmed_tab_ids = surviving_confirmed_tab_ids(state, workspace_id, &confirmed_tabs);
+        if confirmed_tab_ids.len() != confirmed_tabs.len() {
+            return Ok(Some(PartialPresetLaunch {
+                confirmed_tab_ids,
+                confirmed_commands: confirmed_tabs.len(),
+                total_commands: commands.len(),
+                error: "A launched terminal closed before the preset finished".to_string(),
+            }));
+        }
+    }
+    Ok(None)
 }
 
 /// Get the active pane ID for a specific workspace.
@@ -676,10 +888,24 @@ fn write_command_to_pty(
     sessions: &Arc<std::sync::Mutex<std::collections::HashMap<String, terminal::SessionRuntime>>>,
     session_id: &str,
     command: &str,
-) {
+) -> Result<(), String> {
     let payload = build_pty_command_payload(command);
-    if let Err(error) = terminal::write_pty_input_sync(sessions, session_id, &payload) {
-        eprintln!("[codemux::presets] cannot write command to {session_id}: {error}");
+    terminal::write_pty_input_sync(sessions, session_id, &payload)
+}
+
+/// A fresh current tab needs the same writer and shell readiness checks as
+/// a tab created by `apply_preset` itself. Wait for the PTY acknowledgement
+/// before the caller reports that its agent opened.
+fn write_current_terminal_command(
+    sessions: &Arc<std::sync::Mutex<std::collections::HashMap<String, terminal::SessionRuntime>>>,
+    session_id: &str,
+    command: &str,
+    fresh_terminal: bool,
+) -> Result<(), String> {
+    if fresh_terminal {
+        wait_and_write_command(sessions, session_id, command, 120)
+    } else {
+        write_command_to_pty(sessions, session_id, command)
     }
 }
 
@@ -701,7 +927,7 @@ fn build_pty_payload(command: &str, terminator: &[u8]) -> Vec<u8> {
 
 /// Write a command to a newly-spawned PTY after the shell is ready.
 ///
-/// Phase 1: Polls for `writer.is_some()` (every 50ms, up to 5s).
+/// Phase 1: Polls for `writer.is_some()` (every 50ms, up to 15s).
 /// Phase 2: Detects shell readiness via quiet-after-output heuristic — waits
 ///          until PTY output has arrived and then gone quiet for `settle_ms`.
 ///
@@ -714,7 +940,9 @@ pub(crate) fn write_command_when_ready(
     settle_ms: u64,
 ) {
     std::thread::spawn(move || {
-        wait_and_write_command(&sessions, &session_id, &command, settle_ms);
+        if let Err(error) = wait_and_write_command(&sessions, &session_id, &command, settle_ms) {
+            eprintln!("[codemux::presets] cannot write command to {session_id}: {error}");
+        }
     });
 }
 
@@ -724,47 +952,8 @@ fn wait_and_write_command(
     session_id: &str,
     command: &str,
     settle_ms: u64,
-) {
-    wait_and_write(sessions, session_id, command, settle_ms, PTY_COMMAND_TERMINATOR);
-}
-
-/// Pick the shell that receives a preset command. Device sessions run Bash
-/// regardless of the desktop's SHELL. A newly created local session uses the
-/// same default-shell selection as PTY spawn. An existing session with no
-/// recorded shell remains unknown, so its prompt cannot be embedded.
-pub(crate) fn receiving_shell_for_agent_prompt(
-    state: &AppStateStore,
-    workspace_id: &str,
-    session_id: &str,
-    newly_spawned: bool,
-) -> Option<String> {
-    let snapshot = state.snapshot();
-    let remote = snapshot
-        .workspaces
-        .iter()
-        .find(|workspace| workspace.workspace_id.0 == workspace_id)?
-        .host_id.is_some();
-    let shell = snapshot
-        .terminal_sessions
-        .iter()
-        .find(|session| session.session_id.0 == session_id)?
-        .shell.as_deref();
-    let local_default = (!remote && newly_spawned).then(terminal::default_shell);
-    choose_agent_launch_shell(remote, shell, local_default.as_deref())
-}
-
-fn choose_agent_launch_shell(
-    remote: bool,
-    recorded_shell: Option<&str>,
-    newly_spawned_local_shell: Option<&str>,
-) -> Option<String> {
-    if remote {
-        Some("bash".to_string())
-    } else {
-        recorded_shell
-            .or(newly_spawned_local_shell)
-            .map(str::to_string)
-    }
+) -> Result<(), String> {
+    wait_and_write(sessions, session_id, command, settle_ms, PTY_COMMAND_TERMINATOR)
 }
 
 /// Tell the user a prompt cannot be delivered safely through this terminal.
@@ -807,7 +996,7 @@ fn wait_and_write(
     command: &str,
     settle_ms: u64,
     terminator: &[u8],
-) {
+) -> Result<(), String> {
     // Only commands reach the PTY through this helper. Untrusted
     // starting prompts never enter a PTY input queue.
     // Phase 1: poll until the PTY writer is available (shell process spawned).
@@ -862,7 +1051,7 @@ fn wait_and_write(
              after {:?}",
             writer_poll_start.elapsed()
         );
-        return;
+        return Err(format!("Timed out waiting for PTY writer for session {session_id}"));
     }
 
     let command_to_write = {
@@ -889,7 +1078,7 @@ fn wait_and_write(
     };
 
     if command_to_write.is_empty() {
-        return;
+        return Err(format!("No command to write to PTY session {session_id}"));
     }
 
     // Phase 2: wait for shell output to arrive and then go quiet.
@@ -967,10 +1156,9 @@ fn wait_and_write(
              (payload_len={})",
             payload.len(),
         ),
-        Err(error) => {
-            eprintln!("[codemux::presets] cannot write command to {session_id}: {error}")
-        }
+        Err(error) => return Err(error),
     }
+    Ok(())
 }
 
 /// Check whether a command's binary exists on `PATH` for the current user.
@@ -1069,25 +1257,6 @@ mod tests {
     use std::collections::HashMap;
     use std::io::Write;
 
-    #[test]
-    fn agent_prompt_uses_the_receiving_shell() {
-        // Device PTYs launch Bash even when the desktop launches Fish.
-        let remote_shell = choose_agent_launch_shell(true, None, Some("/usr/bin/fish"));
-        assert_eq!(remote_shell.as_deref(), Some("bash"));
-        assert_eq!(
-            crate::branch_name::prepare_agent_command(
-                "builtin-claude", "claude", Some("fix it"), remote_shell.as_deref(),
-            ),
-            ("claude $'fix it'".to_string(), false)
-        );
-        assert_eq!(
-            choose_agent_launch_shell(false, Some("/bin/zsh"), Some("/usr/bin/fish")),
-            Some("/bin/zsh".to_string())
-        );
-        // Existing local sessions without a recorded shell are unknown.
-        assert_eq!(choose_agent_launch_shell(false, None, None), None);
-    }
-
     fn make_sessions() -> Arc<std::sync::Mutex<HashMap<String, SessionRuntime>>> {
         Arc::new(std::sync::Mutex::new(HashMap::new()))
     }
@@ -1110,7 +1279,7 @@ mod tests {
         let sessions = make_sessions();
         insert_session_with_writer(&sessions, "sess");
 
-        write_command_to_pty(&sessions, "sess", "echo hello");
+        write_command_to_pty(&sessions, "sess", "echo hello").unwrap();
 
         // Verify command was written — text followed by CR (0x0D),
         // not LF (0x0A). See `PTY_COMMAND_TERMINATOR` for why CR is
@@ -1141,6 +1310,43 @@ mod tests {
             self.calls.lock().unwrap().push(buf.to_vec());
             Ok(buf.len())
         }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    struct FailingWriter;
+
+    impl Write for FailingWriter {
+        fn write(&mut self, _buf: &[u8]) -> std::io::Result<usize> {
+            Err(std::io::Error::other("second terminal rejected the write"))
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    struct CloseTabOnWrite {
+        state: std::sync::Arc<AppStateStore>,
+        workspace_id: String,
+        tab_id: String,
+        calls: std::sync::Arc<std::sync::Mutex<Vec<Vec<u8>>>>,
+        fail: bool,
+    }
+
+    impl Write for CloseTabOnWrite {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.calls.lock().unwrap().push(buf.to_vec());
+            self.state
+                .close_tab(&self.workspace_id, &self.tab_id)
+                .map_err(std::io::Error::other)?;
+            if self.fail {
+                return Err(std::io::Error::other("later terminal rejected the write"));
+            }
+            Ok(buf.len())
+        }
+
         fn flush(&mut self) -> std::io::Result<()> {
             Ok(())
         }
@@ -1179,7 +1385,7 @@ mod tests {
             guard.insert("sess".into(), runtime);
         }
 
-        write_command_to_pty(&sessions, "sess", "claude --dangerously-skip-permissions");
+        write_command_to_pty(&sessions, "sess", "claude --dangerously-skip-permissions").unwrap();
 
         let recorded = calls.lock().unwrap();
         assert_eq!(
@@ -1213,7 +1419,7 @@ mod tests {
             guard.insert("sess".into(), runtime);
         }
 
-        wait_and_write(&sessions, "sess", "npm install -g @openai/codex", 30, b"");
+        wait_and_write(&sessions, "sess", "npm install -g @openai/codex", 30, b"").unwrap();
 
         assert_eq!(*calls.lock().unwrap(), vec![b"npm install -g @openai/codex".to_vec()]);
     }
@@ -1255,7 +1461,7 @@ mod tests {
 
         let start = std::time::Instant::now();
         // Call synchronous core directly with short settle time
-        wait_and_write_command(&sessions, "sess", "test-cmd", 80);
+        wait_and_write_command(&sessions, "sess", "test-cmd", 80).unwrap();
         let elapsed = start.elapsed();
 
         producer.join().unwrap();
@@ -1277,7 +1483,7 @@ mod tests {
         insert_session_with_writer(&sessions, "sess");
 
         let start = std::time::Instant::now();
-        wait_and_write_command(&sessions, "sess", "timeout-cmd", 120);
+        wait_and_write_command(&sessions, "sess", "timeout-cmd", 120).unwrap();
         let elapsed = start.elapsed();
 
         assert!(
@@ -1308,8 +1514,10 @@ mod tests {
         }
 
         let start = std::time::Instant::now();
-        wait_and_write_command(&sessions, "no-writer", "cmd", 120);
+        let result = wait_and_write_command(&sessions, "no-writer", "cmd", 120);
         let elapsed = start.elapsed();
+
+        assert!(result.is_err(), "an unconfirmed preset launch must fail");
 
         assert!(
             elapsed >= std::time::Duration::from_secs(14),
@@ -1362,7 +1570,7 @@ mod tests {
 
         let start = std::time::Instant::now();
         // settle_ms = 80 so Phase 2's quiet detection fires quickly.
-        wait_and_write_command(&sessions, "slow-spawn", "echo hi", 80);
+        wait_and_write_command(&sessions, "slow-spawn", "echo hi", 80).unwrap();
         let elapsed = start.elapsed();
         producer.join().unwrap();
 
@@ -1396,6 +1604,524 @@ mod tests {
     }
 
     #[test]
+    fn promptless_fresh_terminal_waits_for_delayed_writer_and_confirms_command() {
+        let sessions = make_sessions();
+        let calls = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        sessions
+            .lock()
+            .unwrap()
+            .insert("fresh".to_string(), SessionRuntime::new("fresh"));
+
+        let producer_sessions = sessions.clone();
+        let producer_calls = calls.clone();
+        let producer = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(150));
+            let mut guard = producer_sessions.lock().unwrap();
+            let runtime = guard.get_mut("fresh").unwrap();
+            runtime.writer = Some(Box::new(RecordingWriter {
+                calls: producer_calls,
+            }));
+            runtime.pending_output.push_back(b"$ ".to_vec());
+        });
+
+        // The caller created this tab but supplied no starting prompt.
+        // Returning success must mean the preset command reached its writer.
+        let result = write_current_terminal_command(&sessions, "fresh", "agent --flag", true);
+        producer.join().unwrap();
+
+        assert_eq!(result, Ok(()));
+        assert_eq!(*calls.lock().unwrap(), vec![b"agent --flag\r".to_vec()]);
+    }
+
+    #[test]
+    fn explicit_tab_target_survives_selection_change_before_dispatch() {
+        let state = AppStateStore::default();
+        let workspace = state.create_workspace_at_path(std::path::PathBuf::from("/tmp"));
+        let first_tab = state
+            .snapshot()
+            .workspaces
+            .iter()
+            .find(|item| item.workspace_id.0 == workspace.0)
+            .unwrap()
+            .tabs[0]
+            .tab_id
+            .clone();
+        let (expected_session, _) =
+            current_terminal_target(&state, &workspace.0, Some(&first_tab)).unwrap();
+        let (other_tab, _) = state
+            .create_tab(&workspace.0, crate::state::TabKind::Terminal)
+            .unwrap();
+
+        assert!(state.reorder_tabs(&workspace.0, vec![other_tab.clone(), first_tab.clone()]));
+
+        let (session, tab) =
+            current_terminal_target(&state, &workspace.0, Some(&first_tab)).unwrap();
+        assert_eq!(session, expected_session);
+        assert_eq!(tab, first_tab);
+        assert_eq!(
+            state
+                .snapshot()
+                .workspaces
+                .iter()
+                .find(|item| item.workspace_id.0 == workspace.0)
+                .unwrap()
+                .active_tab_id,
+            other_tab
+        );
+
+        let other_workspace =
+            state.create_workspace_at_path(std::path::PathBuf::from("/tmp/other"));
+        assert!(current_terminal_target(&state, &other_workspace.0, Some(&first_tab)).is_err());
+        let (browser_tab, _) = state
+            .create_tab(&workspace.0, crate::state::TabKind::Browser)
+            .unwrap();
+        assert!(current_terminal_target(&state, &workspace.0, Some(&browser_tab))
+            .unwrap_err()
+            .contains("not a terminal"));
+        state.close_tab(&workspace.0, &first_tab).unwrap();
+        assert!(current_terminal_target(&state, &workspace.0, Some(&first_tab)).is_err());
+    }
+
+    #[test]
+    fn fresh_multi_command_preset_uses_one_tab_per_command_without_prompt_bytes() {
+        let state = AppStateStore::default();
+        let workspace = state.create_workspace_at_path(std::path::PathBuf::from("/tmp"));
+        let target = state
+            .snapshot()
+            .workspaces
+            .iter()
+            .find(|item| item.workspace_id.0 == workspace.0)
+            .unwrap()
+            .tabs[0]
+            .tab_id
+            .clone();
+        let (first_session, _) =
+            current_terminal_target(&state, &workspace.0, Some(&target)).unwrap();
+        let sessions = make_sessions();
+        let first_calls = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let second_calls = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut first_runtime = SessionRuntime::new(&first_session);
+        first_runtime.writer = Some(Box::new(RecordingWriter {
+            calls: first_calls.clone(),
+        }));
+        first_runtime.pending_output.push_back(b"$ ".to_vec());
+        sessions
+            .lock()
+            .unwrap()
+            .insert(first_session.clone(), first_runtime);
+
+        let mut second_session = None;
+        let mut prompt_notices = Vec::new();
+        let result = launch_fresh_terminal_preset(
+            &state,
+            &sessions,
+            &workspace.0,
+            &target,
+            true,
+            &["agent-one".into(), "agent-two".into()],
+            Some("keep $(id) out of the PTY"),
+            "Agent",
+            &Some("agent".into()),
+            |session_id| {
+                let mut runtime = SessionRuntime::new(&session_id);
+                runtime.writer = Some(Box::new(RecordingWriter {
+                    calls: second_calls.clone(),
+                }));
+                runtime.pending_output.push_back(b"$ ".to_vec());
+                sessions.lock().unwrap().insert(session_id.clone(), runtime);
+                second_session = Some(session_id);
+            },
+            |session_id| prompt_notices.push(session_id.to_string()),
+        )
+        .unwrap();
+        assert_eq!(result, None);
+
+        let second_session = second_session.expect("second terminal spawned");
+        assert_ne!(first_session, second_session);
+        assert_eq!(*first_calls.lock().unwrap(), vec![b"agent-one\r".to_vec()]);
+        assert_eq!(*second_calls.lock().unwrap(), vec![b"agent-two\r".to_vec()]);
+        assert_eq!(prompt_notices, vec![first_session, second_session]);
+        let snapshot = state.snapshot();
+        let tabs = &snapshot
+            .workspaces
+            .iter()
+            .find(|item| item.workspace_id.0 == workspace.0)
+            .unwrap()
+            .tabs;
+        assert_eq!(tabs.len(), 2);
+        assert!(tabs.iter().all(|tab| tab.title == "Agent"));
+    }
+
+    #[test]
+    fn background_multi_command_launch_does_not_select_its_new_tabs() {
+        let state = AppStateStore::default();
+        let background = state.create_workspace_at_path(std::path::PathBuf::from("/tmp/background"));
+        let first_tab = state
+            .snapshot()
+            .workspaces
+            .iter()
+            .find(|item| item.workspace_id.0 == background.0)
+            .unwrap()
+            .active_tab_id
+            .clone();
+        let (selected_tab, _) = state
+            .create_tab(&background.0, crate::state::TabKind::Terminal)
+            .unwrap();
+        let desktop = state.create_workspace_at_path(std::path::PathBuf::from("/tmp/desktop"));
+        assert!(state.activate_workspace(&desktop.0));
+        let before = state.snapshot();
+        let background_before = before
+            .workspaces
+            .iter()
+            .find(|item| item.workspace_id.0 == background.0)
+            .unwrap();
+        assert_eq!(background_before.active_tab_id, selected_tab);
+        let first_surface = background_before.active_surface_id.clone();
+        let desktop_tab = before
+            .workspaces
+            .iter()
+            .find(|item| item.workspace_id.0 == desktop.0)
+            .unwrap()
+            .active_tab_id
+            .clone();
+        let (first_session, _) =
+            current_terminal_target(&state, &background.0, Some(&first_tab)).unwrap();
+        let sessions = make_sessions();
+        let first_calls = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let second_calls = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut first_runtime = SessionRuntime::new(&first_session);
+        first_runtime.writer = Some(Box::new(RecordingWriter {
+            calls: first_calls.clone(),
+        }));
+        first_runtime.pending_output.push_back(b"$ ".to_vec());
+        sessions.lock().unwrap().insert(first_session, first_runtime);
+
+        let result = launch_fresh_terminal_preset(
+            &state,
+            &sessions,
+            &background.0,
+            &first_tab,
+            false,
+            &["agent-one".into(), "agent-two".into()],
+            None,
+            "Agent",
+            &None,
+            |session_id| {
+                let mut runtime = SessionRuntime::new(&session_id);
+                runtime.writer = Some(Box::new(RecordingWriter {
+                    calls: second_calls.clone(),
+                }));
+                runtime.pending_output.push_back(b"$ ".to_vec());
+                sessions.lock().unwrap().insert(session_id, runtime);
+            },
+            |_| {},
+        )
+        .unwrap();
+
+        assert_eq!(result, None);
+        assert_eq!(*first_calls.lock().unwrap(), vec![b"agent-one\r".to_vec()]);
+        assert_eq!(*second_calls.lock().unwrap(), vec![b"agent-two\r".to_vec()]);
+        let after = state.snapshot();
+        assert_eq!(after.active_workspace_id.0, desktop.0);
+        let background_after = after
+            .workspaces
+            .iter()
+            .find(|item| item.workspace_id.0 == background.0)
+            .unwrap();
+        assert_eq!(background_after.tabs.len(), 3);
+        assert_eq!(background_after.active_tab_id, selected_tab);
+        assert_eq!(background_after.active_surface_id, first_surface);
+        assert_eq!(after
+            .workspaces
+            .iter()
+            .find(|item| item.workspace_id.0 == desktop.0)
+            .unwrap()
+            .active_tab_id, desktop_tab);
+    }
+
+    #[test]
+    fn later_write_failure_reports_the_first_confirmed_tab_without_prompt_bytes() {
+        let state = AppStateStore::default();
+        let workspace = state.create_workspace_at_path(std::path::PathBuf::from("/tmp"));
+        let target = state
+            .snapshot()
+            .workspaces
+            .iter()
+            .find(|item| item.workspace_id.0 == workspace.0)
+            .unwrap()
+            .tabs[0]
+            .tab_id
+            .clone();
+        let (first_session, _) =
+            current_terminal_target(&state, &workspace.0, Some(&target)).unwrap();
+        let sessions = make_sessions();
+        let first_calls = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut first_runtime = SessionRuntime::new(&first_session);
+        first_runtime.writer = Some(Box::new(RecordingWriter {
+            calls: first_calls.clone(),
+        }));
+        first_runtime.pending_output.push_back(b"$ ".to_vec());
+        sessions
+            .lock()
+            .unwrap()
+            .insert(first_session, first_runtime);
+
+        let partial = launch_fresh_terminal_preset(
+            &state,
+            &sessions,
+            &workspace.0,
+            &target,
+            true,
+            &["agent-one".into(), "agent-two".into()],
+            Some("never send $(id) to the PTY"),
+            "Agent",
+            &None,
+            |session_id| {
+                let mut runtime = SessionRuntime::new(&session_id);
+                runtime.writer = Some(Box::new(FailingWriter));
+                runtime.pending_output.push_back(b"$ ".to_vec());
+                sessions.lock().unwrap().insert(session_id, runtime);
+            },
+            |_| {},
+        )
+        .expect("a confirmed first command is reported as partial")
+        .expect("later write failure includes confirmed tabs");
+
+        assert_eq!(partial.confirmed_tab_ids, vec![target.clone()]);
+        assert_eq!(partial.confirmed_commands, 1);
+        assert_eq!(partial.total_commands, 2);
+        assert!(partial.error.contains("second terminal rejected the write"));
+        assert_eq!(*first_calls.lock().unwrap(), vec![b"agent-one\r".to_vec()]);
+        let snapshot = state.snapshot();
+        let tabs = &snapshot
+            .workspaces
+            .iter()
+            .find(|item| item.workspace_id.0 == workspace.0)
+            .unwrap()
+            .tabs;
+        assert_eq!(tabs.len(), 2);
+        assert_eq!(tabs[0].tab_id, target);
+        assert_eq!(tabs[0].title, "Agent");
+        assert_ne!(tabs[1].title, "Agent");
+    }
+
+    #[test]
+    fn closed_tab_during_write_is_not_reported_as_a_confirmed_launch() {
+        let state = std::sync::Arc::new(AppStateStore::default());
+        let workspace = state.create_workspace_at_path(std::path::PathBuf::from("/tmp"));
+        let target = state
+            .snapshot()
+            .workspaces
+            .iter()
+            .find(|item| item.workspace_id.0 == workspace.0)
+            .unwrap()
+            .tabs[0]
+            .tab_id
+            .clone();
+        let (session_id, _) = current_terminal_target(&state, &workspace.0, Some(&target)).unwrap();
+        let sessions = make_sessions();
+        let mut runtime = SessionRuntime::new(&session_id);
+        runtime.writer = Some(Box::new(CloseTabOnWrite {
+            state: state.clone(),
+            workspace_id: workspace.0.clone(),
+            tab_id: target.clone(),
+            calls: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+            fail: false,
+        }));
+        runtime.pending_output.push_back(b"$ ".to_vec());
+        sessions.lock().unwrap().insert(session_id, runtime);
+
+        let partial = launch_fresh_terminal_preset(
+            &state,
+            &sessions,
+            &workspace.0,
+            &target,
+            true,
+            &["agent-one".into()],
+            None,
+            "Agent",
+            &None,
+            |_| {},
+            |_| {},
+        )
+        .expect("the command reached a terminal before its tab closed")
+        .expect("the closed tab is reported as a partial launch");
+
+        assert!(partial.confirmed_tab_ids.is_empty());
+        assert_eq!(partial.confirmed_commands, 1);
+        assert_eq!(partial.total_commands, 1);
+        assert!(partial.error.contains(&target));
+        assert!(state
+            .snapshot()
+            .workspaces
+            .iter()
+            .find(|item| item.workspace_id.0 == workspace.0)
+            .unwrap()
+            .tabs
+            .is_empty());
+    }
+
+    #[test]
+    fn closed_earlier_tab_is_not_offered_after_a_later_write() {
+        for fail_later_write in [false, true] {
+            let state = std::sync::Arc::new(AppStateStore::default());
+            let workspace = state.create_workspace_at_path(std::path::PathBuf::from("/tmp"));
+            let first_tab = state
+                .snapshot()
+                .workspaces
+                .iter()
+                .find(|item| item.workspace_id.0 == workspace.0)
+                .unwrap()
+                .tabs[0]
+                .tab_id
+                .clone();
+            let (first_session, _) =
+                current_terminal_target(&state, &workspace.0, Some(&first_tab)).unwrap();
+            let sessions = make_sessions();
+            let first_calls = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+            let second_calls = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+            let mut first_runtime = SessionRuntime::new(&first_session);
+            first_runtime.writer = Some(Box::new(RecordingWriter {
+                calls: first_calls.clone(),
+            }));
+            first_runtime.pending_output.push_back(b"$ ".to_vec());
+            sessions
+                .lock()
+                .unwrap()
+                .insert(first_session, first_runtime);
+
+            let result = launch_fresh_terminal_preset(
+                &state,
+                &sessions,
+                &workspace.0,
+                &first_tab,
+                true,
+                &["agent-one".into(), "agent-two".into()],
+                Some("never send $(id) to the PTY"),
+                "Agent",
+                &None,
+                |session_id| {
+                    let mut runtime = SessionRuntime::new(&session_id);
+                    runtime.writer = Some(Box::new(CloseTabOnWrite {
+                        state: state.clone(),
+                        workspace_id: workspace.0.clone(),
+                        tab_id: first_tab.clone(),
+                        calls: second_calls.clone(),
+                        fail: fail_later_write,
+                    }));
+                    runtime.pending_output.push_back(b"$ ".to_vec());
+                    sessions.lock().unwrap().insert(session_id, runtime);
+                },
+                |_| {},
+            );
+
+            let snapshot = state.snapshot();
+            let tabs = &snapshot
+                .workspaces
+                .iter()
+                .find(|item| item.workspace_id.0 == workspace.0)
+                .unwrap()
+                .tabs;
+            assert_eq!(tabs.len(), 1);
+            assert_ne!(tabs[0].tab_id, first_tab);
+            assert_eq!(*first_calls.lock().unwrap(), vec![b"agent-one\r".to_vec()]);
+            assert_eq!(*second_calls.lock().unwrap(), vec![b"agent-two\r".to_vec()]);
+
+            if fail_later_write {
+                let partial = result
+                    .expect("the first command reached its terminal")
+                    .expect("a later write failed");
+                assert!(partial.confirmed_tab_ids.is_empty());
+                assert_eq!(partial.confirmed_commands, 1);
+                assert!(partial.error.contains("later terminal rejected the write"));
+                assert_ne!(tabs[0].title, "Agent");
+            } else {
+                let partial = result
+                    .expect("a later tab received a confirmed command")
+                    .expect("the first tab closed during the later write");
+                assert_eq!(partial.confirmed_tab_ids, vec![tabs[0].tab_id.clone()]);
+                assert_eq!(partial.confirmed_commands, 2);
+                assert_eq!(partial.total_commands, 2);
+                assert!(partial.error.contains("closed"));
+                assert_eq!(tabs[0].title, "Agent");
+            }
+        }
+    }
+
+    #[test]
+    fn explicit_tab_target_keeps_metadata_when_selection_changes_during_write() {
+        let state = std::sync::Arc::new(AppStateStore::default());
+        let workspace = state.create_workspace_at_path(std::path::PathBuf::from("/tmp"));
+        let first_tab = state
+            .snapshot()
+            .workspaces
+            .iter()
+            .find(|item| item.workspace_id.0 == workspace.0)
+            .unwrap()
+            .tabs[0]
+            .tab_id
+            .clone();
+        let (session_id, tab_id) =
+            current_terminal_target(&state, &workspace.0, Some(&first_tab)).unwrap();
+        let (other_tab, _) = state
+            .create_tab(&workspace.0, crate::state::TabKind::Terminal)
+            .unwrap();
+        state.activate_tab(&workspace.0, &first_tab).unwrap();
+
+        let sessions = make_sessions();
+        sessions
+            .lock()
+            .unwrap()
+            .insert(session_id.clone(), SessionRuntime::new(&session_id));
+        let calls = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let producer_state = state.clone();
+        let producer_sessions = sessions.clone();
+        let producer_calls = calls.clone();
+        let producer_workspace = workspace.0.clone();
+        let producer_tab = other_tab.clone();
+        let producer_session = session_id.clone();
+        let producer = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(150));
+            producer_state
+                .activate_tab(&producer_workspace, &producer_tab)
+                .unwrap();
+            let mut guard = producer_sessions.lock().unwrap();
+            let runtime = guard.get_mut(&producer_session).unwrap();
+            runtime.writer = Some(Box::new(RecordingWriter {
+                calls: producer_calls,
+            }));
+            runtime.pending_output.push_back(b"$ ".to_vec());
+        });
+
+        write_current_terminal_command(&sessions, &session_id, "agent --flag", true).unwrap();
+        producer.join().unwrap();
+        set_preset_tab_metadata(&state, &workspace.0, &tab_id, "Agent", &Some("agent".into()))
+            .unwrap();
+
+        let snapshot = state.snapshot();
+        let target_workspace = snapshot
+            .workspaces
+            .iter()
+            .find(|item| item.workspace_id.0 == workspace.0)
+            .unwrap();
+        assert_eq!(target_workspace.active_tab_id, other_tab);
+        let first = target_workspace
+            .tabs
+            .iter()
+            .find(|tab| tab.tab_id == first_tab)
+            .unwrap();
+        let other = target_workspace
+            .tabs
+            .iter()
+            .find(|tab| tab.tab_id == other_tab)
+            .unwrap();
+        assert_eq!(first.title, "Agent");
+        assert_eq!(first.icon.as_deref(), Some("agent"));
+        assert_ne!(other.title, "Agent");
+        assert_eq!(*calls.lock().unwrap(), vec![b"agent --flag\r".to_vec()]);
+    }
+
+    #[test]
     fn test_resume_command_overrides_original_command() {
         let sessions = make_sessions();
         insert_session_with_writer(&sessions, "sess");
@@ -1420,7 +2146,8 @@ mod tests {
             "sess",
             "claude --dangerously-skip-permissions --system-prompt \"$CODEMUX_AGENT_CONTEXT\"",
             80,
-        );
+        )
+        .unwrap();
 
         producer.join().unwrap();
 

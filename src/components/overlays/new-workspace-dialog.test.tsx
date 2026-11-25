@@ -5,6 +5,8 @@ import { NewWorkspaceDialog, branchNameError } from "./new-workspace-dialog";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import { useAppStore } from "@/stores/app-store";
 import { useUIStore } from "@/stores/ui-store";
+import { useChatDraftStore } from "@/stores/chat-draft-store";
+import { PartialPresetLaunchError } from "@/lib/partial-preset-launch";
 import type {
   AppStateSnapshot,
   ProviderChatCapabilities,
@@ -35,16 +37,23 @@ vi.mock("@/tauri/commands", () => ({
         is_builtin: true,
         auto_run_on_workspace: false,
         auto_run_on_new_tab: false,
+        kind: "cli",
       },
     ],
   }),
   pickFolderDialog: vi.fn().mockResolvedValue(null),
   createWorkspace: vi.fn().mockResolvedValue("ws-new"),
+  createEmptyWorkspace: vi.fn().mockResolvedValue("ws-new"),
+  createTab: vi.fn().mockResolvedValue("tab-created"),
   createWorktreeWorkspaceResult: vi
     .fn()
-    .mockResolvedValue({ workspaceId: "ws-new", cwd: null, adopted: false }),
+    .mockResolvedValue({ workspaceId: "ws-new", cwd: null, adopted: false, initialTabId: "tab-default" }),
   importWorktreeWorkspace: vi.fn().mockResolvedValue("ws-new"),
   activateWorkspace: vi.fn().mockResolvedValue(undefined),
+  activateTab: vi.fn().mockResolvedValue(undefined),
+  getAppState: vi.fn().mockResolvedValue({
+    workspaces: [{ workspace_id: "ws-new", tabs: [{ tab_id: "tab-default", kind: "terminal" }] }],
+  }),
   renameWorkspace: vi.fn().mockResolvedValue(undefined),
   applyPreset: vi.fn().mockResolvedValue(undefined),
   dbAddRecentProject: vi.fn().mockResolvedValue(undefined),
@@ -123,6 +132,8 @@ import {
   getGitBranchInfo,
   createWorktreeWorkspaceResult,
   activateWorkspace,
+  activateTab,
+  getAppState,
   renameWorkspace,
   generateBranchName,
   generateRandomBranchName,
@@ -131,6 +142,8 @@ import {
   getPresets,
   listChatProviderCapabilities,
   createWorkspace,
+  createEmptyWorkspace,
+  createTab,
   applyPreset,
   listBranchesDetailed,
   listWorktrees,
@@ -289,6 +302,7 @@ beforeEach(() => {
     workspaceId: "ws-new",
     cwd: null,
     adopted: false,
+    initialTabId: "tab-default",
   });
   // useDefaultBranch keeps a module-level cache so the same project_root
   // only fetches once per session. Clear it between tests so a previous
@@ -304,6 +318,7 @@ beforeEach(() => {
     lastSelectedAgentId: null,
     lastModelSelections: {},
   });
+  useChatDraftStore.setState({ draftsById: {}, activeDraftId: null });
 });
 
 describe("NewWorkspaceDialog", () => {
@@ -599,13 +614,8 @@ describe("Submit flow", () => {
         "single",
         expect.any(String),
         null,
-        "builtin-claude",
         null,
-        // 9th arg = launch-time model selection. This mock's preset
-        // omits `kind`, so it's filtered from the cli-preset list and
-        // no family is detected — the model picker stays absent and
-        // the selection is null. The picker's own behaviour is covered
-        // by launch-model-picker.test.tsx.
+        null,
         null,
       );
     });
@@ -614,7 +624,112 @@ describe("Submit flow", () => {
     expect(generateRandomBranchName).not.toHaveBeenCalled();
   });
 
-  it("threads a remembered model selection through to workspace creation", async () => {
+  it("keeps a new worktree prompt without claiming the agent opened when its write fails", async () => {
+    setAppState("/path/to/project");
+    (applyPreset as Mock).mockRejectedValueOnce("Terminal shell is not writable");
+    renderDialog(true);
+
+    const dialog = await screen.findByRole("dialog");
+    fireEvent.change(within(dialog).getByPlaceholderText("What do you want to do?"), {
+      target: { value: "Fix the login bug" },
+    });
+    fireEvent.click(within(dialog).getByRole("button", { name: /Create/i }));
+
+    await waitFor(() => expect(toast.warning).toHaveBeenCalledWith(
+      expect.stringContaining("could not be confirmed open"),
+      expect.objectContaining({ action: expect.objectContaining({ label: "Copy prompt" }) }),
+    ));
+    expect((createWorktreeWorkspaceResult as Mock).mock.calls[0][6]).toBeNull();
+    expect(applyPreset).toHaveBeenCalledWith(
+      "ws-new", "builtin-claude", "current_terminal", null,
+      { model: null, reasoning: null, context: null }, true, "tab-default",
+    );
+    const saved = Object.values(useChatDraftStore.getState().draftsById)[0];
+    expect(saved.inputDraft).toBe("Fix the login bug");
+    expect(saved.manualPromptRequired).toBe(false);
+    expect(toast.success).not.toHaveBeenCalled();
+  });
+
+  it("describes a confirmed launch command without claiming the agent is ready", async () => {
+    setAppState("/path/to/project");
+    renderDialog(true);
+
+    const dialog = await screen.findByRole("dialog");
+    fireEvent.change(within(dialog).getByPlaceholderText("What do you want to do?"), {
+      target: { value: "Fix the login bug" },
+    });
+    fireEvent.click(within(dialog).getByRole("button", { name: /Create/i }));
+
+    await waitFor(() => expect(toast.success).toHaveBeenCalledWith(
+      expect.stringContaining("launch command reached a terminal. Paste this task only when the agent's input is visible"),
+      expect.objectContaining({ action: expect.objectContaining({ label: "Copy prompt" }) }),
+    ));
+    expect(applyPreset).toHaveBeenCalledTimes(1);
+  });
+
+  it("keeps a partially launched worktree prompt and opens its confirmed tab", async () => {
+    setAppState("/path/to/project");
+    (applyPreset as Mock).mockRejectedValueOnce(new PartialPresetLaunchError({
+      confirmed_tab_ids: ["tab-default"],
+      total_commands: 2,
+      error: "second terminal rejected the write",
+    }));
+    renderDialog(true);
+
+    const dialog = await screen.findByRole("dialog");
+    fireEvent.change(within(dialog).getByPlaceholderText("What do you want to do?"), {
+      target: { value: "Fix the login bug" },
+    });
+    fireEvent.click(within(dialog).getByRole("button", { name: /Create/i }));
+
+    await waitFor(() => expect(toast.warning).toHaveBeenCalledWith(
+      expect.stringContaining("opened 1 of 2 tabs"),
+      expect.objectContaining({
+        action: expect.objectContaining({ label: "Copy prompt" }),
+        cancel: expect.objectContaining({ label: "Open terminal" }),
+      }),
+    ));
+    expect(activateTab).toHaveBeenCalledWith("ws-new", "tab-default");
+    const saved = Object.values(useChatDraftStore.getState().draftsById)[0];
+    expect(saved.inputDraft).toBe("Fix the login bug");
+    expect(saved.manualPromptRequired).toBe(true);
+    expect(toast.success).not.toHaveBeenCalled();
+    expect(applyPreset).toHaveBeenCalledTimes(1);
+  });
+
+  it("keeps a partial prompt without an agent link if its confirmed tab closed", async () => {
+    setAppState("/path/to/project");
+    (getAppState as Mock).mockResolvedValueOnce({
+      workspaces: [{ workspace_id: "ws-new", tabs: [] }],
+    });
+    (applyPreset as Mock).mockRejectedValueOnce(new PartialPresetLaunchError({
+      confirmed_tab_ids: ["tab-default"],
+      total_commands: 2,
+      error: "second terminal rejected the write",
+    }));
+    renderDialog(true);
+
+    const dialog = await screen.findByRole("dialog");
+    fireEvent.change(within(dialog).getByPlaceholderText("What do you want to do?"), {
+      target: { value: "Fix the login bug" },
+    });
+    fireEvent.click(within(dialog).getByRole("button", { name: /Create/i }));
+
+    await waitFor(() => expect(toast.warning).toHaveBeenCalledWith(
+      expect.stringContaining("1 of 2 preset commands reached terminals; no terminal tab remains open"),
+      expect.objectContaining({ action: expect.objectContaining({ label: "Copy prompt" }) }),
+    ));
+    const options = (toast.warning as Mock).mock.calls[0][1];
+    expect(options.cancel).toBeUndefined();
+    expect(activateTab).not.toHaveBeenCalled();
+    expect(toast.success).not.toHaveBeenCalled();
+    const saved = Object.values(useChatDraftStore.getState().draftsById)[0];
+    expect(saved.inputDraft).toBe("Fix the login bug");
+    expect(saved.manualPromptRequired).toBe(true);
+    expect(applyPreset).toHaveBeenCalledTimes(1);
+  });
+
+  it("threads a remembered model selection through to the confirmed preset launch", async () => {
     // A cli-kind preset so the model-selection wiring actually engages
     // (the shared mock preset omits `kind` and is filtered out of the
     // cli-preset list, leaving the model picker absent).
@@ -655,14 +770,16 @@ describe("Submit flow", () => {
     await waitFor(() => {
       expect(createWorktreeWorkspaceResult).toHaveBeenCalled();
     });
-    // 9th arg is the launch-time ModelSelection — the remembered pick,
-    // intact (not dropped despite capabilities never loading).
+    // Workspace creation starts only the terminal. The confirmed preset
+    // write receives the remembered model pick, even without a prompt.
     const call = (createWorktreeWorkspaceResult as Mock).mock.calls[0];
-    expect(call[8]).toEqual({
-      model: "claude-sonnet-4-6",
-      reasoning: "high",
-      context: null,
-    });
+    expect(call[6]).toBeNull();
+    expect(call[8]).toBeNull();
+    await waitFor(() => expect(applyPreset).toHaveBeenCalledWith(
+      "ws-new", "builtin-claude", "current_terminal", null,
+      { model: "claude-sonnet-4-6", reasoning: "high", context: null },
+      true, "tab-default",
+    ));
     // And the stored preference is not corrupted by the launch.
     expect(useUIStore.getState().lastModelSelections.claude).toEqual({
       model: "claude-sonnet-4-6",
@@ -698,9 +815,11 @@ describe("Submit flow", () => {
     expect(createWorktreeWorkspaceResult).not.toHaveBeenCalled();
     // The dedup must not be silent — that's what made re-linking an issue
     // look like "nothing happened" and quietly dropped the typed message.
-    expect(toast.info).toHaveBeenCalledWith(
-      expect.stringContaining("already has a workspace"),
+    expect(toast.success).toHaveBeenCalledWith(
+      expect.stringContaining("prompt. It is saved"),
+      expect.objectContaining({ action: expect.objectContaining({ label: "Copy prompt" }) }),
     );
+    expect(Object.values(useChatDraftStore.getState().draftsById)[0].inputDraft).toBe("Fix the login bug");
   });
 
   it("surfaces an 'Open it' notice before submit when the branch already has a workspace", async () => {
@@ -761,9 +880,13 @@ describe("Submit flow", () => {
     await waitFor(() => {
       expect(activateWorkspace).toHaveBeenCalledWith("ws-existing");
     });
-    expect(toast.info).toHaveBeenCalledWith(
-      expect.stringContaining("prompt wasn't sent"),
+    expect(toast.success).toHaveBeenCalledWith(
+      expect.stringContaining("without sending this prompt"),
+      expect.objectContaining({ action: expect.objectContaining({ label: "Copy prompt" }) }),
     );
+    const saved = Object.values(useChatDraftStore.getState().draftsById)[0];
+    expect(saved.inputDraft).toBe("Fix the login bug");
+    expect(saved.manualPromptRequired).toBe(false);
   });
 
   it("does not rename an adopted workspace to the typed name", async () => {
@@ -1446,10 +1569,13 @@ describe("Failure recovery", () => {
 
     fireEvent.click(within(dialog).getByRole("button", { name: /Create/i }));
     await waitFor(() => expect(createWorktreeWorkspaceResult).toHaveBeenCalled());
-    const sentPrompt = (createWorktreeWorkspaceResult as Mock).mock.calls[0][5];
-    expect(sentPrompt).toContain("Look at this");
-    expect(sentPrompt).toContain("Attached files:\n- /tmp/shot.png");
-    expect(sentPrompt).toContain("#92");
+    expect((createWorktreeWorkspaceResult as Mock).mock.calls[0][5]).toBeNull();
+    await waitFor(() => expect(Object.values(useChatDraftStore.getState().draftsById)).toHaveLength(1));
+    const savedPrompt = Object.values(useChatDraftStore.getState().draftsById)[0].inputDraft;
+    expect(savedPrompt).toContain("Look at this");
+    expect(savedPrompt).toContain("Attached files:\n- /tmp/shot.png");
+    expect(savedPrompt).toContain("#92");
+    expect(savedPrompt).toContain("Implement the backend endpoints.");
     // The retry replaced the failed row.
     await waitFor(() =>
       expect(
@@ -1568,11 +1694,12 @@ describe("Failure recovery", () => {
     fireEvent.click(within(dialog).getByRole("button", { name: /Create/i }));
 
     await waitFor(() => expect(createWorktreeWorkspaceResult).toHaveBeenCalled());
-    expect((createWorktreeWorkspaceResult as Mock).mock.calls[0][8]).toEqual({
-      model: "claude-sonnet-4-6",
-      reasoning: null,
-      context: null,
-    });
+    expect((createWorktreeWorkspaceResult as Mock).mock.calls[0][8]).toBeNull();
+    await waitFor(() => expect(applyPreset).toHaveBeenCalledWith(
+      "ws-new", "builtin-claude", "current_terminal", null,
+      { model: "claude-sonnet-4-6", reasoning: null, context: null },
+      true, "tab-default",
+    ));
   });
 
   it("blocks submit on an invalid branch name and says why", async () => {
@@ -1704,13 +1831,40 @@ describe("Non-git project", () => {
         "ws-new",
         "builtin-claude",
         "current_terminal",
-        "Tidy the notes",
         null,
+        { model: null, reasoning: null, context: null },
+        true,
+        "tab-created",
       );
     });
-    expect(createWorkspace).toHaveBeenCalledWith("/path/to/project");
+    expect(Object.values(useChatDraftStore.getState().draftsById)[0].inputDraft).toBe("Tidy the notes");
+    expect(createEmptyWorkspace).toHaveBeenCalledWith("/path/to/project");
+    expect(createTab).toHaveBeenCalledWith("ws-new", "terminal");
     expect(createWorktreeWorkspaceResult).not.toHaveBeenCalled();
     expect(generateBranchName).not.toHaveBeenCalled();
+  });
+
+  it("keeps the prompt recoverable and gives no launch success when the fresh PTY write fails", async () => {
+    setAppState("/path/to/project");
+    (checkIsGitRepo as Mock).mockResolvedValue(false);
+    (applyPreset as Mock).mockRejectedValueOnce("Terminal shell is not writable");
+    renderDialog(true);
+
+    const dialog = await screen.findByRole("dialog");
+    fireEvent.change(
+      within(dialog).getByPlaceholderText("What do you want to do?"),
+      { target: { value: "Tidy the notes" } },
+    );
+    fireEvent.click(within(dialog).getByRole("button", { name: /Create/i }));
+
+    await waitFor(() => expect(toast.warning).toHaveBeenCalledWith(
+      expect.stringContaining("could not be confirmed open"),
+      expect.objectContaining({ action: expect.objectContaining({ label: "Copy prompt" }) }),
+    ));
+    expect(toast.success).not.toHaveBeenCalled();
+    const saved = Object.values(useChatDraftStore.getState().draftsById)[0];
+    expect(saved.inputDraft).toBe("Tidy the notes");
+    expect(saved.manualPromptRequired).toBe(false);
   });
 });
 
@@ -1738,7 +1892,8 @@ describe("Detected default branch routing", () => {
   it("attaches the repo's detected default to the repo root", async () => {
     await submitBranch("trunk");
     await waitFor(() => {
-      expect(createWorkspace).toHaveBeenCalledWith("/path/to/project");
+      expect(createEmptyWorkspace).toHaveBeenCalledWith("/path/to/project");
+      expect(createTab).toHaveBeenCalledWith("ws-new", "terminal");
     });
     expect(createWorktreeWorkspaceResult).not.toHaveBeenCalled();
   });
@@ -1753,7 +1908,7 @@ describe("Detected default branch routing", () => {
         "single",
         null,
         null,
-        "builtin-claude",
+        null,
         null,
         null,
       );

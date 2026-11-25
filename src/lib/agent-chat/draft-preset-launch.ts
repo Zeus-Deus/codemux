@@ -16,9 +16,9 @@ export const CLEAR_AFTER_PROMOTION_MS = 5000;
 /**
  * Materialise an active draft by clicking a preset: commit the draft
  * (spawning only that preset's pane) via `materializeWithPreset`, then
- * run the same transition cleanup DraftChatSurface uses on composer
- * submit — clear the active draft immediately so the router swaps to
- * the live workspace, and sweep the draft entry after the grace period.
+ * show the live workspace. A CLI prompt withheld from terminal input stays
+ * in its draft for the user to copy into the agent; empty drafts and native
+ * chats still get the usual grace-period cleanup.
  *
  * Shared by the legacy `PresetBar` (draft mode) and the GUI-chrome
  * `DraftAgentLauncher` so both entry points stay behaviourally
@@ -64,6 +64,8 @@ export async function launchDraftWithPreset(
       markMaterialized: state.markMaterialized,
       markPromoted: state.markPromoted,
       markSendFailed: state.markSendFailed,
+      markManualPromptRequired: state.markManualPromptRequired,
+      markPromptRetained: state.markPromptRetained,
       ensureThread: chat.ensureThread,
       appendUserMessage: chat.appendUserMessage,
       removeUserMessageByNonce: chat.removeUserMessageByNonce,
@@ -88,12 +90,14 @@ export async function launchDraftWithPreset(
   );
 
   if (result.success) {
-    const draftIdToClear = draft.draftId;
     state.setActiveDraft(null);
-    setTimeout(
-      () => useChatDraftStore.getState().clearDraft(draftIdToClear),
-      CLEAR_AFTER_PROMOTION_MS,
-    );
+    if (!result.manualPromptRequired && !result.retainedDraft) {
+      const draftIdToClear = draft.draftId;
+      setTimeout(
+        () => useChatDraftStore.getState().clearDraft(draftIdToClear),
+        CLEAR_AFTER_PROMOTION_MS,
+      );
+    }
   }
 
   return result;

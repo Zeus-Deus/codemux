@@ -48,8 +48,10 @@ import {
   generateBranchName,
   generateRandomBranchName,
   createWorktreeWorkspaceResult,
+  applyPreset,
   importWorktreeWorkspace,
   activateWorkspace,
+  activateTab,
   closeWorkspace,
   detectPackageManager,
   setProjectScripts,
@@ -66,6 +68,10 @@ import { randomUUID } from "@/lib/uuid";
 import { autoNameWorkspace } from "@/lib/agent-chat/materialize";
 import { utilitySelectionFromStores } from "@/lib/utility-agent";
 import { toast, errorMessage } from "@/lib/toast";
+import { saveWorkspacePrompt } from "@/lib/workspace-prompt-handoff";
+import { PartialPresetLaunchError } from "@/lib/partial-preset-launch";
+import { focusConfirmedPresetTab, partialPresetStatusMessage, type ConfirmedPresetTabState } from "@/lib/confirmed-preset-tabs";
+import { initialTerminalTabId } from "@/lib/terminal-preset-target";
 import { Eyebrow } from "@/components/ui/eyebrow";
 import { PresetIcon } from "@/components/icons/preset-icon";
 
@@ -345,22 +351,62 @@ export function ProjectOnboarding({ projectDir, tempWorkspaceId, onComplete, onC
             : await generateRandomBranchName(projectDir);
         }
 
-        // The task is the agent's first prompt, so the workspace opens with
-        // the agent already working on what the user just described.
-        const prompt = selectedAgentId ? task.trim() || null : null;
+        // The task is kept locally for manual entry after the terminal opens.
+        const prompt = task.trim();
         const created = await createWorktreeWorkspaceResult(
           projectDir,
           branch,
           true, // new branch
           "single",
           baseBranch || null,
-          prompt,
-          selectedAgentId,
+          null,
+          null,
         );
-        // The backend reused a live workspace for this worktree and dropped
-        // the prompt rather than type into a running session; say so.
-        if (created.adopted && prompt) {
-          toast.info(`"${branch}" already has a live workspace — switched to it. Your task wasn't sent.`);
+        let launchError: string | null = null;
+        let partialLaunch: PartialPresetLaunchError | null = null;
+        let confirmedTabId: string | null = null;
+        let partialTab: ConfirmedPresetTabState | null = null;
+        if (!created.adopted && selectedAgentId) {
+          try {
+            const tabId = initialTerminalTabId(created);
+            await applyPreset(created.workspaceId, selectedAgentId, "current_terminal", null, null, true, tabId);
+          } catch (error) {
+            if (error instanceof PartialPresetLaunchError) {
+              partialLaunch = error;
+              partialTab = await focusConfirmedPresetTab(created.workspaceId, error.confirmedTabIds);
+              confirmedTabId = partialTab.tabId;
+            } else {
+              launchError = errorMessage(error);
+            }
+          }
+        }
+        const openConfirmedTab = confirmedTabId
+          ? () => activateWorkspace(created.workspaceId).then(() => activateTab(created.workspaceId, confirmedTabId))
+          : undefined;
+        if (prompt) {
+          const commandDelivered =
+            !launchError &&
+            (!partialLaunch || partialLaunch.confirmedCommands > 0) &&
+            !created.adopted &&
+            !!selectedAgent?.commands.some((command) => command.trim());
+          saveWorkspacePrompt(
+            created.workspaceId,
+            prompt,
+            commandDelivered,
+            partialLaunch
+              ? partialPresetStatusMessage(selectedAgent?.name ?? "Agent", partialLaunch, partialTab ?? { tabId: null, openTabCount: null })
+              : launchError
+              ? `Workspace opened, but ${selectedAgent?.name ?? "Agent"} could not be confirmed open. The task is saved in Drafts.`
+              : commandDelivered
+              ? `${selectedAgent?.name ?? "Agent"} launch command reached a terminal. Paste this task only when the agent's input is visible.`
+              : "Workspace opened without sending this task. It is saved for later.",
+            launchError || partialLaunch ? "warning" : "success",
+            openConfirmedTab,
+          );
+        } else if (partialLaunch) {
+          toast.warning(partialPresetStatusMessage(selectedAgent?.name ?? "Agent", partialLaunch, partialTab ?? { tabId: null, openTabCount: null }));
+        } else if (launchError) {
+          toast.error(`Workspace opened, but ${selectedAgent?.name ?? "Agent"} could not be confirmed open: ${launchError}`);
         }
         // Title the new workspace from the task, separately from its branch.
         if (!created.adopted && task.trim()) {
@@ -397,6 +443,7 @@ export function ProjectOnboarding({ projectDir, tempWorkspaceId, onComplete, onC
       generatedBranch,
       baseBranch,
       selectedAgentId,
+      selectedAgent,
       projectDir,
       setupMode,
       actions,

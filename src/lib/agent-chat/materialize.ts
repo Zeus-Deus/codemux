@@ -5,6 +5,7 @@ import {
   agentChatSendTurn,
   agentChatStartSession,
   applyPreset,
+  createTab,
   createEmptyWorkspace,
   createWorkspaceOnHost,
   createWorktreeWorkspaceResult,
@@ -22,6 +23,8 @@ import { utilitySelectionFromStores } from "@/lib/utility-agent";
 import type { ChatDraft, DraftId } from "@/stores/chat-draft-store";
 import type { TerminalPreset } from "@/tauri/types";
 import { randomUUID } from "@/lib/uuid";
+import { PartialPresetLaunchError } from "@/lib/partial-preset-launch";
+import { focusConfirmedPresetTab } from "@/lib/confirmed-preset-tabs";
 
 import {
   deriveTitleFromFirstMessage,
@@ -62,6 +65,10 @@ export interface MaterializeActions {
   ) => void;
   /** Records a send failure so the composer can surface retry UI. */
   markSendFailed: (id: DraftId, error: string) => void;
+  /** Keeps a successfully launched terminal preset's unsent prompt for manual entry. */
+  markManualPromptRequired: (id: DraftId) => void;
+  /** Keeps an unsent prompt without claiming a reachable agent tab. */
+  markPromptRetained: (id: DraftId) => void;
   /** Idempotent — ensures a slice exists on the agent-chat store for
    *  the pre-minted `thread_id` so the optimistic user message has a
    *  home before the live pane mounts. */
@@ -121,6 +128,17 @@ export type MaterializeResult =
       workspaceId: string;
       paneId: string;
       threadId: string;
+      /** Terminal preset launched, but its prompt is still in the draft. */
+      manualPromptRequired?: boolean;
+      /** A commandless shell opened; the draft remains without agent guidance. */
+      retainedDraft?: boolean;
+      /** Earlier CLI commands reached their tabs before a later one failed. */
+      partialPreset?: {
+        confirmedTabId: string | null;
+        confirmedCommands: number;
+        openTabCount: number | null;
+        totalCommands: number;
+      };
     }
   | { success: false; error: string };
 
@@ -485,14 +503,14 @@ export async function materializeAndSend(
  *
  * This is the commit-on-preset-click path: when the user clicks a
  * preset tile while a draft is active, the draft's composer text
- * carries over as the preset's initial prompt, the draft's target
+ * remains available for manual entry, the draft's target
  * (home / project / existing) turns into a real workspace, and the
  * preset takes over that workspace's active surface.
  *
  * Dispatch depends on `preset.kind`:
- *   - `cli`      — delegate to the Rust `apply_preset` command,
- *                  which spawns a terminal pane and runs the preset's
- *                  shell commands with `initialPrompt` spliced in.
+ *   - `cli`      — delegate to the Rust `apply_preset` command, which
+ *                  starts the terminal preset and keeps any unsent prompt
+ *                  in the draft for manual entry.
  *   - `chat_agent` — create an `agent_chat` pane, start a session with
  *                  the draft's model/permission/etc., and send the
  *                  first turn. Same sequence `materializeAndSend` uses,
@@ -722,28 +740,74 @@ export async function materializeWithPreset(
   }
 
   // ── CLI dispatch ──
-  // Delegate to the existing Rust `apply_preset`, which spawns a
-  // terminal pane and runs the preset's commands. For agent presets
-  // like Claude Code, the CLI reads `initialPrompt` and launches its
-  // own session inside the PTY.
+  // Empty workspaces have no terminal yet. Create one and pin the preset
+  // to its tab so another selection cannot redirect the command.
   try {
+    const tabId = await createTab(workspaceId, "terminal");
     await applyPreset(
       workspaceId,
       preset.id,
       "current_terminal",
-      prompt.length > 0 ? prompt : null,
+      null,
+      undefined,
+      true,
+      tabId,
     );
   } catch (err) {
+    if (err instanceof PartialPresetLaunchError) {
+      const tab = await focusConfirmedPresetTab(workspaceId, err.confirmedTabIds);
+      // A confirmed write stays confirmed even if its tab closed or the
+      // follow-up state read failed. Keep the draft's delivery notice so a
+      // later visit cannot mistake this for an untouched, retryable prompt.
+      if (prompt.length > 0) {
+        actions.markManualPromptRequired(draft.draftId);
+      } else if (tab.tabId) {
+        actions.markPromoted(draft.draftId, {
+          workspaceId,
+          paneId: "cli-preset",
+          threadId: draft.threadId,
+        });
+      } else {
+        actions.markPromptRetained(draft.draftId);
+      }
+      return {
+        success: true,
+        workspaceId,
+        paneId: "cli-preset",
+        threadId: draft.threadId,
+        ...(prompt.length > 0 ? { manualPromptRequired: true } : {}),
+        ...(!tab.tabId ? { retainedDraft: true } : {}),
+        partialPreset: {
+          confirmedTabId: tab.tabId,
+          confirmedCommands: err.confirmedCommands,
+          openTabCount: tab.openTabCount,
+          totalCommands: err.totalCommands,
+        },
+      };
+    }
     const message = errorMessage(err);
     actions.markSendFailed(draft.draftId, message);
     return { success: false, error: message };
   }
 
-  // CLI presets don't give us a usable paneId / threadId from the
-  // frontend — `apply_preset` spawns the pane server-side. The
-  // promotedTo values are placeholders; the grace-period cleanup
-  // still runs via DraftChatSurface's `setActiveDraft(null)` +
-  // scheduled `clearDraft`.
+  // A PTY command cannot safely carry an untrusted prompt when its
+  // foreground shell may change before the write arrives. Keep the draft
+  // visible in the sidebar with its original text for the user to copy.
+  if (prompt.length > 0) {
+    const commandDelivered = preset.commands.some((command) => command.trim());
+    if (commandDelivered) actions.markManualPromptRequired(draft.draftId);
+    else actions.markPromptRetained(draft.draftId);
+    return {
+      success: true,
+      workspaceId,
+      paneId: "cli-preset",
+      threadId: draft.threadId,
+      ...(commandDelivered ? { manualPromptRequired: true } : { retainedDraft: true }),
+    };
+  }
+
+  // Empty-prompt CLI launches can retire the draft normally. CLI presets
+  // do not give us a usable paneId or threadId from the frontend.
   actions.markPromoted(draft.draftId, {
     workspaceId,
     paneId: "cli-preset",

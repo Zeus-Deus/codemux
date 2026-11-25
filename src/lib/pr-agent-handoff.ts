@@ -8,24 +8,28 @@
  *
  * The prompts are deliberately verbose. The agent lands in a fresh
  * thread knowing nothing: not the pull request, not the failure, not
- * which branch it is standing on. Everything it would otherwise have to
- * go and fetch is in the first message, quoted from data this panel
- * already has.
+ * which branch it is standing on. The prepared first message is saved
+ * as a draft for the user to copy after the terminal opens.
  */
 
 import {
   applyPreset,
+  activateTab,
   createTab,
   createWorktreeWorkspaceResult,
   getCheckLogExcerpt,
   getPresets,
 } from "@/tauri/commands";
+import { PartialPresetLaunchError } from "@/lib/partial-preset-launch";
+import { focusConfirmedPresetTab, partialPresetStatusMessage, type ConfirmedPresetTabState } from "@/lib/confirmed-preset-tabs";
 import type { ModelSelection, TerminalPreset, WorkspaceSnapshot } from "@/tauri/types";
 import { activateWorkspaceInteraction } from "@/lib/perf/instrumented-activate";
 import { useAppStore } from "@/stores/app-store";
 import { useUIStore } from "@/stores/ui-store";
 import { usePrAgentRunsStore } from "@/stores/pr-agent-runs-store";
-import { toast } from "@/lib/toast";
+import { saveWorkspacePrompt } from "@/lib/workspace-prompt-handoff";
+import { initialTerminalTabId } from "@/lib/terminal-preset-target";
+import { useChatDraftStore } from "@/stores/chat-draft-store";
 
 // ── Task shapes ───────────────────────────────────────────────────────
 
@@ -97,6 +101,7 @@ export interface HandoffOutcome {
   workspaceTitle: string;
   presetName: string;
   prompt: string;
+  partial?: boolean;
 }
 
 // ── Preset resolution ─────────────────────────────────────────────────
@@ -114,7 +119,9 @@ export function pickAgentPreset(
   presets: TerminalPreset[],
   lastSelectedAgentId: string | null,
 ): TerminalPreset | null {
-  const candidates = presets.filter((p) => p.pinned && p.kind === "cli");
+  const candidates = presets.filter(
+    (p) => p.pinned && p.kind === "cli" && p.commands.some((command) => command.trim()),
+  );
   const remembered = lastSelectedAgentId
     ? candidates.find((p) => p.id === lastSelectedAgentId)
     : undefined;
@@ -286,13 +293,6 @@ export function buildHandoffPrompt(req: HandoffRequest, excerpt?: string | null)
   return parts.filter(Boolean).join("\n\n");
 }
 
-/** The half-sentence a toast uses to say what was handed over. */
-export function taskLabel(task: HandoffTask, pr: HandoffPr): string {
-  if (task.kind === "failing-check") return `fixing ${task.checkName}`;
-  if (task.kind === "review-thread") return `addressing ${task.reviewer}'s comment`;
-  return `resolving conflicts with ${pr.base_branch ?? "the base branch"}`;
-}
-
 // ── Routing ───────────────────────────────────────────────────────────
 
 function workspaceById(id: string): WorkspaceSnapshot | null {
@@ -311,28 +311,6 @@ export function findWorkspaceForBranch(
     list.find((w) => w.project_root === projectRoot && w.git_branch === branch) ??
     null
   );
-}
-
-/**
- * Start the preset in a *fresh* tab of an existing workspace.
- *
- * `apply_preset` only carries an initial prompt on its `current_terminal`
- * path — the `new_tab` branch spawns the agent with no prompt at all. So
- * the tab is created first (which makes it the active one) and the
- * preset is then applied to it. That also means we never type into the
- * terminal the user was already working in.
- */
-async function startThreadIn(
-  workspaceId: string,
-  presetId: string,
-  prompt: string,
-  modelSelection: ModelSelection | null,
-): Promise<string | null> {
-  // The id is kept so the timeline's "Open thread" can land on this
-  // conversation rather than merely on the workspace containing it.
-  const tabId = await createTab(workspaceId, "terminal");
-  await applyPreset(workspaceId, presetId, "current_terminal", prompt, modelSelection);
-  return tabId ?? null;
 }
 
 /** What the run's card says it was pointed at. */
@@ -377,6 +355,7 @@ export async function handOffToAgent(req: HandoffRequest): Promise<HandoffOutcom
       prNumber: pr.number,
       kind: task.kind,
       summary: runSummary(task, pr),
+      promptNotSent: true,
       workspaceId,
       workspaceTitle,
       threadTabId,
@@ -401,6 +380,7 @@ export async function handOffToAgent(req: HandoffRequest): Promise<HandoffOutcom
     route: HandoffRoute,
     workspaceId: string,
     threadTabId: string | null,
+    partial?: { launch: PartialPresetLaunchError; tab: ConfirmedPresetTabState },
   ): HandoffOutcome => {
     const title = workspaceById(workspaceId)?.title ?? pr.head_branch ?? "a new workspace";
     const where =
@@ -410,15 +390,45 @@ export async function handOffToAgent(req: HandoffRequest): Promise<HandoffOutcom
           ? `in a new worktree for ${pr.head_branch}`
           : `in ${title}`;
     remember(workspaceId, title, threadTabId);
-    toast.success(`${presetName} is ${taskLabel(task, pr)} — new thread ${where}`);
-    return { route, workspaceId, workspaceTitle: title, presetName, prompt };
+    saveWorkspacePrompt(
+      workspaceId,
+      prompt,
+      partial ? partial.launch.confirmedCommands > 0 : true,
+      partial
+        ? partialPresetStatusMessage(presetName, partial.launch, partial.tab)
+        : `${presetName} launch command reached a terminal ${where}. The PR task is saved in Drafts; paste it only when the agent's input is visible.`,
+      partial ? "warning" : "success",
+      partial && threadTabId
+        ? () => activateWorkspaceInteraction(workspaceId).then(() => activateTab(workspaceId, threadTabId))
+        : undefined,
+    );
+    return { route, workspaceId, workspaceTitle: title, presetName, prompt, ...(partial ? { partial: true } : {}) };
+  };
+
+  const launchIn = async (
+    route: HandoffRoute,
+    workspaceId: string,
+    originalTabId?: string,
+  ): Promise<HandoffOutcome> => {
+    let tabId: string;
+    try {
+      tabId = originalTabId ?? await createTab(workspaceId, "terminal");
+      await applyPreset(workspaceId, presetId, "current_terminal", null, modelSelection, true, tabId);
+    } catch (error) {
+      if (error instanceof PartialPresetLaunchError) {
+        const tab = await focusConfirmedPresetTab(workspaceId, error.confirmedTabIds);
+        return finish(route, workspaceId, tab.tabId, { launch: error, tab });
+      }
+      useChatDraftStore.getState().saveWorkspacePrompt(workspaceId, prompt, false);
+      throw new Error(`Workspace opened, but no ${presetName} tab could be confirmed. The PR task is saved in Drafts. ${String(error)}`);
+    }
+    return finish(route, workspaceId, tabId);
   };
 
   // (a) You are standing in the branch: the worktree already exists and
   // it is the one on screen.
   if (currentWorkspaceId) {
-    const tabId = await startThreadIn(currentWorkspaceId, presetId, prompt, modelSelection);
-    return finish("current", currentWorkspaceId, tabId);
+    return launchIn("current", currentWorkspaceId);
   }
 
   if (!pr.head_branch) {
@@ -430,33 +440,35 @@ export async function handOffToAgent(req: HandoffRequest): Promise<HandoffOutcom
   const existing = findWorkspaceForBranch(projectRoot, pr.head_branch);
   if (existing) {
     await activateWorkspaceInteraction(existing.workspace_id);
-    const tabId = await startThreadIn(existing.workspace_id, presetId, prompt, modelSelection);
-    return finish("existing", existing.workspace_id, tabId);
+    return launchIn("existing", existing.workspace_id);
   }
 
-  // (c) Nowhere to land: cut the worktree, with the prompt attached.
+  // (c) Nowhere to land: cut the worktree and save its task separately.
   const result = await createWorktreeWorkspaceResult(
     projectRoot,
     pr.head_branch,
     false,
     "single",
     null,
-    prompt,
-    presetId,
+    null,
+    null,
     pr.number,
-    modelSelection,
+    null,
   );
 
-  // An adopted workspace is one the backend attached to instead of
-  // creating, and adoption drops the prompt and the preset. Rather than
-  // telling the user their instruction went nowhere, start the thread
-  // the second way.
+  // Adoption skips the preset. Start it in a new tab and retain the task.
   if (result.adopted) {
-    const tabId = await startThreadIn(result.workspaceId, presetId, prompt, modelSelection);
-    return finish("adopted", result.workspaceId, tabId);
+    return launchIn("adopted", result.workspaceId);
   }
 
-  // The worktree route carried the prompt at creation time, so no tab was
-  // created here and there is no id to point "Open thread" at.
-  return finish("worktree", result.workspaceId, null);
+  // Creating a worktree starts its terminal but no agent command. Confirm
+  // delivery to that terminal before recording a successful handoff.
+  let initialTabId: string;
+  try {
+    initialTabId = initialTerminalTabId(result);
+  } catch (error) {
+    useChatDraftStore.getState().saveWorkspacePrompt(result.workspaceId, prompt, false);
+    throw new Error(`Workspace opened, but ${presetName} did not open. The PR task is saved in Drafts. ${String(error)}`);
+  }
+  return launchIn("worktree", result.workspaceId, initialTabId);
 }

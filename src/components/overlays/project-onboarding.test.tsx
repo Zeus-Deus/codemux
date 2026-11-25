@@ -3,6 +3,7 @@ import { describe, it, expect, vi, beforeEach } from "vitest";
 import { render, screen, fireEvent, act, cleanup, within } from "@testing-library/react";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import { ProjectOnboarding } from "./project-onboarding";
+import { PartialPresetLaunchError } from "@/lib/partial-preset-launch";
 
 // ── Mock Tauri commands ──
 //
@@ -19,9 +20,14 @@ vi.mock("@/tauri/commands", () => ({
   generateRandomBranchName: vi.fn().mockResolvedValue("random-branch"),
   createWorktreeWorkspaceResult: vi
     .fn()
-    .mockResolvedValue({ workspaceId: "ws-new", adopted: false }),
+    .mockResolvedValue({ workspaceId: "ws-new", adopted: false, initialTabId: "tab-default" }),
+  applyPreset: vi.fn().mockResolvedValue(undefined),
   importWorktreeWorkspace: vi.fn().mockResolvedValue("ws-new"),
   activateWorkspace: vi.fn().mockResolvedValue(undefined),
+  activateTab: vi.fn().mockResolvedValue(undefined),
+  getAppState: vi.fn().mockResolvedValue({
+    workspaces: [{ workspace_id: "ws-new", tabs: [{ tab_id: "tab-default", kind: "terminal" }] }],
+  }),
   closeWorkspace: vi.fn().mockResolvedValue(undefined),
   detectPackageManager: vi.fn().mockResolvedValue([]),
   setProjectScripts: vi.fn().mockResolvedValue(undefined),
@@ -39,19 +45,24 @@ vi.mock("@/lib/toast", () => ({
 }));
 
 import {
+  applyPreset,
   closeWorkspace,
   createWorktreeWorkspaceResult,
   getPresets,
   importWorktreeWorkspace,
   listWorktrees,
   activateWorkspace,
+  activateTab,
+  getAppState,
 } from "@/tauri/commands";
 import { toast } from "@/lib/toast";
 import { useUIStore } from "@/stores/ui-store";
+import { useChatDraftStore } from "@/stores/chat-draft-store";
 import type { TerminalPreset, WorktreeInfo } from "@/tauri/types";
 
 const mockCloseWorkspace = vi.mocked(closeWorkspace);
 const mockCreate = vi.mocked(createWorktreeWorkspaceResult);
+const mockApplyPreset = vi.mocked(applyPreset);
 const mockGetPresets = vi.mocked(getPresets);
 const mockImport = vi.mocked(importWorktreeWorkspace);
 const mockListWorktrees = vi.mocked(listWorktrees);
@@ -106,6 +117,7 @@ beforeEach(() => {
   cleanup();
   vi.clearAllMocks();
   useUIStore.setState({ lastSelectedAgentId: null });
+  useChatDraftStore.setState({ draftsById: {}, activeDraftId: null });
 });
 
 async function goToSetupStep(task = "Add dark mode") {
@@ -127,7 +139,7 @@ describe("ProjectOnboarding — task and agent", () => {
     });
   });
 
-  it("sends the task as the first prompt to the selected agent", async () => {
+  it("keeps the task for manual entry after delivering the launch command", async () => {
     const { onComplete } = renderOnboarding();
     await flushMountEffects();
     await goToSetupStep("  Add dark mode  ");
@@ -141,10 +153,99 @@ describe("ProjectOnboarding — task and agent", () => {
       true,
       "single",
       "main",
-      "Add dark mode",
-      "builtin-claude",
+      null,
+      null,
+    );
+    expect(mockApplyPreset).toHaveBeenCalledWith(
+      "ws-new", "builtin-claude", "current_terminal", null, null, true, "tab-default",
+    );
+    const saved = Object.values(useChatDraftStore.getState().draftsById)[0];
+    expect(saved.target).toEqual({ kind: "existing_workspace", workspaceId: "ws-new" });
+    expect(saved.inputDraft).toBe("Add dark mode");
+    expect(saved.manualPromptRequired).toBe(true);
+    expect(vi.mocked(toast.success)).toHaveBeenCalledWith(
+      expect.stringContaining("launch command reached a terminal. Paste this task only when the agent's input is visible"),
+      expect.objectContaining({ action: expect.objectContaining({ label: "Copy prompt" }) }),
     );
     expect(onComplete).toHaveBeenCalledTimes(1);
+  });
+
+  it("keeps the task and warns if the new worktree's preset write fails", async () => {
+    mockApplyPreset.mockRejectedValueOnce(new Error("Terminal shell is not writable"));
+    const { onComplete } = renderOnboarding();
+    await flushMountEffects();
+    await goToSetupStep();
+
+    fireEvent.click(screen.getByRole("button", { name: "Create & start Claude Code" }));
+    await vi.waitFor(() => expect(onComplete).toHaveBeenCalledOnce());
+
+    const saved = Object.values(useChatDraftStore.getState().draftsById)[0];
+    expect(saved.inputDraft).toBe("Add dark mode");
+    expect(saved.manualPromptRequired).toBe(false);
+    expect(vi.mocked(toast.warning)).toHaveBeenCalledWith(
+      expect.stringContaining("could not be confirmed open"),
+      expect.objectContaining({ action: expect.objectContaining({ label: "Copy prompt" }) }),
+    );
+    expect(toast.success).not.toHaveBeenCalled();
+  });
+
+  it("keeps the task and links the confirmed tab when a later command fails", async () => {
+    mockApplyPreset.mockRejectedValueOnce(new PartialPresetLaunchError({
+      confirmed_tab_ids: ["tab-default"],
+      total_commands: 2,
+      error: "second terminal rejected the write",
+    }));
+    const { onComplete } = renderOnboarding();
+    await flushMountEffects();
+    await goToSetupStep();
+
+    fireEvent.click(screen.getByRole("button", { name: "Create & start Claude Code" }));
+    await vi.waitFor(() => expect(onComplete).toHaveBeenCalledOnce());
+
+    const saved = Object.values(useChatDraftStore.getState().draftsById)[0];
+    expect(saved.inputDraft).toBe("Add dark mode");
+    expect(saved.manualPromptRequired).toBe(true);
+    expect(activateTab).toHaveBeenCalledWith("ws-new", "tab-default");
+    expect(vi.mocked(toast.warning)).toHaveBeenCalledWith(
+      expect.stringContaining("opened 1 of 2 tabs"),
+      expect.objectContaining({
+        action: expect.objectContaining({ label: "Copy prompt" }),
+        cancel: expect.objectContaining({ label: "Open terminal" }),
+      }),
+    );
+    expect(toast.success).not.toHaveBeenCalled();
+    expect(mockApplyPreset).toHaveBeenCalledTimes(1);
+  });
+
+  it("warns and retains the task if fresh tab state cannot be loaded", async () => {
+    vi.mocked(getAppState)
+      .mockRejectedValueOnce(new Error("state unavailable"))
+      .mockRejectedValueOnce(new Error("state still unavailable"));
+    mockApplyPreset.mockRejectedValueOnce(new PartialPresetLaunchError({
+      confirmed_tab_ids: ["tab-default"],
+      confirmed_commands: 1,
+      total_commands: 2,
+      error: "second terminal rejected the write",
+    }));
+    const { onComplete } = renderOnboarding();
+    await flushMountEffects();
+    await goToSetupStep();
+
+    fireEvent.click(screen.getByRole("button", { name: "Create & start Claude Code" }));
+    await vi.waitFor(() => expect(onComplete).toHaveBeenCalledOnce());
+
+    expect(vi.mocked(toast.warning)).toHaveBeenCalledWith(
+      expect.stringContaining("open tabs could not be confirmed"),
+      expect.objectContaining({ action: expect.objectContaining({ label: "Copy prompt" }) }),
+    );
+    expect(vi.mocked(toast.warning).mock.calls[0][1]?.cancel).toBeUndefined();
+    expect(toast.success).not.toHaveBeenCalled();
+    expect(activateTab).not.toHaveBeenCalled();
+    const saved = Object.values(useChatDraftStore.getState().draftsById)[0];
+    expect(saved.inputDraft).toBe("Add dark mode");
+    expect(saved.manualPromptRequired).toBe(true);
+    expect(getAppState).toHaveBeenCalledTimes(2);
+    expect(mockApplyPreset).toHaveBeenCalledTimes(1);
   });
 
   it("starts the agent the user last picked when it is still pinned", async () => {
@@ -171,7 +272,7 @@ describe("ProjectOnboarding — task and agent", () => {
     );
   });
 
-  it("says so when the backend adopts a live workspace and drops the task", async () => {
+  it("saves the task without claiming an agent opened when a workspace is adopted", async () => {
     mockCreate.mockResolvedValueOnce({ workspaceId: "ws-live", cwd: null, adopted: true });
     const { onComplete } = renderOnboarding();
     await flushMountEffects();
@@ -180,9 +281,13 @@ describe("ProjectOnboarding — task and agent", () => {
     fireEvent.click(screen.getByRole("button", { name: /create & start/i }));
     await flushMountEffects();
 
-    expect(vi.mocked(toast.info)).toHaveBeenCalledWith(
-      expect.stringContaining("Your task wasn't sent"),
+    expect(vi.mocked(toast.success)).toHaveBeenCalledWith(
+      expect.stringContaining("without sending this task"),
+      expect.objectContaining({ action: expect.objectContaining({ label: "Copy prompt" }) }),
     );
+    const saved = Object.values(useChatDraftStore.getState().draftsById)[0];
+    expect(saved.inputDraft).toBe("Add dark mode");
+    expect(saved.manualPromptRequired).toBe(false);
     expect(mockActivate).toHaveBeenCalledWith("ws-live");
     expect(onComplete).toHaveBeenCalledTimes(1);
   });

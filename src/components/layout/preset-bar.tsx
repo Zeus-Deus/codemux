@@ -43,9 +43,12 @@ import {
   type DraftId,
 } from "@/stores/chat-draft-store";
 import { useFeatureFlags } from "@/stores/feature-flags";
+import { partialPresetStatusMessage } from "@/lib/confirmed-preset-tabs";
 import { useUIStore } from "@/stores/ui-store";
 import {
   applyPreset,
+  activateTab,
+  activateWorkspace,
   getPresets,
   reorderPresets,
   setPresetBarVisible,
@@ -347,6 +350,24 @@ function PresetBarImpl({
     void launchDraftWithPreset(draftId, preset).then((result) => {
       if (!result.success) {
         toast.error(`${preset.name}: ${result.error ?? "Send failed"}`);
+      } else if (result.partialPreset) {
+        const partial = result.partialPreset;
+        const confirmedTabId = partial.confirmedTabId;
+        toast.warning(
+          `${partialPresetStatusMessage(preset.name, partial, { tabId: confirmedTabId, openTabCount: partial.openTabCount })}${result.manualPromptRequired || result.retainedDraft ? " The prompt remains in Drafts." : ""}`,
+          confirmedTabId ? {
+            action: {
+              label: "Open terminal",
+              onClick: () => {
+                void activateWorkspace(result.workspaceId)
+                  .then(() => activateTab(result.workspaceId, confirmedTabId))
+                  .catch((error) => toast.failure("Couldn't open terminal tab", error));
+              },
+            },
+          } : undefined,
+        );
+      } else if (result.manualPromptRequired) {
+        toast.info(`${preset.name} launch command reached a terminal. Your prompt is saved in Drafts; paste it only when the agent's input is visible.`);
       }
     });
   };

@@ -343,6 +343,45 @@ describe("chat-draft-store", () => {
       expect(next.lastSendError).toBe("git lock");
       expect(next.promotedTo).toBeNull();
     });
+
+    it("keeps a terminal prompt for manual entry without reporting a send failure", () => {
+      const draft = useChatDraftStore.getState().getOrCreateHomeDraft();
+      useChatDraftStore.getState().updateDraftInput(draft.draftId, "review this issue");
+      useChatDraftStore.getState().markPromoting(draft.draftId);
+      useChatDraftStore.getState().markManualPromptRequired(draft.draftId);
+      const saved = useChatDraftStore.getState().draftsById[draft.draftId];
+      expect(saved.inputDraft).toBe("review this issue");
+      expect(saved.promoting).toBe(false);
+      expect(saved.lastSendError).toBeNull();
+      expect(saved.manualPromptRequired).toBe(true);
+      expect(saved.promotedTo).toBeNull();
+
+      useChatDraftStore.getState().markPromoting(draft.draftId);
+      expect(useChatDraftStore.getState().draftsById[draft.draftId].manualPromptRequired).toBe(false);
+    });
+
+    it("saves the exact prompt as a workspace draft across persistence", () => {
+      const prompt = "Review #92\n\nDescription:\nUse literal `$(date)` here";
+      const id = useChatDraftStore.getState().saveWorkspacePrompt("ws-92", prompt, true);
+      const state = useChatDraftStore.getState();
+      expect(state.draftsById[id]).toMatchObject({
+        target: { kind: "existing_workspace", workspaceId: "ws-92" },
+        inputDraft: prompt,
+        manualPromptRequired: true,
+      });
+      expect(partializeChatDraftStoreState(state).draftsById[id]?.inputDraft).toBe(prompt);
+    });
+
+    it("retains a commandless Shell prompt without manual agent guidance", () => {
+      const draft = useChatDraftStore.getState().getOrCreateHomeDraft();
+      useChatDraftStore.getState().updateDraftInput(draft.draftId, "inspect this branch");
+      useChatDraftStore.getState().markPromoting(draft.draftId);
+      useChatDraftStore.getState().markPromptRetained(draft.draftId);
+      const saved = useChatDraftStore.getState().draftsById[draft.draftId];
+      expect(saved.promoting).toBe(false);
+      expect(saved.manualPromptRequired).toBe(false);
+      expect(saved.inputDraft).toBe("inspect this branch");
+    });
   });
 
   describe("clearDraft", () => {

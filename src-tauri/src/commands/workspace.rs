@@ -441,6 +441,8 @@ pub async fn create_workspace<R: tauri::Runtime>(
 /// `base_branch` is what a freshly created worktree branch forked from, as
 /// recorded on the workspace; absent when nothing was recorded (adopted or
 /// reused checkouts, plain folders), so older readers see the old shape.
+/// `initial_tab_id` is captured before creation emits state, so a later tab
+/// reorder cannot redirect a preset intended for the first terminal.
 #[derive(Debug, Clone, Serialize)]
 pub struct WorkspaceCreated {
     pub workspace_id: String,
@@ -448,6 +450,8 @@ pub struct WorkspaceCreated {
     pub adopted: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub base_branch: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub initial_tab_id: Option<String>,
 }
 
 // `async fn` so the git-info subprocesses run on the blocking pool instead
@@ -542,6 +546,7 @@ async fn create_empty_workspace_impl<R: tauri::Runtime>(
         cwd,
         adopted: false,
         base_branch: None,
+        initial_tab_id: None,
     })
 }
 
@@ -763,7 +768,7 @@ pub(crate) fn find_live_workspace_for_worktree_path(
 ///
 /// One atomic operation: git worktree creation, workspace and layout
 /// hydration, PTY spawn, setup scripts, and the
-/// preset launch with an optional starting prompt. A new workspace takes
+/// preset launch with an optional prompt for manual entry. A new workspace takes
 /// `request.reserved_id` when given.
 pub(crate) async fn create_worktree_from_request<R: tauri::Runtime>(
     app: tauri::AppHandle<R>,
@@ -915,7 +920,7 @@ pub(crate) async fn create_worktree_checked<R: tauri::Runtime>(
     // Archived workspaces do not participate — see
     // `find_live_workspace_for_worktree_path` for why they are neither a
     // blocker nor auto-unarchived here.
-    let claim = state.adopt_or_create_worktree_workspace_with_selection(
+    let (claim, initial_tab_id) = state.adopt_or_create_worktree_workspace_with_selection(
         wt_path_buf.clone(),
         layout,
         worktree_path.clone(),
@@ -945,6 +950,7 @@ pub(crate) async fn create_worktree_checked<R: tauri::Runtime>(
                 workspace_id: existing_id,
                 adopted: true,
                 base_branch: None,
+                initial_tab_id: None,
             });
         }
         WorktreeWorkspaceClaim::Created(id) => id,
@@ -1055,18 +1061,10 @@ pub(crate) async fn create_worktree_checked<R: tauri::Runtime>(
                 let _ = state.set_tab_icon(&workspace_id.0, &tab_id, preset.icon.clone());
 
                 if !session_id.is_empty() && !command.is_empty() {
-                    let shell = super::presets::receiving_shell_for_agent_prompt(
-                        &state,
-                        &workspace_id.0,
-                        &session_id,
-                        true,
-                    );
                     let (cmd, prompt_requires_manual_entry) =
                         crate::branch_name::prepare_agent_command(
-                            &preset.id,
                             command,
                             initial_prompt.as_deref(),
-                            shell.as_deref(),
                         );
 
                     state.update_terminal_session_command(&session_id, command.clone());
@@ -1096,6 +1094,7 @@ pub(crate) async fn create_worktree_checked<R: tauri::Runtime>(
         cwd: worktree_path,
         adopted: false,
         base_branch,
+        initial_tab_id,
     })
 }
 
@@ -1156,6 +1155,7 @@ async fn import_worktree_workspace_checked<R: tauri::Runtime>(
     checkpoint.check()?;
     let layout = match layout.as_str() {
         "single" => WorkspacePresetLayout::Single,
+        "empty" => WorkspacePresetLayout::Empty,
         "pair" => WorkspacePresetLayout::Pair,
         "quad" => WorkspacePresetLayout::Quad,
         "six" => WorkspacePresetLayout::Six,
@@ -3281,6 +3281,7 @@ pub fn create_tab<R: tauri::Runtime>(
     state: State<'_, AppStateStore>,
     workspace_id: String,
     kind: String,
+    select: Option<bool>,
 ) -> Result<String, String> {
     let kind = match kind.as_str() {
         "terminal" => TabKind::Terminal,
@@ -3290,7 +3291,8 @@ pub fn create_tab<R: tauri::Runtime>(
         _ => return Err(format!("Unsupported tab kind: {kind}")),
     };
 
-    let (tab_id, session_id) = state.create_tab(&workspace_id, kind)?;
+    let (tab_id, session_id) =
+        state.create_tab_with_selection(&workspace_id, kind, select.unwrap_or(true))?;
 
     if let Some(session_id) = session_id {
         terminal::spawn_pty_for_session(app.clone(), session_id.0);
@@ -3298,6 +3300,66 @@ pub fn create_tab<R: tauri::Runtime>(
 
     crate::state::emit_app_state(&app);
     Ok(tab_id)
+}
+
+#[cfg(test)]
+mod create_tab_selection_tests {
+    use super::*;
+    use tauri::Manager;
+
+    #[test]
+    fn background_tab_creation_keeps_desktop_and_workspace_selection() {
+        let app = tauri::test::mock_app();
+        app.manage(AppStateStore::default());
+        let state = app.state::<AppStateStore>();
+        let background =
+            state.create_workspace_at_path(std::path::PathBuf::from("/tmp/background"));
+        let desktop = state.create_workspace_at_path(std::path::PathBuf::from("/tmp/desktop"));
+        assert!(state.activate_workspace(&desktop.0));
+        let before = state.snapshot();
+        let background_before = before
+            .workspaces
+            .iter()
+            .find(|workspace| workspace.workspace_id == background)
+            .unwrap();
+        let desktop_before = before
+            .workspaces
+            .iter()
+            .find(|workspace| workspace.workspace_id == desktop)
+            .unwrap();
+        let background_tab = background_before.active_tab_id.clone();
+        let background_surface = background_before.active_surface_id.clone();
+        let desktop_tab = desktop_before.active_tab_id.clone();
+
+        // A browser tab avoids spawning a real PTY while exercising the
+        // command's select argument and the same atomic state mutation.
+        let tab_id = create_tab(
+            app.handle().clone(),
+            state,
+            background.0.clone(),
+            "browser".into(),
+            Some(false),
+        )
+        .unwrap();
+
+        let after = app.state::<AppStateStore>().snapshot();
+        assert_eq!(after.active_workspace_id, desktop);
+        let background_after = after
+            .workspaces
+            .iter()
+            .find(|workspace| workspace.workspace_id == background)
+            .unwrap();
+        assert_eq!(background_after.tabs.len(), 2);
+        assert!(background_after.tabs.iter().any(|tab| tab.tab_id == tab_id));
+        assert_eq!(background_after.active_tab_id, background_tab);
+        assert_eq!(background_after.active_surface_id, background_surface);
+        assert_eq!(after
+            .workspaces
+            .iter()
+            .find(|workspace| workspace.workspace_id == desktop)
+            .unwrap()
+            .active_tab_id, desktop_tab);
+    }
 }
 
 #[tauri::command]

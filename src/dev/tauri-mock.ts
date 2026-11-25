@@ -5218,6 +5218,10 @@ const handlers: Record<string, Handler> = {
       protected: true,
       archived_at: 0,
     });
+    workspace.tabs = [];
+    workspace.surfaces = [];
+    workspace.active_tab_id = "";
+    workspace.active_surface_id = "";
     appState = { ...appState, workspaces: [...appState.workspaces, workspace] };
     emitAppState();
     return id;
@@ -6619,12 +6623,8 @@ const handlers: Record<string, Handler> = {
     return undefined;
   },
   /**
-   * Records the launch instead of spawning anything.
-   *
-   * The prompt is the whole point of the agent-handoff surfaces, and in
-   * dev there is no PTY to type it into — so it is echoed to the console
-   * and kept on `window.__codemuxAgentHandoffs`, which makes "did the
-   * prompt survive the route?" answerable from the browser console.
+   * Records the launch instead of spawning a PTY. The starting prompt stays
+   * in Drafts; the record lets the mock UI show which preset was selected.
    */
   apply_preset: (a) => {
     const record = {
@@ -6638,7 +6638,7 @@ const handlers: Record<string, Handler> = {
       `[mock] apply_preset → ${record.presetId} in ${record.workspaceId} (${record.overrideMode})`,
       record.prompt ?? "(no prompt)",
     );
-    return undefined;
+    return null;
   },
 
   // ── Editors / tooling ──
@@ -8149,6 +8149,12 @@ const handlers: Record<string, Handler> = {
       String(a.repoPath ?? `${MOCK_HOME_DIR}/projects/codemux`),
       String(a.branch ?? "mock-branch"),
     );
+    if (a.layout === "empty" && !a.initialChat) {
+      ws.tabs = [];
+      ws.surfaces = [];
+      ws.active_tab_id = "";
+      ws.active_surface_id = "";
+    }
     if (a.initialChat && ws.surfaces[0].root.kind === "agent_chat") {
       const chat = a.initialChat as { provider: AgentChatProviderKind; thread_id: string };
       ws.surfaces[0].root.provider = chat.provider;
@@ -8159,6 +8165,27 @@ const handlers: Record<string, Handler> = {
     // snapshot is asynchronous. Follow-up rename/activate must find it.
     appState = { ...appState, workspaces: [...appState.workspaces, ws] };
     setTimeout(() => emitAppState(), 0);
+    return {
+      workspace_id: ws.workspace_id,
+      cwd: ws.cwd,
+      adopted: false,
+      initial_tab_id: ws.tabs[0]?.tab_id ?? null,
+    };
+  },
+  import_worktree_workspace: (a) => {
+    const path = String(a.worktreePath ?? "");
+    const branch = String(a.branch ?? "mock-branch");
+    const ws = buildWorktreeWorkspace(path, branch);
+    ws.cwd = path;
+    ws.worktree_path = path;
+    if (a.layout === "empty") {
+      ws.tabs = [];
+      ws.surfaces = [];
+      ws.active_tab_id = "";
+      ws.active_surface_id = "";
+    }
+    appState = { ...appState, workspaces: [...appState.workspaces, ws] };
+    emitAppState();
     return ws.workspace_id;
   },
   // Reuses the Home workspace or adds one rooted at the mock home dir, so
@@ -8272,10 +8299,8 @@ const handlers: Record<string, Handler> = {
   /**
    * A real extra terminal tab, so an agent handoff is visible in dev.
    *
-   * The handoff opens a fresh tab and then applies the preset to it
-   * (the only `apply_preset` path that carries a prompt), so a mock that
-   * returned a bare id would make the most important half of the
-   * interaction invisible in the browser.
+   * The handoff opens a fresh tab and then applies the preset to it, so a
+   * mock that returned a bare id would hide the terminal in the browser.
    */
   create_tab: (a) => {
     const ws = findWorkspace(a.workspaceId);

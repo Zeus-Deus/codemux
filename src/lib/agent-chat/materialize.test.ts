@@ -2,15 +2,32 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 
 import type { ChatDraft, DraftId } from "@/stores/chat-draft-store";
 import type { TerminalPreset } from "@/tauri/types";
+import { PartialPresetLaunchError } from "@/lib/partial-preset-launch";
 
 // ── Module mocks ──
 
+function currentMockAppState() {
+  return Promise.resolve(
+    useAppStore.getState().appState ?? {
+      schema_version: 1,
+      active_workspace_id: "",
+      workspaces: [{
+        workspace_id: "ws-project",
+        tabs: [{ tab_id: "tab-cli", kind: "terminal" }],
+      }],
+    },
+  );
+}
+const mockGetAppState = vi.fn(currentMockAppState);
+
 vi.mock("@/tauri/commands", () => ({
   activateWorkspace: vi.fn().mockResolvedValue(undefined),
+  activateTab: vi.fn().mockResolvedValue(undefined),
   agentChatCreatePane: vi.fn().mockResolvedValue("pane-new"),
   agentChatSendTurn: vi.fn().mockResolvedValue({ turn_id: "turn-1", queued_id: null }),
   agentChatStartSession: vi.fn().mockResolvedValue("thread-echoed"),
   applyPreset: vi.fn().mockResolvedValue(undefined),
+  createTab: vi.fn().mockResolvedValue("tab-cli"),
   // `createEmptyWorkspace` is called with either `/home/user` (home
   // targets since Stage C) or a project path. Return ids that
   // reflect the caller so assertions can distinguish the two.
@@ -37,15 +54,7 @@ vi.mock("@/tauri/commands", () => ({
   // fallback path. Return the store's current snapshot so a poll never
   // clobbers seeded state; the worktree tests drive resolution via the
   // store subscription instead.
-  getAppState: vi.fn(() =>
-    Promise.resolve(
-      useAppStore.getState().appState ?? {
-        schema_version: 1,
-        active_workspace_id: "",
-        workspaces: [],
-      },
-    ),
-  ),
+  getAppState: () => mockGetAppState(),
 }));
 
 // Naming must run on the Utility agent's model; pin a known selection so the
@@ -68,10 +77,12 @@ import {
 } from "./materialize";
 import {
   activateWorkspace,
+  activateTab,
   agentChatCreatePane,
   agentChatSendTurn,
   agentChatStartSession,
   applyPreset,
+  createTab,
   createEmptyWorkspace,
   createWorkspaceOnHost,
   createWorktreeWorkspaceResult,
@@ -94,6 +105,8 @@ function makeActions(): SpyActions {
     markMaterialized: vi.fn(),
     markPromoted: vi.fn(),
     markSendFailed: vi.fn(),
+    markManualPromptRequired: vi.fn(),
+    markPromptRetained: vi.fn(),
     ensureThread: vi.fn(),
     appendUserMessage: vi.fn(),
     removeUserMessageByNonce: vi.fn(),
@@ -139,13 +152,16 @@ function makeDraft(overrides: Partial<ChatDraft> = {}): ChatDraft {
 
 describe("materializeAndSend", () => {
   beforeEach(() => {
+    mockGetAppState.mockReset().mockImplementation(currentMockAppState);
     vi.mocked(activateWorkspace).mockClear().mockResolvedValue(undefined);
+    vi.mocked(activateTab).mockClear().mockResolvedValue(undefined);
     vi.mocked(agentChatCreatePane).mockClear().mockResolvedValue("pane-new");
     vi.mocked(agentChatSendTurn).mockClear().mockResolvedValue({ turn_id: "turn-1", queued_id: null });
     vi.mocked(agentChatStartSession)
       .mockClear()
       .mockResolvedValue("thread-echoed");
     vi.mocked(applyPreset).mockClear().mockResolvedValue(undefined);
+    vi.mocked(createTab).mockClear().mockResolvedValue("tab-cli");
     vi.mocked(createEmptyWorkspace)
       .mockClear()
       .mockImplementation((cwd: string) =>
@@ -1550,13 +1566,16 @@ function makePreset(overrides: Partial<TerminalPreset> = {}): TerminalPreset {
 
 describe("materializeWithPreset", () => {
   beforeEach(() => {
+    mockGetAppState.mockReset().mockImplementation(currentMockAppState);
     vi.mocked(activateWorkspace).mockClear().mockResolvedValue(undefined);
+    vi.mocked(activateTab).mockClear().mockResolvedValue(undefined);
     vi.mocked(agentChatCreatePane).mockClear().mockResolvedValue("pane-new");
     vi.mocked(agentChatSendTurn).mockClear().mockResolvedValue({ turn_id: "turn-1", queued_id: null });
     vi.mocked(agentChatStartSession)
       .mockClear()
       .mockResolvedValue("thread-echoed");
     vi.mocked(applyPreset).mockClear().mockResolvedValue(undefined);
+    vi.mocked(createTab).mockClear().mockResolvedValue("tab-cli");
     vi.mocked(createEmptyWorkspace)
       .mockClear()
       .mockImplementation((cwd: string) =>
@@ -1569,7 +1588,7 @@ describe("materializeWithPreset", () => {
   });
 
   describe("CLI preset dispatch", () => {
-    it("happy path: resolves workspace, activates it, delegates to applyPreset with the prompt", async () => {
+    it("launches the CLI while keeping an unsent prompt in its draft", async () => {
       const actions = makeActions();
       const draft = makeDraft({
         target: { kind: "project", projectPath: "/projects/foo" },
@@ -1578,20 +1597,45 @@ describe("materializeWithPreset", () => {
 
       const result = await materializeWithPreset(draft, preset, "ship it", actions);
 
-      expect(result.success).toBe(true);
+      expect(result).toMatchObject({ success: true, manualPromptRequired: true });
       expect(createEmptyWorkspace).toHaveBeenCalledWith("/projects/foo", undefined);
       expect(activateWorkspace).toHaveBeenCalledWith("ws-project");
+      expect(createTab).toHaveBeenCalledWith("ws-project", "terminal");
       expect(applyPreset).toHaveBeenCalledWith(
         "ws-project",
         "builtin-claude",
         "current_terminal",
-        "ship it",
+        null,
+        undefined,
+        true,
+        "tab-cli",
       );
       // CLI path does not mint its own chat pane / session / turn.
       expect(agentChatCreatePane).not.toHaveBeenCalled();
       expect(agentChatStartSession).not.toHaveBeenCalled();
       expect(agentChatSendTurn).not.toHaveBeenCalled();
-      expect(actions.markPromoted).toHaveBeenCalled();
+      expect(actions.markPromoted).not.toHaveBeenCalled();
+      expect(actions.markManualPromptRequired).toHaveBeenCalledWith(draft.draftId);
+      expect(actions.markSendFailed).not.toHaveBeenCalled();
+    });
+
+    it("keeps a commandless Shell prompt without claiming an agent opened", async () => {
+      const actions = makeActions();
+      const draft = makeDraft({ target: { kind: "project", projectPath: "/projects/foo" } });
+
+      const result = await materializeWithPreset(
+        draft,
+        makePreset({ id: "builtin-shell", name: "Shell", commands: [] }),
+        "inspect this branch",
+        actions,
+      );
+
+      expect(result).toMatchObject({ success: true, retainedDraft: true });
+      expect(result).not.toHaveProperty("manualPromptRequired");
+      expect(actions.markPromptRetained).toHaveBeenCalledWith(draft.draftId);
+      expect(actions.markManualPromptRequired).not.toHaveBeenCalled();
+      expect(actions.markPromoted).not.toHaveBeenCalled();
+      expect(applyPreset).toHaveBeenCalledWith("ws-project", "builtin-shell", "current_terminal", null, undefined, true, "tab-cli");
     });
 
     it("empty/whitespace prompt becomes null when delegated to applyPreset", async () => {
@@ -1601,14 +1645,19 @@ describe("materializeWithPreset", () => {
       });
       const preset = makePreset({ kind: "cli" });
 
-      await materializeWithPreset(draft, preset, "   ", actions);
+      const result = await materializeWithPreset(draft, preset, "   ", actions);
 
       expect(applyPreset).toHaveBeenCalledWith(
         "ws-project",
         "builtin-claude",
         "current_terminal",
         null,
+        undefined,
+        true,
+        "tab-cli",
       );
+      expect(result.success).toBe(true);
+      expect(actions.markPromoted).toHaveBeenCalled();
     });
 
     it("workspace-create failure → markSendFailed, applyPreset not called", async () => {
@@ -1632,7 +1681,7 @@ describe("materializeWithPreset", () => {
 
     it("applyPreset failure → markSendFailed, no markPromoted", async () => {
       vi.mocked(applyPreset).mockRejectedValueOnce(
-        new Error("claude is not installed"),
+        new Error("Terminal shell is not writable"),
       );
       const actions = makeActions();
       const draft = makeDraft({
@@ -1644,16 +1693,80 @@ describe("materializeWithPreset", () => {
 
       expect(result).toEqual({
         success: false,
-        error: "claude is not installed",
+        error: "Terminal shell is not writable",
       });
       expect(actions.markSendFailed).toHaveBeenCalledWith(
         "draft-1",
-        "claude is not installed",
+        "Terminal shell is not writable",
       );
       expect(actions.markPromoted).not.toHaveBeenCalled();
       // The workspace was created but not rolled back (locked policy).
       expect(createEmptyWorkspace).toHaveBeenCalled();
       expect(activateWorkspace).toHaveBeenCalled();
+    });
+
+    it("keeps the draft and opens the confirmed tab after a later command fails", async () => {
+      vi.mocked(applyPreset).mockRejectedValueOnce(new PartialPresetLaunchError({
+        confirmed_tab_ids: ["tab-cli"],
+        total_commands: 2,
+        error: "second terminal rejected the write",
+      }));
+      const actions = makeActions();
+      const draft = makeDraft({ target: { kind: "project", projectPath: "/projects/foo" } });
+
+      const result = await materializeWithPreset(
+        draft,
+        makePreset({ commands: ["agent-one", "agent-two"] }),
+        "fix this bug",
+        actions,
+      );
+
+      expect(result).toMatchObject({
+        success: true,
+        manualPromptRequired: true,
+        partialPreset: { confirmedTabId: "tab-cli", confirmedCommands: 1, totalCommands: 2 },
+      });
+      expect(activateTab).toHaveBeenCalledWith("ws-project", "tab-cli");
+      expect(actions.markManualPromptRequired).toHaveBeenCalledWith(draft.draftId);
+      expect(actions.markSendFailed).not.toHaveBeenCalled();
+      expect(actions.markPromoted).not.toHaveBeenCalled();
+    });
+
+    it("retains the prompt without retrying when partial launch tab state is unavailable", async () => {
+      mockGetAppState.mockRejectedValue(new Error("state unavailable"));
+      vi.mocked(applyPreset).mockRejectedValueOnce(new PartialPresetLaunchError({
+        confirmed_tab_ids: ["tab-cli"],
+        confirmed_commands: 1,
+        total_commands: 2,
+        error: "second terminal rejected the write",
+      }));
+      const actions = makeActions();
+      const draft = makeDraft({ target: { kind: "project", projectPath: "/projects/foo" } });
+
+      const result = await materializeWithPreset(
+        draft,
+        makePreset({ commands: ["agent-one", "agent-two"] }),
+        "fix this bug",
+        actions,
+      );
+
+      expect(result).toMatchObject({
+        success: true,
+        manualPromptRequired: true,
+        retainedDraft: true,
+        partialPreset: {
+          confirmedTabId: null,
+          confirmedCommands: 1,
+          openTabCount: null,
+          totalCommands: 2,
+        },
+      });
+      expect(actions.markManualPromptRequired).toHaveBeenCalledWith(draft.draftId);
+      expect(actions.markPromptRetained).not.toHaveBeenCalled();
+      expect(actions.markSendFailed).not.toHaveBeenCalled();
+      expect(actions.markPromoted).not.toHaveBeenCalled();
+      expect(activateTab).not.toHaveBeenCalled();
+      expect(applyPreset).toHaveBeenCalledTimes(1);
     });
   });
 

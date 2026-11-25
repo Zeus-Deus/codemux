@@ -37,6 +37,9 @@ import {
   GitBranch,
 } from "lucide-react";
 import { toast } from "@/lib/toast";
+import { saveWorkspacePrompt } from "@/lib/workspace-prompt-handoff";
+import { PartialPresetLaunchError } from "@/lib/partial-preset-launch";
+import { focusConfirmedPresetTab, partialPresetStatusMessage, type ConfirmedPresetTabState } from "@/lib/confirmed-preset-tabs";
 import { selectActiveWorkspaceId, useAppStore } from "@/stores/app-store";
 import { useUIStore } from "@/stores/ui-store";
 import { PresetIcon } from "@/components/icons/preset-icon";
@@ -52,9 +55,12 @@ import {
   getGitBranchInfo,
   gitFetchPrune,
   createWorkspace,
+  createEmptyWorkspace,
+  createTab,
   createWorktreeWorkspaceResult,
   importWorktreeWorkspace,
   activateWorkspace,
+  activateTab,
   getPresets,
   checkIsGitRepo,
   dbAddRecentProject,
@@ -964,24 +970,38 @@ export function NewWorkspaceDialog({ open, onOpenChange }: Props) {
 
     // Where the workspace lands. Null means an existing workspace already
     // owns the branch and has been focused instead.
-    type Placed = { wsId: string; agentHandled: boolean; adopted: boolean };
+    type Placed = {
+      wsId: string;
+      adopted: boolean;
+      terminalTabId: string | null;
+      needsTerminalTab: boolean;
+    };
     const placeWorkspace = async (): Promise<Placed | null> => {
       // A plain folder: the workspace runs in it directly, no branch.
       if (!gitRepo) {
-        const wsId = await createWorkspace(projectDir);
-        return { wsId, agentHandled: false, adopted: false };
+        const wsId = await createEmptyWorkspace(projectDir);
+        return { wsId, adopted: false, terminalTabId: null, needsTerminalTab: true };
       }
 
       // Open existing branch mode — skip branch generation
       if (branchMode === "open_existing" && openExistingBranch) {
         const existingWsId = branchWorkspaceMap.get(openExistingBranch);
         if (existingWsId) {
-          toast.info(
-            linkedIssue
-              ? `Issue #${linkedIssue.number} already has a workspace — switched to it.`
-              : `"${openExistingBranch}" already has a workspace — switched to it.`,
-          );
           await activateWorkspaceInteraction(existingWsId);
+          if (fullPrompt) {
+            saveWorkspacePrompt(
+              existingWsId,
+              fullPrompt,
+              false,
+              "Workspace opened without sending this prompt. It is saved for later.",
+            );
+          } else {
+            toast.info(
+              linkedIssue
+                ? `Issue #${linkedIssue.number} already has a workspace — switched to it.`
+                : `"${openExistingBranch}" already has a workspace — switched to it.`,
+            );
+          }
           return null;
         }
 
@@ -999,15 +1019,15 @@ export function NewWorkspaceDialog({ open, onOpenChange }: Props) {
         );
 
         if (orphan) {
-          const wsId = await importWorktreeWorkspace(orphan.path, openExistingBranch, "single");
-          return { wsId, agentHandled: false, adopted: false };
+          const wsId = await importWorktreeWorkspace(orphan.path, openExistingBranch, "empty");
+          return { wsId, adopted: false, terminalTabId: null, needsTerminalTab: true };
         }
         if (attachesToRoot(openExistingBranch)) {
           // Open on the default branch always attaches to the real repo root.
           // The sidebar label will reflect actual HEAD via the live refresh loop,
           // so the user sees reality. No phantom worktree is created.
-          const wsId = await createWorkspace(projectDir);
-          return { wsId, agentHandled: false, adopted: false };
+          const wsId = await createEmptyWorkspace(projectDir);
+          return { wsId, adopted: false, terminalTabId: null, needsTerminalTab: true };
         }
         const created = await createWorktreeWorkspaceResult(
           projectDir,
@@ -1015,24 +1035,25 @@ export function NewWorkspaceDialog({ open, onOpenChange }: Props) {
           false,
           "single",
           null,
-          fullPrompt || null,
-          selectedAgentId,
           null,
-          launchSelection,
+          null,
+          null,
+          null,
         );
         // The backend adopted an existing live workspace for this worktree
         // instead of creating one — the prompt/preset were deliberately
         // dropped (injecting into an in-flight session is worse). Silence
         // here would read as "nothing happened" and quietly lose the
         // typed message, so say so.
-        if (created.adopted) {
-          toast.info(
-            fullPrompt
-              ? `"${openExistingBranch}" already has a live workspace — switched to it. Your prompt wasn't sent.`
-              : `"${openExistingBranch}" already has a live workspace — switched to it.`,
-          );
+        if (created.adopted && !fullPrompt) {
+          toast.info(`"${openExistingBranch}" already has a live workspace — switched to it.`);
         }
-        return { wsId: created.workspaceId, agentHandled: true, adopted: created.adopted };
+        return {
+          wsId: created.workspaceId,
+          adopted: created.adopted,
+          terminalTabId: created.initialTabId ?? null,
+          needsTerminalTab: false,
+        };
       }
 
       // Determine branch name
@@ -1065,12 +1086,21 @@ export function NewWorkspaceDialog({ open, onOpenChange }: Props) {
       // and quietly drops the message they just typed.
       const existingWsId = branchWorkspaceMap.get(resolvedBranch);
       if (existingWsId) {
-        toast.info(
-          linkedIssue
-            ? `Issue #${linkedIssue.number} already has a workspace — switched to it.`
-            : `"${resolvedBranch}" already has a workspace — switched to it.`,
-        );
         await activateWorkspaceInteraction(existingWsId);
+        if (fullPrompt) {
+          saveWorkspacePrompt(
+            existingWsId,
+            fullPrompt,
+            false,
+            "Workspace opened without sending this prompt. It is saved for later.",
+          );
+        } else {
+          toast.info(
+            linkedIssue
+              ? `Issue #${linkedIssue.number} already has a workspace — switched to it.`
+              : `"${resolvedBranch}" already has a workspace — switched to it.`,
+          );
+        }
         return null;
       }
 
@@ -1080,8 +1110,8 @@ export function NewWorkspaceDialog({ open, onOpenChange }: Props) {
       // worktree at ~/.codemux/worktrees/<project>/<branch>. Feature
       // branches always get a proper worktree.
       if (!isNewBranch && attachesToRoot(resolvedBranch)) {
-        const wsId = await createWorkspace(projectDir);
-        return { wsId, agentHandled: false, adopted: false };
+        const wsId = await createEmptyWorkspace(projectDir);
+        return { wsId, adopted: false, terminalTabId: null, needsTerminalTab: true };
       }
 
       // Same orphan filter as the open-existing flow above: skip the main
@@ -1098,9 +1128,9 @@ export function NewWorkspaceDialog({ open, onOpenChange }: Props) {
         const wsId = await importWorktreeWorkspace(
           orphan.path,
           resolvedBranch,
-          "single",
+          "empty",
         );
-        return { wsId, agentHandled: false, adopted: false };
+        return { wsId, adopted: false, terminalTabId: null, needsTerminalTab: true };
       }
 
       const created = await createWorktreeWorkspaceResult(
@@ -1109,29 +1139,30 @@ export function NewWorkspaceDialog({ open, onOpenChange }: Props) {
         isNewBranch,
         "single",
         isNewBranch ? baseBranch || null : null,
-        fullPrompt || null,
-        selectedAgentId,
         null,
-        launchSelection,
+        null,
+        null,
+        null,
       );
       // Adopt path: an existing live workspace claims this worktree, so
       // the backend focused it and dropped the prompt/preset instead of
       // typing into its in-flight session. Surface that — otherwise the
       // user's prompt disappears silently.
-      if (created.adopted) {
-        toast.info(
-          fullPrompt
-            ? `"${resolvedBranch}" already has a live workspace — switched to it. Your prompt wasn't sent.`
-            : `"${resolvedBranch}" already has a live workspace — switched to it.`,
-        );
+      if (created.adopted && !fullPrompt) {
+        toast.info(`"${resolvedBranch}" already has a live workspace — switched to it.`);
       }
-      return { wsId: created.workspaceId, agentHandled: true, adopted: created.adopted };
+      return {
+        wsId: created.workspaceId,
+        adopted: created.adopted,
+        terminalTabId: created.initialTabId ?? null,
+        needsTerminalTab: false,
+      };
     };
 
     await runCreate(closeDialog, displayName, draft, async () => {
       const placed = await placeWorkspace();
       if (!placed) return null;
-      const { wsId, agentHandled, adopted } = placed;
+      const { wsId, adopted, terminalTabId, needsTerminalTab } = placed;
 
       if (!adopted) {
         // A typed name wins; otherwise the prompt titles the workspace in
@@ -1143,15 +1174,69 @@ export function NewWorkspaceDialog({ open, onOpenChange }: Props) {
         }
       }
 
-      // Launch agent for paths that don't handle it internally
-      if (!agentHandled && selectedAgentId && fullPrompt) {
-        await applyPreset(
+      // A plain folder or imported checkout starts empty so createTab gives
+      // us the exact terminal ID. Worktree creation returns its original ID.
+      let launchError: string | null = null;
+      let partialLaunch: PartialPresetLaunchError | null = null;
+      let confirmedTabId: string | null = null;
+      let partialTab: ConfirmedPresetTabState | null = null;
+      if (!adopted && (needsTerminalTab || selectedAgentId)) {
+        try {
+          const tabId = needsTerminalTab
+            ? await createTab(wsId, "terminal")
+            : terminalTabId;
+          if (!tabId) throw new Error("Workspace creation did not return its terminal tab");
+          if (selectedAgentId) {
+            await applyPreset(
+              wsId,
+              selectedAgentId,
+              "current_terminal",
+              null,
+              launchSelection,
+              true,
+              tabId,
+            );
+          }
+        } catch (error) {
+          if (error instanceof PartialPresetLaunchError) {
+            partialLaunch = error;
+            partialTab = await focusConfirmedPresetTab(wsId, error.confirmedTabIds);
+            confirmedTabId = partialTab.tabId;
+          } else {
+            launchError = errorText(error);
+          }
+        }
+      }
+
+      const openConfirmedTab = confirmedTabId
+        ? () => activateWorkspace(wsId).then(() => activateTab(wsId, confirmedTabId))
+        : undefined;
+
+      if (fullPrompt) {
+        const commandDelivered =
+          !launchError &&
+          (!partialLaunch || partialLaunch.confirmedCommands > 0) &&
+          !adopted &&
+          !!selectedAgentId &&
+          !!selectedAgent?.commands.some((command) => command.trim());
+        saveWorkspacePrompt(
           wsId,
-          selectedAgentId,
-          "current_terminal",
           fullPrompt,
-          launchSelection,
+          commandDelivered,
+          partialLaunch
+            ? partialPresetStatusMessage(selectedAgent?.name ?? "Agent", partialLaunch, partialTab ?? { tabId: null, openTabCount: null })
+            : launchError
+            ? `Workspace opened, but ${selectedAgent?.name ?? "the terminal"} could not be confirmed open. The prompt is saved in Drafts.`
+            : commandDelivered
+            ? `${selectedAgent?.name ?? "Agent"} launch command reached a terminal. Paste this task only when the agent's input is visible.`
+            : "Workspace opened without sending this prompt. It is saved for later.",
+          launchError || partialLaunch ? "warning" : "success",
+          openConfirmedTab,
         );
+      } else if (partialLaunch) {
+        toast.warning(partialPresetStatusMessage(selectedAgent?.name ?? "Agent", partialLaunch, partialTab ?? { tabId: null, openTabCount: null }));
+      } else if (launchError) {
+        toast.error(`Workspace opened, but ${selectedAgent?.name ?? "the terminal"} could not be confirmed open: ${launchError}`);
       }
 
       // Track as recent project

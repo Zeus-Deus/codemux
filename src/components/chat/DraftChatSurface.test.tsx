@@ -490,6 +490,19 @@ describe("DraftChatSurface", () => {
       expect(container.firstChild).toBeNull();
     });
 
+    it("waits for the agent's input before suggesting a saved prompt be pasted", () => {
+      const store = useChatDraftStore.getState();
+      const draftId = store.saveWorkspacePrompt("ws-1", "Fix the app", true);
+      store.setActiveDraft(draftId);
+
+      const { getByText, getByRole } = renderSurface();
+
+      expect(getByText(/The launch command reached a terminal/)).toHaveTextContent(
+        "Paste this prompt only when the agent's input is visible",
+      );
+      expect(getByRole("button", { name: "Copy prompt" })).toBeInTheDocument();
+    });
+
     it("marks the pane ready on mount so a workspace-switch trace can settle", () => {
       // The draft surface has no transcript to hydrate: it is ready as soon
       // as it mounts. Without this mark a switch that lands on the draft view

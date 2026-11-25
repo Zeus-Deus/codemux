@@ -98,6 +98,9 @@ export interface ChatDraft {
   /** Last materialise-and-send error, surfaced as an inline retry
    *  affordance on the composer. Cleared on next successful send. */
   lastSendError: string | null;
+  /** A terminal received a preset command but not this draft's prompt.
+   *  The prompt remains here for manual entry if the agent becomes ready. */
+  manualPromptRequired?: boolean;
   /** When `true`, this draft was created by an explicit user action
    *  (clicking the sidebar "New agent" button) and should NOT be
    *  auto-redirected to the active project workspace by the mount-
@@ -160,6 +163,8 @@ export interface ChatDraftStore {
    *  effect have already kicked in. */
   getOrCreateHomeDraft: (opts?: { lockedToHome?: boolean }) => ChatDraft;
   getOrCreateProjectDraft: (projectPath: string) => ChatDraft;
+  /** Keep a terminal launch's exact unsent prompt beside its workspace. */
+  saveWorkspacePrompt: (workspaceId: string, prompt: string, commandDelivered: boolean) => DraftId;
 
   // Active-draft selection
   setActiveDraft: (draftId: DraftId | null) => void;
@@ -207,6 +212,8 @@ export interface ChatDraftStore {
     promotedTo: NonNullable<ChatDraft["promotedTo"]>,
   ) => void;
   markSendFailed: (draftId: DraftId, error: string) => void;
+  markManualPromptRequired: (draftId: DraftId) => void;
+  markPromptRetained: (draftId: DraftId) => void;
   clearSendError: (draftId: DraftId) => void;
 
   // Removal
@@ -535,6 +542,18 @@ export const useChatDraftStore = create<ChatDraftStore>()(
         return draft;
       },
 
+      saveWorkspacePrompt: (workspaceId, prompt, commandDelivered) => {
+        const draft: ChatDraft = {
+          ...makeDraft({ kind: "existing_workspace", workspaceId }),
+          inputDraft: prompt,
+          manualPromptRequired: commandDelivered,
+        };
+        set((state) => ({
+          draftsById: { ...state.draftsById, [draft.draftId]: draft },
+        }));
+        return draft.draftId;
+      },
+
       setActiveDraft: (draftId) => set({ activeDraftId: draftId }),
 
       updateDraftTarget: (draftId, target) =>
@@ -637,6 +656,7 @@ export const useChatDraftStore = create<ChatDraftStore>()(
                 ...existing,
                 promoting: true,
                 lastSendError: null,
+                manualPromptRequired: false,
               },
             },
           };
@@ -663,6 +683,7 @@ export const useChatDraftStore = create<ChatDraftStore>()(
             promotedTo,
             promoting: false,
             lastSendError: null,
+            manualPromptRequired: false,
           };
           const nextDraftsById = { ...s.draftsById, [draftId]: nextDraft };
 
@@ -680,6 +701,40 @@ export const useChatDraftStore = create<ChatDraftStore>()(
           return patch as ChatDraftStore;
         }),
 
+      markManualPromptRequired: (draftId) =>
+        set((s) => {
+          const existing = s.draftsById[draftId];
+          if (!existing) return s;
+          return {
+            draftsById: {
+              ...s.draftsById,
+              [draftId]: {
+                ...existing,
+                promoting: false,
+                lastSendError: null,
+                manualPromptRequired: true,
+              },
+            },
+          };
+        }),
+
+      markPromptRetained: (draftId) =>
+        set((s) => {
+          const existing = s.draftsById[draftId];
+          if (!existing) return s;
+          return {
+            draftsById: {
+              ...s.draftsById,
+              [draftId]: {
+                ...existing,
+                promoting: false,
+                lastSendError: null,
+                manualPromptRequired: false,
+              },
+            },
+          };
+        }),
+
       markSendFailed: (draftId, error) =>
         set((s) => {
           const existing = s.draftsById[draftId];
@@ -691,6 +746,7 @@ export const useChatDraftStore = create<ChatDraftStore>()(
                 ...existing,
                 promoting: false,
                 lastSendError: error,
+                manualPromptRequired: false,
               },
             },
           };

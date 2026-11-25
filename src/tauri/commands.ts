@@ -6,6 +6,7 @@ import { invoke, Channel } from "@tauri-apps/api/core";
 
 import { bytesToBase64 } from "@/lib/agent-chat/attachment-block";
 import { isRemoteClient } from "@/components/remote/is-remote-client";
+import { PartialPresetLaunchError, type PartialPresetLaunchResponse } from "@/lib/partial-preset-launch";
 import { useEditorStore } from "@/stores/editor-store";
 import {
   noteLocalActivationFallback,
@@ -373,6 +374,7 @@ export interface WorkspaceCreateResult {
   workspaceId: string;
   cwd: string | null;
   adopted: boolean;
+  initialTabId?: string | null;
 }
 
 /** Coerce the create_* response, which is either the legacy bare
@@ -381,17 +383,20 @@ export interface WorkspaceCreateResult {
  *  shape so the frontend never breaks on the sibling backend's rollout
  *  order. */
 function normalizeWorkspaceCreate(raw: unknown): WorkspaceCreateResult {
-  if (typeof raw === "string") return { workspaceId: raw, cwd: null, adopted: false };
+  if (typeof raw === "string") return { workspaceId: raw, cwd: null, adopted: false, initialTabId: null };
   const obj = (raw ?? {}) as {
     workspace_id?: string;
     workspaceId?: string;
     cwd?: string | null;
     adopted?: boolean;
+    initial_tab_id?: string | null;
+    initialTabId?: string | null;
   };
   return {
     workspaceId: obj.workspace_id ?? obj.workspaceId ?? "",
     cwd: obj.cwd ?? null,
     adopted: obj.adopted === true,
+    initialTabId: obj.initial_tab_id ?? obj.initialTabId ?? null,
   };
 }
 
@@ -1430,16 +1435,30 @@ export const applyPreset = async (
   overrideMode?: LaunchMode | "current_terminal" | "existing_panes",
   initialPrompt?: string | null,
   modelSelection?: ModelSelection | null,
+  /** Confirm the command reaches a terminal tab the caller just created. */
+  freshTerminal?: boolean,
+  /** Pin the command and tab metadata to this tab even if selection changes. */
+  targetTabId?: string,
 ) => {
   const sequence = beginRemoteNavigation();
-  await invoke("apply_preset", {
+  const partial = await invoke<PartialPresetLaunchResponse | null>("apply_preset", {
     workspaceId,
     presetId,
     overrideMode,
     initialPrompt,
     modelSelection: modelSelection ?? null,
+    ...(freshTerminal !== undefined ? { freshTerminal } : {}),
+    ...(targetTabId !== undefined ? { targetTabId } : {}),
   });
-  if (isRemoteClient()) await refreshRemoteWorkspaceView(workspaceId, undefined, undefined, sequence);
+  if (isRemoteClient()) {
+    try {
+      await refreshRemoteWorkspaceView(workspaceId, targetTabId, undefined, sequence);
+    } catch {
+      // Refresh can fail after the preset command reached its PTY. The
+      // backend launch result remains authoritative for caller guidance.
+    }
+  }
+  if (partial) throw new PartialPresetLaunchError(partial);
 };
 
 export const setPresetBarVisible = (visible: boolean) =>
