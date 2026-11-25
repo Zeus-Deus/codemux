@@ -1431,7 +1431,7 @@ fn persist_secret_key(path: &Path, key: &SecretKey) -> Result<(), String> {
 mod windows_key_security {
     use std::ffi::{OsStr, OsString};
     use std::io::{Read, Write};
-    use std::os::windows::ffi::OsStrExt;
+    use std::os::windows::ffi::{OsStrExt, OsStringExt};
     use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
     use std::path::{Component, Path, PathBuf, Prefix};
     use std::ptr::{null, null_mut};
@@ -1464,11 +1464,11 @@ mod windows_key_security {
         BY_HANDLE_FILE_INFORMATION, DELETE, FILE_ADD_FILE, FILE_ADD_SUBDIRECTORY, FILE_ATTRIBUTE_DIRECTORY,
         FILE_ATTRIBUTE_NORMAL, FILE_ATTRIBUTE_REPARSE_POINT, FILE_DELETE_CHILD,
         FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_GENERIC_READ,
-        FILE_GENERIC_WRITE, FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
+        FILE_GENERIC_WRITE, FILE_READ_ATTRIBUTES, FILE_READ_EA, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
         FILE_TRAVERSE, FILE_WRITE_ATTRIBUTES, FILE_WRITE_EA, FILE_DISPOSITION_INFO,
         OPEN_EXISTING, READ_CONTROL, SYNCHRONIZE, WRITE_DAC, WRITE_OWNER,
     };
-    use windows_sys::Win32::System::IO::{IO_STATUS_BLOCK, IO_STATUS_BLOCK_0};
+    use windows_sys::Win32::System::IO::{DeviceIoControl, IO_STATUS_BLOCK, IO_STATUS_BLOCK_0};
     use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
 
     fn wide(value: &OsStr) -> Vec<u16> {
@@ -1708,6 +1708,19 @@ mod windows_key_security {
         options: u32,
         security: Option<&PrivateDacl>,
     ) -> Result<std::fs::File, i32> {
+        open_relative_with_reparse(parent, name, access, share, disposition, options, security, false)
+    }
+
+    fn open_relative_with_reparse(
+        parent: &std::fs::File,
+        name: &OsStr,
+        access: u32,
+        share: u32,
+        disposition: u32,
+        options: u32,
+        security: Option<&PrivateDacl>,
+        follow_reparse: bool,
+    ) -> Result<std::fs::File, i32> {
         let mut name: Vec<u16> = name.encode_wide().collect();
         if name.is_empty() || name == [b'.' as u16] || name == [b'.' as u16, b'.' as u16]
             || name.iter().any(|value| matches!(*value, 0 | 47 | 58 | 92))
@@ -1731,7 +1744,8 @@ mod windows_key_security {
             NtCreateFile(
                 &mut handle, access | SYNCHRONIZE, &attributes, &mut status_block,
                 null(), FILE_ATTRIBUTE_NORMAL, share, disposition,
-                options | FILE_OPEN_REPARSE_POINT | FILE_SYNCHRONOUS_IO_NONALERT,
+                options | FILE_SYNCHRONOUS_IO_NONALERT
+                    | if follow_reparse { 0 } else { FILE_OPEN_REPARSE_POINT },
                 null(), 0,
             )
         };
@@ -1766,18 +1780,28 @@ mod windows_key_security {
         Ok(Some(file))
     }
 
-    fn validate_app_directory(file: &std::fs::File, security: &PrivateDacl, app_root: bool) -> Result<(), String> {
+    fn directory_attributes(file: &std::fs::File) -> Result<u32, String> {
+        let mut info = unsafe { std::mem::zeroed::<BY_HANDLE_FILE_INFORMATION>() };
+        if unsafe { GetFileInformationByHandle(file.as_raw_handle(), &mut info) } == 0 {
+            return Err(format!("inspect iroh app directory: {}", std::io::Error::last_os_error()));
+        }
+        if info.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY == 0 {
+            return Err("iroh app directory is not a directory".to_string());
+        }
+        Ok(info.dwFileAttributes)
+    }
+
+    fn validate_app_directory(
+        file: &std::fs::File,
+        security: &PrivateDacl,
+        app_root: bool,
+        allow_reparse: bool,
+    ) -> Result<(), String> {
         const MUTATE: u32 = GENERIC_ALL | GENERIC_WRITE | FILE_ADD_FILE | FILE_ADD_SUBDIRECTORY
             | FILE_DELETE_CHILD | FILE_WRITE_EA | FILE_WRITE_ATTRIBUTES | DELETE | WRITE_DAC | WRITE_OWNER;
         const REPLACE_CHILD: u32 = GENERIC_ALL | FILE_DELETE_CHILD | DELETE | WRITE_DAC | WRITE_OWNER;
-        let handle = file.as_raw_handle();
-        let mut info = unsafe { std::mem::zeroed::<BY_HANDLE_FILE_INFORMATION>() };
-        if unsafe { GetFileInformationByHandle(handle, &mut info) } == 0 {
-            return Err(format!("inspect iroh app directory: {}", std::io::Error::last_os_error()));
-        }
-        if info.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT != 0
-            || info.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY == 0
-        {
+        let attributes = directory_attributes(file)?;
+        if !allow_reparse && attributes & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
             return Err("iroh app directory is not a normal directory".to_string());
         }
         let mut owner = null_mut();
@@ -1824,7 +1848,73 @@ mod windows_key_security {
         result
     }
 
+    fn junction_target(link: &std::fs::File) -> Result<PathBuf, String> {
+        // FSCTL_GET_REPARSE_POINT returns an 8-byte header followed by the
+        // mount-point offsets and UTF-16 path buffer. Read only the substitute
+        // name: the print name is display text and need not identify the target.
+        const FSCTL_GET_REPARSE_POINT: u32 = 0x0009_00a8;
+        const IO_REPARSE_TAG_MOUNT_POINT: u32 = 0xa000_0003;
+        const MAX_REPARSE_DATA: usize = 16_384;
+        let mut buffer = vec![0u8; MAX_REPARSE_DATA];
+        let mut returned = 0u32;
+        if unsafe {
+            DeviceIoControl(link.as_raw_handle(), FSCTL_GET_REPARSE_POINT,
+                null(), 0, buffer.as_mut_ptr().cast(), buffer.len() as u32,
+                &mut returned, null_mut())
+        } == 0 {
+            return Err(format!("read iroh app directory junction: {}", std::io::Error::last_os_error()));
+        }
+        let returned = returned as usize;
+        if returned < 16 || returned > buffer.len() {
+            return Err("iroh app directory junction has a short response".to_string());
+        }
+        let u16_at = |offset: usize| u16::from_le_bytes([buffer[offset], buffer[offset + 1]]) as usize;
+        let tag = u32::from_le_bytes(buffer[..4].try_into().unwrap());
+        let data_len = u16_at(4);
+        if tag != IO_REPARSE_TAG_MOUNT_POINT || data_len < 8 || returned != 8 + data_len {
+            return Err("iroh app directory is not a supported junction".to_string());
+        }
+        let offset = u16_at(8);
+        let length = u16_at(10);
+        let end = 16usize.checked_add(offset).and_then(|start| start.checked_add(length))
+            .ok_or("iroh app directory junction path is too long")?;
+        if offset % 2 != 0 || length == 0 || length % 2 != 0 || end > returned {
+            return Err("iroh app directory junction target is malformed".to_string());
+        }
+        let name: Vec<u16> = buffer[16 + offset..end]
+            .chunks_exact(2)
+            .map(|unit| u16::from_le_bytes([unit[0], unit[1]]))
+            .collect();
+        if name.contains(&0) || !name.starts_with(&[92, 63, 63, 92]) {
+            return Err("iroh app directory junction target is not absolute".to_string());
+        }
+        let target = &name[4..];
+        let disk = target.len() >= 3
+            && matches!(target[0], 65..=90 | 97..=122)
+            && target[1..3] == [58, 92];
+        let unc = target.starts_with(&[85, 78, 67, 92]);
+        if !disk && !unc {
+            return Err("iroh app directory junction target uses an unsupported namespace".to_string());
+        }
+        let mut path = vec![92, 92, 63, 92]; // Win32's \\?\ prefix.
+        path.extend_from_slice(target);
+        Ok(PathBuf::from(OsString::from_wide(&path)))
+    }
+
     fn open_app_root(root: &Path, create: bool, security: &PrivateDacl) -> Result<std::fs::File, String> {
+        open_app_root_inner(root, create, security, true, 0)
+    }
+
+    fn open_app_root_inner(
+        root: &Path,
+        create: bool,
+        security: &PrivateDacl,
+        final_is_app_root: bool,
+        hops: u8,
+    ) -> Result<std::fs::File, String> {
+        if hops > 32 {
+            return Err("iroh app directory junction chain is too long".to_string());
+        }
         let mut components = root.components();
         let (Some(Component::Prefix(prefix)), Some(Component::RootDir)) =
             (components.next(), components.next())
@@ -1836,6 +1926,9 @@ mod windows_key_security {
         {
             return Err("iroh app directory uses an unsupported Windows path prefix".to_string());
         }
+        // As with existing UNC and mapped-drive app-data paths, these ACL
+        // checks rely on the backing filesystem or server enforcing Windows
+        // security descriptors. A network-storage policy must cover both.
         let mut anchor_path = PathBuf::from(prefix.as_os_str());
         anchor_path.push("\\");
         let mut names = Vec::<OsString>::new();
@@ -1845,7 +1938,7 @@ mod windows_key_security {
                 _ => return Err("iroh app directory contains an unsafe path component".to_string()),
             }
         }
-        if names.is_empty() {
+        if names.is_empty() && hops == 0 {
             return Err("iroh app directory cannot be a volume root".to_string());
         }
         let handle = unsafe {
@@ -1858,21 +1951,54 @@ mod windows_key_security {
             return Err(format!("open iroh volume root: {}", std::io::Error::last_os_error()));
         }
         let anchor = unsafe { std::fs::File::from_raw_handle(handle) };
-        validate_app_directory(&anchor, security, false)?;
+        validate_app_directory(&anchor, security, names.is_empty() && final_is_app_root, false)?;
+        if names.is_empty() {
+            return Ok(anchor);
+        }
         // Keep every parent open without delete sharing until its child is
         // validated. A path component cannot be swapped during the walk.
         let mut held = vec![anchor];
+        let mut links = Vec::new();
         for (index, name) in names.iter().enumerate() {
+            let parent = held.last().unwrap();
             let file = open_relative(
-                held.last().unwrap(), name,
-                FILE_READ_ATTRIBUTES | READ_CONTROL | FILE_TRAVERSE,
+                parent, name,
+                FILE_READ_ATTRIBUTES | FILE_READ_EA | READ_CONTROL | FILE_TRAVERSE,
                 FILE_SHARE_READ | FILE_SHARE_WRITE,
                 if create { FILE_OPEN_IF } else { FILE_OPEN },
                 FILE_DIRECTORY_FILE,
                 if create { Some(security) } else { None },
             ).map_err(|status| format!("open iroh app directory component: NTSTATUS {status:#010x}"))?;
-            validate_app_directory(&file, security, index + 1 == names.len())?;
-            held.push(file);
+            let is_reparse = directory_attributes(&file)? & FILE_ATTRIBUTE_REPARSE_POINT != 0;
+            if is_reparse {
+                // A junction can change its target through a write to the
+                // link itself. Require a strict ACL before reading it.
+                validate_app_directory(&file, security, true, true)?;
+                let target_path = junction_target(&file)?;
+                let target = open_app_root_inner(
+                    &target_path, false, security,
+                    final_is_app_root && index + 1 == names.len(), hops + 1,
+                )?;
+                let followed = open_relative_with_reparse(
+                    parent, name, FILE_READ_ATTRIBUTES | READ_CONTROL | FILE_TRAVERSE,
+                    FILE_SHARE_READ | FILE_SHARE_WRITE, FILE_OPEN,
+                    FILE_DIRECTORY_FILE, None, true,
+                ).map_err(|status| format!("follow iroh app directory junction: NTSTATUS {status:#010x}"))?;
+                let walked_id = crate::windows_file_id::file_id(&target)
+                    .map_err(|e| format!("identify iroh junction target: {e}"))?;
+                let followed_id = crate::windows_file_id::file_id(&followed)
+                    .map_err(|e| format!("identify followed iroh junction: {e}"))?;
+                if walked_id != followed_id {
+                    return Err("iroh app directory junction changed during validation".to_string());
+                }
+                links.push(file);
+                held.push(target);
+            } else {
+                validate_app_directory(
+                    &file, security, final_is_app_root && index + 1 == names.len(), false,
+                )?;
+                held.push(file);
+            }
         }
         Ok(held.pop().unwrap())
     }
@@ -3287,6 +3413,58 @@ mod tests {
         assert_eq!(windows_key_security::key_ace_count(&legacy, false).unwrap(), 3);
         assert_eq!(windows_key_security::key_ace_count(path.parent().unwrap(), true).unwrap(), 3);
         assert_eq!(windows_key_security::key_ace_count(&path, false).unwrap(), 3);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn iroh_identity_key_migrates_through_trusted_junction() {
+        let temp = tempfile::tempdir().unwrap();
+        let target = temp.path().join("relocated-app-data");
+        std::fs::create_dir(&target).unwrap();
+        let junction = temp.path().join("codemux");
+        let made = std::process::Command::new("cmd")
+            .args(["/C", "mklink", "/J"])
+            .arg(&junction)
+            .arg(&target)
+            .output()
+            .unwrap();
+        assert!(made.status.success(), "{}", String::from_utf8_lossy(&made.stderr));
+        windows_key_security::inherited_grant_fixture(&junction, "GR").unwrap();
+        windows_key_security::inherited_grant_fixture(&target, "GR").unwrap();
+
+        let key = SecretKey::generate();
+        let node_id = key.public().to_string();
+        std::fs::write(target.join(KEY_FILE), crate::auth::encrypt_data(&key.to_bytes()).unwrap()).unwrap();
+        let path = junction.join(KEY_DIR).join(KEY_FILE);
+        assert_eq!(load_or_create_secret_key_at(&path).unwrap().public(), key.public());
+        assert_eq!(persisted_node_id_at(&path).as_deref(), Some(node_id.as_str()));
+        assert!(target.join(KEY_DIR).join(KEY_FILE).exists());
+        assert!(target.join(KEY_FILE).exists(), "the legacy key remains for crash recovery");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn iroh_identity_key_rejects_junction_target_through_replaceable_ancestor() {
+        let temp = tempfile::tempdir().unwrap();
+        let shared = temp.path().join("shared");
+        let target = shared.join("relocated-app-data");
+        std::fs::create_dir_all(&target).unwrap();
+        windows_key_security::inherited_grant_fixture(&shared, "0x00000040").unwrap();
+        windows_key_security::inherited_grant_fixture(&target, "GR").unwrap();
+        let junction = temp.path().join("codemux");
+        let made = std::process::Command::new("cmd")
+            .args(["/C", "mklink", "/J"])
+            .arg(&junction)
+            .arg(&target)
+            .output()
+            .unwrap();
+        assert!(made.status.success(), "{}", String::from_utf8_lossy(&made.stderr));
+        windows_key_security::inherited_grant_fixture(&junction, "GR").unwrap();
+
+        let path = junction.join(KEY_DIR).join(KEY_FILE);
+        let error = load_or_create_secret_key_at(&path).unwrap_err();
+        assert!(error.contains("grants another user write access"), "{error}");
+        assert!(!target.join(KEY_DIR).exists());
     }
 
     #[cfg(windows)]
