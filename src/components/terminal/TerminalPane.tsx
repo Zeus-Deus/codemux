@@ -58,12 +58,10 @@ import { openRightPanelDoc } from "@/lib/open-right-panel-doc";
 import { toast } from "@/lib/toast";
 import {
   findTerminalLinks,
-  hyperlinkTextMatchesTarget,
   hyperlinkTitle,
   isLoopbackUrl,
   rangeForMatch,
   readLogicalLine,
-  readRangeText,
   resolveTerminalPath,
   terminalHyperlinkTarget,
   type TerminalLinkMatch,
@@ -405,30 +403,33 @@ export const TerminalPane = memo(function TerminalPane({ sessionId, paneId, focu
       // `term.unicode` (Unicode 11 widths below) is a proposed API.
       allowProposedApi: true,
       // OSC 8 hyperlinks: same gesture and routing as detected links. Their
-      // label is arbitrary program output, so one whose text is not its own
-      // address is confirmed, showing the real address, before it opens.
+      // label is arbitrary program output that can hide, wrap or restyle the
+      // text the user sees, so every one is confirmed, showing the real
+      // address, before it opens. Detected links show their own address and
+      // keep opening directly.
       linkHandler: {
         // Lets `mailto:` through; `terminalHyperlinkTarget` refuses the rest.
         allowNonHttpProtocols: true,
-        activate: (event, uri, range) => {
+        activate: (event, uri) => {
           if (!isOpenGesture(event)) return;
           const target = terminalHyperlinkTarget(uri);
           if (!target) return;
-          if (hyperlinkTextMatchesTarget(readRangeText(term, range), target)) {
-            openUrl(target);
-            return;
-          }
           void confirm({
             title: "Open terminal link?",
             description: (
               <>
-                The link text doesn't match where it goes. Check the address before opening it.
-                <span className="mt-3 block select-text break-all rounded-lg bg-muted px-3 py-2 text-left font-mono text-label text-muted-foreground">
+                Terminal link text can differ from where it goes. Check the address before opening it.
+                <span className="mt-3 block max-h-32 select-text overflow-y-auto break-all rounded-lg bg-muted px-3 py-2 text-left font-mono text-label text-muted-foreground">
                   {target}
                 </span>
               </>
             ),
             confirmLabel: "Open link",
+            // The dialog has no trigger to return focus to; hand it back to
+            // the terminal the click came from while it is still on screen.
+            returnFocus: () => {
+              if (containerEl.isConnected) term.focus();
+            },
           }).then((confirmed) => {
             if (confirmed) openUrl(target);
           });

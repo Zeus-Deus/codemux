@@ -3,12 +3,10 @@ import type { Terminal } from "@xterm/xterm";
 
 import {
   findTerminalLinks,
-  hyperlinkTextMatchesTarget,
   hyperlinkTitle,
   isLoopbackUrl,
   rangeForMatch,
   readLogicalLine,
-  readRangeText,
   resolveTerminalPath,
   terminalHyperlinkTarget,
 } from "./terminal-links";
@@ -120,23 +118,6 @@ describe("terminalHyperlinkTarget", () => {
   });
 });
 
-describe("hyperlinkTextMatchesTarget", () => {
-  it("matches a label that is its own address", () => {
-    expect(hyperlinkTextMatchesTarget("https://example.com/a", "https://example.com/a")).toBe(true);
-    // The parser's normalization (trailing slash) is not a disguise.
-    expect(hyperlinkTextMatchesTarget(" https://example.com ", "https://example.com/")).toBe(true);
-  });
-
-  it("rejects a label that names somewhere else", () => {
-    expect(
-      hyperlinkTextMatchesTarget("https://github.com/o/r/pull/7", "https://evil.example/oauth"),
-    ).toBe(false);
-    expect(hyperlinkTextMatchesTarget("docs", "https://example.com/")).toBe(false);
-    // Same host, different path still differs from what the reader sees.
-    expect(hyperlinkTextMatchesTarget("https://example.com/a", "https://example.com/b")).toBe(false);
-  });
-});
-
 describe("hyperlinkTitle", () => {
   it("shows the real address above the hint", () => {
     expect(hyperlinkTitle("https://evil.example/oauth", "Ctrl+click to open")).toBe(
@@ -173,17 +154,6 @@ function fakeTerminal(rows: { cells: string[]; wrapped?: boolean }[]) {
     buffer: { active: { getLine: (y: number) => lines[y] } },
   } as unknown as Pick<Terminal, "buffer">;
 }
-
-describe("readRangeText", () => {
-  it("reads the cells inside a 1-based inclusive range, skipping wide-glyph spacers", () => {
-    const term = fakeTerminal([
-      { cells: ["x", "✅", "\u0000", "o", "k", " "] },
-      { cells: ["n", "e", "x", "t", " ", " "] },
-    ]);
-    expect(readRangeText(term, { start: { x: 2, y: 1 }, end: { x: 5, y: 1 } })).toBe("✅ok");
-    expect(readRangeText(term, { start: { x: 4, y: 1 }, end: { x: 2, y: 2 } })).toBe("ok ne");
-  });
-});
 
 describe("readLogicalLine", () => {
   it("joins wrapped rows and maps wide glyphs to their cells", () => {

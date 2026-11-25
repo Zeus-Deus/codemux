@@ -58,4 +58,36 @@ describe("useConfirm", () => {
     await waitFor(() => expect(screen.getByRole("status")).toHaveTextContent("false"));
     expect(screen.queryByRole("alertdialog")).toBeNull();
   });
+
+  it("hands focus to returnFocus when it closes", async () => {
+    function FocusHarness() {
+      const { confirm, dialog } = useConfirm();
+      return (
+        <>
+          <textarea aria-label="Terminal" />
+          <button
+            type="button"
+            onClick={() => {
+              void confirm({
+                title: "Open link?",
+                description: "https://example.com/",
+                confirmLabel: "Open link",
+                returnFocus: () => screen.getByRole("textbox", { name: "Terminal" }).focus(),
+              });
+            }}
+          >
+            Ask
+          </button>
+          {dialog}
+        </>
+      );
+    }
+    render(<FocusHarness />);
+    fireEvent.click(screen.getByRole("button", { name: "Ask" }));
+    fireEvent.click(
+      within(await screen.findByRole("alertdialog")).getByRole("button", { name: "Cancel" }),
+    );
+    await waitFor(() => expect(screen.queryByRole("alertdialog")).toBeNull());
+    expect(document.activeElement).toBe(screen.getByRole("textbox", { name: "Terminal" }));
+  });
 });

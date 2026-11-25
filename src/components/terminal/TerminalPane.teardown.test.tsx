@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
-import { act, cleanup, fireEvent, render } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, waitFor } from "@testing-library/react";
 import { attachPtyOutput, createBrowserPane, getTerminalScrollback, resizePty, restartTerminalSession, writeToPty } from "@/tauri/commands";
 import { updateAppShortcuts } from "@/lib/app-shortcuts";
 import { remoteViewHost, setRemoteViewHost } from "@/remote/client-view";
@@ -1088,11 +1088,13 @@ describe("TerminalPane OSC 8 hyperlinks", () => {
     return { view, handler, range, click };
   }
 
-  it("opens a link whose text is its own address without asking", async () => {
+  it("asks even when the text looks like its own address", async () => {
+    // The buffer text can be concealed, recolored or wrapped, so matching
+    // text alone never proves what the user saw.
     const { view, click } = await hyperlink("https://github.com/acme/app/pull/7");
     await click("https://github.com/acme/app/pull/7");
-    expect(openExternalUrl).toHaveBeenCalledWith("https://github.com/acme/app/pull/7");
-    expect(view.queryByRole("alertdialog")).toBeNull();
+    expect(view.getByRole("alertdialog").textContent).toContain("https://github.com/acme/app/pull/7");
+    expect(openExternalUrl).not.toHaveBeenCalled();
   });
 
   it("shows the real address and waits for confirmation when the text differs", async () => {
@@ -1108,13 +1110,25 @@ describe("TerminalPane OSC 8 hyperlinks", () => {
     expect(openExternalUrl).toHaveBeenCalledWith("https://evil.example/oauth");
   });
 
-  it("does not open a disguised link when the user cancels", async () => {
+  it("does not open a disguised link when the user cancels, and returns focus to the terminal", async () => {
     const { view, click } = await hyperlink("docs");
     await click("https://example.com/docs");
     await act(async () => {
       fireEvent.click(view.getByRole("button", { name: "Cancel" }));
     });
     expect(openExternalUrl).not.toHaveBeenCalled();
+    const term = h.terminals[h.terminals.length - 1];
+    await waitFor(() => expect(view.queryByRole("alertdialog")).toBeNull());
+    expect(document.activeElement).toBe(term.input);
+  });
+
+  it("keeps a long address inside a scrollable box", async () => {
+    const { view, click } = await hyperlink("docs");
+    await click(`https://example.com/${"a".repeat(5000)}`);
+    const address = view.getByText(/^https:\/\/example\.com\/a+$/);
+    expect(address.className).toContain("max-h-32");
+    expect(address.className).toContain("overflow-y-auto");
+    expect(view.getByRole("button", { name: "Open link" })).toBeTruthy();
   });
 
   it("never opens file or custom-scheme targets", async () => {

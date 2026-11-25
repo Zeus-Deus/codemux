@@ -18,6 +18,9 @@ export interface ConfirmOptions {
   cancelLabel?: string;
   /** Paints the confirm button as destructive. */
   destructive?: boolean;
+  /** Where focus goes when the dialog closes. Needed when nothing on the
+   *  page opened it (no trigger for the dialog to return focus to). */
+  returnFocus?: () => void;
 }
 
 /**
@@ -59,7 +62,13 @@ export function useConfirm(): {
         if (!next) settle(false);
       }}
     >
-      <AlertDialogContent>
+      <AlertDialogContent
+        onCloseAutoFocus={(event) => {
+          if (!options?.returnFocus) return;
+          event.preventDefault();
+          options.returnFocus();
+        }}
+      >
         <AlertDialogHeader>
           <AlertDialogTitle>{options?.title}</AlertDialogTitle>
           <AlertDialogDescription>{options?.description}</AlertDialogDescription>

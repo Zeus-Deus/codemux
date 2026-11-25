@@ -116,18 +116,6 @@ export function terminalHyperlinkTarget(uri: string): string | null {
   }
 }
 
-/** True when a hyperlink's visible text is its own address, so the user
- *  already sees where it goes. Any other label could be a disguise. */
-export function hyperlinkTextMatchesTarget(text: string, target: string): boolean {
-  const shown = text.trim();
-  if (shown === target) return true;
-  try {
-    return new URL(shown).href === target;
-  } catch {
-    return false;
-  }
-}
-
 const MAX_TITLE_URL = 500;
 
 /** Hover text for an OSC 8 hyperlink: its real address, then how to open it. */
@@ -137,25 +125,6 @@ export function hyperlinkTitle(uri: string, hint: string): string {
   let shown = target ?? uri.replace(/[\p{Cc}\p{Cf}]/gu, "");
   if (shown.length > MAX_TITLE_URL) shown = `${shown.slice(0, MAX_TITLE_URL)}…`;
   return `${shown}\n${target ? hint : "This kind of link can't be opened from the terminal"}`;
-}
-
-/** The text drawn in a buffer range (1-based, inclusive, as xterm reports
- *  link ranges). */
-export function readRangeText(term: Pick<Terminal, "buffer">, range: IBufferRange): string {
-  const buffer = term.buffer.active;
-  let text = "";
-  for (let y = range.start.y; y <= range.end.y; y++) {
-    const line = buffer.getLine(y - 1);
-    if (!line) break;
-    const from = y === range.start.y ? range.start.x - 1 : 0;
-    const to = y === range.end.y ? range.end.x - 1 : line.length - 1;
-    for (let x = from; x <= to && x < line.length; x++) {
-      const cell = line.getCell(x);
-      if (!cell || cell.getWidth() === 0) continue;
-      text += cell.getChars() || " ";
-    }
-  }
-  return text;
 }
 
 /**
