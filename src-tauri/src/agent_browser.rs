@@ -661,15 +661,11 @@ fn stop_owned_browser_daemon(session: &str, record: &BrowserPidRecord, bin: &str
     {
         return;
     }
+    // On Windows the CLI resolves its control port from a separate file. It
+    // could send `close` to an unrelated listener after the PID check, so
+    // only terminate the repeatedly verified process tree below.
     #[cfg(windows)]
-    let _ = run_agent_browser_native(
-        bin,
-        &["close".into(), "--session".into(), session.to_owned()],
-        session,
-        0,
-        true,
-        CLOSE_TIMEOUT,
-    );
+    let _ = bin;
     #[cfg(not(windows))]
     {
         let mut cmd = std::process::Command::new("sh");
@@ -767,8 +763,8 @@ fn clear_session_pid(session_name: &str) {
     }
 }
 
-/// Windows fallback after verifying the browser daemon identity. `/T` stops
-/// Chromium children and `/F` forces termination after graceful close.
+/// Windows teardown after verifying the browser daemon identity. `/T` stops
+/// Chromium children and `/F` forces termination of that process tree.
 #[cfg(windows)]
 pub(crate) fn kill_pid(pid: u32) {
     if pid == 0 {
@@ -1905,6 +1901,13 @@ impl AgentBrowserManager {
         self.test_stream_ports.lock().await.insert(port);
     }
 
+    async fn clear_stale_running_stream_allocation(&self, session_key: &str, port: u16) {
+        let mut sessions = self.sessions.lock().await;
+        if sessions.get(session_key).is_some_and(|s| s.port == port && s.running) {
+            sessions.remove(session_key);
+        }
+    }
+
     /// **Deprecated.** No-op kept for binary/source compatibility with any
     /// external caller that linked against the old aliasing-based API.
     ///
@@ -2207,7 +2210,7 @@ impl AgentBrowserManager {
     }
 
     /// Best-effort teardown of the daemon behind a closed session:
-    /// graceful CLI `close`, then a kill of the verified daemon. Spawns
+    /// graceful CLI `close` on Unix, then a kill of the verified daemon. Spawns
     /// external processes — which is exactly why
     /// `close()` only calls this in non-test builds.
     #[cfg(not(test))]
@@ -2261,8 +2264,12 @@ impl AgentBrowserManager {
             if already_running && probe_stream_port(port, 1, Duration::from_millis(0)) {
                 let owned = read_agent_browser_daemon_pid(&session)
                     .and_then(|pid| owned_browser_pid(&session, pid));
-                let Some(record) = owned else { return Err(format!("Could not verify ownership of browser session {session}")) };
+                let Some(record) = owned else {
+                    self.clear_stale_running_stream_allocation(browser_id, port).await;
+                    return Err(format!("Could not verify ownership of browser session {session}"));
+                };
                 if !listener_owned_by_pid(port, record.pid) {
+                    self.clear_stale_running_stream_allocation(browser_id, port).await;
                     return Err(format!("Browser stream port {port} is not owned by session {session}"));
                 }
                 return Ok(format!("ws://127.0.0.1:{port}"));
@@ -2515,6 +2522,82 @@ mod tests {
         let port = manager.allocate_port("unowned-listener-test").await.unwrap();
         let _listener = std::net::TcpListener::bind(("127.0.0.1", port)).unwrap();
         assert!(!manager.owns_stream_port(port).await);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn shutdown_does_not_send_close_to_a_stale_control_listener() {
+        struct ChildGuard(std::process::Child);
+        impl Drop for ChildGuard {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+        struct RuntimeFiles([std::path::PathBuf; 2]);
+        impl Drop for RuntimeFiles {
+            fn drop(&mut self) {
+                for path in &self.0 {
+                    let _ = std::fs::remove_file(path);
+                }
+            }
+        }
+
+        let temp = tempfile::tempdir().unwrap();
+        let binary = temp.path().join("agent-browser.exe");
+        std::fs::copy(which::which("ping").unwrap(), &binary).unwrap();
+        let session = format!("browser-stop-{}", uuid::Uuid::new_v4().simple());
+        let token = browser_owner_token().to_owned();
+        let child = std::process::Command::new(&binary)
+            .args(["-t", "127.0.0.1"])
+            .env("CODEMUX_BROWSER_OWNER", &token)
+            .env("CODEMUX_BROWSER_SESSION", &session)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        let mut child = ChildGuard(child);
+        let pid = child.0.id();
+        let started_waiting = Instant::now();
+        let start_time = loop {
+            if let Some(start) = browser_process_start(pid, &session, &token) {
+                break start;
+            }
+            if started_waiting.elapsed() >= Duration::from_secs(3) {
+                panic!("browser identity unavailable: pid={pid}, child_status={:?}", child.0.try_wait().unwrap());
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        };
+        let record = BrowserPidRecord { pid, start_time, token };
+
+        let dir = run_dir().unwrap();
+        let pid_path = dir.join(format!("{session}.pid"));
+        let port_path = dir.join(format!("{session}.port"));
+        let _runtime_files = RuntimeFiles([pid_path.clone(), port_path.clone()]);
+        std::fs::write(&pid_path, pid.to_string()).unwrap();
+        let unrelated = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let port = unrelated.local_addr().unwrap().port();
+        std::fs::write(&port_path, port.to_string()).unwrap();
+        assert!(!browser_control_listener_owned_by_pid(&session, &dir, pid));
+
+        let marker = temp.path().join("close-called");
+        let fake_cli = temp.path().join("close-marker.cmd");
+        std::fs::write(&fake_cli, "@echo off\r\necho called>\"%~dp0close-called\"\r\n").unwrap();
+        let bin = fake_cli.to_str().unwrap();
+        let close_args = ["close".into(), "--session".into(), session.clone()];
+        run_agent_browser_native(bin, &close_args, &session, 0, true, Duration::from_secs(2))
+            .unwrap();
+        assert!(marker.exists(), "test CLI must reveal a close invocation");
+        std::fs::remove_file(&marker).unwrap();
+
+        stop_owned_browser_daemon(&session, &record, bin);
+        assert!(!marker.exists(), "shutdown must not invoke the control CLI");
+        assert!(std::net::TcpStream::connect(("127.0.0.1", port)).is_ok());
+        let stopped_waiting = Instant::now();
+        while child.0.try_wait().unwrap().is_none() {
+            assert!(stopped_waiting.elapsed() < Duration::from_secs(3), "verified daemon must stop");
+            std::thread::sleep(Duration::from_millis(25));
+        }
     }
 
     #[cfg(unix)]
@@ -3051,6 +3134,32 @@ mod tests {
         let error = mgr.start_stream(&session).await.unwrap_err();
         assert!(error.contains("was taken by another process"), "{error}");
         assert!(mgr.get_port(&session).await.is_none());
+        let retry_port = mgr.allocate_port(&session).await.unwrap();
+        assert_ne!(retry_port, port);
+        drop(blocker);
+    }
+
+    #[tokio::test]
+    async fn stale_running_stream_allocation_retries_on_a_fresh_port() {
+        let mgr = AgentBrowserManager::new();
+        let session = format!("browser-stale-running-{}", uuid::Uuid::new_v4().simple());
+        let mut blocked = None;
+        for _ in 0..5 {
+            let port = mgr.allocate_port(&session).await.unwrap();
+            if let Ok(listener) = std::net::TcpListener::bind(("127.0.0.1", port)) {
+                blocked = Some((port, listener));
+                break;
+            }
+            mgr.clear_failed_stream_allocation(&session, port).await;
+        }
+        let (port, blocker) = blocked.expect("could not reserve an allocated stream port");
+        mgr.sessions.lock().await.get_mut(&session).unwrap().running = true;
+
+        let error = mgr.start_stream(&session).await.unwrap_err();
+        assert!(error.contains("Could not verify ownership"), "{error}");
+        assert!(mgr.get_port(&session).await.is_none());
+        assert!(std::net::TcpStream::connect(("127.0.0.1", port)).is_ok());
+
         let retry_port = mgr.allocate_port(&session).await.unwrap();
         assert_ne!(retry_port, port);
         drop(blocker);
