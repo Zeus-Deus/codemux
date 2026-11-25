@@ -182,6 +182,8 @@ describe("lazy tool-result body", () => {
     await userEvent.click(screen.getByRole("button", { name: "Open image" }));
     fireEvent.error(within(screen.getByRole("dialog")).getByRole("img"));
     await waitFor(() => expect(within(screen.getByRole("dialog")).getByRole("img")).toHaveAttribute("src", "blob:tool-image"));
+    await userEvent.keyboard("{Escape}");
+    await waitFor(() => expect(screen.getByRole("button", { name: "Open image" })).toHaveFocus());
     expect(agentChatGetToolResultImage).toHaveBeenLastCalledWith(ROW_ID, "/1", true);
     expect(fetchMock).toHaveBeenCalledWith("data:image/png;base64,AQID");
     expect(agentChatGetToolResult).not.toHaveBeenCalled();

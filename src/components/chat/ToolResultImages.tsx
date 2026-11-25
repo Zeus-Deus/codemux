@@ -78,7 +78,7 @@ export function ToolResultImages({ images, onImageError, lazyImageIdentity }: {
     <div className="flex flex-wrap gap-2">
       {images.map((image, i) => (
         <ToolResultThumbnail
-          key={`${image.src}-${i}`}
+          key={lazyImageIdentity ? i : `${image.src}-${i}`}
           image={image}
           approved={!needsRemoteConfirmation(image) || approvedRemoteSources[i] === image.src}
           onConfirm={() => setApprovedRemoteSources((current) => ({ ...current, [i]: image.src }))}
@@ -123,6 +123,10 @@ function ToolResultThumbnail({
   const [confirmationSrc, setConfirmationSrc] = useState<string | null>(null);
   const approvedButtonRef = useRef<HTMLButtonElement>(null);
   const focusApprovedRef = useRef(false);
+
+  useEffect(() => {
+    setFailed(false);
+  }, [image.src]);
 
   useEffect(() => {
     // Approval removes the dialog trigger; focus its replacement after React mounts it.
