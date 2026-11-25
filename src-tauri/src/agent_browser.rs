@@ -932,6 +932,9 @@ struct StreamSession {
     /// the session was adopted from a stale PID file or when the
     /// agent-browser CLI didn't write its lock file in time.
     pid: Option<u32>,
+    /// Start time disambiguates PID reuse after an automation command
+    /// restarts the daemon without going through start_stream.
+    pid_start_time: Option<u64>,
     /// Rotates after every successful daemon launch, even if the OS reuses
     /// the same PID and stream port immediately.
     stream_generation: u128,
@@ -954,12 +957,31 @@ pub struct AgentBrowserManager {
     test_stream_ports: Mutex<std::collections::HashSet<u16>>,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct BrowserStreamIdentity {
     pub port: u16,
     pub pid: u32,
     pub start_time: u64,
     pub generation: u128,
+}
+
+fn refresh_stream_session_identity(
+    stream: &mut StreamSession,
+    record: &BrowserPidRecord,
+) -> BrowserStreamIdentity {
+    let identity_changed = stream.pid != Some(record.pid)
+        || stream.pid_start_time.is_some_and(|start| start != record.start_time);
+    if identity_changed {
+        stream.stream_generation = uuid::Uuid::new_v4().as_u128();
+    }
+    stream.pid = Some(record.pid);
+    stream.pid_start_time = Some(record.start_time);
+    BrowserStreamIdentity {
+        port: stream.port,
+        pid: record.pid,
+        start_time: record.start_time,
+        generation: stream.stream_generation,
+    }
 }
 
 fn session_name(browser_id: &str) -> &str {
@@ -1068,16 +1090,16 @@ fn resolve_binary() -> Result<String, String> {
 }
 
 fn resolve_binary_uncached() -> Result<String, String> {
-    let (sidecar_name, npm_relative) = if cfg!(all(target_os = "linux", target_arch = "x86_64")) {
-        ("agent-browser-x86_64-unknown-linux-gnu", "node_modules/@agent-browser/cli-linux-x64-gnu/bin/agent-browser")
+    let npm_relative = if cfg!(all(target_os = "linux", target_arch = "x86_64")) {
+        "node_modules/@agent-browser/cli-linux-x64-gnu/bin/agent-browser"
     } else if cfg!(all(target_os = "linux", target_arch = "aarch64")) {
-        ("agent-browser-aarch64-unknown-linux-gnu", "node_modules/@agent-browser/cli-linux-arm64-gnu/bin/agent-browser")
+        "node_modules/@agent-browser/cli-linux-arm64-gnu/bin/agent-browser"
     } else if cfg!(all(target_os = "macos", target_arch = "x86_64")) {
-        ("agent-browser-x86_64-apple-darwin", "node_modules/@agent-browser/cli-darwin-x64/bin/agent-browser")
+        "node_modules/@agent-browser/cli-darwin-x64/bin/agent-browser"
     } else if cfg!(all(target_os = "macos", target_arch = "aarch64")) {
-        ("agent-browser-aarch64-apple-darwin", "node_modules/@agent-browser/cli-darwin-arm64/bin/agent-browser")
+        "node_modules/@agent-browser/cli-darwin-arm64/bin/agent-browser"
     } else if cfg!(all(target_os = "windows", target_arch = "x86_64")) {
-        ("agent-browser.exe", "node_modules/@agent-browser/cli-win32-x64-msvc/bin/agent-browser.exe")
+        "node_modules/@agent-browser/cli-win32-x64-msvc/bin/agent-browser.exe"
     } else {
         return Err("No secure agent-browser sidecar is available for this platform".into());
     };
@@ -1087,8 +1109,12 @@ fn resolve_binary_uncached() -> Result<String, String> {
     let dev_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).parent();
     #[cfg(not(debug_assertions))]
     let dev_root: Option<&std::path::Path> = None;
-    let candidates = native_binary_candidates(exe.as_deref().and_then(std::path::Path::parent), dev_root, sidecar_name, npm_relative);
+    let candidates = native_binary_candidates(exe.as_deref().and_then(std::path::Path::parent), dev_root, bundled_browser_binary_name(), npm_relative);
     resolve_verified_candidate(&candidates)
+}
+
+fn bundled_browser_binary_name() -> &'static str {
+    if cfg!(windows) { "agent-browser.exe" } else { "agent-browser" }
 }
 
 fn native_binary_candidates(
@@ -1798,6 +1824,7 @@ impl AgentBrowserManager {
                     port,
                     running: false,
                     pid: None,
+                    pid_start_time: None,
                     stream_generation: 0,
                     last_seen_at: None,
                 },
@@ -1825,28 +1852,36 @@ impl AgentBrowserManager {
     pub(crate) async fn verified_stream_identity(&self, browser_id: &str) -> Result<BrowserStreamIdentity, String> {
         let session = session_name(browser_id).to_owned();
         validate_session_name(&session)?;
-        let (port, tracked_pid, generation) = {
+        let _start_guard = self.start_lock.lock().await;
+        let (port, generation) = {
             let sessions = self.sessions.lock().await;
             let stream = sessions.get(browser_id)
                 .ok_or_else(|| format!("Browser session {session} is not streaming"))?;
             if !stream.running {
                 return Err(format!("Browser session {session} is not streaming"));
             }
-            (stream.port, stream.pid, stream.stream_generation)
+            (stream.port, stream.stream_generation)
         };
-        tokio::task::spawn_blocking(move || {
+        let record = tokio::task::spawn_blocking(move || {
             require_owned_browser_session(&session)?;
-            let pid = tracked_pid.or_else(|| read_agent_browser_daemon_pid(&session))
+            let pid = read_agent_browser_daemon_pid(&session)
                 .ok_or_else(|| format!("Cannot verify browser session {session} PID"))?;
             let record = owned_browser_pid(&session, pid)
                 .ok_or_else(|| format!("Cannot verify browser session {session} owner"))?;
             if !listener_owned_by_pid(port, pid) {
                 return Err(format!("Browser session {session} does not own stream port {port}"));
             }
-            Ok(BrowserStreamIdentity { port, pid, start_time: record.start_time, generation })
+            Ok(record)
         })
         .await
-        .map_err(|error| format!("Browser ownership check failed: {error}"))?
+        .map_err(|error| format!("Browser ownership check failed: {error}"))??;
+        let mut sessions = self.sessions.lock().await;
+        let stream = sessions.get_mut(browser_id)
+            .ok_or_else(|| "Browser session closed during ownership check".to_string())?;
+        if !stream.running || stream.port != port || stream.stream_generation != generation {
+            return Err("Browser session changed during ownership check".into());
+        }
+        Ok(refresh_stream_session_identity(stream, &record))
     }
 
     pub(crate) async fn owns_stream_port(&self, port: u16) -> bool {
@@ -1951,6 +1986,7 @@ impl AgentBrowserManager {
         self.sessions.lock().await.entry(browser_id.to_string()).and_modify(|s| {
             s.running = true;
             s.pid = pid;
+            s.pid_start_time = None;
             s.stream_generation = uuid::Uuid::new_v4().as_u128();
         });
         Ok(())
@@ -2000,6 +2036,7 @@ impl AgentBrowserManager {
         if let Some(s) = sessions.get_mut(browser_id) {
             s.running = false;
             s.pid = None;
+            s.pid_start_time = None;
             s.stream_generation = 0;
         }
     }
@@ -2240,6 +2277,7 @@ impl AgentBrowserManager {
                 .and_modify(|s| {
                     s.running = false;
                     s.pid = None;
+                    s.pid_start_time = None;
                     s.stream_generation = 0;
                 });
         }
@@ -2391,6 +2429,7 @@ impl AgentBrowserManager {
             .and_modify(|s| {
                 s.running = port_alive;
                 s.pid = pid;
+                s.pid_start_time = None;
                 s.stream_generation = uuid::Uuid::new_v4().as_u128();
                 s.last_seen_at = now;
             });
@@ -2664,6 +2703,28 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn resolver_finds_release_style_bundled_binary_without_a_dev_fallback() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        let app_dir = temp.path().join("app");
+        std::fs::create_dir(&app_dir).unwrap();
+        let binary = app_dir.join("agent-browser");
+        std::fs::write(&binary, b"#!/bin/sh\necho 'agent-browser 0.44.0'\n").unwrap();
+        std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert_eq!(bundled_browser_binary_name(), "agent-browser");
+        let candidates = native_binary_candidates(
+            Some(&app_dir),
+            None,
+            bundled_browser_binary_name(),
+            "node_modules/unavailable/agent-browser",
+        );
+        assert_eq!(candidates, vec![binary.clone()]);
+        assert_eq!(resolve_verified_candidate(&candidates).unwrap(), binary.to_string_lossy());
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn resolver_rejects_old_native_binary_and_accepts_secure_version() {
         use std::os::unix::fs::PermissionsExt;
 
@@ -2675,6 +2736,38 @@ mod tests {
 
         std::fs::write(&binary, b"#!/bin/sh\necho 'agent-browser 0.44.0'\n").unwrap();
         assert_eq!(resolve_verified_candidate(&[binary.clone()]).unwrap(), binary.to_string_lossy());
+    }
+
+    #[test]
+    fn verified_replacement_rotates_stale_stream_capability() {
+        let mut stream = StreamSession {
+            port: 9223,
+            running: true,
+            pid: Some(41),
+            pid_start_time: Some(100),
+            stream_generation: 1,
+            last_seen_at: None,
+        };
+        let replacement = BrowserPidRecord {
+            pid: 42,
+            start_time: 200,
+            token: "a".repeat(32),
+        };
+        let identity = refresh_stream_session_identity(&mut stream, &replacement);
+        assert_eq!(identity.pid, 42);
+        assert_eq!(identity.start_time, 200);
+        assert_ne!(identity.generation, 1);
+        assert_eq!(refresh_stream_session_identity(&mut stream, &replacement), identity);
+
+        // A replacement may reuse the same PID and port; its process start
+        // still invalidates the old capability.
+        let reused_pid = BrowserPidRecord {
+            start_time: 201,
+            ..replacement
+        };
+        let reused_identity = refresh_stream_session_identity(&mut stream, &reused_pid);
+        assert_eq!(reused_identity.pid, identity.pid);
+        assert_ne!(reused_identity.generation, identity.generation);
     }
 
     #[cfg(not(target_os = "windows"))]
