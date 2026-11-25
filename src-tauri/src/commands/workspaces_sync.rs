@@ -1154,6 +1154,28 @@ pub async fn workspaces_adopt_synced<R: tauri::Runtime>(
     })
 }
 
+#[cfg(unix)]
+fn prepare_repo_adopt_landing(
+    ssh_target: &str,
+    remote_repo_path: &str,
+    local_project_path: &std::path::Path,
+) -> Result<(), String> {
+    if !crate::ssh::push::is_transfer_safe_remote_path(remote_repo_path) {
+        return Err(format!(
+            "rsync failed: {}",
+            crate::ssh::push::unsafe_remote_path_reason(remote_repo_path)
+        ));
+    }
+    crate::ssh::push::rsync_ssh_target(ssh_target)
+        .map_err(|reason| format!("rsync failed: {reason}"))?;
+    std::fs::create_dir_all(local_project_path).map_err(|e| {
+        format!(
+            "could not create local project dir {}: {e}",
+            local_project_path.display()
+        )
+    })
+}
+
 /// Adopt a `worktree` row by materialising its PARENT repo locally and
 /// recreating the linked worktree — the "whole-repo + recreate" model.
 ///
@@ -1283,12 +1305,7 @@ async fn adopt_worktree_via_repo_rsync<R: tauri::Runtime>(
         // Only a directory this call creates is this call's to remove.
         let created_here = !local_project_path.exists();
         if !already_local {
-            if let Err(e) = std::fs::create_dir_all(&local_project_path) {
-                return Err(format!(
-                    "could not create local project dir {}: {e}",
-                    local_project_path.display()
-                ));
-            }
+            prepare_repo_adopt_landing(&host.ssh_target, &remote_repo_path, &local_project_path)?;
             let opts = crate::ssh::PullOptions::new(
                 &host.ssh_target,
                 &remote_repo_path,
@@ -2236,6 +2253,23 @@ mod landing_tests {
         adopt_worktree_landing_via_repo, choose_landing,
     };
     use std::path::{Path, PathBuf};
+
+    #[cfg(unix)]
+    #[test]
+    fn rejected_remote_repo_does_not_create_adoption_landing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let landing = tmp.path().join("project");
+        let error = super::prepare_repo_adopt_landing("host", "/srv/project with space", &landing)
+            .unwrap_err();
+        assert!(error.contains("refusing remote path"), "{error}");
+        assert!(!landing.exists());
+        let error = super::prepare_repo_adopt_landing("host:", "/srv/project", &landing)
+            .unwrap_err();
+        assert!(error.contains("refusing SSH target"), "{error}");
+        assert!(!landing.exists());
+        super::prepare_repo_adopt_landing("host", "/srv/project", &landing).unwrap();
+        assert!(landing.is_dir());
+    }
 
     fn git(dir: &Path, args: &[&str]) -> String {
         let out = std::process::Command::new("git")

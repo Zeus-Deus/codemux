@@ -118,7 +118,7 @@ impl<'a> PullOptions<'a> {
 /// Build the rsync argv for `push`. Extracted for unit testing — getting
 /// the trailing-slash semantics wrong is the kind of bug that silently
 /// nests directories one level deep on the remote.
-pub fn build_push_rsync_argv(opts: &PushOptions<'_>) -> Vec<String> {
+pub fn build_push_rsync_argv(opts: &PushOptions<'_>) -> Result<Vec<String>, String> {
     let mut local = opts.local_worktree.to_string_lossy().to_string();
     // Trailing slash makes rsync copy CONTENTS into the target, not the
     // directory itself. Without this `homelab:/path/branch/` we'd end up
@@ -126,8 +126,8 @@ pub fn build_push_rsync_argv(opts: &PushOptions<'_>) -> Vec<String> {
     if !local.ends_with('/') {
         local.push('/');
     }
-    let remote_spec = format!("{}:{}/", opts.ssh_target, opts.remote_path);
-    vec![
+    let remote_spec = format!("{}:{}/", rsync_ssh_target(opts.ssh_target)?, opts.remote_path);
+    Ok(vec![
         // -a = archive (recursive + preserve perms/times/owner/group)
         // -z = compress in transit (worth it for source code)
         // --partial = resume interrupted transfers on retry
@@ -158,17 +158,17 @@ pub fn build_push_rsync_argv(opts: &PushOptions<'_>) -> Vec<String> {
         "ssh -o BatchMode=yes -o ConnectTimeout=10".into(),
         local,
         remote_spec,
-    ]
+    ])
 }
 
 /// Mirror of `build_push_rsync_argv` for the reverse direction.
-pub fn build_pull_rsync_argv(opts: &PullOptions<'_>) -> Vec<String> {
-    let remote_spec = format!("{}:{}/", opts.ssh_target, opts.remote_path);
+pub fn build_pull_rsync_argv(opts: &PullOptions<'_>) -> Result<Vec<String>, String> {
+    let remote_spec = format!("{}:{}/", rsync_ssh_target(opts.ssh_target)?, opts.remote_path);
     let mut local = opts.local_worktree.to_string_lossy().to_string();
     if !local.ends_with('/') {
         local.push('/');
     }
-    vec![
+    Ok(vec![
         "-az".into(),
         "--partial".into(),
         "--human-readable".into(),
@@ -183,7 +183,32 @@ pub fn build_pull_rsync_argv(opts: &PullOptions<'_>) -> Vec<String> {
         "ssh -o BatchMode=yes -o ConnectTimeout=10".into(),
         remote_spec,
         local,
-    ]
+    ])
+}
+
+/// Keep rsync's destination in SSH path mode. A colon in a host alias can
+/// change `host:~/path` into rsync's `host::~/path` daemon-module form, while
+/// an IPv6 literal needs brackets in rsync's spec but not in `ssh`'s argv.
+pub(crate) fn rsync_ssh_target(target: &str) -> Result<String, String> {
+    crate::ssh::exec::validate_ssh_target(target)?;
+    let (user, host) = match target.split_once('@') {
+        Some((user, host)) if !user.is_empty() && !host.contains('@') => (Some(user), host),
+        Some(_) => return Err(format!("refusing SSH target {target:?}: invalid user or host")),
+        None => (None, target),
+    };
+    if host.is_empty() || host.starts_with('-') || user.is_some_and(|user| user.contains(':')) {
+        return Err(format!("refusing SSH target {target:?}: invalid user or host"));
+    }
+    if host.contains(':') {
+        if host.parse::<std::net::Ipv6Addr>().is_err() {
+            return Err(format!("refusing SSH target {target:?}: colon must be an IPv6 address"));
+        }
+        return Ok(match user {
+            Some(user) => format!("{user}@[{host}]"),
+            None => format!("[{host}]"),
+        });
+    }
+    Ok(target.to_string())
 }
 
 /// Whether `path` can be handed to the remote host as an rsync path. Older
@@ -219,6 +244,10 @@ pub async fn push_workspace(opts: PushOptions<'_>) -> PushResult {
     if !is_transfer_safe_remote_path(opts.remote_path) {
         return PushResult::RsyncFailed { reason: unsafe_remote_path_reason(opts.remote_path) };
     }
+    let argv = match build_push_rsync_argv(&opts) {
+        Ok(argv) => argv,
+        Err(reason) => return PushResult::RsyncFailed { reason },
+    };
     if !opts.local_worktree.exists() {
         return PushResult::LocalNotFound {
             path: opts.local_worktree.display().to_string(),
@@ -245,7 +274,6 @@ pub async fn push_workspace(opts: PushOptions<'_>) -> PushResult {
     }
 
     // Actual rsync.
-    let argv = build_push_rsync_argv(&opts);
     let mut cmd = Command::new("rsync");
     for arg in &argv {
         cmd.arg(arg);
@@ -297,6 +325,10 @@ pub async fn pull_workspace_back(opts: PullOptions<'_>) -> PullResult {
     if !is_transfer_safe_remote_path(opts.remote_path) {
         return PullResult::RsyncFailed { reason: unsafe_remote_path_reason(opts.remote_path) };
     }
+    let argv = match build_pull_rsync_argv(&opts) {
+        Ok(argv) => argv,
+        Err(reason) => return PullResult::RsyncFailed { reason },
+    };
     if !opts.local_worktree.exists() {
         // The local target dir must exist for rsync to write into. Try
         // to create it; if that fails (permissions, disk full), surface
@@ -364,7 +396,6 @@ pub async fn pull_workspace_back(opts: PullOptions<'_>) -> PullResult {
         }
     }
 
-    let argv = build_pull_rsync_argv(&opts);
     let mut cmd = Command::new("rsync");
     for arg in &argv {
         cmd.arg(arg);
@@ -710,7 +741,7 @@ mod tests {
             remote_path: "~/.codemux/worktrees/proj/branch",
             step_timeout: Duration::from_secs(60),
         };
-        let argv = build_push_rsync_argv(&opts);
+        let argv = build_push_rsync_argv(&opts).unwrap();
         let src = argv.iter().find(|a| a.starts_with("/tmp/foo")).unwrap();
         assert!(src.ends_with('/'), "source must have trailing slash, got {src}");
     }
@@ -724,7 +755,7 @@ mod tests {
             remote_path: "~/.codemux/worktrees/proj/branch",
             step_timeout: Duration::from_secs(60),
         };
-        let argv = build_push_rsync_argv(&opts);
+        let argv = build_push_rsync_argv(&opts).unwrap();
         let e_idx = argv.iter().position(|a| a == "-e").expect("has -e");
         let spec = &argv[e_idx + 1];
         assert!(spec.contains("BatchMode=yes"), "spec={spec}");
@@ -740,7 +771,7 @@ mod tests {
             remote_path: "~/.codemux/worktrees/proj/branch",
             step_timeout: Duration::from_secs(60),
         };
-        let argv = build_push_rsync_argv(&opts);
+        let argv = build_push_rsync_argv(&opts).unwrap();
         // --delete is load-bearing: without it, files removed locally
         // would persist on the remote forever. Catch a regression
         // here loudly.
@@ -756,7 +787,7 @@ mod tests {
             remote_path: "~/.codemux/worktrees/proj/branch",
             step_timeout: Duration::from_secs(60),
         };
-        let argv = build_push_rsync_argv(&opts);
+        let argv = build_push_rsync_argv(&opts).unwrap();
         assert!(argv.iter().any(|a| a == "--exclude=node_modules/"));
         assert!(argv.iter().any(|a| a == "--exclude=target/"));
     }
@@ -770,7 +801,7 @@ mod tests {
             local_worktree: &local,
             step_timeout: Duration::from_secs(60),
         };
-        let argv = build_pull_rsync_argv(&opts);
+        let argv = build_pull_rsync_argv(&opts).unwrap();
         // The last two positional args must be remote-first, local-
         // second for pull (rsync convention: src then dst).
         let remote_pos = argv.iter().position(|a| a.contains("u@h:")).unwrap();
@@ -779,6 +810,26 @@ mod tests {
             remote_pos < local_pos,
             "pull must have remote BEFORE local in argv"
         );
+    }
+
+    #[test]
+    fn rsync_specs_keep_ssh_path_mode_for_ipv6_and_reject_ambiguous_targets() {
+        let local = PathBuf::from("/tmp/foo");
+        let path = "~/.codemux/worktrees/proj/branch";
+        for (target, rsync_host) in [("::1", "[::1]"), ("user@::1", "user@[::1]")] {
+            let push = PushOptions::new(target, &local, path);
+            let pull = PullOptions::new(target, path, &local);
+            let expected = format!("{rsync_host}:{path}/");
+            assert_eq!(build_push_rsync_argv(&push).unwrap().last(), Some(&expected));
+            let pull_argv = build_pull_rsync_argv(&pull).unwrap();
+            assert_eq!(pull_argv.get(pull_argv.len() - 2), Some(&expected));
+        }
+        for target in ["host:", "user@host:", "user@-oProxyCommand=id", "user@@host", "[::1]"] {
+            let push = PushOptions::new(target, &local, path);
+            let pull = PullOptions::new(target, path, &local);
+            assert!(build_push_rsync_argv(&push).is_err(), "{target}");
+            assert!(build_pull_rsync_argv(&pull).is_err(), "{target}");
+        }
     }
 
     #[test]
@@ -852,6 +903,18 @@ mod tests {
         assert!(matches!(push, PushResult::RsyncFailed { ref reason } if reason.contains("refusing remote path")), "{push:?}");
         let pull = pull_workspace_back(PullOptions::new("unused-host", "relative/path", dir.path())).await;
         assert!(matches!(pull, PullResult::RsyncFailed { ref reason } if reason.contains("refusing remote path")), "{pull:?}");
+    }
+
+    #[tokio::test]
+    async fn push_and_pull_refuse_ambiguous_ssh_targets_before_any_ssh() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = "~/.codemux/worktrees/proj/branch";
+        let push = push_workspace(PushOptions::new("host:", dir.path(), path)).await;
+        assert!(matches!(push, PushResult::RsyncFailed { ref reason } if reason.contains("refusing SSH target")), "{push:?}");
+        let local = dir.path().join("not-created");
+        let pull = pull_workspace_back(PullOptions::new("host:", path, &local)).await;
+        assert!(matches!(pull, PullResult::RsyncFailed { ref reason } if reason.contains("refusing SSH target")), "{pull:?}");
+        assert!(!local.exists());
     }
 
     #[test]
