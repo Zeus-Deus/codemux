@@ -187,7 +187,16 @@ function HtmlRenderDocument({
         }}
       />
       <AlertDialog open={pendingUrl !== null} onOpenChange={(open) => !open && dismissLink()}>
-        <AlertDialogContent className="flex max-h-[calc(100dvh-2rem)] flex-col gap-2 overflow-hidden">
+        <AlertDialogContent
+          className="flex max-h-[calc(100dvh-2rem)] flex-col gap-2 overflow-hidden [@media(max-height:320px)]:gap-1 [@media(max-height:320px)]:[--dialog-pad:--spacing(3)]"
+          onCloseAutoFocus={(event) => {
+            const frame = frameRef.current;
+            if (frame?.isConnected) {
+              event.preventDefault();
+              frame.focus();
+            }
+          }}
+        >
           <AlertDialogHeader className="min-h-0 overflow-y-auto [@media(max-height:320px)]:overflow-hidden">
             <AlertDialogMedia className="[@media(max-height:320px)]:hidden">
               <ExternalLink aria-hidden="true" />
@@ -197,14 +206,14 @@ function HtmlRenderDocument({
               This page asked to open a link. Check the address before continuing.
             </AlertDialogDescription>
           </AlertDialogHeader>
-          <div className="shrink-0 rounded-lg bg-muted px-3 py-1.5 text-label">
+          <div className="shrink-0 rounded-lg bg-muted px-3 py-1.5 text-label [@media(max-height:320px)]:py-1">
             <div className="text-muted-foreground">Destination origin</div>
             <bdi
               dir="ltr"
               role="region"
               aria-label="Destination origin"
               tabIndex={0}
-              className="block max-h-12 select-text overflow-y-auto break-all font-mono text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-focus-ring [unicode-bidi:isolate]"
+              className="block max-h-12 select-text overflow-y-auto break-all font-mono text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-focus-ring [unicode-bidi:isolate] [@media(max-height:320px)]:max-h-8"
             >
               {pendingUrl === null ? null : new URL(pendingUrl).origin}
             </bdi>
@@ -213,13 +222,13 @@ function HtmlRenderDocument({
             role="region"
             aria-label="Full destination address"
             tabIndex={0}
-            className="min-h-12 basis-0 flex-1 overflow-y-auto rounded-lg bg-muted px-3 py-2 text-label focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-focus-ring"
+            className="min-h-12 basis-0 flex-1 overflow-y-auto rounded-lg bg-muted px-3 py-2 text-label focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-focus-ring [@media(max-height:320px)]:min-h-8 [@media(max-height:320px)]:py-1"
           >
             <bdi dir="ltr" className="mt-1 block select-text break-all font-mono text-muted-foreground [unicode-bidi:isolate]">
               {pendingUrl}
             </bdi>
           </div>
-          <AlertDialogFooter className="shrink-0 py-2">
+          <AlertDialogFooter className="shrink-0 py-2 [@media(max-height:320px)]:flex-row [@media(max-height:320px)]:justify-end [@media(max-height:320px)]:py-1">
             <AlertDialogCancel>Cancel</AlertDialogCancel>
             <AlertDialogAction
               onClick={() => {

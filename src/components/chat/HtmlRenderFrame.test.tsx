@@ -116,6 +116,24 @@ describe("HtmlRenderFrame", () => {
     expect(mocks.openExternalUrl).not.toHaveBeenCalled();
   });
 
+  it("returns focus to the rendered page after Cancel or Escape", async () => {
+    const user = userEvent.setup();
+    render(<HtmlRenderFrame item={renderCall()} />);
+    const frame = screen.getByTitle<HTMLIFrameElement>("Weekly turns");
+    frame.focus();
+    postLink(frame, "https://example.com/cancel");
+
+    await user.click(screen.getByRole("button", { name: "Cancel" }));
+    await waitFor(() => expect(frame).toHaveFocus());
+
+    postLink(frame, "https://example.com/escape");
+    expect(screen.getByRole("alertdialog")).toBeInTheDocument();
+    await user.keyboard("{Escape}");
+    await waitFor(() => expect(frame).toHaveFocus());
+    expect(screen.queryByRole("alertdialog")).toBeNull();
+    expect(mocks.openExternalUrl).not.toHaveBeenCalled();
+  });
+
   it("shows and opens the canonical destination, rejecting credentials and malformed URLs", async () => {
     render(<HtmlRenderFrame item={renderCall()} />);
     const frame = screen.getByTitle<HTMLIFrameElement>("Weekly turns");
