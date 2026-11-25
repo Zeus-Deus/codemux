@@ -38,6 +38,8 @@ const MAX_ATTACHMENT_OUTLINE_ENTRIES: usize = 200;
 const FOLDER_TREE_MAX_ENTRIES: usize = 100;
 const FOLDER_WALK_MAX_VISITS: usize = 10_000;
 const FOLDER_WALK_MAX_DEPTH: usize = 8;
+const MAX_ATTACHMENT_IGNORE_FILE_BYTES: u64 = 1024 * 1024;
+const MAX_ATTACHMENT_IGNORE_TOTAL_BYTES: u64 = 4 * 1024 * 1024;
 
 /// Convert a `Path` (or path string) to a forward-slash-separated string
 /// for the frontend. On Linux/macOS this is a no-op. On Windows the
@@ -433,6 +435,43 @@ struct FolderWalkFilter {
     raw_visits: usize,
     exhausted: bool,
     had_error: bool,
+    fatal_error: Option<String>,
+    checked_rule_dirs: HashSet<PathBuf>,
+    rule_bytes: u64,
+}
+
+impl FolderWalkFilter {
+    fn check_rule_files(&mut self, dir: &Path) -> Result<(), String> {
+        if !self.checked_rule_dirs.insert(dir.to_path_buf()) {
+            return Ok(());
+        }
+        for relative in [".ignore", ".gitignore", ".git/info/exclude"] {
+            // Linked worktrees use a `.git` file, so there is no exclude
+            // file beneath it to inspect.
+            if relative == ".git/info/exclude" && !dir.join(".git").is_dir() {
+                continue;
+            }
+            let file = dir.join(relative);
+            let metadata = match std::fs::symlink_metadata(&file) {
+                Ok(metadata) => metadata,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) => {
+                    return Err(format!("cannot inspect attachment ignore rules at {}: {error}", file.display()));
+                }
+            };
+            if !metadata.is_file() {
+                return Err(format!("attachment ignore rules are not a regular file: {}", file.display()));
+            }
+            if metadata.len() > MAX_ATTACHMENT_IGNORE_FILE_BYTES {
+                return Err(format!("attachment ignore rule file exceeds 1 MiB: {}", file.display()));
+            }
+            self.rule_bytes = self.rule_bytes.saturating_add(metadata.len());
+            if self.rule_bytes > MAX_ATTACHMENT_IGNORE_TOTAL_BYTES {
+                return Err("attachment ignore rules exceed 4 MiB in total".to_string());
+            }
+        }
+        Ok(())
+    }
 }
 
 /// Read a folder for attachment. Walks the directory with depth and raw-entry
@@ -488,12 +527,21 @@ fn read_folder_for_attachment_with_limit(
         .into_iter()
         .next()
         .expect("one ignore matcher for the attached folder");
-    let filter = Arc::new(Mutex::new(FolderWalkFilter {
+    let mut filter_state = FolderWalkFilter {
         matcher,
         raw_visits: 0,
         exhausted: false,
         had_error: false,
-    }));
+        fatal_error: None,
+        checked_rule_dirs: HashSet::new(),
+        rule_bytes: 0,
+    };
+    // Incremental matching reads rule files lazily, including those in the
+    // attached folder's parents. Check them before the first match.
+    for ancestor in path.ancestors() {
+        filter_state.check_rule_files(ancestor)?;
+    }
+    let filter = Arc::new(Mutex::new(filter_state));
     let filter_for_walk = Arc::clone(&filter);
     let root_for_filter = path.to_path_buf();
     // Keep filesystem iteration order here: sorting before the visit cap
@@ -526,6 +574,12 @@ fn read_folder_for_attachment_with_limit(
             }) {
                 return false;
             }
+            if let Some(parent) = entry.path().parent() {
+                if let Err(error) = state.check_rule_files(parent) {
+                    state.fatal_error = Some(error);
+                    return true;
+                }
+            }
             let is_dir = entry.file_type().map(|kind| kind.is_dir()).unwrap_or(false);
             let (matched, error) = state.matcher.matched_with_errors(relative, is_dir);
             state.had_error |= error.is_some();
@@ -535,10 +589,15 @@ fn read_folder_for_attachment_with_limit(
     let mut entries: Vec<(PathBuf, bool)> = Vec::new();
     let mut item_count_lower_bound = false;
     for result in raw_walker.build() {
-        if filter.lock().expect("folder walk filter lock").exhausted {
+        let state = filter.lock().expect("folder walk filter lock");
+        if let Some(error) = &state.fatal_error {
+            return Err(error.clone());
+        }
+        if state.exhausted {
             item_count_lower_bound = true;
             break;
         }
+        drop(state);
         let Ok(entry) = result else {
             let mut state = filter.lock().expect("folder walk filter lock");
             if state.raw_visits >= max_visits {
@@ -2058,6 +2117,54 @@ mod tests {
         assert!(info.item_count <= 5);
         assert!(!info.tree.contains("ignored_"));
         assert!(info.tree.contains("additional entries may be omitted"));
+    }
+
+    #[test]
+    fn oversized_ignore_rules_are_rejected_before_parsing() {
+        let dir = tempdir().unwrap();
+        fs::create_dir(dir.path().join(".git")).unwrap();
+        fs::write(
+            dir.path().join(".gitignore"),
+            vec![b'x'; MAX_ATTACHMENT_IGNORE_FILE_BYTES as usize + 1],
+        )
+        .unwrap();
+        fs::write(dir.path().join("visible.txt"), "x").unwrap();
+        let error = read_folder_for_attachment_blocking(
+            dir.path().to_string_lossy().into_owned(),
+            None,
+            1,
+        )
+        .unwrap_err();
+        assert!(error.contains("ignore rule file exceeds 1 MiB"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlinked_ignore_rules_are_rejected_before_parsing() {
+        let dir = tempdir().unwrap();
+        fs::write(dir.path().join("rules"), "*.txt\n").unwrap();
+        std::os::unix::fs::symlink("rules", dir.path().join(".gitignore")).unwrap();
+        let error = read_folder_for_attachment_blocking(
+            dir.path().to_string_lossy().into_owned(),
+            None,
+            1,
+        )
+        .unwrap_err();
+        assert!(error.contains("ignore rules are not a regular file"));
+    }
+
+    #[test]
+    fn worktree_git_file_does_not_block_folder_attachment() {
+        let dir = tempdir().unwrap();
+        fs::write(dir.path().join(".git"), "gitdir: /tmp/example\n").unwrap();
+        fs::write(dir.path().join("visible.txt"), "x").unwrap();
+        let info = read_folder_for_attachment_blocking(
+            dir.path().to_string_lossy().into_owned(),
+            None,
+            1,
+        )
+        .unwrap();
+        assert!(info.tree.contains("visible.txt"));
     }
 
     #[test]
