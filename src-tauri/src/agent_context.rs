@@ -182,14 +182,16 @@ fn launch_file_path(workspace_id: &str, kind: &str) -> String {
 }
 
 /// Shell prefix that creates [`LAUNCH_DIR`] owner-only before a launch file
-/// is written into it, and stops unless it is a real directory (not a
-/// symlink) owned by this user. `chmod` only runs after that check, so it
-/// never follows a planted link. The test syntax works in sh, bash, zsh and
-/// fish.
+/// is written into it. The home directory is the trust anchor: anyone who
+/// can write there can already change the user's shell startup files. Below
+/// it, `~/.codemux` must belong to the user and the launch folder must be a
+/// real directory (not a symlink) owned by the user; it is created 0700 and
+/// `chmod` only runs after those checks, so it never follows a planted link.
+/// The test syntax works in sh, bash, zsh and fish.
 #[cfg(unix)]
 fn prepare_launch_dir() -> String {
     format!(
-        "mkdir -p \"{LAUNCH_DIR}\" && [ -d \"{LAUNCH_DIR}\" ] && [ ! -L \"{LAUNCH_DIR}\" ] && [ -O \"{LAUNCH_DIR}\" ] && chmod 700 \"{LAUNCH_DIR}\""
+        "mkdir -p -m 700 \"{LAUNCH_DIR}\" && [ -O \"$HOME/.codemux\" ] && [ -d \"{LAUNCH_DIR}\" ] && [ ! -L \"{LAUNCH_DIR}\" ] && [ -O \"{LAUNCH_DIR}\" ] && chmod 700 \"{LAUNCH_DIR}\""
     )
 }
 
@@ -575,7 +577,8 @@ mod tests {
             let path = format!("\"$HOME/.codemux/agent-launch/{name}\"");
             assert!(
                 result.starts_with(
-                    "mkdir -p \"$HOME/.codemux/agent-launch\" && [ -d \"$HOME/.codemux/agent-launch\" ] \
+                    "mkdir -p -m 700 \"$HOME/.codemux/agent-launch\" && [ -O \"$HOME/.codemux\" ] \
+                     && [ -d \"$HOME/.codemux/agent-launch\" ] \
                      && [ ! -L \"$HOME/.codemux/agent-launch\" ] && [ -O \"$HOME/.codemux/agent-launch\" ] \
                      && chmod 700 \"$HOME/.codemux/agent-launch\" && "
                 ),

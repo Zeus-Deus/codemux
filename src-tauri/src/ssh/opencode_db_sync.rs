@@ -127,13 +127,27 @@ fn remote_quote(path: &str) -> String {
     super::push::shell_escape(path)
 }
 
+/// Folders between the remote home and [`REMOTE_BUNDLE_DIR`]. Each must be
+/// owned by the remote user (a user's own symlink, say `~/.cache` on another
+/// disk, is fine as long as its target is theirs too).
+const REMOTE_BUNDLE_PARENTS: [&str; 2] = ["~/.cache", "~/.cache/codemux"];
+
 /// Shell steps that create [`REMOTE_BUNDLE_DIR`] owner-only, so any bundle
-/// written into it is private whatever its own mode. They stop unless the
-/// folder is a real directory (not a symlink) owned by the remote user, and
-/// `chmod` only runs after that check.
+/// written into it is private whatever its own mode. The home directory is
+/// the trust anchor: anyone who can write there can already change the
+/// user's shell startup files. Below it, every folder must belong to the
+/// remote user, and the bundle folder itself must be a real directory (not
+/// a symlink) that is created 0700. `chmod` only runs after those checks.
+/// Bundle names are random, so a write never lands on an existing file.
 fn remote_bundle_dir_prep() -> String {
     let dir = remote_quote(REMOTE_BUNDLE_DIR);
-    format!("umask 077 && mkdir -p {dir} && [ -d {dir} ] && [ ! -L {dir} ] && [ -O {dir} ] && chmod 700 {dir}")
+    let parents: String = REMOTE_BUNDLE_PARENTS
+        .iter()
+        .map(|parent| format!(" && [ -O {} ]", remote_quote(parent)))
+        .collect();
+    format!(
+        "umask 077 && mkdir -p -m 700 {dir}{parents} && [ -d {dir} ] && [ ! -L {dir} ] && [ -O {dir} ] && chmod 700 {dir}"
+    )
 }
 
 /// Login-shell script (fed to `bash -ls` over stdin) that imports a
@@ -141,15 +155,17 @@ fn remote_bundle_dir_prep() -> String {
 /// removes the bundle. Exits with `opencode import`'s status so the caller
 /// can tell success from failure.
 pub(crate) fn remote_import_script(remote_cwd: &str, remote_bundle: &str) -> String {
-    // `mkdir -p` defends against the rare case where the workspace dir
-    // isn't there yet (the push rsync normally creates it first); `cd` is
-    // load-bearing because `opencode import` derives the session directory
-    // from the process cwd.
+    // The exit trap removes the bundle however the script ends, including
+    // the early `exit 3`. `mkdir -p` defends against the rare case where the
+    // workspace dir isn't there yet (the push rsync normally creates it
+    // first); `cd` is load-bearing because `opencode import` derives the
+    // session directory from the process cwd.
     format!(
-        "mkdir -p {cwd} && cd {cwd} || exit 3\n\
+        "codemux_cleanup() {{ rm -f {bundle}; }}\n\
+         trap codemux_cleanup EXIT\n\
+         mkdir -p {cwd} && cd {cwd} || exit 3\n\
          opencode import {bundle} 2>&1\n\
          rc=$?\n\
-         rm -f {bundle}\n\
          exit $rc\n",
         cwd = shell_sq(remote_cwd),
         bundle = remote_quote(remote_bundle),
@@ -261,7 +277,15 @@ pub async fn sync_opencode_session(
     upload?;
 
     let script = remote_import_script(&remote_cwd.to_string_lossy(), &remote_bundle);
-    let (ok, output) = run_remote_login_script(ssh_target, &script).await?;
+    let (ok, output) = match run_remote_login_script(ssh_target, &script).await {
+        Ok(result) => result,
+        Err(error) => {
+            // The script may never have run its cleanup; try once more and
+            // report the original failure.
+            let _ = run_remote_rm(ssh_target, &remote_bundle).await;
+            return Err(error);
+        }
+    };
     if !ok {
         return Err(format!(
             "remote `opencode import` failed: {}",
@@ -603,8 +627,34 @@ mod tests {
         // `~/` stays unquoted so the remote shell expands it.
         assert!(s.contains("opencode import ~/'.cache/codemux/opencode-sync/b1.json'"));
         assert!(s.contains("rm -f ~/'.cache/codemux/opencode-sync/b1.json'"));
+        // Cleanup is installed before anything can exit early.
+        assert!(s.starts_with("codemux_cleanup() {"), "{s}");
+        assert!(s.find("trap codemux_cleanup EXIT").unwrap() < s.find("|| exit 3").unwrap());
         // Propagates import's exit status so callers can detect failure.
         assert!(s.contains("exit $rc"));
+    }
+
+    #[test]
+    fn remote_import_script_removes_the_bundle_when_it_exits_early() {
+        let home = tempfile::tempdir().unwrap();
+        let bundle_dir = home.path().join(".cache/codemux/opencode-sync");
+        std::fs::create_dir_all(&bundle_dir).unwrap();
+        std::fs::write(bundle_dir.join("b3.json"), "transcript").unwrap();
+        // A workspace path under a regular file can't be created, so `cd`
+        // fails and the script takes its `exit 3` path.
+        std::fs::write(home.path().join("file"), "").unwrap();
+        let script = remote_import_script(
+            &home.path().join("file/ws").to_string_lossy(),
+            "~/.cache/codemux/opencode-sync/b3.json",
+        );
+        let status = std::process::Command::new("bash")
+            .arg("-c")
+            .arg(&script)
+            .env("HOME", home.path())
+            .status()
+            .unwrap();
+        assert_eq!(status.code(), Some(3));
+        assert!(!bundle_dir.join("b3.json").exists(), "the transcript was left behind");
     }
 
     #[test]
@@ -627,7 +677,8 @@ mod tests {
         assert!(bundle.starts_with("~/.cache/codemux/opencode-sync/codemux-opencode-"));
         let dir = "~/'.cache/codemux/opencode-sync'";
         let prep = format!(
-            "umask 077 && mkdir -p {dir} && [ -d {dir} ] && [ ! -L {dir} ] && [ -O {dir} ] && chmod 700 {dir}"
+            "umask 077 && mkdir -p -m 700 {dir} && [ -O ~/'.cache' ] && [ -O ~/'.cache/codemux' ] \
+             && [ -d {dir} ] && [ ! -L {dir} ] && [ -O {dir} ] && chmod 700 {dir}"
         );
         assert_eq!(remote_bundle_dir_prep(), prep);
         // The export creates the private folder before writing into it.
