@@ -153,6 +153,18 @@ fn git_ssh_command() -> String {
     )
 }
 
+const CORE_SSH_COMMAND_MIN_GIT: (u32, u32) = (2, 10);
+
+fn supports_core_ssh_command(command: &std::process::Command) -> std::io::Result<bool> {
+    let output = config_command(command).arg("--version").output()?;
+    let version = String::from_utf8_lossy(&output.stdout);
+    let release = version.strip_prefix("git version ").and_then(|version| {
+        let mut parts = version.trim_end().split('.');
+        Some((parts.next()?.parse().ok()?, parts.next()?.parse().ok()?))
+    });
+    Ok(output.status.success() && release.is_some_and(|v| v >= CORE_SSH_COMMAND_MIN_GIT))
+}
+
 fn command_env(command: &std::process::Command, key: &str) -> Option<std::ffi::OsString> {
     if let Some((_, value)) = command.get_envs().find(|(name, _)| *name == key) {
         return value.map(std::ffi::OsStr::to_owned);
@@ -347,6 +359,11 @@ fn legacy_git_ssh(
     // Clients predating GIT_SSH_COMMAND must still fail closed. Git also
     // uses this path if a preflighted core.sshCommand is later removed.
     command.env("GIT_SSH", policy_dir.join("ssh-requires-git-2.3"));
+    // Git before 2.10 can read core.sshCommand but does not use it for SSH.
+    if !supports_core_ssh_command(command)? {
+        command.env("GIT_SSH_COMMAND", default_ssh);
+        return Ok(());
+    }
     let clone_git_dir = clone_destination.map(|destination| destination.join(".git"));
     let mut query = config_command(command);
     if let Some(git_dir) = &clone_git_dir {
@@ -414,11 +431,32 @@ esac
 /// directly whether an owner-supplied command already applies there.
 pub(crate) fn unattended_git_script(command: &str) -> String {
     let transport = shell_quote(&git_ssh_command());
+    let (minimum_major, minimum_minor) = CORE_SSH_COMMAND_MIN_GIT;
     format!(
         r#"export GIT_TERMINAL_PROMPT=0
+git_supports_core_ssh_command() {{
+    version=$(git --version) || return 1
+    case $version in
+        'git version '*.*) version=${{version#git version }} ;;
+        *) return 1 ;;
+    esac
+    major=${{version%%.*}}
+    remaining=${{version#*.}}
+    minor=${{remaining%%.*}}
+    case $major in ''|*[!0-9]*) return 1 ;; esac
+    case $minor in ''|*[!0-9]*) return 1 ;; esac
+    [ "$major" -gt {minimum_major} ] || {{ [ "$major" -eq {minimum_major} ] && [ "$minor" -ge {minimum_minor} ]; }}
+}}
 if [ "${{GIT_SSH+x}}" != x ] && [ "${{GIT_SSH_COMMAND+x}}" != x ]; then
-    (unset GIT_CONFIG; git config --get core.sshCommand >/dev/null)
-    case $? in
+    # Refuse an unmanaged SSH fallback if Git ignores GIT_SSH_COMMAND or
+    # the configured command disappears before the access check runs.
+    export GIT_SSH=/dev/null
+    config_status=1
+    if git_supports_core_ssh_command; then
+        (unset GIT_CONFIG; git config --get core.sshCommand >/dev/null)
+        config_status=$?
+    fi
+    case $config_status in
         0) ;;
         1) export GIT_SSH_COMMAND={transport} ;;
         *) exit 1 ;;
@@ -526,6 +564,83 @@ printf 'transport started\n'
                 .or_else(|| line.strip_prefix("proxycommand "))
         });
         assert!(routes.into_iter().all(|route| matches!(route, "" | "none")), "{direct}");
+    }
+
+    #[test]
+    fn git_before_2_10_uses_verified_ssh_even_when_core_ssh_command_is_configured() {
+        if crate::test_isolation::isolated(
+            "ssh_policy::unattended_git_tests::git_before_2_10_uses_verified_ssh_even_when_core_ssh_command_is_configured",
+        ) {
+            return;
+        }
+        let root = tempfile::tempdir().unwrap();
+        let git_location = Command::new("sh")
+            .args(["-c", "command -v git"])
+            .output()
+            .unwrap();
+        assert!(git_location.status.success(), "{git_location:?}");
+        let real_git = std::str::from_utf8(&git_location.stdout).unwrap().trim_end();
+        for (file, script) in [
+            (
+                "git",
+                r#"#!/bin/sh
+if [ "$1" = --version ]; then printf 'git version 2.7.4\n'; exit 0; fi
+unset GIT_CONFIG_SYSTEM
+exec "$CODEMUX_FIXTURE_REAL_GIT" "$@"
+"#,
+            ),
+            (
+                "ssh",
+                r#"#!/bin/sh
+[ "$1" != -G ] || exit 0
+printf 'verified %s\n' "$*" >&2
+exit 1
+"#,
+            ),
+        ] {
+            let executable = root.path().join(file);
+            fs::write(&executable, script).unwrap();
+            fs::set_permissions(executable, fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        let path = std::env::join_paths(
+            std::iter::once(root.path().to_owned())
+                .chain(std::env::split_paths(&std::env::var_os("PATH").unwrap())),
+        )
+        .unwrap();
+        let mut config = crate::git::git_command();
+        config.current_dir(root.path()).args([
+            "config",
+            "--global",
+            "core.sshCommand",
+            "sh -c 'echo unexpected-override >&2; exit 1'",
+        ]);
+        let configured = config.output().unwrap();
+        assert!(configured.status.success(), "{configured:?}");
+
+        let verify = |output: std::process::Output| {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(!output.status.success(), "{output:?}");
+            assert!(stderr.contains("verified "), "{stderr}");
+            assert!(stderr.contains("StrictHostKeyChecking=yes"), "{stderr}");
+            assert!(!stderr.contains("unexpected-override"), "{stderr}");
+        };
+        let remote = "ssh://git@fixture.invalid/repo";
+        let mut clone = crate::git::git_command();
+        clone.current_dir(root.path())
+            .env("PATH", &path)
+            .env("CODEMUX_FIXTURE_REAL_GIT", real_git)
+            .args(["clone", "--", remote, "verified-clone"]);
+        let _policy = unattended_git(&mut clone, Some(Path::new("verified-clone"))).unwrap();
+        verify(clone.output().unwrap());
+
+        let script = unattended_git_script(&format!("git ls-remote --heads '{remote}'"));
+        verify(Command::new("sh")
+            .current_dir(root.path())
+            .env("PATH", &path)
+            .env("CODEMUX_FIXTURE_REAL_GIT", real_git)
+            .args(["-c", &script])
+            .output()
+            .unwrap());
     }
 
     #[test]

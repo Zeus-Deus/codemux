@@ -505,6 +505,17 @@ fn interpret_repo_probe(stdout: &str) -> bool {
     stdout.contains(REPO_PROBE_MARKER)
 }
 
+fn repo_access_probe_script(remote: &str) -> Option<String> {
+    // Older Git versions do not accept -- here. Refuse option-like remotes
+    // and keep the URL inside a single-quoted shell argument.
+    if remote.starts_with('-') || remote.contains('\'') {
+        return None;
+    }
+    Some(crate::ssh_policy::unattended_git_script(&format!(
+        "git ls-remote --heads '{remote}' >/dev/null 2>&1 && echo {REPO_PROBE_MARKER}"
+    )))
+}
+
 /// Check whether the automation's host can reach its project repo.
 ///
 /// "This machine" always passes — it uses the local project directly.
@@ -552,26 +563,18 @@ pub async fn automations_check_repo_access(
             })
         }
     };
-    // The remote URL is interpolated into a single-quoted token in the
-    // host-side command; a `'` would break out of the quoting. No git
-    // URL contains one, so reject it rather than risk an injection.
-    if remote.contains('\'') {
+    let Some(script) = repo_access_probe_script(&remote) else {
         return Ok(RepoAccessResult {
             ok: false,
-            message: "The project's git remote URL contains an unexpected \
-                      character."
-                .to_string(),
+            message: "The project's git remote URL is invalid.".to_string(),
         });
-    }
+    };
     let host = db
         .list_hosts()
         .into_iter()
         .find(|h| h.id == host_id)
         .ok_or_else(|| format!("Host not found: {host_id}"))?;
 
-    let script = crate::ssh_policy::unattended_git_script(&format!(
-        "git ls-remote --heads -- '{remote}' >/dev/null 2>&1 && echo {REPO_PROBE_MARKER}"
-    ));
     let probe = tokio::time::timeout(std::time::Duration::from_secs(20), async {
         use std::process::Stdio;
         use tokio::io::AsyncWriteExt;
@@ -634,6 +637,34 @@ pub async fn automations_check_repo_access(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn repo_access_probe_rejects_options_and_accepts_a_local_repository() {
+        if crate::test_isolation::isolated(
+            "commands::automations::tests::repo_access_probe_rejects_options_and_accepts_a_local_repository",
+        ) {
+            return;
+        }
+        assert!(repo_access_probe_script("--heads").is_none());
+        assert!(repo_access_probe_script("a'b").is_none());
+
+        let root = tempfile::tempdir().unwrap();
+        let init = crate::git::git_command()
+            .current_dir(root.path())
+            .args(["init", "--bare", "origin.git"])
+            .output()
+            .unwrap();
+        assert!(init.status.success(), "{init:?}");
+        let script = repo_access_probe_script("./origin.git").unwrap();
+        let result = std::process::Command::new("sh")
+            .current_dir(root.path())
+            .args(["-c", &script])
+            .output()
+            .unwrap();
+        assert!(result.status.success(), "{result:?}");
+        assert!(interpret_repo_probe(&String::from_utf8_lossy(&result.stdout)));
+    }
 
     fn input(trigger: Option<AutomationTrigger>) -> AutomationInput {
         AutomationInput {
