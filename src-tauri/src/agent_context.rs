@@ -90,6 +90,32 @@ pub(crate) fn launch_shell_for_workspace(
     }
 }
 
+/// Existing panes keep the shell they were spawned with, even if the default
+/// changes before a preset is applied. Fresh panes use the workspace default.
+pub(crate) fn launch_shell_for_session(
+    state: &crate::state::AppStateStore,
+    workspace_id: &str,
+    session_id: &str,
+) -> String {
+    let fallback = launch_shell_for_workspace(state, workspace_id);
+    recorded_shell_or_default(&state.snapshot(), session_id, &fallback)
+}
+
+fn recorded_shell_or_default(
+    snapshot: &crate::state::AppStateSnapshot,
+    session_id: &str,
+    fallback: &str,
+) -> String {
+    snapshot
+        .terminal_sessions
+        .iter()
+        .find(|terminal| terminal.session_id.0 == session_id)
+        .and_then(|terminal| terminal.shell.as_deref())
+        .filter(|shell| !shell.is_empty())
+        .unwrap_or(fallback)
+        .to_string()
+}
+
 fn shell_name(shell: &str) -> &str {
     shell.rsplit(|c| c == '/' || c == '\\').next().unwrap_or(shell)
 }
@@ -245,7 +271,8 @@ fn run_with_launch_file(path: &str, kind: &str, contents: &str, run: &str, shell
     let remove = remove_launch_file(path, kind);
     if shell_name(shell) == "fish" {
         return format!(
-            "set -l cmx_file ({write})\n\
+            "begin\n\
+             set -l cmx_file ({write})\n\
              if test -n \"$cmx_file\"\n\
                {run}\n\
                set -l cmx_agent_status $status\n\
@@ -258,6 +285,7 @@ fn run_with_launch_file(path: &str, kind: &str, contents: &str, run: &str, shell
                end\n\
              else\n\
                false\n\
+             end\n\
              end"
         );
     }
@@ -933,6 +961,52 @@ mod tests {
             .unwrap()
             .next()
             .is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn fish_two_wrapped_commands_stop_after_first_failure() {
+        let fish = std::env::var_os("CODEMUX_TEST_FISH")
+            .map(std::path::PathBuf::from)
+            .or_else(|| which::which("fish").ok());
+        let Some(fish) = fish else { return };
+        let home = tempfile::tempdir().unwrap();
+        let home_path = home.path().canonicalize().unwrap();
+        let log = home_path.join("launches.log");
+        let command =
+            super::inject_agent_context("droid", "ws-two-commands", fish.to_str().unwrap());
+        let script = format!(
+            "function droid\necho launch >> \"$CMX_LOG\"\nfalse\nend\n{command} && {command}"
+        );
+        let out = std::process::Command::new(fish)
+            .arg("-c")
+            .arg(script)
+            .env("HOME", &home_path)
+            .env("CMX_LOG", &log)
+            .output()
+            .unwrap();
+        assert!(!out.status.success(), "both commands must not succeed");
+        assert_eq!(std::fs::read_to_string(&log).unwrap(), "launch\n");
+        assert!(std::fs::read_dir(home_path.join(".codemux-agent-launch"))
+            .unwrap()
+            .next()
+            .is_none());
+    }
+
+    #[test]
+    fn reattached_fish_pane_keeps_its_shell_after_bash_becomes_default() {
+        let state = crate::state::AppStateStore::default();
+        let workspace = state.create_workspace();
+        let snapshot = state.snapshot();
+        let session_id = crate::state::collect_terminal_sessions(&snapshot.workspaces[0].surfaces)
+            .into_iter()
+            .next()
+            .unwrap();
+        assert!(state.update_terminal_session_shell(&session_id, "/usr/bin/fish".into(), true));
+        let shell = super::recorded_shell_or_default(&state.snapshot(), &session_id, "/bin/bash");
+        assert_eq!(shell, "/usr/bin/fish");
+        let command = super::inject_agent_context("gemini --yolo", &workspace.0, &shell);
+        assert!(command.starts_with("begin\n"), "{command}");
     }
 
     #[cfg(unix)]

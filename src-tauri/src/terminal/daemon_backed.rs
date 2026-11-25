@@ -1115,6 +1115,7 @@ async fn spawn_prepared_session<R: Runtime>(
         false
     };
     let reattached = existing.is_some();
+    let shell = shell_for_daemon_session(existing.as_ref(), &shell);
     let shell_id = match (&existing, client.supports_guarded_shells()) {
         (Some(existing), true) => existing.shell_id,
         (Some(_), false) => None,
@@ -1793,6 +1794,13 @@ async fn spawn_prepared_session<R: Runtime>(
     Ok(DaemonSpawnOutcome::DaemonShell)
 }
 
+fn shell_for_daemon_session(existing: Option<&DaemonSessionInfo>, default_shell: &str) -> String {
+    existing
+        .and_then(|session| session.argv.first())
+        .filter(|shell| !shell.is_empty())
+        .map_or_else(|| default_shell.to_string(), Clone::clone)
+}
+
 pub(super) struct PreparedDaemonClose {
     route: DaemonWorkspaceRoute,
     session_id: String,
@@ -2126,6 +2134,32 @@ mod tests {
     use crate::pty_daemon::{DaemonSessionInfo, PtyDaemonClient, PtyDaemonError};
     use std::time::Duration;
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+    #[test]
+    fn reattached_shell_comes_from_daemon_argv() {
+        let mut session = DaemonSessionInfo {
+            session_id: "session".into(),
+            shell_id: None,
+            workspace_id: "workspace".into(),
+            pid: 123,
+            argv: vec!["/usr/bin/fish".into()],
+            cwd: "/workspace".into(),
+            rows: 24,
+            cols: 80,
+            created_at: 0,
+        };
+        assert_eq!(
+            super::shell_for_daemon_session(Some(&session), "bash"),
+            "/usr/bin/fish"
+        );
+
+        // Remote panes retain Bash even when the desktop's default is Fish.
+        session.argv = vec!["bash".into()];
+        assert_eq!(
+            super::shell_for_daemon_session(Some(&session), "/usr/bin/fish"),
+            "bash"
+        );
+    }
 
     /// Read one `Write` request off the fake daemon socket.
     async fn read_test_write(
