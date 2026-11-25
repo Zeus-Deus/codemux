@@ -123,7 +123,7 @@ pub(crate) fn authorize_background<R: Runtime>(app: &AppHandle<R>, caller: &Cont
         super::CallerPrincipal::RemoteClient { .. } if !web_remote_enabled(app) => {
             return Err(ControlError::new(ErrorCode::StaleCaller, "Remote Access was turned off"));
         }
-        super::CallerPrincipal::RemoteClient { session_id } if !remote_session_approved(app, session_id) => {
+        super::CallerPrincipal::RemoteClient { session_id } if !crate::web_remote::server::session_active(app, session_id) => {
             return Err(ControlError::new(ErrorCode::StaleCaller, "The paired device's session was revoked"));
         }
         super::CallerPrincipal::Thread { thread_id, provider, authority, ceiling, .. } => {
@@ -145,13 +145,6 @@ pub(crate) fn authorize_background<R: Runtime>(app: &AppHandle<R>, caller: &Cont
     crate::mcp_connector::validate_caller(app, caller)
 }
 
-/// A paired device's session stands until the person revokes or removes it,
-/// however often the device disconnects.
-fn remote_session_approved<R: Runtime>(app: &AppHandle<R>, session_id: &str) -> bool {
-    app.state::<DatabaseStore>().web_remote_get_session(session_id)
-        .is_some_and(|session| session.approved && !session.revoked)
-}
-
 /// Remote Access's master switch, read from the persisted setting: before
 /// anything hydrated it, the in-memory config is a default nobody chose.
 fn web_remote_enabled<R: Runtime>(app: &AppHandle<R>) -> bool {
@@ -166,7 +159,7 @@ fn authorize_with_delivery_retry<R: Runtime>(app: &AppHandle<R>, caller: &Contro
     if let super::CallerPrincipal::RemoteClient { session_id } = &caller.identity {
         let connected = app.try_state::<crate::web_remote::WebRemoteState>()
             .is_some_and(|state| state.shared().connections.session_live(session_id));
-        if !remote_session_approved(app, session_id) || !connected {
+        if !crate::web_remote::server::session_active(app, session_id) || !connected {
             return Err(ControlError::new(ErrorCode::StaleCaller, "The remote client disconnected or its session was revoked"));
         }
     }

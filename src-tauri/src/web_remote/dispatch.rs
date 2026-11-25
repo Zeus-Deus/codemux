@@ -106,13 +106,18 @@ impl ChannelRouter {
     /// Allocate a fresh server-side channel id bound to a browser
     /// callback id on a specific connection. `raw_bytes` tags the route for
     /// binary re-encoding (see [`is_raw_byte_stream`]).
-    fn alloc(&self, client_cb: u32, conn_id: u64, out: OutboundTx, raw_bytes: bool) -> u32 {
+    fn alloc(&self, client_cb: u32, conn_id: u64, out: OutboundTx, raw_bytes: bool) -> Option<u32> {
+        let mut routes = self.routes.lock().unwrap();
+        // Teardown trips the close signal before removing routes. Check it
+        // under the route lock so a racing invoke cannot add a route afterward.
+        if out.is_closed() {
+            return None;
+        }
         // Start high to keep server ids clustered away from the low ids a
         // freshly booted desktop webview tends to mint first. (Collisions
         // are still only possible against a *currently live* server id and
         // are astronomically unlikely — see the module deviation note.)
         let server_cb = 0x4000_0000u32.wrapping_add(self.next.fetch_add(1, Ordering::SeqCst));
-        let mut routes = self.routes.lock().unwrap();
         routes.insert(
             server_cb,
             ChannelRoute {
@@ -123,7 +128,7 @@ impl ChannelRouter {
             },
         );
         self.active.store(routes.len(), Ordering::Relaxed);
-        server_cb
+        Some(server_cb)
     }
 
     /// Interceptor entry point. Returns `true` when `server_cb` is one of
@@ -215,8 +220,9 @@ fn rewrite_channel_markers(
         Value::String(s) => {
             if let Some(rest) = s.strip_prefix(CHANNEL_PREFIX) {
                 if let Ok(client_cb) = rest.parse::<u32>() {
-                    let server_cb = router.alloc(client_cb, conn_id, out.clone(), raw_bytes);
-                    *s = format!("{CHANNEL_PREFIX}{server_cb}");
+                    if let Some(server_cb) = router.alloc(client_cb, conn_id, out.clone(), raw_bytes) {
+                        *s = format!("{CHANNEL_PREFIX}{server_cb}");
+                    }
                 }
             }
         }
@@ -244,6 +250,9 @@ pub async fn dispatch_invoke<R: Runtime>(
     cmd: String,
     mut args: Value,
 ) {
+    if !out.can_invoke(app) {
+        return;
+    }
     let admission = if super::policy::affects_workspace_layout(&cmd) {
         super::serve::ShutdownAdmission::admit(app)
     } else {
@@ -388,7 +397,14 @@ pub async fn dispatch_invoke<R: Runtime>(
     // inline on this blocking thread, an async command is handed to
     // Tauri's runtime and resolves the responder later. Either way the
     // oneshot carries the result back.
+    let worker_app = app.clone();
+    let worker_out = out.clone();
     let _ = tokio::task::spawn_blocking(move || {
+        // A detached worker may have waited for a blocking slot after the
+        // dispatcher admitted it. Recheck before starting native work.
+        if !worker_out.can_invoke(&worker_app) {
+            return;
+        }
         webview.on_message(
             request,
             Box::new(move |_webview, _cmd, response, _callback, _error| {
@@ -399,6 +415,7 @@ pub async fn dispatch_invoke<R: Runtime>(
 
     let (response, _admission) = match rx.await {
         Ok(response) => response,
+        Err(_) if out.is_closed() => return,
         Err(_) => {
             let _ = out.send(err_text(id, "web-remote: command dropped without responding"));
             return;
@@ -561,6 +578,67 @@ mod tests {
 
         tokio::time::timeout(timeout, invoke).await.expect("released fetch should respond");
         assert_eq!(drain_text(&mut frames), json!({"t":"ok", "id":1, "data":"/fixture/slow-fetch"}));
+    }
+
+    #[test]
+    fn queued_account_invoke_cannot_start_after_logout() {
+        use crate::database::{init_test_database, DatabaseStore};
+        use crate::web_remote::{auth, server, serve::ShutdownAdmission};
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .max_blocking_threads(1)
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let db = init_test_database();
+            auth::seed_account_browser(&db, "account", "account-browser");
+            let app = tauri::test::mock_builder()
+                .manage(db)
+                .manage(ShutdownAdmission::default())
+                .manage(SlowFetch::default())
+                .invoke_handler(tauri::generate_handler![git_fetch_changes])
+                .build(tauri::test::mock_context(tauri::test::noop_assets()))
+                .unwrap();
+            let _webview = tauri::WebviewWindowBuilder::new(&app, "main", Default::default())
+                .build()
+                .unwrap();
+            let db = app.state::<DatabaseStore>();
+            let guard = auth::AccountSessionGuard::new(&db, "account").unwrap();
+            let (close, closed) = tokio::sync::watch::channel(false);
+            let (out, mut frames) = server::outbound_channel(close, guard.account_session_id());
+            let router = Arc::new(ChannelRouter::default());
+
+            // Occupy the only blocking worker until dispatch has queued the
+            // native invoke and the sign-out transaction has committed.
+            let (release, wait) = std::sync::mpsc::channel::<()>();
+            let (entered, ready) = tokio::sync::oneshot::channel();
+            let blocker = tokio::task::spawn_blocking(move || {
+                let _ = entered.send(());
+                let _ = wait.recv();
+            });
+            ready.await.unwrap();
+            let invoke = dispatch_invoke(
+                app.handle(),
+                &router,
+                7,
+                &out,
+                1,
+                "git_fetch_changes".into(),
+                json!({"path": "/fixture/queued-fetch"}),
+            );
+            tokio::pin!(invoke);
+            assert!(futures_util::poll!(&mut invoke).is_pending());
+            db.clear_auth_token().unwrap();
+            release.send(()).unwrap();
+            blocker.await.unwrap();
+
+            tokio::time::timeout(Duration::from_secs(5), invoke)
+                .await
+                .expect("the native command must be discarded");
+            assert!(*closed.borrow());
+            assert!(frames.try_recv().is_err());
+        });
     }
 
     /// Register one route the way the dispatcher does and hand back the
@@ -728,8 +806,8 @@ mod tests {
         let router = Arc::new(ChannelRouter::default());
         let (tx_a, _ra) = crate::web_remote::server::test_outbound();
         let (tx_b, _rb) = crate::web_remote::server::test_outbound();
-        router.alloc(1, 100, tx_a, false);
-        router.alloc(2, 200, tx_b, false);
+        router.alloc(1, 100, tx_a, false).unwrap();
+        router.alloc(2, 200, tx_b, false).unwrap();
         assert_eq!(router.routes.lock().unwrap().len(), 2);
         router.remove_conn(100);
         let routes = router.routes.lock().unwrap();
@@ -742,8 +820,8 @@ mod tests {
         let router = Arc::new(ChannelRouter::default());
         let (tx_a, _ra) = crate::web_remote::server::test_outbound();
         let (tx_b, _rb) = crate::web_remote::server::test_outbound();
-        let a = router.alloc(1, 100, tx_a, false);
-        let b = router.alloc(2, 200, tx_b, false);
+        let a = router.alloc(1, 100, tx_a, false).unwrap();
+        let b = router.alloc(2, 200, tx_b, false).unwrap();
         assert_eq!(router.routed_ids(), [a, b].into_iter().collect());
         router.remove_conn(100);
         assert_eq!(router.routed_ids(), [b].into_iter().collect());
@@ -969,7 +1047,7 @@ mod platform_transport_remote_tests {
             let db = app.state::<DatabaseStore>();
             db.web_remote_insert_session("remote",None,None,"fixture-hash",true).unwrap();
             let (close, _) = tokio::sync::watch::channel(false);
-            let (out, _frames) = crate::web_remote::server::outbound_channel(close.clone());
+            let (out, _frames) = crate::web_remote::server::outbound_channel(close.clone(), None);
             let conn = shared.connections.register("remote",crate::web_remote::server::Transport::Lan,out,close);
             let directory = source(root.path(),"remote-worker","1.0.0",r#"export function activate(ctx){ctx.handle('action:run',async(input,i)=>{if(input?.hold)await new Promise(resolve=>setTimeout(resolve,150));if(input?.write)await ctx.storage.set('saved',true);return {data:{caller:i.caller,saved:await ctx.storage.get('saved')}};});}"#);
             let active = enable(&app,&install(&app,&directory).await).await;
@@ -988,13 +1066,13 @@ mod platform_transport_remote_tests {
             assert!(error.contains("stale_caller") || error.contains("remote client disconnected or its session was revoked"), "{error}");
             if disconnect {
                 let (close,_) = tokio::sync::watch::channel(false);
-                let (out,_frames) = crate::web_remote::server::outbound_channel(close.clone());
+                let (out,_frames) = crate::web_remote::server::outbound_channel(close.clone(), None);
                 shared.connections.register("remote",crate::web_remote::server::Transport::Lan,out,close);
             } else {
                 // A new authenticated session may inspect the same host-owned storage.
                 db.web_remote_insert_session("fresh",None,None,"fresh-hash",true).unwrap();
                 let (close,_) = tokio::sync::watch::channel(false);
-                let (out,_frames) = crate::web_remote::server::outbound_channel(close.clone());
+                let (out,_frames) = crate::web_remote::server::outbound_channel(close.clone(), None);
                 shared.connections.register("fresh",crate::web_remote::server::Transport::Lan,out,close);
             }
             let session = if disconnect {"remote"} else {"fresh"};
