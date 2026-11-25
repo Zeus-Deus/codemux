@@ -1003,6 +1003,33 @@ impl McpRegistry {
         Ok(self.ensure_started(Some(app), config).await)
     }
 
+    /// Forget the approval of `fingerprint` and stop every server running
+    /// that definition; they wait for approval again. Returns whether an
+    /// approval was recorded.
+    pub async fn revoke_project_approval<R: Runtime>(
+        &self,
+        app: &AppHandle<R>,
+        fingerprint: &str,
+    ) -> Result<bool, String> {
+        let revoked = super::project_trust::revoke_approval(app, fingerprint)?;
+        let configs: Vec<McpServerConfig> = {
+            let inner = self.inner.lock().await;
+            inner
+                .handles
+                .values()
+                .filter(|handle| {
+                    super::project_trust::fingerprint(&handle.config).as_deref() == Some(fingerprint)
+                })
+                .map(|handle| handle.config.clone())
+                .collect()
+        };
+        for config in configs {
+            let _ = self.stop_server(Some(app), &config.id).await;
+            self.ensure_started(Some(app), config).await;
+        }
+        Ok(revoked)
+    }
+
     /// Spawn every enabled (non-disabled) MCP server discovered for the
     /// given project root, plus Codemux's own hardcoded entry. Errors
     /// per server are surfaced as `Errored` rows rather than failing
@@ -2441,6 +2468,7 @@ mod project_trust_tests {
         .unwrap();
     }
 
+    #[cfg(unix)]
     fn touch_server(marker: &std::path::Path) -> serde_json::Value {
         serde_json::json!({
             "command": "sh",
@@ -2473,8 +2501,16 @@ mod project_trust_tests {
         false
     }
 
+    /// Negative checks: the gate decides before spawning, so a short wait
+    /// is enough to see a command that should not have run.
+    async fn stays_absent(path: &std::path::Path) -> bool {
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        !path.exists()
+    }
+
     /// A repository's `.mcp.json` starts nothing until the user approves that
     /// definition, and asks again once the definition changes.
+    #[cfg(unix)] // The fixture is a POSIX `sh` command.
     #[tokio::test]
     async fn project_server_waits_for_approval_and_asks_again_after_a_change() {
         let (project, scratch) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
@@ -2494,7 +2530,7 @@ mod project_trust_tests {
         // Restart reuses the stored config and still spawns nothing.
         let restarted = reg.restart_server(Some(handle), &config.id).await.unwrap();
         assert_eq!(shown_fingerprint(&restarted), fingerprint);
-        assert!(!appears(&first).await, "the project command ran before approval");
+        assert!(stays_absent(&first).await, "the project command ran before approval");
 
         assert!(reg
             .approve_project_server(handle, &config.id, "stale")
@@ -2510,11 +2546,12 @@ mod project_trust_tests {
         assert_eq!(changed.id, config.id);
         let row = reg.ensure_started(Some(handle), changed).await;
         assert_ne!(shown_fingerprint(&row), fingerprint);
-        assert!(!appears(&second).await, "a changed definition ran without approval");
+        assert!(stays_absent(&second).await, "a changed definition ran without approval");
         reg.shutdown_all().await;
     }
 
     /// Approval is per project: the same file in another checkout asks again.
+    #[cfg(unix)] // The fixture is a POSIX `sh` command.
     #[tokio::test]
     async fn project_approval_does_not_carry_to_another_project() {
         let (a, b, scratch) = (
@@ -2576,6 +2613,7 @@ mod project_trust_tests {
 
     /// Servers from the user's own files start as before, with or without
     /// an app to read approvals from.
+    #[cfg(unix)] // The fixture is a POSIX `sh` command.
     #[tokio::test]
     async fn project_trust_leaves_user_scope_servers_alone() {
         let scratch = tempfile::tempdir().unwrap();
@@ -2601,6 +2639,7 @@ mod project_trust_tests {
         reg.shutdown_all().await;
     }
 
+    #[cfg(unix)]
     fn git(dir: &std::path::Path, args: &[&str]) {
         let status = std::process::Command::new("git")
             .args(["-c", "user.name=t", "-c", "user.email=t@example.test", "-c", "commit.gpgsign=false"])
@@ -2616,6 +2655,7 @@ mod project_trust_tests {
     /// to the project, so the next worktree of it starts the same server,
     /// while a folder whose `.git` file merely points at the repository
     /// does not.
+    #[cfg(unix)] // The fixture is a POSIX `sh` command.
     #[tokio::test]
     async fn worktrees_share_their_project_approvals() {
         let (repo, worktrees, scratch) = (
@@ -2661,7 +2701,7 @@ mod project_trust_tests {
         .await
         .unwrap();
         assert_eq!(shown_fingerprint(&row), fingerprint);
-        assert!(!appears(&marker).await, "the project command ran before approval");
+        assert!(stays_absent(&marker).await, "the project command ran before approval");
 
         crate::commands::approve_mcp_server(handle.clone(), app.state(), in_first.id.clone(), fingerprint)
             .await
@@ -2684,7 +2724,7 @@ mod project_trust_tests {
             Some(std::fs::canonicalize(&fake).unwrap().as_path())
         );
         shown_fingerprint(&reg.ensure_started(Some(handle), in_fake).await);
-        assert!(!appears(&marker).await, "an unregistered folder borrowed the approval");
+        assert!(stays_absent(&marker).await, "an unregistered folder borrowed the approval");
     }
 
     /// An approved server keeps running when its file changes, and the
@@ -2717,7 +2757,49 @@ mod project_trust_tests {
             .await;
         assert!(matches!(row.status, McpServerStatus::Running { .. }), "{row:?}");
         assert!(old_pid.exists());
-        assert!(!appears(&new_pid).await, "the changed definition started");
+        assert!(stays_absent(&new_pid).await, "the changed definition started");
+        reg.shutdown_all().await;
+    }
+
+    /// A repository copying a server the user turned off (in Settings, or
+    /// with `"disabled": true` in their own file) does not turn it back on,
+    /// even when the project file ranks ahead of the user's.
+    #[tokio::test]
+    async fn a_project_copy_does_not_restart_a_server_the_user_turned_off() {
+        let scratch = tempfile::tempdir().unwrap();
+        let pid_file = scratch.path().join("pid");
+        let fixture = format!("{}/tests/fixtures/plugin_mcp.py", env!("CARGO_MANIFEST_DIR"));
+        let entry = |id: &str, source: McpConfigSource, disabled: bool| McpServerConfig {
+            id: id.into(),
+            name: "docs".into(),
+            sources: vec![source],
+            command: "python3".into(),
+            args: vec![fixture.clone(), "--pid-file".into(), pid_file.display().to_string()],
+            env: HashMap::new(),
+            disabled,
+            transport: super::super::McpTransport::Stdio,
+            raw: serde_json::json!({}),
+            project_root: (source == McpConfigSource::CodemuxProject).then(|| scratch.path().into()),
+        };
+        let app = app();
+        let reg = McpRegistry::new();
+
+        let merged = super::super::dedupe_servers(vec![
+            entry("repo", McpConfigSource::CodemuxProject, false),
+            entry("user", McpConfigSource::ClaudeUser, true),
+        ]);
+        assert_eq!(merged.len(), 1);
+        assert!(merged[0].disabled, "the project copy re-enabled the user's server");
+
+        let merged = super::super::dedupe_servers(vec![
+            entry("repo", McpConfigSource::CodemuxProject, false),
+            entry("user", McpConfigSource::ClaudeUser, false),
+        ]);
+        assert_eq!(merged[0].id, "user");
+        reg.set_disabled_ids(Some(app.handle()), vec!["user".into()]).await.unwrap();
+        let row = reg.ensure_started(Some(app.handle()), merged[0].clone()).await;
+        assert!(matches!(row.status, McpServerStatus::Stopped), "{row:?}");
+        assert!(stays_absent(&pid_file).await, "the user's off switch was bypassed");
         reg.shutdown_all().await;
     }
 }

@@ -228,9 +228,10 @@ pub fn source_rank(s: McpConfigSource) -> u8 {
 /// Merge identical configs across sources into single rows.
 ///
 /// **Dedupe key:** `(name, command, args, env, transport, headers, cwd)`.
-/// Merged entries start exactly the same thing, so a project row that a
-/// user-owned file also defines needs no approval (see
-/// [`project_trust::fingerprint`]). Two entries with the
+/// Merged entries start exactly the same thing. When a user-owned file
+/// defines the row too, that entry is canonical, so the row needs no
+/// approval (see [`project_trust::fingerprint`]) and a project's copy
+/// cannot re-enable or reconfigure it. Two entries with the
 /// same name but different command/args stay as two separate rows so the
 /// UI can show a source disambiguator (e.g. two different versions of
 /// the same MCP).
@@ -306,6 +307,16 @@ pub fn dedupe_servers(servers: Vec<McpServerConfig>) -> Vec<McpServerConfig> {
         );
 
         if let Some(&idx) = by_key.get(&key) {
+            // A user-owned entry outranks a project file's copy of it, so
+            // the merged row keeps the user's id (Settings' off switch),
+            // `disabled` flag and remaining fields, whichever ranks first.
+            let user_owned = |sources: &[McpConfigSource]| {
+                sources.iter().any(|source| !is_project_source(*source))
+            };
+            let mut srv = srv;
+            if user_owned(&srv.sources) && !user_owned(&out[idx].sources) {
+                std::mem::swap(&mut out[idx], &mut srv);
+            }
             // Merge: append the additional source(s) onto the canonical
             // row, deduplicating in case the input already had a merged
             // entry for some reason.

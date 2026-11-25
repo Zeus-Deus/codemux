@@ -219,42 +219,49 @@ pub async fn approve_mcp_server<R: Runtime>(
 }
 
 /// `codemux mcp-approve` on the host, the only way to approve on a headless
-/// `codemux serve`: without `fingerprint`, the servers `checkout`'s own
-/// files define that wait for approval, each with its full definition;
-/// with one, approve the server whose definition it names and start it.
+/// `codemux serve`. Without `fingerprint` or `revoke`: the servers
+/// `checkout`'s own files define, those that wait for approval with their
+/// full definition and those already approved. With `fingerprint`: approve
+/// the waiting server whose definition it names and start it. With
+/// `revoke`: forget that approval and stop the servers running it.
 pub(crate) async fn project_approval<R: Runtime>(
     app: &AppHandle<R>,
     checkout: &Path,
     fingerprint: Option<&str>,
+    revoke: Option<&str>,
 ) -> Result<serde_json::Value, String> {
     use crate::mcp::project_trust;
     use tauri::Manager;
     let registry = app
         .try_state::<McpRegistry>()
         .ok_or("The MCP runtime is not running")?;
-    let pending = crate::mcp::registry::discover_configs(Some(checkout))
+    if let Some(revoke) = revoke {
+        let revoked = registry.revoke_project_approval(app, revoke).await?;
+        return Ok(serde_json::json!({ "revoked": revoked }));
+    }
+    let (approved, pending): (Vec<_>, Vec<_>) = crate::mcp::registry::discover_configs(Some(checkout))
         .into_iter()
-        .filter_map(|config| {
-            let fingerprint = project_trust::fingerprint(&config)?;
-            (!project_trust::is_approved(Some(app), &fingerprint)).then_some((fingerprint, config))
-        });
+        .filter_map(|config| Some((project_trust::fingerprint(&config)?, config)))
+        .partition(|(fingerprint, _)| project_trust::is_approved(Some(app), fingerprint));
     let Some(wanted) = fingerprint else {
-        let pending: Vec<_> = pending
-            .map(|(fingerprint, config)| {
-                serde_json::json!({
-                    "name": config.name,
-                    "fingerprint": fingerprint,
-                    "summary": project_trust::summary(&config),
+        let rows = |rows: Vec<(String, McpServerConfig)>| -> Vec<serde_json::Value> {
+            rows.into_iter()
+                .map(|(fingerprint, config)| {
+                    serde_json::json!({
+                        "name": project_trust::escape(&config.name),
+                        "fingerprint": fingerprint,
+                        "summary": project_trust::summary(&config),
+                    })
                 })
-            })
-            .collect();
-        return Ok(serde_json::json!({ "pending": pending }));
+                .collect()
+        };
+        return Ok(serde_json::json!({ "pending": rows(pending), "approved": rows(approved) }));
     };
     let (_, config) = pending
         .into_iter()
         .find(|(fingerprint, _)| fingerprint == wanted)
         .ok_or("No server in this folder waits for that approval. It may have changed or already be approved; list them again.")?;
-    let name = config.name.clone();
+    let name = project_trust::escape(&config.name);
     let row = registry.approve_definition(app, config, wanted).await?;
     Ok(serde_json::json!({ "approved": name, "status": row.status }))
 }
@@ -391,17 +398,20 @@ mod tests {
     }
 
     /// `codemux mcp-approve`: lists what waits with its full definition,
-    /// approves only a fingerprint it listed, then has nothing left to list.
+    /// approves only a fingerprint it listed, lists it as approved, and
+    /// `--revoke` stops it and makes it wait again.
     #[tokio::test]
-    async fn host_approval_lists_then_approves_the_exact_definition() {
+    async fn host_approval_lists_approves_and_revokes_the_exact_definition() {
+        use crate::mcp::runtime::McpServerStatus;
         use tauri::Manager;
         let (project, scratch) = (TempDir::new().unwrap(), TempDir::new().unwrap());
-        let marker = scratch.path().join("ran");
+        let pid_file = scratch.path().join("pid");
+        let fixture = format!("{}/tests/fixtures/plugin_mcp.py", env!("CARGO_MANIFEST_DIR"));
         fs::write(
             project.path().join(".mcp.json"),
             serde_json::json!({ "mcpServers": { "lint": {
-                "command": "sh",
-                "args": ["-c", format!("touch '{}'", marker.display())],
+                "command": "python3",
+                "args": [fixture, "--pid-file", pid_file.display().to_string()],
                 "env": { "NODE_OPTIONS": "--require ./x.js" },
             }}})
             .to_string(),
@@ -411,29 +421,40 @@ mod tests {
         app.manage(crate::database::DatabaseStore::new_in_memory());
         app.manage(McpRegistry::new());
 
-        let listed = project_approval(app.handle(), project.path(), None).await.unwrap();
+        let listed = project_approval(app.handle(), project.path(), None, None).await.unwrap();
         let pending = listed["pending"].as_array().unwrap();
         assert_eq!(pending.len(), 1, "{listed}");
+        assert_eq!(listed["approved"], serde_json::json!([]));
         assert_eq!(pending[0]["name"], "lint");
         let summary = pending[0]["summary"].as_str().unwrap();
-        assert!(summary.contains("env NODE_OPTIONS='--require ./x.js'"), "{summary}");
-        assert!(project_approval(app.handle(), project.path(), Some("stale")).await.is_err());
-        assert!(!marker.exists());
+        let env = if cfg!(windows) { r#"NODE_OPTIONS="--require ./x.js""# } else { "NODE_OPTIONS='--require ./x.js'" };
+        assert!(summary.contains(&format!("env {env}")), "{summary}");
+        assert!(project_approval(app.handle(), project.path(), Some("stale"), None).await.is_err());
+        assert!(!pid_file.exists());
 
-        let fingerprint = pending[0]["fingerprint"].as_str().unwrap();
-        let approved = project_approval(app.handle(), project.path(), Some(fingerprint))
+        let fingerprint = pending[0]["fingerprint"].as_str().unwrap().to_string();
+        let approved = project_approval(app.handle(), project.path(), Some(&fingerprint), None)
             .await
             .unwrap();
         assert_eq!(approved["approved"], "lint");
-        for _ in 0..40 {
-            if marker.exists() {
-                break;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-        }
-        assert!(marker.exists(), "the approved server did not start");
-        let listed = project_approval(app.handle(), project.path(), None).await.unwrap();
+        assert_eq!(approved["status"]["kind"], "running", "{approved}");
+        assert!(pid_file.exists(), "the approved server did not start");
+        let listed = project_approval(app.handle(), project.path(), None, None).await.unwrap();
         assert_eq!(listed["pending"], serde_json::json!([]));
-        app.state::<McpRegistry>().shutdown_all().await;
+        assert_eq!(listed["approved"][0]["fingerprint"], fingerprint.as_str());
+
+        let revoked = project_approval(app.handle(), project.path(), None, Some(&fingerprint))
+            .await
+            .unwrap();
+        assert_eq!(revoked["revoked"], true);
+        let registry = app.state::<McpRegistry>();
+        let rows = registry.list_runtime().await;
+        assert!(
+            matches!(&rows[0].status, McpServerStatus::NeedsApproval { fingerprint: shown, .. } if *shown == fingerprint),
+            "{rows:?}"
+        );
+        let listed = project_approval(app.handle(), project.path(), None, None).await.unwrap();
+        assert_eq!(listed["pending"][0]["fingerprint"], fingerprint.as_str());
+        registry.shutdown_all().await;
     }
 }

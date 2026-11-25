@@ -2205,12 +2205,17 @@ pub(crate) async fn dispatch_request_as<R: Runtime>(
         // how a headless `serve` host does.
         "mcp_project_approval" => {
             #[derive(Deserialize)] #[serde(deny_unknown_fields)]
-            struct Args { path: String, #[serde(default)] fingerprint: Option<String> }
+            struct Args {
+                path: String,
+                #[serde(default)] fingerprint: Option<String>,
+                #[serde(default)] revoke: Option<String>,
+            }
             match serde_json::from_value::<Args>(request.params.clone()) {
                 Ok(args) => crate::commands::mcp::project_approval(
                     app,
                     std::path::Path::new(&args.path),
                     args.fingerprint.as_deref(),
+                    args.revoke.as_deref(),
                 )
                 .await,
                 Err(error) => Err(error.to_string()),

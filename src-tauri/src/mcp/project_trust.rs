@@ -6,7 +6,8 @@
 //! sends it environment-derived credentials, only after the user approves
 //! that exact definition for that project on this computer.
 //!
-//! Approvals live in the local database, never in the repository. Each one
+//! Approvals live in their own local database table, never in the
+//! repository or the settings paired devices can read. Each one
 //! is keyed by a hash of the canonical project root and the server's full
 //! definition, so a change to the command, arguments, environment, working
 //! directory, URL or headers asks again. The project root of a registered
@@ -22,8 +23,6 @@ use tauri::{AppHandle, Manager, Runtime};
 
 use super::{is_project_source, McpServerConfig, McpTransport};
 use crate::database::DatabaseStore;
-
-const SETTING_PREFIX: &str = "mcp.project_approval:";
 
 /// Keys the registry adds to `raw` at runtime. They are not part of what
 /// the project defines.
@@ -59,8 +58,9 @@ pub fn approval_root(checkout: &Path) -> PathBuf {
 /// definition Codemux would start comes from a user-owned file.
 ///
 /// Dedupe merges only entries whose name, command, arguments, environment,
-/// working directory, transport and headers all match, so a row that any
-/// user-owned file also defines starts exactly what the user wrote there.
+/// working directory, transport and headers all match, and makes the
+/// user-owned entry canonical, so a row that any user-owned file also
+/// defines starts exactly what the user wrote there.
 pub fn fingerprint(config: &McpServerConfig) -> Option<String> {
     if config.sources.is_empty() || !config.sources.iter().all(|source| is_project_source(*source)) {
         return None;
@@ -96,7 +96,7 @@ pub fn fingerprint(config: &McpServerConfig) -> Option<String> {
 /// (tests, early startup) nothing is approved.
 pub fn is_approved<R: Runtime>(app: Option<&AppHandle<R>>, fingerprint: &str) -> bool {
     app.and_then(|app| app.try_state::<DatabaseStore>())
-        .is_some_and(|db| db.get_setting(&setting_key(fingerprint)).is_some())
+        .is_some_and(|db| db.mcp_project_server_approved(fingerprint))
 }
 
 /// Record the user's approval of `config`, whose fingerprint is `fingerprint`.
@@ -108,16 +108,26 @@ pub fn record_approval<R: Runtime>(
     let db = app
         .try_state::<DatabaseStore>()
         .ok_or("Local settings are unavailable")?;
-    let value = json!({
-        "projectRoot": config.project_root,
-        "name": config.name,
-    });
-    db.set_setting(&setting_key(fingerprint), &value.to_string())
+    let root = config
+        .project_root
+        .as_deref()
+        .map(|root| root.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    db.approve_mcp_project_server(fingerprint, &root, &config.name)
+}
+
+/// Forget the approval of `fingerprint`. Returns whether there was one.
+pub fn revoke_approval<R: Runtime>(app: &AppHandle<R>, fingerprint: &str) -> Result<bool, String> {
+    app.try_state::<DatabaseStore>()
+        .ok_or("Local settings are unavailable")?
+        .revoke_mcp_project_approval(fingerprint)
 }
 
 /// What approving starts, in full: the command line with its environment
 /// and working directory, or the URL with the environment variables its
 /// headers would send. Shown only on this computer, never to paired devices.
+/// Every part goes through [`escape`], so the repository cannot hide part
+/// of it from the person reading it.
 pub fn summary(config: &McpServerConfig) -> String {
     let mut parts = Vec::new();
     match config.transport {
@@ -133,24 +143,52 @@ pub fn summary(config: &McpServerConfig) -> String {
                 parts.push(format!("cwd {}", quote(cwd)));
             }
         }
-        McpTransport::Http => parts.push(config.command.clone()),
+        McpTransport::Http => parts.push(escape(&config.command)),
     }
     let sent = header_env_names(&config.raw);
     if !sent.is_empty() {
+        let sent: Vec<String> = sent.iter().map(|name| escape(name)).collect();
         parts.push(format!("sends {}", sent.join(", ")));
     }
     parts.join(" · ")
 }
 
-/// `part` as a shell word, quoted only when it needs to be.
-fn quote(part: &str) -> String {
-    let plain = !part.is_empty()
-        && part.chars().all(|c| c.is_ascii_alphanumeric() || "-_./=:@,+%".contains(c));
-    if plain {
-        part.to_string()
-    } else {
-        crate::ssh::exec::sh_quote(part)
+/// `text` with every character that could rewrite or hide what a terminal
+/// or the Settings page shows (control, bidi, zero-width and other
+/// invisible formatting characters) written out as `\u{..}`.
+pub fn escape(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for c in text.chars() {
+        let invisible = matches!(c,
+            '\u{00AD}' | '\u{034F}' | '\u{061C}' | '\u{115F}' | '\u{1160}' | '\u{17B4}'
+            | '\u{17B5}' | '\u{180B}'..='\u{180F}' | '\u{200B}'..='\u{200F}'
+            | '\u{2028}'..='\u{202E}' | '\u{2060}'..='\u{206F}' | '\u{3164}'
+            | '\u{FE00}'..='\u{FE0F}' | '\u{FEFF}' | '\u{FFA0}' | '\u{FFF0}'..='\u{FFFB}'
+            | '\u{E0000}'..='\u{E0FFF}');
+        if c.is_control() || invisible {
+            out.push_str(&format!("\\u{{{:x}}}", c as u32));
+        } else {
+            out.push(c);
+        }
     }
+    out
+}
+
+/// `part` as a word of the host's shell, quoted only when it needs to be,
+/// then [`escape`]d.
+fn quote(part: &str) -> String {
+    // Windows paths read best unquoted, and `\` is not an escape there.
+    let plain_extra = if cfg!(windows) { "-_./=:@,+%\\" } else { "-_./=:@,+%" };
+    let plain = !part.is_empty()
+        && part.chars().all(|c| c.is_ascii_alphanumeric() || plain_extra.contains(c));
+    let quoted = if plain {
+        part.to_string()
+    } else if cfg!(windows) {
+        format!("\"{}\"", part.replace('"', "\\\""))
+    } else {
+        format!("'{}'", part.replace('\'', r"'\''"))
+    };
+    escape(&quoted)
 }
 
 /// Environment variables whose values the HTTP client puts in headers.
@@ -182,10 +220,6 @@ fn header_env_names(raw: &Value) -> Vec<String> {
     names.sort();
     names.dedup();
     names
-}
-
-fn setting_key(fingerprint: &str) -> String {
-    format!("{SETTING_PREFIX}{fingerprint}")
 }
 
 #[cfg(test)]
@@ -231,19 +265,42 @@ mod tests {
         }
     }
 
-    /// A repository copying a server from the user's own files does not
-    /// make that server wait: dedupe only merges identical definitions.
+    /// A repository copying a server from the user's own files runs only
+    /// what the user wrote: the user's entry is canonical even when the
+    /// project file ranks first, so the copy cannot re-enable it, take
+    /// over its id (Settings' off switch) or change its other fields.
     #[test]
-    fn rows_the_user_also_defines_need_no_approval() {
-        let mut project_first = project(McpConfigSource::CodemuxProject);
-        project_first.sources.push(McpConfigSource::ClaudeUser);
-        assert!(fingerprint(&project_first).is_none());
-        let mut user_first = project(McpConfigSource::CodemuxUser);
-        user_first.sources.push(McpConfigSource::ClaudeProject);
-        assert!(fingerprint(&user_first).is_none());
-        let mut two_projects = project(McpConfigSource::CodemuxProject);
-        two_projects.sources.push(McpConfigSource::ClaudeProject);
-        assert!(fingerprint(&two_projects).is_some());
+    fn a_project_copy_of_a_user_server_keeps_the_users_entry() {
+        for user_source in [
+            McpConfigSource::ClaudeUser,
+            McpConfigSource::CursorUser,
+            McpConfigSource::CodexUser,
+            McpConfigSource::OpenCodeUser,
+        ] {
+            let mut repo = project(McpConfigSource::CodemuxProject);
+            repo.id = "repo".into();
+            repo.raw["description"] = json!("from the repository");
+            repo.project_root = Some("/repo".into());
+            let mut user = project(user_source);
+            user.id = "user".into();
+            user.disabled = true;
+            user.project_root = None;
+            let rows = crate::mcp::dedupe_servers(vec![repo, user]);
+            assert_eq!(rows.len(), 1, "{user_source:?}");
+            let row = &rows[0];
+            assert_eq!(row.id, "user");
+            assert!(row.disabled);
+            assert!(row.raw.get("description").is_none());
+            assert_eq!(row.project_root, None);
+            assert_eq!(row.sources, vec![user_source, McpConfigSource::CodemuxProject]);
+            assert!(fingerprint(row).is_none());
+        }
+        let rows = crate::mcp::dedupe_servers(vec![
+            project(McpConfigSource::CodemuxProject),
+            project(McpConfigSource::ClaudeProject),
+        ]);
+        assert_eq!(rows.len(), 1);
+        assert!(fingerprint(&rows[0]).is_some());
     }
 
     /// Dedupe keeps entries that differ only in their working directory
@@ -286,15 +343,24 @@ mod tests {
 
     #[test]
     fn summary_shows_the_whole_definition() {
+        let q = |word: &str| if cfg!(windows) { format!("\"{word}\"") } else { format!("'{word}'") };
         let mut stdio = project(McpConfigSource::ClaudeProject);
-        assert_eq!(summary(&stdio), "sh -c 'echo hi'");
+        assert_eq!(summary(&stdio), format!("sh -c {}", q("echo hi")));
         stdio.env.insert("NODE_OPTIONS".into(), "--require ./x.js".into());
         stdio.env.insert("A".into(), "1".into());
         stdio.raw["cwd"] = json!("./tools dir");
         assert_eq!(
             summary(&stdio),
-            "sh -c 'echo hi' · env A=1 NODE_OPTIONS='--require ./x.js' · cwd './tools dir'"
+            format!(
+                "sh -c {} · env A=1 NODE_OPTIONS={} · cwd {}",
+                q("echo hi"),
+                q("--require ./x.js"),
+                q("./tools dir")
+            )
         );
+        stdio.args = vec!["it's".into()];
+        let expected = if cfg!(windows) { r#""it's""# } else { r"'it'\''s'" };
+        assert_eq!(summary(&stdio).split(" · ").next().unwrap(), format!("sh {expected}"));
         let mut http = project(McpConfigSource::ClaudeProject);
         http.transport = McpTransport::Http;
         http.command = "http://example.test/mcp".into();
@@ -304,5 +370,24 @@ mod tests {
             "bearer_token_env_var": "A",
         });
         assert_eq!(summary(&http), "http://example.test/mcp · sends A, B, C");
+    }
+
+    /// Terminal escapes, carriage returns and bidi or zero-width characters
+    /// from the repository are shown, not interpreted.
+    #[test]
+    fn summary_cannot_hide_part_of_the_definition() {
+        let mut stdio = project(McpConfigSource::ClaudeProject);
+        stdio.command = "node".into();
+        stdio.args = vec![
+            "\u{1b}[2K\r  npx -y @safe/server".into(),
+            "evil\u{202e}txt.js".into(),
+            "a\u{200b}b".into(),
+        ];
+        let shown = summary(&stdio);
+        assert!(!shown.chars().any(|c| c.is_control() || matches!(c, '\u{202e}' | '\u{200b}')), "{shown:?}");
+        assert!(shown.contains("\\u{1b}[2K\\u{d}  npx"), "{shown}");
+        assert!(shown.contains("evil\\u{202e}txt.js"), "{shown}");
+        assert!(shown.contains("a\\u{200b}b"), "{shown}");
+        assert_eq!(escape("plain C:\\dir é"), "plain C:\\dir é");
     }
 }
