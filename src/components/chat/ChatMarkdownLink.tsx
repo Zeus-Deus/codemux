@@ -1,4 +1,4 @@
-import { useState, type ComponentProps } from "react";
+import { useRef, useState, type ComponentProps } from "react";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import { ExternalLink } from "lucide-react";
 
@@ -59,6 +59,7 @@ export function ChatMarkdownLink({
   ...props
 }: ChatMarkdownLinkProps) {
   const [confirmationOpen, setConfirmationOpen] = useState(false);
+  const linkRef = useRef<HTMLAnchorElement>(null);
   const threadId = chatLinkId(href);
   if (threadId) return <ChatLink {...props} threadId={threadId} className={className} onClick={onClick} onAuxClick={onAuxClick}>{children}</ChatLink>;
   const incomplete = href === INCOMPLETE_LINK;
@@ -87,6 +88,7 @@ export function ChatMarkdownLink({
   const link = (
     <a
       {...props}
+      ref={linkRef}
       href={externalHref ?? undefined}
       rel={externalHref ? "noopener noreferrer" : rel}
       title={title ?? inertHref}
@@ -137,7 +139,14 @@ export function ChatMarkdownLink({
   return (
     <AlertDialog open={confirmationOpen} onOpenChange={setConfirmationOpen}>
       {link}
-      <AlertDialogContent className="flex max-h-[calc(100dvh-2rem)] flex-col overflow-hidden">
+      <AlertDialogContent
+        className="flex max-h-[calc(100dvh-2rem)] flex-col overflow-hidden"
+        onCloseAutoFocus={(event) => {
+          if (!linkRef.current?.isConnected) return;
+          event.preventDefault();
+          linkRef.current.focus({ preventScroll: true });
+        }}
+      >
         <div role="region" aria-label="Link confirmation details" className="thin-scrollbar min-h-0 space-y-4 overflow-y-auto" tabIndex={0}>
           <AlertDialogHeader>
             <AlertDialogMedia>

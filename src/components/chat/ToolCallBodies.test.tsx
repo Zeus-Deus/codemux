@@ -487,7 +487,7 @@ describe("GenericToolBody edge cases", () => {
 });
 
 describe("Tool result images", () => {
-  it("returns keyboard focus to the remote image control after Escape or Cancel", async () => {
+  it("returns keyboard focus to the remote image control after dismissal or approval", async () => {
     render(<ToolCallBody item={makeTool({ result_content: [
       { type: "image_url", image_url: { url: "https://private.example.test/proof.png" } },
     ] })} />);
@@ -502,6 +502,10 @@ describe("Tool result images", () => {
     await userEvent.keyboard("{Enter}");
     await userEvent.click(screen.getByRole("button", { name: "Cancel" }));
     await waitFor(() => expect(trigger).toHaveFocus());
+
+    await userEvent.keyboard("{Enter}");
+    await userEvent.click(screen.getByRole("button", { name: "Load image" }));
+    await waitFor(() => expect(screen.getByRole("button", { name: "Open image" })).toHaveFocus());
   });
 
   it("keeps confirmation actions outside the scrollable long image address", () => {

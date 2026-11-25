@@ -92,6 +92,15 @@ function ToolResultThumbnail({
 }) {
   const [failed, setFailed] = useState(false);
   const [confirmationSrc, setConfirmationSrc] = useState<string | null>(null);
+  const approvedButtonRef = useRef<HTMLButtonElement>(null);
+  const focusApprovedRef = useRef(false);
+
+  useEffect(() => {
+    // Approval removes the dialog trigger; focus its replacement after React mounts it.
+    if (!approved || !focusApprovedRef.current) return;
+    focusApprovedRef.current = false;
+    approvedButtonRef.current?.focus({ preventScroll: true });
+  }, [approved]);
 
   if (!approved) {
     let host: string;
@@ -135,7 +144,11 @@ function ToolResultThumbnail({
           </div>
           <AlertDialogFooter className="shrink-0">
             <AlertDialogCancel>Cancel</AlertDialogCancel>
-            <AlertDialogAction onClick={() => { onConfirm(); setConfirmationSrc(null); }}>
+            <AlertDialogAction onClick={() => {
+              focusApprovedRef.current = true;
+              onConfirm();
+              setConfirmationSrc(null);
+            }}>
               Load image
             </AlertDialogAction>
           </AlertDialogFooter>
@@ -157,6 +170,7 @@ function ToolResultThumbnail({
 
   return (
     <button
+      ref={approvedButtonRef}
       type="button"
       onClick={onOpen}
       aria-label="Open image"

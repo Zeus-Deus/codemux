@@ -7,6 +7,7 @@ import {
   screen,
   waitFor,
 } from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
 
 const mocks = vi.hoisted(() => ({
   openUrl: vi.fn().mockResolvedValue(undefined),
@@ -75,6 +76,26 @@ describe("ChatMarkdown selection compatibility", () => {
 });
 
 describe("ChatMarkdown rich external links", () => {
+  it("returns focus to a remote image link after Escape or Cancel", async () => {
+    const { container } = render(
+      <ChatMarkdown>{"![Proof](https://images.example.test/proof.png)"}</ChatMarkdown>,
+    );
+    const link = container.querySelector('a[data-streamdown="link"]') as HTMLAnchorElement;
+    expect(link).toHaveTextContent("Proof");
+    expect(container.querySelector("img")).toBeNull();
+
+    link.focus();
+    await userEvent.keyboard("{Enter}");
+    await waitFor(() => expect(screen.getByRole("button", { name: "Cancel" })).toHaveFocus());
+    await userEvent.keyboard("{Escape}");
+    await waitFor(() => expect(link).toHaveFocus());
+
+    await userEvent.keyboard("{Enter}");
+    await userEvent.click(screen.getByRole("button", { name: "Cancel" }));
+    await waitFor(() => expect(link).toHaveFocus());
+    expect(mocks.openUrl).not.toHaveBeenCalled();
+  });
+
   it("keeps confirmation actions outside the scrollable long link address", () => {
     const url = `https://links.example.test/${"a".repeat(4096)}`;
     const { container } = render(<ChatMarkdown>{`[Reference](${url})`}</ChatMarkdown>);
