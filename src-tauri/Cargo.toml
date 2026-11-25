@@ -177,7 +177,9 @@ rpassword = "7"
 # tree, keeping this a pure-Rust addition with no new C toolchain deps.
 # Use the same patched ZIP line as tauri-plugin-updater on Windows.
 zip = { version = "9", default-features = false, features = ["deflate-flate2"] }
-web-push = { version = "0.11", default-features = false }
+# The maintained fork avoids the old JWT/RSA dependency chain while retaining
+# the Web Push builder API used by push.rs.
+web-push = { package = "sad-web-push", version = "0.12", default-features = false }
 openssl = "0.10"
 
 [target.'cfg(windows)'.dependencies.keyring]
