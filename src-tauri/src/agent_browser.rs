@@ -4400,7 +4400,7 @@ mod tests {
         let mut fake_command = std::process::Command::new(bin);
         fake_command.args(&close_args);
         set_browser_owner_env(&mut fake_command, &session).unwrap();
-        assert!(launch_status_with_timeout(fake_command, Duration::from_secs(2)).unwrap().status.success());
+        assert!(output_capture_with_timeout(fake_command, Duration::from_secs(2)).unwrap().status.success());
         assert!(marker.exists(), "test CLI must reveal a close invocation");
         std::fs::remove_file(&marker).unwrap();
 
