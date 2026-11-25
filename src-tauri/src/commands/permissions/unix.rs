@@ -1,7 +1,7 @@
 use cap_fs_ext::{DirExt, FollowSymlinks, OpenOptionsFollowExt};
 use cap_std::fs::{Dir, MetadataExt, OpenOptions, OpenOptionsExt};
 use std::fs::File;
-use std::io::{self, ErrorKind, Read, Write};
+use std::io::{self, ErrorKind};
 use std::path::Path;
 
 pub(super) struct ProjectSettingsDir {
@@ -43,43 +43,7 @@ impl ProjectSettingsDir {
                 "Settings must be a regular file",
             ));
         }
-        Ok(file)
-    }
-
-    pub(super) fn replace(&self, name: &str, original: &[u8], content: &[u8]) -> io::Result<()> {
         self.check_binding()?;
-        let permissions = self.open_file(name)?.metadata()?.permissions();
-        let temporary = format!(".settings-{}.tmp", uuid::Uuid::new_v4().simple());
-        let mut options = OpenOptions::new();
-        options
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .follow(FollowSymlinks::No);
-        let mut staged = self.directory.open_with(&temporary, &options)?.into_std();
-        let result = (|| {
-            staged.write_all(content)?;
-            staged.set_permissions(permissions)?;
-            staged.sync_all()?;
-
-            let mut current = Vec::new();
-            self.open_file(name)?
-                .take((original.len() as u64).saturating_add(1))
-                .read_to_end(&mut current)?;
-            if current != original {
-                return Err(super::settings_changed());
-            }
-            // Refuse a stale project directory before committing. The rename
-            // still uses the held directory for both paths to avoid redirects.
-            self.check_binding()?;
-            self.directory.rename(&temporary, &self.directory, name)?;
-            // Best effort, matching the user settings replacement path.
-            let _ = self.directory.open(".").and_then(|dir| dir.sync_all());
-            Ok(())
-        })();
-        if result.is_err() {
-            let _ = self.directory.remove_file(&temporary);
-        }
-        result
+        Ok(file)
     }
 }

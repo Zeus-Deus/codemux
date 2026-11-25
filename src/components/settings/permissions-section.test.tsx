@@ -109,6 +109,22 @@ describe("PermissionsSection", () => {
     expect(screen.queryByText(/Failed to load rules:/i)).not.toBeInTheDocument();
   });
 
+  it("shows read-only project rules and keeps user rules removable", async () => {
+    vi.mocked(listToolPermissions).mockResolvedValue({
+      rules: RULES,
+      scope_errors: [],
+      read_only_scopes: ["project", "local"],
+    });
+    render(<PermissionsSection projectRoot="/work/proj" />);
+
+    const local = await screen.findByRole("region", { name: "This project (gitignored)" });
+    expect(within(local).getByText("WebFetch")).toBeInTheDocument();
+    expect(within(local).getByText("Edit this file directly to change its rules.")).toBeInTheDocument();
+    expect(within(local).queryByRole("button", { name: "Remove rule" })).toBeNull();
+    const user = screen.getByRole("region", { name: "User-wide" });
+    expect(within(user).getAllByRole("button", { name: "Remove rule" })).toHaveLength(2);
+  });
+
   it("hides project-scoped groups when projectRoot is null", async () => {
     vi.mocked(listToolPermissions).mockResolvedValue({ rules: [RULES[0]!], scope_errors: [] });
     render(<PermissionsSection projectRoot={null} />);

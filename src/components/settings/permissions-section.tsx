@@ -143,6 +143,7 @@ function PermissionRules({ projectRoot }: Props) {
             <RuleGroup
               key={group.scope}
               group={group}
+              readOnly={list.read_only_scopes?.includes(group.scope) ?? false}
               error={
                 list.scope_errors.find((entry) => entry.scope === group.scope)
                   ?.message
@@ -188,10 +189,12 @@ function PermissionRules({ projectRoot }: Props) {
 
 function RuleGroup({
   group,
+  readOnly,
   error,
   onRemove,
 }: {
   group: Group;
+  readOnly: boolean;
   error?: string;
   onRemove: (rule: PermissionRule) => void;
 }) {
@@ -204,6 +207,11 @@ function RuleGroup({
         <p className="text-label text-subtle-foreground font-mono mt-0.5">
           {group.filename}
         </p>
+        {readOnly && group.rules.length > 0 && (
+          <p className="mt-1 text-label text-muted-foreground">
+            Edit this file directly to change its rules.
+          </p>
+        )}
       </header>
       {error ? (
         <p role="status" className="text-label text-destructive">
@@ -235,15 +243,17 @@ function RuleGroup({
                   </span>
                 )}
               </div>
-              <Button
-                variant="ghost"
-                size="icon-xs"
-                aria-label="Remove rule"
-                className="opacity-0 group-hover:opacity-100 group-focus-within:opacity-100 focus-visible:opacity-100 transition-opacity duration-150 hover:bg-destructive/10 hover:text-destructive"
-                onClick={() => onRemove(rule)}
-              >
-                <Trash2 className="size-3.5" />
-              </Button>
+              {!readOnly && (
+                <Button
+                  variant="ghost"
+                  size="icon-xs"
+                  aria-label="Remove rule"
+                  className="opacity-0 group-hover:opacity-100 group-focus-within:opacity-100 focus-visible:opacity-100 transition-opacity duration-150 hover:bg-destructive/10 hover:text-destructive"
+                  onClick={() => onRemove(rule)}
+                >
+                  <Trash2 className="size-3.5" />
+                </Button>
+              )}
             </li>
           ))}
         </ul>

@@ -2568,6 +2568,7 @@ export interface PermissionRule {
 export interface ToolPermissionList {
   rules: PermissionRule[];
   scope_errors: { scope: PermissionRule["scope"]; message: string }[];
+  read_only_scopes?: PermissionRule["scope"][];
 }
 
 export const listToolPermissions = async (
