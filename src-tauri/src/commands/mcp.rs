@@ -196,39 +196,26 @@ pub async fn list_mcp_tools_for_server(
     Ok(registry.list_tools_for_server(&id).await)
 }
 
-/// Re-discover the config for a single server id by walking the same
-/// paths `list_mcp_servers` walks. Returns the first match. Used by
-/// the start command when the registry doesn't already hold a handle.
+/// Re-discover the config for a single server id, deduplicated and tagged
+/// the same way chat priming discovers it. Used by the start command when
+/// the registry doesn't already hold a handle.
 fn find_config(id: &str, project_root: Option<&Path>) -> Option<McpServerConfig> {
-    if id == "codemux-self" {
-        return Some(codemux_self_config());
-    }
+    crate::mcp::registry::discover_configs(project_root)
+        .into_iter()
+        .find(|config| config.id == id)
+}
 
-    let project_path: Option<PathBuf> = project_root.map(|p| p.to_path_buf());
-    let scan = enumerate_mcp_paths(project_path.as_deref());
-
-    for (path, source) in scan.paths {
-        let parsed = if is_claude_wrapped_path(&path) {
-            parse_claude_wrapped_config(&path, project_path.as_deref())
-        } else if source == McpConfigSource::CodexUser {
-            parse_codex_config_file(&path)
-        } else if matches!(
-            source,
-            McpConfigSource::OpenCodeUser | McpConfigSource::OpenCodeProject
-        ) {
-            parse_opencode_config_file(&path, source)
-        } else {
-            parse_mcp_config_file(&path, source)
-        };
-        if let Ok(parsed) = parsed {
-            for srv in parsed {
-                if srv.id == id {
-                    return Some(srv);
-                }
-            }
-        }
-    }
-    None
+/// Approve a server defined by the project's own files after the user
+/// reviewed it in Settings, then start it. `fingerprint` comes from the
+/// row's `needsApproval` status; the approval is stored locally only.
+#[tauri::command]
+pub async fn approve_mcp_server<R: Runtime>(
+    app: AppHandle<R>,
+    registry: State<'_, McpRegistry>,
+    id: String,
+    fingerprint: String,
+) -> Result<McpServerRuntime, String> {
+    registry.approve_project_server(&app, &id, &fingerprint).await
 }
 
 #[cfg(test)]

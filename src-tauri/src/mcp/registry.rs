@@ -601,6 +601,28 @@ impl McpRegistry {
             }
         }
 
+        // A server from the project's own files waits for the user's
+        // approval of this exact definition. Every start path (chat prime,
+        // Settings, start by id, restart) arrives here.
+        if let Some(fingerprint) = super::project_trust::fingerprint(&config) {
+            if !super::project_trust::is_approved(app, &fingerprint) {
+                let mut inner = self.inner.lock().await;
+                if let Some(existing) = inner.handles.get(&id).filter(|h| {
+                    matches!(h.status, McpServerStatus::Running { .. } | McpServerStatus::Starting)
+                }) {
+                    return McpServerRuntime::from_handle(existing);
+                }
+                let summary = super::project_trust::summary(&config);
+                let mut handle = McpServerHandle::discovered(config);
+                handle.status = McpServerStatus::NeedsApproval { fingerprint, summary };
+                let row = McpServerRuntime::from_handle(&handle);
+                inner.handles.insert(id, handle);
+                drop(inner);
+                emit_status_with_bus(app, &self.status_tx, &row);
+                return row;
+            }
+        }
+
         // Reserve the generation under one lock; stop/unregister can revoke
         // it while the handshake is in flight without resurrecting a child.
         let generation = uuid::Uuid::new_v4().to_string();
@@ -935,10 +957,46 @@ impl McpRegistry {
         Ok(self.ensure_started(app, config).await)
     }
 
+    /// Approve a project-defined server the user reviewed in Settings, then
+    /// start it. `fingerprint` is the one its `NeedsApproval` row showed, so
+    /// a definition that changed after the user looked is not approved.
+    pub async fn approve_project_server<R: Runtime>(
+        &self,
+        app: &AppHandle<R>,
+        id: &str,
+        fingerprint: &str,
+    ) -> Result<McpServerRuntime, String> {
+        let config = {
+            let inner = self.inner.lock().await;
+            match inner.handles.get(id) {
+                Some(handle)
+                    if matches!(
+                        &handle.status,
+                        McpServerStatus::NeedsApproval { fingerprint: shown, .. } if shown == fingerprint
+                    ) =>
+                {
+                    handle.config.clone()
+                }
+                _ => {
+                    return Err(
+                        "This server changed or no longer needs approval. Refresh and review it again."
+                            .into(),
+                    )
+                }
+            }
+        };
+        if super::project_trust::fingerprint(&config).as_deref() != Some(fingerprint) {
+            return Err("This server changed. Refresh and review it again.".into());
+        }
+        super::project_trust::record_approval(app, fingerprint, &config)?;
+        Ok(self.ensure_started(Some(app), config).await)
+    }
+
     /// Spawn every enabled (non-disabled) MCP server discovered for the
     /// given project root, plus Codemux's own hardcoded entry. Errors
     /// per server are surfaced as `Errored` rows rather than failing
-    /// the whole prime.
+    /// the whole prime. Servers from the project's own files that the
+    /// user has not approved become `NeedsApproval` rows instead.
     ///
     /// Used by:
     ///   1. `agent_chat_start_session` — first chat session triggers spawn.
@@ -1071,6 +1129,7 @@ impl McpRegistry {
             disabled: false,
             transport: super::McpTransport::Stdio,
             raw: serde_json::Value::Null,
+            project_root: None,
         };
         let mut handle = McpServerHandle::discovered(config);
         handle.status = McpServerStatus::Running { tool_count: 1 };
@@ -1350,10 +1409,15 @@ fn now_ms() -> i64 {
 /// `Vec<McpServerConfig>` suitable for spawning. Identical definitions from
 /// multiple providers are deduplicated before launch so Codemux owns one
 /// child/connection and one stable tool namespace for all adapters.
-fn discover_configs(project_root: Option<&std::path::Path>) -> Vec<McpServerConfig> {
+/// Project-sourced entries carry the canonical project root their approval
+/// is keyed by.
+pub(crate) fn discover_configs(project_root: Option<&std::path::Path>) -> Vec<McpServerConfig> {
     let mut out: Vec<McpServerConfig> = vec![codemux_self_config()];
 
     let project_path: Option<PathBuf> = project_root.map(|p| p.to_path_buf());
+    let canonical_root = project_path
+        .as_deref()
+        .map(|root| std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf()));
     let scan = enumerate_mcp_paths(project_path.as_deref());
     let own = PathBuf::from(crate::mcp_server::codemux_mcp_command());
 
@@ -1372,12 +1436,15 @@ fn discover_configs(project_root: Option<&std::path::Path>) -> Vec<McpServerConf
         };
         match parsed {
             Ok(parsed) => {
-                for srv in parsed {
+                for mut srv in parsed {
                     // Same filter as the list command: drop provider-written
                     // Codemux entries, whatever their name, so we don't spawn
                     // the built-in twice.
                     if srv.is_codemux_entry(&own) {
                         continue;
+                    }
+                    if super::is_project_source(source) {
+                        srv.project_root = canonical_root.clone();
                     }
                     out.push(srv);
                 }
@@ -1520,6 +1587,7 @@ pub(crate) mod test_support {
             disabled: false,
             transport: McpTransport::Http,
             raw: serde_json::json!({}),
+            project_root: None,
         };
         let row = registry
             .ensure_started(None::<&tauri::AppHandle<tauri::Wry>>, config)
@@ -1549,6 +1617,7 @@ mod tests {
             disabled: false,
             transport: McpTransport::Stdio,
             raw: serde_json::Value::Null,
+            project_root: None,
         }
     }
 
@@ -2218,6 +2287,7 @@ mod tests {
             disabled: false,
             transport: McpTransport::Http,
             raw: serde_json::json!({}),
+            project_root: None,
         };
         let row = reg
             .ensure_started(None::<&tauri::AppHandle<tauri::Wry>>, config)
@@ -2337,5 +2407,185 @@ mod native_visibility_tests {
                 assert!(native_tool_visible(&plugin,&caller));
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod project_trust_tests {
+    use super::*;
+    use tauri::Manager;
+
+    fn app() -> tauri::App<tauri::test::MockRuntime> {
+        let app = tauri::test::mock_app();
+        app.manage(crate::database::DatabaseStore::new_in_memory());
+        app
+    }
+
+    fn write_project(root: &std::path::Path, servers: serde_json::Value) {
+        std::fs::write(
+            root.join(".mcp.json"),
+            serde_json::json!({ "mcpServers": servers }).to_string(),
+        )
+        .unwrap();
+    }
+
+    fn touch_server(marker: &std::path::Path) -> serde_json::Value {
+        serde_json::json!({
+            "command": "sh",
+            "args": ["-c", format!("touch '{}'", marker.display())],
+            "disabled": false,
+        })
+    }
+
+    fn discovered(root: &std::path::Path, name: &str) -> McpServerConfig {
+        discover_configs(Some(root))
+            .into_iter()
+            .find(|config| config.name == name)
+            .unwrap()
+    }
+
+    fn shown_fingerprint(row: &McpServerRuntime) -> String {
+        match &row.status {
+            McpServerStatus::NeedsApproval { fingerprint, .. } => fingerprint.clone(),
+            other => panic!("expected needsApproval, got {other:?}"),
+        }
+    }
+
+    async fn appears(path: &std::path::Path) -> bool {
+        for _ in 0..40 {
+            if path.exists() {
+                return true;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        false
+    }
+
+    /// A repository's `.mcp.json` starts nothing until the user approves that
+    /// definition, and asks again once the definition changes.
+    #[tokio::test]
+    async fn project_server_waits_for_approval_and_asks_again_after_a_change() {
+        let (project, scratch) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let (first, second) = (scratch.path().join("first"), scratch.path().join("second"));
+        write_project(project.path(), serde_json::json!({ "lint": touch_server(&first) }));
+        let app = app();
+        let handle = app.handle();
+        let reg = McpRegistry::new();
+
+        let config = discovered(project.path(), "lint");
+        assert_eq!(
+            config.project_root.as_deref(),
+            Some(std::fs::canonicalize(project.path()).unwrap().as_path())
+        );
+        let row = reg.ensure_started(Some(handle), config.clone()).await;
+        let fingerprint = shown_fingerprint(&row);
+        // Restart reuses the stored config and still spawns nothing.
+        let restarted = reg.restart_server(Some(handle), &config.id).await.unwrap();
+        assert_eq!(shown_fingerprint(&restarted), fingerprint);
+        assert!(!appears(&first).await, "the project command ran before approval");
+
+        assert!(reg
+            .approve_project_server(handle, &config.id, "stale")
+            .await
+            .is_err());
+        reg.approve_project_server(handle, &config.id, &fingerprint)
+            .await
+            .unwrap();
+        assert!(appears(&first).await, "the approved command did not start");
+
+        write_project(project.path(), serde_json::json!({ "lint": touch_server(&second) }));
+        let changed = discovered(project.path(), "lint");
+        assert_eq!(changed.id, config.id);
+        let row = reg.ensure_started(Some(handle), changed).await;
+        assert_ne!(shown_fingerprint(&row), fingerprint);
+        assert!(!appears(&second).await, "a changed definition ran without approval");
+        reg.shutdown_all().await;
+    }
+
+    /// Approval is per project: the same file in another checkout asks again.
+    #[tokio::test]
+    async fn project_approval_does_not_carry_to_another_project() {
+        let (a, b, scratch) = (
+            tempfile::tempdir().unwrap(),
+            tempfile::tempdir().unwrap(),
+            tempfile::tempdir().unwrap(),
+        );
+        let marker = scratch.path().join("ran");
+        for root in [a.path(), b.path()] {
+            write_project(root, serde_json::json!({ "lint": touch_server(&marker) }));
+        }
+        let app = app();
+        let reg = McpRegistry::new();
+        let in_a = discovered(a.path(), "lint");
+        let row = reg.ensure_started(Some(app.handle()), in_a.clone()).await;
+        reg.approve_project_server(app.handle(), &in_a.id, &shown_fingerprint(&row))
+            .await
+            .unwrap();
+        let row = reg
+            .ensure_started(Some(app.handle()), discovered(b.path(), "lint"))
+            .await;
+        shown_fingerprint(&row);
+        reg.shutdown_all().await;
+    }
+
+    /// An HTTP entry is not contacted, so its `{env:}` headers are never
+    /// expanded or sent, until it is approved.
+    #[tokio::test]
+    async fn project_http_server_receives_nothing_before_approval() {
+        let mut server = mockito::Server::new_async().await;
+        let untouched = server
+            .mock("POST", mockito::Matcher::Any)
+            .expect(0)
+            .create_async()
+            .await;
+        let project = tempfile::tempdir().unwrap();
+        write_project(
+            project.path(),
+            serde_json::json!({ "remote": {
+                "type": "http",
+                "url": format!("{}/mcp", server.url()),
+                "headers": { "X-Secret": "{env:HOME}" },
+                "bearer_token_env_var": "HOME",
+            }}),
+        );
+        let app = app();
+        let reg = McpRegistry::new();
+        let row = reg
+            .ensure_started(Some(app.handle()), discovered(project.path(), "remote"))
+            .await;
+        match &row.status {
+            McpServerStatus::NeedsApproval { summary, .. } => {
+                assert!(summary.ends_with(" · sends HOME"), "{summary}");
+            }
+            other => panic!("expected needsApproval, got {other:?}"),
+        }
+        untouched.assert_async().await;
+    }
+
+    /// Servers from the user's own files start as before, with or without
+    /// an app to read approvals from.
+    #[tokio::test]
+    async fn project_trust_leaves_user_scope_servers_alone() {
+        let scratch = tempfile::tempdir().unwrap();
+        let marker = scratch.path().join("ran");
+        let config = McpServerConfig {
+            id: "user".into(),
+            name: "user".into(),
+            sources: vec![McpConfigSource::CodemuxUser, McpConfigSource::ClaudeProject],
+            command: "sh".into(),
+            args: vec!["-c".into(), format!("touch '{}'", marker.display())],
+            env: HashMap::new(),
+            disabled: false,
+            transport: super::super::McpTransport::Stdio,
+            raw: serde_json::json!({}),
+            project_root: None,
+        };
+        let reg = McpRegistry::new();
+        let row = reg
+            .ensure_started(None::<&tauri::AppHandle<tauri::Wry>>, config)
+            .await;
+        assert!(!matches!(row.status, McpServerStatus::NeedsApproval { .. }), "{row:?}");
+        assert!(appears(&marker).await);
+        reg.shutdown_all().await;
     }
 }

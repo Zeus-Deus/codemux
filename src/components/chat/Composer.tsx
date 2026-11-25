@@ -4003,6 +4003,8 @@ function formatMcpRowStatus(
       return "stopped";
     case "discovered":
       return "discovered";
+    case "needsApproval":
+      return "needs approval in Settings";
   }
 }
 

@@ -105,6 +105,14 @@ pub struct McpServerInfo {
 pub enum McpServerStatus {
     /// Config loaded, child not yet spawned. The default after parsing.
     Discovered,
+    /// Defined by the project's own files and not yet approved for this
+    /// project, or changed since. Never spawned or contacted in this state
+    /// (see `mcp::project_trust`). `summary` is what approving would start.
+    #[serde(rename = "needsApproval")]
+    NeedsApproval {
+        fingerprint: String,
+        summary: String,
+    },
     /// Child spawned, handshake in progress.
     Starting,
     /// `initialize` + `tools/list` succeeded; ready for `tools/call`.
@@ -637,6 +645,7 @@ mod tests {
             disabled: false,
             transport,
             raw: Value::Null,
+            project_root: None,
         }
     }
 

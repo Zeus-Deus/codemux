@@ -3,6 +3,7 @@ import type {
   HostStatusView,
   HostView,
   LocalChatSession,
+  McpServerRuntime,
   StaleWorktree,
 } from "@/tauri/commands";
 import type {
@@ -1067,11 +1068,22 @@ const MOCK_MCP_SERVERS = [
     transport: "stdio",
     raw: null,
   },
+  {
+    id: "repo-lint",
+    name: "repo-lint",
+    sources: ["claudeProject"],
+    command: "node",
+    args: ["…"],
+    env: {},
+    disabled: false,
+    transport: "stdio",
+    raw: null,
+  },
 ] as const;
 
 /** Live runtime rows keyed to the configs above. Tool counts sum to
  *  86 (> the advisory threshold) so the "many tools" note renders. */
-const MOCK_MCP_RUNTIMES = [
+const MOCK_MCP_RUNTIMES: McpServerRuntime[] = [
   {
     id: "codemux-self",
     name: "codemux",
@@ -1115,6 +1127,20 @@ const MOCK_MCP_RUNTIMES = [
     toolsCount: 0,
     errorMessage: "spawn uvx ENOENT",
     stderrTail: "uvx: command not found",
+    startedAtMs: 0,
+  },
+  {
+    // Defined in the project's `.mcp.json`; waits for Settings → Approve.
+    id: "repo-lint",
+    name: "repo-lint",
+    status: {
+      kind: "needsApproval",
+      fingerprint: "mock-fingerprint",
+      summary: "node scripts/lint-mcp.js --fix",
+    },
+    toolsCount: 0,
+    errorMessage: null,
+    stderrTail: null,
     startedAtMs: 0,
   },
 ];
@@ -7641,6 +7667,18 @@ const handlers: Record<string, Handler> = {
   }),
   restart_mcp_server_cmd: (args: Args) =>
     MOCK_MCP_RUNTIMES.find((r) => r.id === args.id) ?? MOCK_MCP_RUNTIMES[0],
+  approve_mcp_server: (args: Args) => {
+    const index = MOCK_MCP_RUNTIMES.findIndex((r) => r.id === args.id);
+    if (index < 0) throw new Error(`no such server: ${String(args.id)}`);
+    const row: McpServerRuntime = {
+      ...MOCK_MCP_RUNTIMES[index],
+      status: { kind: "running", toolCount: 3 },
+      toolsCount: 3,
+    };
+    MOCK_MCP_RUNTIMES[index] = row;
+    emitEvent("mcp-status-changed", row);
+    return row;
+  },
   list_mcp_tools: () =>
     MOCK_MCP_RUNTIMES.flatMap((r) => mockMcpToolsForServer(r.id)),
   list_mcp_tools_for_server: (args: Args) =>

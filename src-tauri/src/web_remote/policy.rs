@@ -600,6 +600,9 @@ mod tests {
             "secrets_store",
             "secrets_list",
             "secrets_delete",
+            // Approving a project's own MCP servers runs repository
+            // commands, so it stays on the desktop.
+            "approve_mcp_server",
         ] {
             assert!(!allowed(cmd), "{cmd}");
         }

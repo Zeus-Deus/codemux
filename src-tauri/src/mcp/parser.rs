@@ -237,6 +237,7 @@ fn extract_servers(
                 || obj.get("enabled").and_then(Value::as_bool) == Some(false),
             transport,
             raw: value.clone(),
+            project_root: None,
         });
     }
 

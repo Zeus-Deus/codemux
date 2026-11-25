@@ -3048,6 +3048,7 @@ export const MCP_STATUS_CHANGED_EVENT = "mcp-status-changed";
 
 export type McpServerStatusKind =
   | "discovered"
+  | "needsApproval"
   | "starting"
   | "stopping"
   | "running"
@@ -3058,6 +3059,9 @@ export type McpServerStatusKind =
  *  arms in the UI. Mirrors the Rust `McpServerStatus` enum. */
 export type McpServerStatus =
   | { kind: "discovered" }
+  /** Defined by the project's own files and not approved for this project,
+   *  or changed since. `summary` is what approving would start. */
+  | { kind: "needsApproval"; fingerprint: string; summary: string }
   | { kind: "starting" }
   | { kind: "stopping" }
   | { kind: "running"; toolCount: number }
@@ -3105,6 +3109,11 @@ export const stopMcpServerCmd = (id: string) =>
 
 export const restartMcpServerCmd = (id: string) =>
   invoke<McpServerRuntime>("restart_mcp_server_cmd", { id });
+
+/** Approve a project-defined server's exact definition (the fingerprint its
+ *  `needsApproval` row showed) on this computer, then start it. */
+export const approveMcpServer = (id: string, fingerprint: string) =>
+  invoke<McpServerRuntime>("approve_mcp_server", { id, fingerprint });
 
 export const listMcpTools = () => invoke<McpTool[]>("list_mcp_tools");
 

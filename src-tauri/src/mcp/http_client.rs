@@ -744,6 +744,7 @@ mod live_tests {
             disabled: false,
             transport: super::super::McpTransport::Http,
             raw: json!({"headers":{"x-api-key":"fixture-only"}}),
+            project_root: None,
         };
         let error = HttpMcpClient::connect(&config).await.unwrap_err();
         assert!(
@@ -795,6 +796,7 @@ mod live_tests {
                 disabled: false,
                 transport: super::super::McpTransport::Http,
                 raw: json!({}),
+                project_root: None,
             };
             let server = tokio::spawn(async move {
                 axum::serve(socket, app).await.unwrap();
@@ -864,6 +866,7 @@ mod live_tests {
             disabled: false,
             transport: super::super::McpTransport::Http,
             raw: json!({}),
+            project_root: None,
         };
         let server = tokio::spawn(async move {
             axum::serve(socket, app).await.unwrap();
@@ -942,6 +945,7 @@ mod live_tests {
                 disabled: false,
                 transport: super::super::McpTransport::Http,
                 raw: json!({}),
+                project_root: None,
             };
             let server = tokio::spawn(async move {
                 axum::serve(socket, app).await.unwrap();
@@ -1002,6 +1006,7 @@ mod live_tests {
                 disabled: false,
                 transport: super::super::McpTransport::Http,
                 raw: json!({}),
+                project_root: None,
             };
             let server = tokio::spawn(async move {
                 axum::serve(socket, app).await.unwrap();
@@ -1581,6 +1586,7 @@ mod live_tests {
             disabled: false,
             transport: super::super::McpTransport::Http,
             raw: json!({}),
+            project_root: None,
         };
         let server = tokio::spawn(async move {
             axum::serve(socket, app).await.unwrap();
@@ -1742,6 +1748,7 @@ mod live_tests {
             disabled: false,
             transport: super::super::McpTransport::Http,
             raw: json!({"headers":{"Authorization":format!("Bearer {token}")}}),
+            project_root: None,
         };
         let client = HttpMcpClient::connect(&config(format!("{target}/mcp"), "loopback-test"))
             .await

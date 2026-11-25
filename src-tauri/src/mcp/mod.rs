@@ -12,6 +12,7 @@ pub mod gateway;
 pub mod http_client;
 pub mod parser;
 pub mod paths;
+pub mod project_trust;
 pub mod protocol;
 pub mod registry;
 pub mod runtime;
@@ -93,6 +94,24 @@ pub struct McpServerConfig {
     /// Pass-through for unknown fields so we don't lose forward-compat info
     /// when round-tripping configs.
     pub raw: serde_json::Value,
+    /// Canonical root of the project whose own files define this server,
+    /// set by discovery for project sources (see [`is_project_source`]).
+    /// Approval is per project, so it is never read from a config file.
+    #[serde(skip)]
+    pub project_root: Option<std::path::PathBuf>,
+}
+
+/// Sources read from files inside the project, which whoever wrote the
+/// repository controls. Servers from these need the user's approval before
+/// Codemux starts them (see [`project_trust`]).
+pub fn is_project_source(source: McpConfigSource) -> bool {
+    matches!(
+        source,
+        McpConfigSource::CodemuxProject
+            | McpConfigSource::ClaudeProject
+            | McpConfigSource::CursorProject
+            | McpConfigSource::OpenCodeProject
+    )
 }
 
 impl McpServerConfig {
@@ -315,6 +334,7 @@ mod tests {
             disabled: false,
             transport: McpTransport::Stdio,
             raw: serde_json::Value::Null,
+            project_root: None,
         }
     }
 
