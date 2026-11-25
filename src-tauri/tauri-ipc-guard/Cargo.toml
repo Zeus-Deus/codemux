@@ -1,0 +1,14 @@
+[package]
+name = "codemux-tauri-ipc-guard"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[features]
+custom-protocol = ["tauri-core/custom-protocol"]
+protocol-asset = ["tauri-core/protocol-asset"]
+test = ["tauri-core/test"]
+tracing = ["tauri-core/tracing"]
+
+[dependencies]
+tauri-core = { package = "tauri", version = "2" }

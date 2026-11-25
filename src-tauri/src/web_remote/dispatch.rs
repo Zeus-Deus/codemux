@@ -379,8 +379,15 @@ pub async fn dispatch_invoke<R: Runtime>(
     };
 
     let mut headers = tauri::http::HeaderMap::new();
+    headers.insert(
+        tauri::ipc::REMOTE_ADMISSION_HEADER,
+        tauri::http::HeaderValue::from_static("1"),
+    );
     if cmd == "agent_chat_send_turn" {
-        headers.insert("x-codemux-input-source", remote_input_source(&args).parse().unwrap());
+        headers.insert(
+            "x-codemux-input-source",
+            remote_input_source(&args).parse().unwrap(),
+        );
     }
     let request = InvokeRequest {
         cmd: cmd.clone(),
@@ -405,11 +412,16 @@ pub async fn dispatch_invoke<R: Runtime>(
         if !worker_out.can_invoke(&worker_app) {
             return;
         }
-        webview.on_message(
-            request,
-            Box::new(move |_webview, _cmd, response, _callback, _error| {
-                let _ = tx.send((response, admission));
-            }),
+        tauri::ipc::with_remote_admission(
+            move || worker_out.can_invoke(&worker_app),
+            || {
+                webview.on_message(
+                    request,
+                    Box::new(move |_webview, _cmd, response, _callback, _error| {
+                        let _ = tx.send((response, admission));
+                    }),
+                )
+            },
         );
     });
 
@@ -417,10 +429,16 @@ pub async fn dispatch_invoke<R: Runtime>(
         Ok(response) => response,
         Err(_) if out.is_closed() => return,
         Err(_) => {
-            let _ = out.send(err_text(id, "web-remote: command dropped without responding"));
+            let _ = out.send(err_text(
+                id,
+                "web-remote: command dropped without responding",
+            ));
             return;
         }
     };
+    if out.is_closed() {
+        return;
+    }
     let frame = match response {
         InvokeResponse::Ok(body) => ok_frame(id, remote_mcp_response(&cmd, body)),
         InvokeResponse::Err(err) => err_value(id, err.0),
@@ -639,6 +657,108 @@ mod tests {
             assert!(*closed.borrow());
             assert!(frames.try_recv().is_err());
         });
+    }
+
+    static ASYNC_BODY_STARTED: std::sync::atomic::AtomicBool =
+        std::sync::atomic::AtomicBool::new(false);
+
+    #[tauri::command]
+    async fn async_body_without_arguments() -> &'static str {
+        ASYNC_BODY_STARTED.store(true, Ordering::SeqCst);
+        "ran"
+    }
+
+    #[tokio::test]
+    async fn account_sign_out_after_ipc_handoff_refuses_the_async_body() {
+        use crate::database::{init_test_database, DatabaseStore};
+        use crate::web_remote::{auth, server};
+
+        let db = init_test_database();
+        auth::seed_account_browser(&db, "account", "account-browser");
+        let app = tauri::test::mock_builder()
+            .manage(db)
+            .invoke_handler(tauri::generate_handler![async_body_without_arguments])
+            .build(tauri::test::mock_context(tauri::test::noop_assets()))
+            .unwrap();
+        let webview = tauri::WebviewWindowBuilder::new(&app, "main", Default::default())
+            .build()
+            .unwrap();
+        let db = app.state::<DatabaseStore>();
+        let guard = auth::AccountSessionGuard::new(&db, "account").unwrap();
+        let (close, closed) = tokio::sync::watch::channel(false);
+        let (out, _frames) = server::outbound_channel(close, guard.account_session_id());
+        let request = |headers| InvokeRequest {
+            cmd: "async_body_without_arguments".into(),
+            callback: CallbackFn(0),
+            error: CallbackFn(1),
+            url: webview.url().unwrap(),
+            body: InvokeBody::Json(json!({})),
+            headers,
+            invoke_key: app.invoke_key().to_string(),
+        };
+        let mut headers = tauri::http::HeaderMap::new();
+        headers.insert(
+            tauri::ipc::REMOTE_ADMISSION_HEADER,
+            tauri::http::HeaderValue::from_static("1"),
+        );
+
+        let first_check = std::sync::atomic::AtomicBool::new(true);
+        let (entered, ready) = tokio::sync::oneshot::channel();
+        let entered = Mutex::new(Some(entered));
+        let (release, wait) = std::sync::mpsc::channel::<()>();
+        let wait = Mutex::new(wait);
+        let (reply, response) = tokio::sync::oneshot::channel();
+        let app_handle = app.handle().clone();
+        tauri::ipc::with_remote_admission(
+            move || {
+                // The first check happens in on_message. Hold the next one on
+                // Tauri's async runtime until sign-out commits in this test.
+                if !first_check.swap(false, Ordering::SeqCst) {
+                    entered.lock().unwrap().take().unwrap().send(()).unwrap();
+                    wait.lock()
+                        .unwrap()
+                        .recv_timeout(Duration::from_secs(5))
+                        .unwrap();
+                }
+                out.can_invoke(&app_handle)
+            },
+            || {
+                webview.clone().on_message(
+                    request(headers),
+                    Box::new(move |_, _, value, _, _| {
+                        let _ = reply.send(value);
+                    }),
+                )
+            },
+        );
+        tokio::time::timeout(Duration::from_secs(5), ready)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(!*closed.borrow());
+        db.clear_auth_token().unwrap();
+        release.send(()).unwrap();
+        let response = tokio::time::timeout(Duration::from_secs(5), response)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(response, InvokeResponse::Err(_)));
+        assert!(*closed.borrow());
+        assert!(!ASYNC_BODY_STARTED.load(Ordering::SeqCst));
+
+        let (reply, response) = tokio::sync::oneshot::channel();
+        webview.clone().on_message(
+            request(tauri::http::HeaderMap::new()),
+            Box::new(move |_, _, value, _, _| {
+                let _ = reply.send(value);
+            }),
+        );
+        let response = tokio::time::timeout(Duration::from_secs(5), response)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(response, InvokeResponse::Ok(_)));
+        assert!(ASYNC_BODY_STARTED.load(Ordering::SeqCst));
     }
 
     /// Register one route the way the dispatcher does and hand back the
