@@ -3052,7 +3052,9 @@ mod tests {
         tokio::io::WriteHalf<tokio::io::DuplexStream>,
     ) {
         let (client, server) = tokio::io::duplex(1 << 16);
-        let served = tokio::spawn(handle_client(app.handle().clone(), server, None));
+        // A duplex stream has no kernel peer credentials. Supply this test
+        // process as the verified peer so wait behavior reaches the handler.
+        let served = tokio::spawn(handle_client(app.handle().clone(), server, Some(std::process::id())));
         let (reader, writer) = tokio::io::split(client);
         (served, BufReader::new(reader).lines(), writer)
     }
