@@ -480,4 +480,35 @@ mod tests {
             assert!(valid_endpoint(good));
         }
     }
+
+    #[test]
+    fn stored_subscription_still_builds_encrypted_vapid_push() {
+        let subscription: SubscriptionInfo = serde_json::from_value(json!({
+            "endpoint": "https://fcm.googleapis.com/fcm/send/test",
+            "keys": {
+                "p256dh": "BLMbF9ffKBiWQLCKvTHb6LO8Nb6dcUh6TItC455vu2kElga6PQvUmaFyCdykxY2nOSSL3yKgfbmFLRTUaGv4yV8",
+                "auth": "AAAAAAAAAAAAAAAAAAAAAA"
+            }
+        }))
+        .unwrap();
+        assert!(valid_subscription(&subscription));
+
+        let private_key = "IQ9Ur0ykXoHS9gzfYX0aBjy9lvdrjx_PFUXmie9YRcY";
+        let public_key = VapidSignatureBuilder::from_base64_no_sub(private_key)
+            .unwrap()
+            .get_public_key();
+        assert_eq!(public_key.len(), 65);
+
+        let mut signature = VapidSignatureBuilder::from_base64(private_key, &subscription).unwrap();
+        signature.add_claim("sub", "https://codemux.org");
+        let mut message = WebPushMessageBuilder::new(&subscription);
+        message.set_vapid_signature(signature.build().unwrap());
+        message.set_payload(ContentEncoding::Aes128Gcm, b"test notification");
+        let payload = message.build().unwrap().payload.unwrap();
+        assert!(!payload.content.is_empty());
+        assert!(payload
+            .crypto_headers
+            .iter()
+            .any(|(name, value)| { *name == "Authorization" && value.starts_with("vapid t=") }));
+    }
 }
