@@ -134,11 +134,28 @@ const REMOTE_TRANSFER: &str = r#"run_transfer() {
         command timeout -s KILL "$seconds" "$@"
     else
         # macOS provides Perl but may not have the GNU timeout executable.
-        command perl -e '
+        command perl -MIO::Select -e '
             getpgrp() == $$ || setpgrp(0, 0) or die "setpgrp: $!";
-            $SIG{ALRM} = $SIG{HUP} = $SIG{TERM} = sub { kill "KILL", -$$ };
-            alarm shift @ARGV;
+            my $seconds = shift @ARGV;
+            my $group = $$;
+            pipe(my $reader, my $completed) or die "pipe: $!";
+            my $watchdog = fork();
+            defined $watchdog or die "fork: $!";
+            if ($watchdog == 0) {
+                close $completed;
+                $SIG{HUP} = $SIG{INT} = $SIG{TERM} = "IGNORE";
+                # The deadline must fire while the supervisor is still in
+                # system(), even when a signal handler would be deferred.
+                exit 0 if IO::Select->new($reader)->can_read($seconds)
+                    && sysread($reader, my $finished, 1);
+                kill "KILL", -$group;
+                exit 1;
+            }
+            close $reader;
             my $status = system { $ARGV[0] } @ARGV;
+            syswrite($completed, "1");
+            close $completed;
+            waitpid($watchdog, 0);
             exit($status == -1 ? 127 : ($status & 127) ? 128 + ($status & 127) : $status >> 8);
         ' "$seconds" "$@"
     fi
@@ -455,6 +472,26 @@ export -f opencode
         output(&mut command, input).await.unwrap()
     }
 
+    fn force_perl_with_blocked_alarm(script: &str) -> String {
+        // A program started over SSH can inherit a signal mask. Exercise
+        // the fallback with SIGALRM unavailable as a timer mechanism.
+        let prefix = r#"command() {
+    case "$1" in
+        timeout) return 1 ;;
+        perl)
+            shift
+            builtin command perl -MPOSIX -e '
+                sigprocmask(SIG_BLOCK, POSIX::SigSet->new(SIGALRM)) or die "sigprocmask: $!";
+                exec "perl", @ARGV or die "exec perl: $!";
+            ' -- "$@"
+            ;;
+        *) builtin command "$@" ;;
+    esac
+}
+"#;
+        [prefix, script].concat()
+    }
+
     fn assert_private_scratch_removed(output: &Output) {
         let diagnostics = std::str::from_utf8(&output.stderr).unwrap();
         let mut lines = diagnostics.lines();
@@ -500,74 +537,77 @@ case "$1" in
     *) return 3 ;;
 esac
 "#;
-        let result = run_transfer_fixture(&script, fake_opencode, None).await;
-        assert!(result.status.success());
-        let (id, bundle) = remote_export_bundle(&result.stdout).unwrap().unwrap();
-        assert_eq!(id, "ses_fixture");
-        assert_eq!(bundle, b"{\"fixture\":1}\n");
-        assert_private_scratch_removed(&result);
+        let fallback = force_perl_with_blocked_alarm(&script);
+        for script in [&script, &fallback] {
+            let result = run_transfer_fixture(script, fake_opencode, None).await;
+            assert!(result.status.success(), "{result:?}");
+            let (id, bundle) = remote_export_bundle(&result.stdout).unwrap().unwrap();
+            assert_eq!(id, "ses_fixture");
+            assert_eq!(bundle, b"{\"fixture\":1}\n");
+            assert_private_scratch_removed(&result);
+        }
     }
 
     #[tokio::test]
     async fn remote_export_cleans_up_after_disconnect_during_stall() {
-        let export = remote_extract_script("/home/me/ws", 2);
-        for use_perl in [false, true] {
-            let mut script = String::new();
-            if use_perl {
-                // Exercise the macOS fallback even on a host with GNU timeout.
-                script.push_str(
-                    "command() { if [ \"$1\" = timeout ]; then return 1; fi; builtin command \"$@\"; }\n",
-                );
-            }
-            script.push_str(&export);
-            let fake_opencode = r#"
+        assert_remote_export_cleanup(&remote_extract_script("/home/me/ws", 2)).await;
+    }
+
+    #[tokio::test]
+    async fn perl_export_deadline_works_with_a_blocked_alarm_signal() {
+        let script = remote_extract_script("/home/me/ws", 2);
+        assert_remote_export_cleanup(&force_perl_with_blocked_alarm(&script)).await;
+    }
+
+    async fn assert_remote_export_cleanup(script: &str) {
+        let fake_opencode = r#"
 case "$1" in
     db) printf 'id\nses_fixture\n' ;;
     export)
         printf 'partial export\n'
         printf 'export started\n' >&2
-        sleep 30
+        sleep 60
         ;;
     *) return 3 ;;
 esac
 "#;
-            let mut child = transfer_fixture(&script, fake_opencode)
-                .stdin(Stdio::null())
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped())
-                .kill_on_drop(true)
-                .spawn()
-                .unwrap();
-            let mut diagnostics = BufReader::new(child.stderr.take().unwrap()).lines();
-            let directory = tokio::time::timeout(Duration::from_secs(5), async {
-                let directory = PathBuf::from(diagnostics.next_line().await.unwrap().unwrap());
-                assert!(diagnostics
-                    .next_line()
-                    .await
-                    .unwrap()
-                    .unwrap()
-                    .starts_with("drwx------"));
-                assert_eq!(
-                    diagnostics.next_line().await.unwrap().unwrap(),
-                    "export started"
-                );
-                directory
-            })
-            .await
-            .expect("export started before disconnect");
-            assert!(directory.join("session.json").is_file());
+        let mut child = transfer_fixture(script, fake_opencode)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        let mut diagnostics = BufReader::new(child.stderr.take().unwrap()).lines();
+        let directory = tokio::time::timeout(Duration::from_secs(10), async {
+            let directory = PathBuf::from(diagnostics.next_line().await.unwrap().unwrap());
+            assert!(diagnostics
+                .next_line()
+                .await
+                .unwrap()
+                .unwrap()
+                .starts_with("drwx------"));
+            assert_eq!(
+                diagnostics.next_line().await.unwrap().unwrap(),
+                "export started"
+            );
+            directory
+        })
+        .await
+        .expect("export started before disconnect");
+        assert!(directory.join("session.json").is_file());
 
-            // A disconnected SSH client can close the pipe without signaling
-            // the waiting shell. Leave stderr open to observe worker exit.
-            drop(child.stdout.take().unwrap());
-            tokio::time::timeout(Duration::from_secs(5), async {
-                assert!(!child.wait().await.unwrap().success());
-                while diagnostics.next_line().await.unwrap().is_some() {}
-            })
-            .await
-            .expect("the remote transfer and its children exited");
-            assert!(!directory.exists(), "scratch remains at {directory:?}");
-        }
+        // A disconnected SSH client can close the pipe without signaling
+        // the waiting shell. Leave stderr open to observe worker exit.
+        drop(child.stdout.take().unwrap());
+        tokio::time::timeout(Duration::from_secs(15), async {
+            let status = child.wait().await.unwrap();
+            assert_eq!(status.code(), Some(128 + libc::SIGKILL));
+            while diagnostics.next_line().await.unwrap().is_some() {}
+        })
+        .await
+        .expect("the remote transfer and its children exited");
+        assert!(!directory.exists(), "scratch remains at {directory:?}");
     }
 
     #[test]
