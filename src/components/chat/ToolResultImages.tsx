@@ -159,12 +159,16 @@ function ToolResultThumbnail({
 
   if (failed) {
     return (
-      <div
-        className="flex h-20 w-28 items-center justify-center rounded-lg border border-hairline bg-surface-1 text-muted-foreground"
-        aria-label="Image failed to load"
+      <button
+        ref={approvedButtonRef}
+        type="button"
+        onClick={() => setFailed(false)}
+        className="flex h-20 w-28 cursor-pointer flex-col items-center justify-center gap-1 rounded-lg border border-hairline bg-surface-1 text-label text-muted-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-focus-ring"
+        aria-label="Retry image"
       >
         <ImageOff className="size-5 opacity-40" aria-hidden />
-      </div>
+        Retry image
+      </button>
     );
   }
 

@@ -651,6 +651,21 @@ describe("ChatMarkdown local image links", () => {
     expect(link).not.toHaveAttribute("href");
     expect(link).toHaveAttribute("title", "/home/me/src/app.tsx");
   });
+
+  it("keeps an image label inert when its source-file destination cannot resolve", () => {
+    const { container } = render(
+      <ChatMarkdown>{"[![Badge](https://images.example.test/badge.png)](src/missing.ts)"}</ChatMarkdown>,
+    );
+
+    const links = container.querySelectorAll('a[data-streamdown="link"]');
+    expect(links).toHaveLength(1);
+    expect(links[0]).toHaveTextContent("Badge");
+    expect(links[0]).not.toHaveAttribute("href");
+    expect(links[0]).toHaveAttribute("data-inert-link");
+    expect(links[0]?.querySelector("a, button, img")).toBeNull();
+    fireEvent.click(links[0]!);
+    expect(screen.queryByRole("alertdialog")).toBeNull();
+  });
 });
 
 describe("ChatMarkdown source references", () => {

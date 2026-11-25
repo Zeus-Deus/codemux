@@ -506,6 +506,12 @@ describe("Tool result images", () => {
     await userEvent.keyboard("{Enter}");
     await userEvent.click(screen.getByRole("button", { name: "Load image" }));
     await waitFor(() => expect(screen.getByRole("button", { name: "Open image" })).toHaveFocus());
+
+    fireEvent.error(screen.getByRole("img"));
+    const retry = screen.getByRole("button", { name: "Retry image" });
+    expect(retry).toHaveFocus();
+    await userEvent.keyboard("{Enter}");
+    expect(screen.getByRole("button", { name: "Open image" })).toHaveFocus();
   });
 
   it("keeps confirmation actions outside the scrollable long image address", () => {

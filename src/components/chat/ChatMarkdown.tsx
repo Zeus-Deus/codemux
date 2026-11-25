@@ -194,7 +194,11 @@ function FileLinkElement({ sourceHref, ...props }: Record<string, unknown>) {
   // anchor back to `ChatMarkdownLink`, which renders every non-web
   // destination inert while still surfacing it on hover. A chip that cannot
   // resolve must not look clickable, but the reader still deserves the path.
-  if (!meta) return <ChatMarkdownLink {...props} href={href} />;
+  if (!meta) return (
+    <InsideMarkdownLink.Provider value={true}>
+      <ChatMarkdownLink {...props} href={href} />
+    </InsideMarkdownLink.Provider>
+  );
   return <MarkdownFileLink meta={meta}>{label}</MarkdownFileLink>;
 }
 
