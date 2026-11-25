@@ -31,6 +31,7 @@ import { isRemoteClient } from "@/components/remote/is-remote-client";
 import {
   detectRunCandidates,
   getProjectScripts,
+  getProjectScriptsForReview,
   getWorkspaceConfig,
   runProjectDevCommand,
   setProjectScripts,
@@ -338,13 +339,16 @@ function RunCommandForm({
     try {
       // Keep the project's other scripts; only the run command changes. A
       // failed read aborts the save rather than writing empty scripts.
-      const existing = await getProjectScripts(projectRoot);
+      const existing = await getProjectScriptsForReview(projectRoot);
+      if (!existing?.review_id || existing.review_root) {
+        throw new Error("Review saved project scripts in Settings before changing the Run command.");
+      }
       await setProjectScripts(projectRoot, {
         setup: existing?.setup ?? [],
         teardown: existing?.teardown ?? [],
         worktree_includes: existing?.worktree_includes ?? [],
         run: trimmed,
-      });
+      }, existing.review_id);
     } catch (e) {
       setError(String(e));
       setSaving(false);

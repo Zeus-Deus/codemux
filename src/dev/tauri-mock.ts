@@ -7752,7 +7752,10 @@ const handlers: Record<string, Handler> = {
     run: null,
     worktree_includes: [],
   },
-  get_project_scripts_for_review: (a) => handlers.get_project_scripts(a),
+  get_project_scripts_for_review: (a) => ({
+    ...(handlers.get_project_scripts(a) as ProjectScripts),
+    review_id: `fixture-project:${a.path}`,
+  }),
   // Kept in memory so the titlebar Run button flips from "Set Run" to
   // "Run" after a command is picked in its popover.
   set_project_scripts: (a) => {

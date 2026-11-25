@@ -1,5 +1,7 @@
 use crate::database::DatabaseStore;
-use cap_std::{ambient_authority, fs::Dir};
+#[cfg(unix)]
+use cap_std::ambient_authority;
+use cap_std::fs::Dir;
 use serde::{Deserialize, Serialize};
 use std::fs::File;
 use std::path::{Path, PathBuf};
@@ -97,6 +99,15 @@ pub(crate) struct LifecyclePaths {
     root_dir: File,
 }
 
+pub(crate) struct LifecycleIncludeDirectories {
+    pub(crate) source: Dir,
+    pub(crate) destination: Dir,
+    #[cfg(windows)]
+    _source_path_lock: WorkspacePathLock,
+    #[cfg(windows)]
+    _destination_path_lock: WorkspacePathLock,
+}
+
 impl LifecyclePaths {
     pub(crate) fn resolve(workspace_path: &Path) -> Result<Self, String> {
         let cwd = dunce::canonicalize(workspace_path)
@@ -136,22 +147,7 @@ impl LifecyclePaths {
 
     #[cfg(unix)]
     pub(crate) fn spawn(&self, cmd: &mut Command) -> std::io::Result<Child> {
-        use std::os::fd::AsRawFd;
-        use std::os::unix::process::CommandExt;
-
-        let cwd = self.cwd_dir.try_clone()?;
-        // SAFETY: The descriptor stays open through the callback. The child
-        // only calls async-signal-safe fchdir and reads errno on failure.
-        unsafe {
-            cmd.pre_exec(move || {
-                if libc::fchdir(cwd.as_raw_fd()) == 0 {
-                    Ok(())
-                } else {
-                    Err(std::io::Error::last_os_error())
-                }
-            });
-        }
-        cmd.spawn()
+        spawn_in_directory(cmd, self.cwd_dir.try_clone()?)
     }
 
     #[cfg(windows)]
@@ -165,7 +161,44 @@ impl LifecyclePaths {
     }
 
     pub(crate) fn permits_include_copy(&self) -> bool {
-        self.checkout == self.root || is_registered_checkout(&self.checkout, &self.root)
+        self.checkout != self.root && is_registered_checkout(&self.checkout, &self.root)
+    }
+
+    #[cfg(unix)]
+    pub(crate) fn include_directories(&self) -> std::io::Result<LifecycleIncludeDirectories> {
+        Ok(LifecycleIncludeDirectories {
+            source: Dir::from_std_file(self.root_dir.try_clone()?),
+            destination: Dir::from_std_file(self.cwd_dir.try_clone()?),
+        })
+    }
+
+    #[cfg(windows)]
+    pub(crate) fn include_directories(&self) -> std::io::Result<LifecycleIncludeDirectories> {
+        // Windows capability filesystem operations use paths internally.
+        // Keep the roots and their ancestors locked through the full copy.
+        let source_path_lock = lock_workspace_path(&self.root, &self.root_dir)?;
+        let destination_path_lock = lock_workspace_path(&self.cwd, &self.cwd_dir)?;
+        Ok(LifecycleIncludeDirectories {
+            source: Dir::from_std_file(source_path_lock.leaf.try_clone()?),
+            destination: Dir::from_std_file(destination_path_lock.leaf.try_clone()?),
+            _source_path_lock: source_path_lock,
+            _destination_path_lock: destination_path_lock,
+        })
+    }
+
+    pub(crate) fn spawn_in_include_source(
+        &self,
+        cmd: &mut Command,
+        directories: &LifecycleIncludeDirectories,
+    ) -> std::io::Result<Child> {
+        #[cfg(unix)]
+        return spawn_in_directory(cmd, directories.source.try_clone()?.into_std_file());
+
+        #[cfg(windows)]
+        {
+            let _ = directories;
+            cmd.current_dir(&self.root).spawn()
+        }
     }
 
     /// Repository configuration still supplies include patterns. Only
@@ -179,8 +212,58 @@ impl LifecyclePaths {
     }
 }
 
+#[cfg(unix)]
+fn spawn_in_directory(cmd: &mut Command, directory: File) -> std::io::Result<Child> {
+    use std::os::fd::AsRawFd;
+    use std::os::unix::process::CommandExt;
+
+    // SAFETY: The descriptor stays open through the callback. The child only
+    // calls async-signal-safe fchdir and reads errno on failure.
+    unsafe {
+        cmd.pre_exec(move || {
+            if libc::fchdir(directory.as_raw_fd()) == 0 {
+                Ok(())
+            } else {
+                Err(std::io::Error::last_os_error())
+            }
+        });
+    }
+    cmd.spawn()
+}
+
+#[cfg(unix)]
 fn open_directory(path: &Path) -> std::io::Result<File> {
     Dir::open_ambient_dir(path, ambient_authority()).map(Dir::into_std_file)
+}
+
+#[cfg(windows)]
+fn open_directory(path: &Path) -> std::io::Result<File> {
+    use windows_sys::Win32::Storage::FileSystem::{FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE};
+
+    // Lifecycle paths are captured before background setup starts. These
+    // handles track identity without blocking a concurrent workspace close.
+    open_windows_directory(path, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+}
+
+#[cfg(windows)]
+fn open_windows_directory(path: &Path, share_mode: u32) -> std::io::Result<File> {
+    use std::fs::OpenOptions;
+    use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
+        FILE_LIST_DIRECTORY, FILE_READ_ATTRIBUTES,
+    };
+
+    let handle = OpenOptions::new()
+        .access_mode(FILE_LIST_DIRECTORY | FILE_READ_ATTRIBUTES)
+        .share_mode(share_mode)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(path)?;
+    let metadata = handle.metadata()?;
+    if !metadata.is_dir() || metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+        return Err(std::io::Error::other("Expected a directory without a reparse point"));
+    }
+    Ok(handle)
 }
 
 fn directory_unchanged(path: &Path, held: &File) -> bool {
@@ -210,14 +293,15 @@ fn same_directory(left: &File, right: &File) -> std::io::Result<bool> {
 }
 
 #[cfg(windows)]
-fn lock_workspace_path(path: &Path, expected: &File) -> std::io::Result<Vec<File>> {
-    use std::fs::OpenOptions;
+struct WorkspacePathLock {
+    _ancestors: Vec<File>,
+    leaf: File,
+}
+
+#[cfg(windows)]
+fn lock_workspace_path(path: &Path, expected: &File) -> std::io::Result<WorkspacePathLock> {
     use std::io::{Error, ErrorKind};
-    use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
-    use windows_sys::Win32::Storage::FileSystem::{
-        FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS,
-        FILE_FLAG_OPEN_REPARSE_POINT, FILE_LIST_DIRECTORY, FILE_READ_ATTRIBUTES, FILE_SHARE_READ,
-    };
+    use windows_sys::Win32::Storage::FileSystem::FILE_SHARE_READ;
 
     // CreateProcess takes a pathname. Hold each component from the volume
     // root down, excluding writers and renames, until that call returns.
@@ -225,22 +309,13 @@ fn lock_workspace_path(path: &Path, expected: &File) -> std::io::Result<Vec<File
     let mut held = Vec::with_capacity(ancestors.len());
     let changed = || Error::other("Workspace directory changed before starting the command");
     while let Some(directory) = ancestors.pop() {
-        let handle = OpenOptions::new()
-            .access_mode(FILE_LIST_DIRECTORY | FILE_READ_ATTRIBUTES)
-            .share_mode(FILE_SHARE_READ)
-            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
-            .open(directory)?;
-        let metadata = handle.metadata()?;
-        if !metadata.is_dir() || metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
-            return Err(changed());
-        }
-        held.push(handle);
+        held.push(open_windows_directory(directory, FILE_SHARE_READ)?);
     }
-    let leaf = held.last().ok_or_else(|| Error::new(ErrorKind::InvalidInput, "Missing workspace directory"))?;
-    if !same_directory(leaf, expected)? {
+    let leaf = held.pop().ok_or_else(|| Error::new(ErrorKind::InvalidInput, "Missing workspace directory"))?;
+    if !same_directory(&leaf, expected)? {
         return Err(changed());
     }
-    Ok(held)
+    Ok(WorkspacePathLock { _ancestors: held, leaf })
 }
 
 fn resolve_project_paths(cwd: &Path) -> std::io::Result<(PathBuf, PathBuf)> {
@@ -563,8 +638,11 @@ mod tests {
             let verbatim = verbatim.to_str().unwrap();
             let legacy = serde_json::to_string(&scripts).unwrap();
             db.set_setting(&format!("project.scripts:{verbatim}"), &legacy).unwrap();
-            assert_eq!(db.get_project_scripts(&git_style), Some(scripts.clone()));
-            assert_eq!(read_saved_config(&nested, &db).unwrap().setup, scripts.setup);
+            assert!(db.get_project_scripts(&git_style).is_none());
+            assert!(read_saved_config(&nested, &db).is_none());
+            let (draft, _, needs_review) = db.project_scripts_for_settings(&git_style).unwrap();
+            assert_eq!(draft, scripts);
+            assert!(needs_review);
 
             let conflicting = serde_json::to_string(&crate::database::ProjectScripts::default()).unwrap();
             db.set_setting(&format!("project.scripts:{git_style}"), &conflicting).unwrap();

@@ -13,6 +13,7 @@ afterEach(() => { delete (window as { __CODEMUX_REMOTE__?: boolean }).__CODEMUX_
 
 vi.mock("@/tauri/commands", () => ({
   getProjectScripts: (...args: unknown[]) => mockGetProjectScripts(...args),
+  getProjectScriptsForReview: async (path: string) => ({ ...await mockGetProjectScripts(path), review_id: "fixture" }),
   getWorkspaceConfig: (...args: unknown[]) => mockGetWorkspaceConfig(...args),
   runProjectDevCommand: (...args: unknown[]) => mockRunProjectDevCommand(...args),
   setProjectScripts: (...args: unknown[]) => mockSetProjectScripts(...args),
@@ -285,7 +286,7 @@ describe("RunButton — panel variant", () => {
       teardown: [],
       worktree_includes: [".env"],
       run: "pnpm run dev",
-    });
+    }, "fixture");
     expect(mockRunProjectDevCommand).toHaveBeenCalledWith("ws-1");
     await waitFor(() => expect(screen.getByText("Run")).toBeInTheDocument());
     expect(screen.queryByLabelText("Run command")).toBeNull();
@@ -299,6 +300,7 @@ describe("RunButton — panel variant", () => {
     expect(mockSetProjectScripts).toHaveBeenCalledWith(
       "/home/user/myapp",
       expect.objectContaining({ run: "just serve" }),
+      "fixture",
     );
     expect(mockRunProjectDevCommand).toHaveBeenCalledWith("ws-1");
   });
@@ -390,6 +392,7 @@ describe("RunButton — panel variant", () => {
     expect(mockSetProjectScripts).toHaveBeenCalledWith(
       "/home/user/myapp",
       expect.objectContaining({ run: "cargo run" }),
+      "fixture",
     );
     await waitFor(() => expect(caret).toHaveFocus());
   });

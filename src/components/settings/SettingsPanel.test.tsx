@@ -1132,6 +1132,13 @@ describe("Settings → Projects", () => {
   });
 
   it("saves on blur only when something changed, then says so", async () => {
+    vi.mocked(commands.getProjectScriptsForReview).mockResolvedValueOnce({
+      setup: [],
+      teardown: [],
+      run: null,
+      worktree_includes: [],
+      review_id: "fixture-selected-project",
+    });
     render(<SettingsView />);
     await waitFor(() => expect(commands.getProjectScriptsForReview).toHaveBeenCalled());
     const setup = screen.getByPlaceholderText("e.g. npm install");
@@ -1146,7 +1153,7 @@ describe("Settings → Projects", () => {
       teardown: [],
       run: null,
       worktree_includes: [],
-    });
+    }, "fixture-selected-project");
     // Every field carries a hidden note; only the one just saved shows.
     const visibleNotes = () =>
       screen.getAllByText("Saved").filter((el) => !el.closest("[aria-hidden='true']"));
@@ -1179,7 +1186,7 @@ describe("Settings → Projects", () => {
       teardown: ["npm run cleanup"],
       run: "npm run dev",
       worktree_includes: [],
-    }, "fixture-review");
+    }, "fixture-review", true);
     await waitFor(() => expect(save).not.toBeInTheDocument());
   });
 

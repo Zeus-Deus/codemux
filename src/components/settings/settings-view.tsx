@@ -1787,7 +1787,12 @@ export function SettingsView() {
 
   // What the backend last confirmed for `scriptsRoot`, so a blur with no
   // edits does not write, and a failed save stays dirty for the next blur.
-  const savedScripts = useRef<{ root: string; generation: number; snapshot: string } | null>(null);
+  const savedScripts = useRef<{
+    root: string;
+    generation: number;
+    snapshot: string;
+    reviewId?: string;
+  } | null>(null);
   const scriptsGeneration = useRef(0);
   const scriptSaveGeneration = useRef(0);
   const currentScriptsRoot = useRef(scriptsRoot);
@@ -1828,16 +1833,16 @@ export function SettingsView() {
     const readScripts = isRemoteClient() ? getProjectScripts : getProjectScriptsForReview;
     readScripts(scriptsRoot).then((scripts) => {
       if (stale) return;
+      const reviewId = scripts && "review_id" in scripts ? scripts.review_id : undefined;
       if (scripts && "review_root" in scripts && scripts.review_root !== undefined) {
         if (
           typeof scripts.review_root !== "string" ||
-          !("review_id" in scripts) ||
-          typeof scripts.review_id !== "string"
+          typeof reviewId !== "string"
         ) {
           setScriptsLoadError("Could not verify the project for script review.");
           return;
         }
-        setScriptReview({ root: scripts.review_root, id: scripts.review_id });
+        setScriptReview({ root: scripts.review_root, id: reviewId });
       }
       const setup = scripts?.setup.join("\n") ?? "";
       const teardown = scripts?.teardown.join("\n") ?? "";
@@ -1851,6 +1856,7 @@ export function SettingsView() {
         root: scriptsRoot,
         generation,
         snapshot: JSON.stringify(projectScriptsFrom(setup, teardown, run, includes)),
+        reviewId: typeof reviewId === "string" ? reviewId : undefined,
       };
       setLoadedScriptsRoot(scriptsRoot);
     }).catch((error) => {
@@ -1889,12 +1895,14 @@ export function SettingsView() {
     const stillCurrent = () => currentScriptsRoot.current === root &&
       scriptsGeneration.current === generation && scriptSaveGeneration.current === saveGeneration;
     const saved = scriptReview
-      ? setProjectScripts(scriptReview.root, scripts, scriptReview.id)
-      : setProjectScripts(root, scripts);
+      ? setProjectScripts(scriptReview.root, scripts, scriptReview.id, true)
+      : owner.reviewId
+        ? setProjectScripts(root, scripts, owner.reviewId)
+        : setProjectScripts(root, scripts);
     saved
       .then(() => {
         if (!stillCurrent()) return;
-        savedScripts.current = { root, generation, snapshot };
+        savedScripts.current = { ...owner, snapshot };
         setScriptReview(null);
         setSavedField(field);
         setSavedVisible(true);
@@ -2862,8 +2870,8 @@ export function SettingsView() {
             {scriptsReady && scriptReview && (
               <SettingsCard className="mb-6 space-y-3">
                 <p className="text-body-sm text-muted-foreground">
-                  These scripts were saved under an earlier path. Review them below before
-                  saving them for this project.
+                  Review these saved scripts for this directory before enabling automatic setup
+                  and teardown.
                   <code className="mt-1 block break-all font-mono">{scriptReview.root}</code>
                 </p>
                 <Button

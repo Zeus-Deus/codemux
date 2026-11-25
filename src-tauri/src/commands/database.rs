@@ -1,7 +1,8 @@
-use crate::database::{DatabaseStore, ProjectScripts, RecentProject, REVIEWED_PROJECT_CHANGED};
-#[cfg(unix)]
-use crate::database::ReviewedProjectRoot;
+use crate::database::{
+    DatabaseStore, ProjectScripts, RecentProject, ReviewedProjectRoot, REVIEWED_PROJECT_CHANGED,
+};
 use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use tauri::State;
 
 #[tauri::command]
@@ -65,47 +66,38 @@ pub struct ProjectScriptsReview {
     #[serde(flatten)]
     scripts: ProjectScripts,
     #[serde(skip_serializing_if = "Option::is_none")]
-    review_root: Option<std::path::PathBuf>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    review_id: Option<String>,
+    review_root: Option<PathBuf>,
+    review_id: String,
+}
+
+struct SelectedProject {
+    id: String,
+    selection: String,
+    root: ReviewedProjectRoot,
+    needs_review: bool,
 }
 
 #[derive(Default)]
 pub struct ProjectScriptsReviews {
     // Settings displays one selected project at a time. A new read replaces
     // the previous review and releases its directory handle.
-    #[cfg(unix)]
-    pending: std::sync::Mutex<Option<(String, ReviewedProjectRoot)>>,
+    pending: std::sync::Mutex<Option<SelectedProject>>,
 }
 
 impl ProjectScriptsReviews {
-    fn read(&self, db: &DatabaseStore, path: &str) -> Option<ProjectScriptsReview> {
-        #[cfg(unix)]
-        let mut pending = {
-            let mut pending = self.pending.lock().ok()?;
-            *pending = None;
-            pending
-        };
-
-        if let Some(scripts) = db.get_project_scripts(path) {
-            return Some(ProjectScriptsReview {
-                scripts,
-                review_root: None,
-                review_id: None,
-            });
-        }
-        #[cfg(unix)]
-        if let Some((scripts, root)) = db.legacy_project_scripts_for_review(path) {
-            let id = uuid::Uuid::new_v4().to_string();
-            let review_root = root.path().to_path_buf();
-            *pending = Some((id.clone(), root));
-            return Some(ProjectScriptsReview {
-                scripts,
-                review_root: Some(review_root),
-                review_id: Some(id),
-            });
-        }
-        None
+    fn read(&self, db: &DatabaseStore, path: &str) -> Result<ProjectScriptsReview, String> {
+        let mut pending = self.pending.lock().map_err(|_| REVIEWED_PROJECT_CHANGED)?;
+        *pending = None;
+        let (scripts, root, needs_review) = db.project_scripts_for_settings(path)?;
+        let id = uuid::Uuid::new_v4().to_string();
+        let review_root = needs_review.then(|| root.path().to_path_buf());
+        *pending = Some(SelectedProject {
+            id: id.clone(),
+            selection: path.to_string(),
+            root,
+            needs_review,
+        });
+        Ok(ProjectScriptsReview { scripts, review_root, review_id: id })
     }
 
     fn save(
@@ -114,23 +106,25 @@ impl ProjectScriptsReviews {
         path: &str,
         review_id: &str,
         scripts: &ProjectScripts,
+        reviewed: bool,
     ) -> Result<(), String> {
-        #[cfg(unix)]
-        {
-            let mut pending = self.pending.lock().map_err(|_| REVIEWED_PROJECT_CHANGED)?;
-            if !pending.as_ref().is_some_and(|(id, root)| {
-                id == review_id && root.path().to_str() == Some(path)
-            }) {
-                return Err(REVIEWED_PROJECT_CHANGED.into());
-            }
-            let (_, root) = pending.take().ok_or(REVIEWED_PROJECT_CHANGED)?;
-            db.save_reviewed_project_scripts(&root, scripts)
+        let mut pending = self.pending.lock().map_err(|_| REVIEWED_PROJECT_CHANGED)?;
+        let selected = pending.as_mut().ok_or(REVIEWED_PROJECT_CHANGED)?;
+        let expected_path = if reviewed {
+            selected.root.path().to_str().ok_or(REVIEWED_PROJECT_CHANGED)?
+        } else {
+            &selected.selection
+        };
+        if selected.id != review_id || selected.needs_review != reviewed || path != expected_path {
+            return Err(REVIEWED_PROJECT_CHANGED.into());
         }
-        #[cfg(not(unix))]
-        {
-            let _ = (db, path, review_id, scripts);
-            Err(REVIEWED_PROJECT_CHANGED.into())
+        if !selected.root.matches_path(Path::new(&selected.selection)) {
+            *pending = None;
+            return Err(REVIEWED_PROJECT_CHANGED.into());
         }
+        db.save_reviewed_project_scripts(&selected.root, scripts, reviewed)?;
+        selected.needs_review = false;
+        Ok(())
     }
 }
 
@@ -139,7 +133,7 @@ pub fn get_project_scripts_for_review(
     db: State<'_, DatabaseStore>,
     reviews: State<'_, ProjectScriptsReviews>,
     path: String,
-) -> Option<ProjectScriptsReview> {
+) -> Result<ProjectScriptsReview, String> {
     reviews.read(&db, &path)
 }
 
@@ -152,22 +146,24 @@ pub fn set_project_scripts(
     reviewed: Option<bool>,
     review_id: Option<String>,
 ) -> Result<(), String> {
-    // A client using the old review flag must obtain a fresh review ID.
-    if reviewed == Some(true) || review_id.is_some() {
-        let review_id = review_id.as_deref().ok_or(REVIEWED_PROJECT_CHANGED)?;
-        reviews.save(&db, &path, review_id, &scripts)
+    if let Some(review_id) = review_id.as_deref() {
+        reviews.save(&db, &path, review_id, &scripts, reviewed.unwrap_or_default())
+    } else if reviewed == Some(true) {
+        Err(REVIEWED_PROJECT_CHANGED.into())
     } else {
+        // Onboarding saves explicitly without opening the Settings form.
         db.set_project_scripts(&path, &scripts)
     }
 }
 
-#[cfg(all(test, unix))]
+#[cfg(test)]
 mod tests {
     use super::*;
     use std::fs;
     use std::path::Path;
 
-    fn legacy_review_fixture() -> (tempfile::TempDir, std::path::PathBuf, DatabaseStore, ProjectScripts) {
+    #[cfg(unix)]
+    fn legacy_review_fixture() -> (tempfile::TempDir, PathBuf, DatabaseStore, ProjectScripts) {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().join("project");
         let alias = dir.path().join("old-project");
@@ -189,12 +185,14 @@ mod tests {
         (dir, root, db, scripts)
     }
 
+    #[cfg(unix)]
     fn review(reviews: &ProjectScriptsReviews, db: &DatabaseStore, root: &Path) -> String {
         let preview = reviews.read(db, root.to_str().unwrap()).unwrap();
         assert_eq!(preview.review_root.as_deref(), Some(root));
-        preview.review_id.unwrap()
+        preview.review_id
     }
 
+    #[cfg(unix)]
     #[test]
     fn legacy_project_script_approval_is_one_shot_and_bound_to_the_reviewed_directory() {
         let (dir, root, db, scripts) = legacy_review_fixture();
@@ -204,12 +202,12 @@ mod tests {
         assert!(db.get_project_scripts(path).is_none());
         let stale_id = review(&reviews, &db, &root);
         let id = review(&reviews, &db, &root);
-        assert!(reviews.save(&db, path, &stale_id, &scripts).is_err());
+        assert!(reviews.save(&db, path, &stale_id, &scripts, true).is_err());
         let mut edited = scripts.clone();
         edited.setup = vec!["reviewed setup".into()];
-        reviews.save(&db, path, &id, &edited).unwrap();
+        reviews.save(&db, path, &id, &edited, true).unwrap();
         assert_eq!(db.get_project_scripts(path), Some(edited.clone()));
-        assert!(reviews.save(&db, path, &id, &scripts).is_err());
+        assert!(reviews.save(&db, path, &id, &scripts, true).is_err());
 
         edited.run = Some("edited run".into());
         db.set_project_scripts(path, &edited).unwrap();
@@ -223,11 +221,11 @@ mod tests {
         assert_eq!(db.set_project_scripts(path, &scripts).unwrap_err(), REVIEWED_PROJECT_CHANGED);
         let preview = reviews.read(&db, path).unwrap();
         assert_eq!(preview.scripts, edited);
-        let id = preview.review_id.unwrap();
-        reviews.save(&db, path, &id, &edited).unwrap();
+        reviews.save(&db, path, &preview.review_id, &edited, true).unwrap();
         assert_eq!(db.get_project_scripts(path), Some(edited));
     }
 
+    #[cfg(unix)]
     #[test]
     fn legacy_project_script_save_refuses_replacement_at_same_path_or_a_symlink() {
         let (dir, root, db, scripts) = legacy_review_fixture();
@@ -238,14 +236,75 @@ mod tests {
         fs::rename(&root, &old).unwrap();
         fs::create_dir(&root).unwrap();
         assert_eq!(dunce::canonicalize(&root).unwrap(), root);
-        assert_eq!(reviews.save(&db, path, &id, &scripts).unwrap_err(), REVIEWED_PROJECT_CHANGED);
+        assert_eq!(reviews.save(&db, path, &id, &scripts, true).unwrap_err(), REVIEWED_PROJECT_CHANGED);
         assert!(db.get_project_scripts(path).is_none());
 
         let fresh = review(&reviews, &db, &root);
         fs::remove_dir(&root).unwrap();
         std::os::unix::fs::symlink(&old, &root).unwrap();
-        assert_eq!(reviews.save(&db, path, &fresh, &scripts).unwrap_err(), REVIEWED_PROJECT_CHANGED);
+        assert_eq!(reviews.save(&db, path, &fresh, &scripts, true).unwrap_err(), REVIEWED_PROJECT_CHANGED);
         assert!(db.get_project_scripts(old.to_str().unwrap()).is_none());
         assert!(db.get_setting(&format!("project.scripts:{path}")).is_none());
+    }
+
+    #[test]
+    fn ordinary_settings_save_binds_the_first_selection() {
+        let fixture = tempfile::tempdir().unwrap();
+        let root = fixture.path().join("project");
+        fs::create_dir(&root).unwrap();
+        let root = dunce::canonicalize(root).unwrap();
+        let path = root.to_str().unwrap();
+        let db = crate::database::init_test_database();
+        let reviews = ProjectScriptsReviews::default();
+        let scripts = ProjectScripts {
+            setup: vec!["setup fixture".into()],
+            teardown: vec!["teardown fixture".into()],
+            ..Default::default()
+        };
+
+        let empty = reviews.read(&db, path).unwrap();
+        assert!(empty.review_root.is_none());
+        fs::rename(&root, fixture.path().join("before-save")).unwrap();
+        fs::create_dir(&root).unwrap();
+        assert_eq!(
+            reviews.save(&db, path, &empty.review_id, &scripts, false).unwrap_err(),
+            REVIEWED_PROJECT_CHANGED,
+        );
+        assert!(db.get_project_scripts(path).is_none());
+
+        let selected = reviews.read(&db, path).unwrap();
+        reviews.save(&db, path, &selected.review_id, &scripts, false).unwrap();
+        assert_eq!(db.get_project_scripts(path), Some(scripts.clone()));
+        fs::rename(&root, fixture.path().join("after-save")).unwrap();
+        fs::create_dir(&root).unwrap();
+        assert!(db.get_project_scripts(path).is_none());
+        let draft = reviews.read(&db, path).unwrap();
+        assert_eq!(draft.review_root.as_deref(), Some(root.as_path()));
+        assert_eq!(draft.scripts, scripts);
+    }
+
+    #[test]
+    fn saved_scripts_without_identity_require_explicit_local_review() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dunce::canonicalize(dir.path()).unwrap();
+        let path = root.to_str().unwrap();
+        let db = crate::database::init_test_database();
+        let scripts = ProjectScripts {
+            setup: vec!["setup fixture".into()],
+            ..Default::default()
+        };
+        db.set_setting(
+            &format!("project.scripts:{path}"),
+            &serde_json::to_string(&scripts).unwrap(),
+        )
+        .unwrap();
+        assert!(db.get_project_scripts(path).is_none());
+        let reviews = ProjectScriptsReviews::default();
+        let preview = reviews.read(&db, path).unwrap();
+        assert_eq!(preview.review_root.as_deref(), Some(root.as_path()));
+        assert_eq!(preview.scripts, scripts);
+        assert!(reviews.save(&db, path, &preview.review_id, &scripts, false).is_err());
+        reviews.save(&db, path, &preview.review_id, &scripts, true).unwrap();
+        assert_eq!(db.get_project_scripts(path), Some(scripts));
     }
 }
