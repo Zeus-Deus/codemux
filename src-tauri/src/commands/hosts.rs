@@ -1145,12 +1145,25 @@ pub async fn workspace_pull_back_impl<R: tauri::Runtime>(
         // De-dup while preserving order (uid-keyed == basename when no uid).
         candidate_sources.dedup();
 
-        // Same as push: stop the workspace's chat sessions before copying
-        // it back, so none keeps editing the host copy, and hold new ones
-        // off until host_id is cleared, so the next send starts each one on
-        // this computer once this succeeds. Every outcome releases the gate.
-        let migration =
-            crate::commands::agent_chat::begin_workspace_migration(&app, &workspace_id).await;
+        // Validate the sources under the migration gate before stopping
+        // chats. A registered path that rsync cannot transfer must leave
+        // the existing conversation running on the host.
+        let migration = match crate::commands::agent_chat::begin_workspace_migration_checked(
+            &app,
+            &workspace_id,
+            || validate_pull_sources(&mut candidate_sources),
+        )
+        .await
+        {
+            Ok(migration) => migration,
+            Err(reason) => {
+                return Ok(WorkspacePullOutcome {
+                    ok: false,
+                    message: format!("rsync failed: {reason}"),
+                    rsync_summary: None,
+                });
+            }
+        };
 
         // Try each candidate; only a "remote path missing" outcome is
         // worth retrying the next one — success / rsync error / host
@@ -1363,6 +1376,18 @@ pub async fn workspace_pull_back_impl<R: tauri::Runtime>(
             rsync_summary: None,
         })
     }
+}
+
+#[cfg(unix)]
+fn validate_pull_sources(sources: &mut Vec<String>) -> Result<(), String> {
+    let first = sources.first().expect("at least one pull source candidate");
+    if !crate::ssh::push::is_transfer_safe_remote_path(first) {
+        return Err(crate::ssh::push::unsafe_remote_path_reason(first));
+    }
+    // Invalid fallbacks cannot be transferred. Keep a valid authoritative
+    // source usable even when a legacy fallback contains unsupported text.
+    sources.retain(|source| crate::ssh::push::is_transfer_safe_remote_path(source));
+    Ok(())
 }
 
 #[derive(Debug, Serialize)]
@@ -1871,6 +1896,20 @@ fn terminate_workspace_sessions<R: tauri::Runtime>(
 #[cfg(test)]
 mod tests {
     use super::{interpret_github_probe, validate_host_fields};
+
+    #[cfg(unix)]
+    #[test]
+    fn pull_source_validation_rejects_unsupported_registry_path() {
+        let mut sources = vec![
+            "/srv/project with space".to_string(),
+            "~/.codemux/worktrees/proj/main".to_string(),
+        ];
+        let error = super::validate_pull_sources(&mut sources).unwrap_err();
+        assert!(error.contains("/srv/project with space"), "{error}");
+        let mut with_bad_fallback = vec!["/srv/project".into(), "/srv/old project".into()];
+        assert!(super::validate_pull_sources(&mut with_bad_fallback).is_ok());
+        assert_eq!(with_bad_fallback, vec!["/srv/project"]);
+    }
 
     #[test]
     fn host_fields_are_trimmed_and_checked() {

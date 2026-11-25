@@ -195,18 +195,23 @@ pub fn build_pull_rsync_argv(opts: &PullOptions<'_>) -> Vec<String> {
 /// bare `~`) stays allowed for the remote home. Codemux's own remote paths
 /// (`~/.codemux/worktrees/<project>/<branch>`) never need anything else.
 pub(crate) fn is_transfer_safe_remote_path(path: &str) -> bool {
+    // rsync interprets `host::module` differently from `host:/directory`.
+    // Require a directory operand as well as shell-safe characters so the
+    // transfer names the same path as the SSH preflight.
+    if !path.starts_with('/') && !path.starts_with("~/") && path != "~" {
+        return false;
+    }
     let body = path
         .strip_prefix("~/")
         .or_else(|| (path == "~").then_some(""))
         .unwrap_or(path);
-    !path.is_empty()
-        && body.chars().all(|c| {
+    body.chars().all(|c| {
             c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '/' | '@' | '+' | ',' | ':' | '=' | '%' | '-')
         })
 }
 
-fn unsafe_remote_path_reason(path: &str) -> String {
-    format!("refusing remote path {path:?}: it holds characters the remote shell would interpret")
+pub(crate) fn unsafe_remote_path_reason(path: &str) -> String {
+    format!("refusing remote path {path:?}: expected an absolute or ~/ path with no shell syntax or whitespace")
 }
 
 /// Push the worktree to the remote host.
@@ -835,7 +840,7 @@ mod tests {
         for ok in ["~/.codemux/worktrees/proj/branch", "/srv/code/my-proj", "~", "/home/u/a@b+c,d=e%f:g"] {
             assert!(is_transfer_safe_remote_path(ok), "{ok}");
         }
-        for bad in ["", "~$(id)/x", "/srv/`id`", "/srv/a;id", "/srv/a|b", "/srv/a&b", "~alice/x", "/srv/a\nb", "/srv/'x'", "/srv/*", "/srv/a$b", "/srv/my proj", "/srv/a\tb"] {
+        for bad in ["", ":module", "::module", "relative/path", "./relative", "~$(id)/x", "/srv/`id`", "/srv/a;id", "/srv/a|b", "/srv/a&b", "~alice/x", "/srv/a\nb", "/srv/'x'", "/srv/*", "/srv/a$b", "/srv/my proj", "/srv/a\tb"] {
             assert!(!is_transfer_safe_remote_path(bad), "{bad}");
         }
     }
@@ -843,9 +848,9 @@ mod tests {
     #[tokio::test]
     async fn push_and_pull_refuse_unsafe_paths_before_any_ssh() {
         let dir = tempfile::tempdir().unwrap();
-        let push = push_workspace(PushOptions::new("unused-host", dir.path(), "~/x;touch /tmp/pwned")).await;
+        let push = push_workspace(PushOptions::new("unused-host", dir.path(), ":module")).await;
         assert!(matches!(push, PushResult::RsyncFailed { ref reason } if reason.contains("refusing remote path")), "{push:?}");
-        let pull = pull_workspace_back(PullOptions::new("unused-host", "~/x$(id)", dir.path())).await;
+        let pull = pull_workspace_back(PullOptions::new("unused-host", "relative/path", dir.path())).await;
         assert!(matches!(pull, PullResult::RsyncFailed { ref reason } if reason.contains("refusing remote path")), "{pull:?}");
     }
 
