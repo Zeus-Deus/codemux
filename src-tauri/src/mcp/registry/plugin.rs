@@ -298,6 +298,7 @@ impl PluginMcpServer {
             transport,
             raw,
             project_root: None,
+            checkout_root: None,
         })
     }
 }
@@ -521,7 +522,7 @@ impl McpRegistry {
             .find(|t| t.name == name)
             .ok_or("Unknown plugin tool")?;
         // The owner's UI may inspect its scoped server without a chat workspace.
-        self.dispatch_tool_call_inner(&tool.prefixed_name, arguments, None, Some(id))
+        self.dispatch_tool_call_inner(&tool.prefixed_name, arguments, None, None, Some(id))
             .await
     }
 }
@@ -665,7 +666,7 @@ impl McpRegistry {
         })
     }
     pub async fn plugin_catalog(&self, workspace: Option<&str>) -> Vec<McpTool> {
-        self.list_tools_for_workspace(&[], workspace)
+        self.list_tools_for_workspace(&[], workspace, None)
             .await
             .into_iter()
             .filter(|tool| tool.server_id.starts_with("plugin:"))
@@ -680,7 +681,7 @@ impl McpRegistry {
     ) -> Option<Result<Value, String>> {
         match name {
             LIST_PLUGIN_TOOLS => {
-                let tools: Vec<_> = self.list_tools_for_workspace(&[], workspace).await.into_iter().filter(|t| t.server_id.starts_with("plugin:")).map(|t| json!({"name":t.prefixed_name,"description":t.description,"inputSchema":t.input_schema,"directlyCallable":direct.contains(&t.prefixed_name)})).collect();
+                let tools: Vec<_> = self.list_tools_for_workspace(&[], workspace, None).await.into_iter().filter(|t| t.server_id.starts_with("plugin:")).map(|t| json!({"name":t.prefixed_name,"description":t.description,"inputSchema":t.input_schema,"directlyCallable":direct.contains(&t.prefixed_name)})).collect();
                 let data = json!({"tools":tools});
                 Some(Ok(
                     json!({"content":[{"type":"text","text":data.to_string()}],"structuredContent":data}),
@@ -691,7 +692,7 @@ impl McpRegistry {
                     return Some(Err("A plugin tool name is required".into()));
                 };
                 if !self
-                    .list_tools_for_workspace(&[], workspace)
+                    .list_tools_for_workspace(&[], workspace, None)
                     .await
                     .iter()
                     .any(|t| t.server_id.starts_with("plugin:") && t.prefixed_name == name)
@@ -1000,13 +1001,13 @@ mod tests {
         assert!(events.try_recv().is_ok());
         assert_eq!(
             registry
-                .list_tools_for_workspace(&[], Some("a"))
+                .list_tools_for_workspace(&[], Some("a"), None)
                 .await
                 .len(),
             4
         );
         assert!(registry
-            .list_tools_for_workspace(&[], Some("b"))
+            .list_tools_for_workspace(&[], Some("b"), None)
             .await
             .is_empty());
         assert!(registry
@@ -1198,7 +1199,7 @@ mod tests {
             .is_ok());
         for workspace in [None, Some("a")] {
             assert!(registry
-                .list_tools_for_workspace(&[], workspace)
+                .list_tools_for_workspace(&[], workspace, None)
                 .await
                 .is_empty());
             assert!(registry

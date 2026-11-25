@@ -179,8 +179,8 @@ pub async fn restart_mcp_server_cmd<R: Runtime>(
     registry.restart_server(Some(&app), &id).await
 }
 
-/// Aggregate every running server's tools. Used to register tools
-/// with agent providers and exposed for debugging via DevTools.
+/// List global running server tools for debugging via DevTools. Provider
+/// sessions use their project-scoped registry view instead.
 #[tauri::command]
 pub async fn list_mcp_tools(registry: State<'_, McpRegistry>) -> Result<Vec<McpTool>, String> {
     Ok(registry.list_all_tools().await)

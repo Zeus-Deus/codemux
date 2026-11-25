@@ -2485,7 +2485,8 @@ async fn attach_chat_mcp(
         None,
         crate::mcp::gateway::OPENCODE_NATIVE_SOURCES.to_vec(),
         false,
-    );
+    )
+    .for_project(directory);
     let connection = chat
         .connection()
         .await

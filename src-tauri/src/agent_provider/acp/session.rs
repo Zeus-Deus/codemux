@@ -144,6 +144,7 @@ fn chat_mcp(
     dialect: AcpDialect,
     registry: Option<&crate::mcp::registry::McpRegistry>,
     remote: Option<&crate::agent_provider::types::RemoteSpawnTarget>,
+    cwd: Option<&std::path::Path>,
     thread_id: &str,
     workspace_id: Option<String>,
     permission_mode: Option<String>,
@@ -160,6 +161,7 @@ fn chat_mcp(
             dialect.native_mcp_sources().to_vec(),
             dialect.is_grok(),
         )
+        .for_project(cwd)
     })
 }
 
@@ -483,6 +485,7 @@ impl AcpSession {
             dialect,
             spawn.mcp_registry.as_ref(),
             remote.as_ref(),
+            Some(&cwd),
             &thread_id.0,
             spawn.workspace_id.clone(),
             permission_mode.clone(),
@@ -5664,8 +5667,8 @@ mod mcp_delivery_tests {
             host_name: "box".into(),
         };
         for dialect in [AcpDialect::Cursor, AcpDialect::Grok] {
-            assert!(chat_mcp(dialect, Some(&registry), Some(&device), "t", None, None).is_none());
-            let local = chat_mcp(dialect, Some(&registry), None, "t", None, None).unwrap();
+            assert!(chat_mcp(dialect, Some(&registry), Some(&device), None, "t", None, None).is_none());
+            let local = chat_mcp(dialect, Some(&registry), None, None, "t", None, None).unwrap();
             let servers = local.servers(super::super::mcp::Transport::Http).await;
             assert_eq!(servers.as_array().map(Vec::len), Some(1), "{dialect:?}: {servers}");
             assert_eq!(servers[0]["type"], "http");

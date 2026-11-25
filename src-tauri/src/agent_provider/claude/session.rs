@@ -292,6 +292,7 @@ pub(crate) struct ClaudeSession {
     /// session on a device. Used by `handle_mcp_tool_call` to route
     /// `mcp-tool-call` requests from the sidecar to the right MCP child.
     mcp_registry: Option<crate::mcp::registry::McpRegistry>,
+    mcp_project_scope: Option<crate::mcp::McpProjectScope>,
     /// Owning workspace of the chat pane this session runs in, from
     /// `StartSessionInput.workspace_id`. Attached per-call to MCP
     /// dispatches so workspace-scoped built-in tools bind to THIS
@@ -481,6 +482,9 @@ impl ClaudeSession {
             spawn.mcp_registry.as_ref(),
             input.remote.as_ref(),
         );
+        let mcp_project_scope = mcp_registry
+            .as_ref()
+            .map(|_| crate::mcp::McpProjectScope::new(&input.cwd));
 
         // Build `start-session` params from the trait-level input.
         //
@@ -576,6 +580,7 @@ impl ClaudeSession {
                             workspace_id: input.workspace_id.clone(),
                             permission_mode: input.permission_mode.clone(),
                         },
+                        mcp_project_scope.as_ref(),
                     )
                     .await
                 }
@@ -672,6 +677,7 @@ impl ClaudeSession {
             } else {
                 mcp_registry
             },
+            mcp_project_scope,
             workspace_id: input.workspace_id.clone(),
             native_authority: crate::delegation::authority::NativeAuthority::with_policy(&thread_id.0,crate::agent_provider::ProviderKind::Claude,input.permission_mode.as_deref()),
             managed_diagnostics: input
@@ -2272,7 +2278,7 @@ async fn push_mcp_refresh(
     registry: &crate::mcp::registry::McpRegistry,
 ) {
     let caller = session.host_caller().await;
-    let tools = collect_shared_tools_for_claude(registry, &caller).await;
+    let tools = collect_shared_tools_for_claude(registry, &caller, session.mcp_project_scope.as_ref()).await;
     let entries: Vec<super::protocol::McpToolEntry> = tools
         .into_iter()
         .map(|t| super::protocol::McpToolEntry {
@@ -2338,11 +2344,12 @@ fn system_prompt_append(tools: &[super::protocol::McpToolEntry]) -> Option<Strin
 async fn collect_mcp_tools(
     registry: Option<&crate::mcp::registry::McpRegistry>,
     caller: &crate::mcp::registry::HostCaller,
+    project: Option<&crate::mcp::McpProjectScope>,
 ) -> Vec<super::protocol::McpToolEntry> {
     let Some(registry) = registry else {
         return Vec::new();
     };
-    let tools = collect_shared_tools_for_claude(registry, caller).await;
+    let tools = collect_shared_tools_for_claude(registry, caller, project).await;
     tools
         .into_iter()
         .map(|t| super::protocol::McpToolEntry {
@@ -2361,6 +2368,7 @@ async fn collect_mcp_tools(
 async fn collect_shared_tools_for_claude(
     registry: &crate::mcp::registry::McpRegistry,
     caller: &crate::mcp::registry::HostCaller,
+    project: Option<&crate::mcp::McpProjectScope>,
 ) -> Vec<crate::mcp::runtime::McpTool> {
     let mut tools = registry
         .list_tools_for_workspace(
@@ -2370,6 +2378,7 @@ async fn collect_shared_tools_for_claude(
                 crate::mcp::McpConfigSource::ClaudeProject,
             ],
             caller.workspace_id.as_deref(),
+            project,
         )
         .await;
     tools.retain(|tool| crate::mcp::registry::native_tool_visible(tool, caller));
@@ -2431,6 +2440,7 @@ async fn handle_mcp_tool_call(
         session.mcp_registry.as_ref(),
         &caller,
         session.workspace_id.as_deref(),
+        session.mcp_project_scope.as_ref(),
         &prefixed_name,
         arguments,
         Some(actor),
@@ -2468,6 +2478,7 @@ async fn run_mcp_tool_call(
     registry: Option<&crate::mcp::registry::McpRegistry>,
     caller: &crate::mcp::registry::HostCaller,
     workspace_id: Option<&str>,
+    project: Option<&crate::mcp::McpProjectScope>,
     prefixed_name: &str,
     arguments: Value,
     actor: Option<crate::delegation::app::NativeActor>,
@@ -2501,8 +2512,8 @@ async fn run_mcp_tool_call(
     }
 
     let dispatched = match actor {
-        Some(actor) => registry.dispatch_native_tool_call(prefixed_name, arguments, actor).await,
-        None => registry.dispatch_tool_call(prefixed_name, arguments, workspace_id).await,
+        Some(actor) => registry.dispatch_native_tool_call_scoped(prefixed_name, arguments, actor, project).await,
+        None => registry.dispatch_tool_call_scoped(prefixed_name, arguments, workspace_id, project).await,
     };
     match dispatched {
         // The MCP child returns the full `tools/call` result — including
@@ -2744,7 +2755,7 @@ mod tests {
                 let actor = crate::delegation::app::NativeActor {thread_id:thread.0.clone(),provider:crate::agent_provider::ProviderKind::Claude,workspace_id:Some("ws-42".into()),session_id:"session".into(),permission_mode:Some(mode.into()),permit:new};
                 let caller = session.host_caller().await;
                 let callback_permit = actor.permit.clone();
-                let job = tokio::spawn(async move { run_mcp_tool_call(Some(&registry), &caller, Some("ws-42"), "mcp__codemux-remote__echo", json!({"text":"hi"}), Some(actor), &[]).await });
+                let job = tokio::spawn(async move { run_mcp_tool_call(Some(&registry), &caller, Some("ws-42"), None, "mcp__codemux-remote__echo", json!({"text":"hi"}), Some(actor), &[]).await });
                 session.native_authority.track(&callback_permit, job.abort_handle());
                 let result = job.await.map_err(|e|e.to_string())?.0;
                 call.assert_async().await;
@@ -2930,7 +2941,7 @@ mod tests {
             if stop_before_capture { owner.invalidate(); db.stop_message_deliveries(&caller.thread_id).unwrap(); }
             let actor = crate::delegation::app::NativeActor { thread_id:caller.thread_id.clone(), provider:caller.provider, workspace_id:caller.workspace_id.clone(), session_id:"session".into(), permission_mode:caller.permission_mode.clone(), permit:owner.capture() };
             if !stop_before_capture { owner.invalidate(); db.stop_message_deliveries(&caller.thread_id).unwrap(); }
-            let (response, _) = run_mcp_tool_call(Some(&registry), &caller, caller.workspace_id.as_deref(), "mcp__codemux__delegate_task", json!({}), Some(actor), &[]).await;
+            let (response, _) = run_mcp_tool_call(Some(&registry), &caller, caller.workspace_id.as_deref(), None, "mcp__codemux__delegate_task", json!({}), Some(actor), &[]).await;
             assert_eq!(response["isError"], true, "a late host call must not acquire the post-Stop generation: {response}");
             assert!(response["content"][0]["text"].as_str().unwrap().contains("revoked"));
         }
@@ -2940,7 +2951,7 @@ mod tests {
     async fn plugin_mcp_claude_payload_has_guidance_and_hides_private_servers() {
         for scope in ["all", "plugin"] {
             let registry = crate::mcp::registry::test_support::plugin_fixture(scope).await;
-            let tools = collect_mcp_tools(Some(&registry), &test_caller()).await;
+            let tools = collect_mcp_tools(Some(&registry), &test_caller(), None).await;
             if scope == "plugin" {
                 assert!(!tools
                     .iter()
@@ -2959,10 +2970,39 @@ mod tests {
     #[tokio::test]
     async fn plugin_mcp_claude_has_no_bridge_without_a_visible_plugin_server() {
         let registry = crate::mcp::registry::McpRegistry::new();
-        let tools = collect_mcp_tools(Some(&registry), &test_caller()).await;
+        let tools = collect_mcp_tools(Some(&registry), &test_caller(), None).await;
         assert!(!tools
             .iter()
             .any(|tool| tool.server_id == "codemux-plugin-bridge"));
+    }
+
+    #[tokio::test]
+    async fn project_tool_call_from_another_checkout_is_refused() {
+        let first = tempfile::tempdir().unwrap();
+        let second = tempfile::tempdir().unwrap();
+        let first_scope = crate::mcp::McpProjectScope::new(first.path());
+        let second_scope = crate::mcp::McpProjectScope::new(second.path());
+        let registry = crate::mcp::registry::McpRegistry::new();
+        registry
+            .insert_running_server_for_test_at(
+                "project",
+                vec![crate::mcp::McpConfigSource::OpenCodeProject],
+                Some(&first_scope),
+            )
+            .await;
+        let (result, failure) = run_mcp_tool_call(
+            Some(&registry),
+            &test_caller(),
+            Some("ws-42"),
+            Some(&second_scope),
+            "mcp__project__tool",
+            json!({}),
+            None,
+            &[],
+        )
+        .await;
+        assert_eq!(result["isError"], true);
+        assert!(failure.unwrap().contains("unknown MCP tool"));
     }
 
     #[tokio::test]
@@ -2983,6 +3023,7 @@ mod tests {
                 Some(&registry),
                 &test_caller(),
                 Some("ws-42"),
+                None,
                 name,
                 arguments,
                 None,
@@ -3000,7 +3041,7 @@ mod tests {
     async fn plugin_mcp_claude_bridge_lists_and_calls_live_tools_with_scope() {
         for scope in ["all", "plugin"] {
             let registry = crate::mcp::registry::test_support::plugin_fixture(scope).await;
-            let tools = collect_mcp_tools(Some(&registry), &test_caller()).await;
+            let tools = collect_mcp_tools(Some(&registry), &test_caller(), None).await;
             assert_eq!(
                 tools
                     .iter()
@@ -3011,6 +3052,7 @@ mod tests {
                 Some(&registry),
                 &test_caller(),
                 Some("ws-42"),
+                None,
                 "codemux_list_plugin_tools",
                 json!({}),
                 None,
@@ -3032,6 +3074,7 @@ mod tests {
                 Some(&registry),
                 &test_caller(),
                 Some("ws-42"),
+                None,
                 "codemux_call_plugin_tool",
                 json!({"name":"fixture__new_tool","arguments":{}}),
                 None,
@@ -3055,7 +3098,7 @@ mod tests {
             crate::mcp::registry::test_support::codemux_remote_server("ws-42").await;
         let local = crate::agent_provider::local_tool_registry(Some(&registry), None);
         assert_eq!(
-            collect_mcp_tools(local.as_ref(), &test_caller())
+            collect_mcp_tools(local.as_ref(), &test_caller(), None)
                 .await
                 .len(),
             1
@@ -3102,7 +3145,7 @@ mod tests {
             )
             .await
             .unwrap();
-        let tools = collect_mcp_tools(local.as_ref(), &test_caller()).await;
+        let tools = collect_mcp_tools(local.as_ref(), &test_caller(), None).await;
         assert_eq!(tools.len(), 3);
         assert!(tools
             .iter()
@@ -3114,6 +3157,7 @@ mod tests {
             local.as_ref(),
             &test_caller(),
             Some("ws-42"),
+            None,
             "mcp__codemux-remote__echo",
             json!({"text": "hi"}),
             None,
@@ -3136,7 +3180,7 @@ mod tests {
             host_name: "ai-node".into(),
         };
         let on_device = crate::agent_provider::local_tool_registry(Some(&registry), Some(&device));
-        assert!(collect_mcp_tools(on_device.as_ref(), &test_caller())
+        assert!(collect_mcp_tools(on_device.as_ref(), &test_caller(), None)
             .await
             .is_empty());
 
@@ -3146,6 +3190,7 @@ mod tests {
             on_device.as_ref(),
             &test_caller(),
             Some("ws-42"),
+            None,
             "mcp__codemux-remote__echo",
             json!({"text": "hi"}),
             None,

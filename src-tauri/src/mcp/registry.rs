@@ -41,7 +41,7 @@ use super::parser::{
 };
 use super::paths::{enumerate_mcp_paths, is_claude_wrapped_path};
 use super::runtime::{McpServerHandle, McpServerStatus, McpTool};
-use super::{McpConfigSource, McpServerConfig};
+use super::{McpConfigSource, McpProjectScope, McpServerConfig};
 
 // Pause an approved first start immediately before its reservation in the
 // revocation race test. Scoped to that test's task and absent in production.
@@ -296,6 +296,7 @@ impl McpRegistry {
     pub(crate) fn set_native_delegation_handler(&self, handler: NativeDelegationHandler) {
         *self.native_delegation.lock().unwrap() = Some(handler);
     }
+    #[cfg(test)]
     pub(crate) async fn dispatch_native_tool_call(
         &self,
         name: &str,
@@ -304,9 +305,25 @@ impl McpRegistry {
     ) -> Result<serde_json::Value, String> {
         self.dispatch_native_tool_call_with_id(name, arguments, actor, None).await
     }
+    pub(crate) async fn dispatch_native_tool_call_scoped(
+        &self,
+        name: &str,
+        arguments: serde_json::Value,
+        actor: crate::delegation::app::NativeActor,
+        project: Option<&McpProjectScope>,
+    ) -> Result<serde_json::Value, String> {
+        self.dispatch_native_tool_call_with_id_scoped(name, arguments, actor, None, project).await
+    }
     pub(crate) async fn dispatch_native_tool_call_with_id(
         &self, name: &str, arguments: serde_json::Value,
         actor: crate::delegation::app::NativeActor, call_id: Option<String>,
+    ) -> Result<serde_json::Value, String> {
+        self.dispatch_native_tool_call_with_id_scoped(name, arguments, actor, call_id, None).await
+    }
+    pub(crate) async fn dispatch_native_tool_call_with_id_scoped(
+        &self, name: &str, arguments: serde_json::Value,
+        actor: crate::delegation::app::NativeActor, call_id: Option<String>,
+        project: Option<&McpProjectScope>,
     ) -> Result<serde_json::Value, String> {
         if let Some(raw) = crate::agent_control::native::tool_name(name) {
             let handler = self.native_delegation.lock().unwrap().clone()
@@ -353,7 +370,7 @@ impl McpRegistry {
             let handler = self.native_delegation.lock().unwrap().clone().ok_or("Native caller policy is unavailable")?;
             return handler(actor, raw.into(), arguments, call_id).await;
         }
-        self.dispatch_tool_call(name, arguments, actor.workspace_id.as_deref()).await
+        self.dispatch_tool_call_scoped(name, arguments, actor.workspace_id.as_deref(), project).await
     }
     pub fn set_activity_emitter(&self, emit: Arc<dyn Fn(PluginMcpActivity) + Send + Sync>) {
         let _ = self.activity.set(emit);
@@ -1101,8 +1118,8 @@ impl McpRegistry {
         out
     }
 
-    /// Provider-facing tools across running servers, without a count cap.
-    /// Trusted native-controller tools are never injected into a provider.
+    /// Global running tools, without a count cap. Sessions use
+    /// `list_tools_for_workspace` with their fixed project scope.
     pub async fn list_all_tools(&self) -> Vec<McpTool> {
         self.list_all_tools_excluding_sources(&[]).await
     }
@@ -1122,17 +1139,21 @@ impl McpRegistry {
         &self,
         sources: &[McpConfigSource],
     ) -> Vec<McpTool> {
-        self.list_tools_for_workspace(sources, None).await
+        self.list_tools_for_workspace(sources, None, None).await
     }
 
     pub async fn list_tools_for_workspace(
         &self,
         sources: &[McpConfigSource],
         workspace_id: Option<&str>,
+        project: Option<&McpProjectScope>,
     ) -> Vec<McpTool> {
         let inner = self.inner.lock().await;
         let mut tools = Vec::new();
         for handle in inner.handles.values() {
+            if !visible_in_project(&handle.config, project) {
+                continue;
+            }
             if inner
                 .plugins
                 .get(&handle.config.id)
@@ -1184,6 +1205,23 @@ impl McpRegistry {
         id: &str,
         sources: Vec<McpConfigSource>,
     ) {
+        self.insert_running_server_for_test_at(id, sources, None).await;
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn insert_running_server_for_test_at(
+        &self,
+        id: &str,
+        sources: Vec<McpConfigSource>,
+        scope: Option<&McpProjectScope>,
+    ) {
+        let project_root = scope.map(|scope| {
+            if sources.first() == Some(&McpConfigSource::ClaudeLocal) {
+                scope.checkout.clone()
+            } else {
+                scope.approval_root.clone()
+            }
+        });
         let config = McpServerConfig {
             id: id.into(),
             name: id.into(),
@@ -1194,7 +1232,8 @@ impl McpRegistry {
             disabled: false,
             transport: super::McpTransport::Stdio,
             raw: serde_json::Value::Null,
-            project_root: None,
+            checkout_root: scope.map(|scope| scope.checkout.clone()),
+            project_root,
         };
         let mut handle = McpServerHandle::discovered(config);
         handle.status = McpServerStatus::Running { tool_count: 1 };
@@ -1249,15 +1288,26 @@ impl McpRegistry {
     /// workspace-scoped tools (browser routing, git cwd) bind to the
     /// session's own workspace rather than whichever one the app
     /// process happens to sit in. `None` keeps the child's env/cwd
-    /// fallback behavior.
+    /// fallback behavior. This unscoped entry point cannot call a
+    /// project-bound server.
     pub async fn dispatch_tool_call(
         &self,
         prefixed_name: &str,
         arguments: serde_json::Value,
         workspace_id: Option<&str>,
     ) -> Result<serde_json::Value, String> {
-        self.dispatch_tool_call_inner(prefixed_name, arguments, workspace_id, None)
+        self.dispatch_tool_call_scoped(prefixed_name, arguments, workspace_id, None)
             .await
+    }
+
+    pub async fn dispatch_tool_call_scoped(
+        &self,
+        prefixed_name: &str,
+        arguments: serde_json::Value,
+        workspace_id: Option<&str>,
+        project: Option<&McpProjectScope>,
+    ) -> Result<serde_json::Value, String> {
+        self.dispatch_tool_call_inner(prefixed_name, arguments, workspace_id, project, None).await
     }
 
     async fn dispatch_tool_call_inner(
@@ -1265,12 +1315,16 @@ impl McpRegistry {
         prefixed_name: &str,
         arguments: serde_json::Value,
         workspace_id: Option<&str>,
+        project: Option<&McpProjectScope>,
         owned_server: Option<&str>,
     ) -> Result<serde_json::Value, String> {
         let (raw_name, is_codemux_self, child, remote, mut cancelled, mut call_guard) = {
             let inner = self.inner.lock().await;
             let mut found = None;
             for handle in inner.handles.values() {
+                if !visible_in_project(&handle.config, project) {
+                    continue;
+                }
                 if owned_server.is_some_and(|id| id != handle.config.id) {
                     continue;
                 }
@@ -1470,6 +1524,22 @@ fn now_ms() -> i64 {
         .unwrap_or(0)
 }
 
+/// A server bound to one checkout must have a matching caller scope. A
+/// missing scope fails closed for project and Claude-local definitions.
+fn visible_in_project(config: &McpServerConfig, project: Option<&McpProjectScope>) -> bool {
+    let Some(project) = project else {
+        return !super::is_project_source(config.primary_source())
+            && config.primary_source() != McpConfigSource::ClaudeLocal;
+    };
+    let approval_root = match config.primary_source() {
+        source if super::is_project_source(source) => Some(&project.approval_root),
+        McpConfigSource::ClaudeLocal => Some(&project.checkout),
+        _ => return true,
+    };
+    config.project_root.as_ref() == approval_root
+        && config.checkout_root.as_ref() == Some(&project.checkout)
+}
+
 /// Walk the configured MCP files for a project root and produce a flat
 /// `Vec<McpServerConfig>` suitable for spawning. Identical definitions from
 /// multiple providers are deduplicated before launch so Codemux owns one
@@ -1511,6 +1581,9 @@ pub(crate) fn discover_configs(project_root: Option<&std::path::Path>) -> Vec<Mc
                         srv.project_root = approval_root
                             .get_or_init(|| project_path.as_deref().map(super::project_trust::approval_root))
                             .clone();
+                        srv.checkout_root = project_path.as_deref().map(|path| {
+                            std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+                        });
                     }
                     out.push(srv);
                 }
@@ -1654,6 +1727,7 @@ pub(crate) mod test_support {
             transport: McpTransport::Http,
             raw: serde_json::json!({}),
             project_root: None,
+            checkout_root: None,
         };
         let row = registry
             .ensure_started(None::<&tauri::AppHandle<tauri::Wry>>, config)
@@ -1684,6 +1758,7 @@ mod tests {
             transport: McpTransport::Stdio,
             raw: serde_json::Value::Null,
             project_root: None,
+            checkout_root: None,
         }
     }
 
@@ -2126,6 +2201,116 @@ mod tests {
         assert!(tools.is_empty());
     }
 
+    #[tokio::test]
+    async fn project_tools_are_bound_to_the_callers_checkout() {
+        let first = tempfile::tempdir().unwrap();
+        let second = tempfile::tempdir().unwrap();
+        let first_scope = McpProjectScope::new(first.path());
+        let second_scope = McpProjectScope::new(second.path());
+        let registry = McpRegistry::new();
+        registry
+            .insert_running_server_for_test("global", vec![McpConfigSource::CodemuxUser])
+            .await;
+        registry
+            .insert_running_server_for_test_at(
+                "first",
+                vec![McpConfigSource::OpenCodeProject],
+                Some(&first_scope),
+            )
+            .await;
+        registry
+            .insert_running_server_for_test_at(
+                "second-local",
+                vec![McpConfigSource::ClaudeLocal],
+                Some(&second_scope),
+            )
+            .await;
+
+        let names = |tools: Vec<McpTool>| {
+            let mut names: Vec<String> = tools.into_iter().map(|tool| tool.prefixed_name).collect();
+            names.sort();
+            names
+        };
+        assert_eq!(
+            names(registry.list_tools_for_workspace(&[], Some("same-workspace"), Some(&first_scope)).await),
+            ["mcp__first__tool", "mcp__global__tool"],
+        );
+        assert_eq!(
+            names(registry.list_tools_for_workspace(&[], Some("same-workspace"), Some(&second_scope)).await),
+            ["mcp__global__tool", "mcp__second-local__tool"],
+        );
+        assert_eq!(
+            names(registry.list_tools_for_workspace(&[], Some("same-workspace"), None).await),
+            ["mcp__global__tool"],
+        );
+        assert!(registry.dispatch_tool_call_scoped("mcp__first__tool", serde_json::json!({}), None, Some(&first_scope)).await.unwrap_err().contains("no live transport"));
+        assert!(registry.dispatch_tool_call_scoped("mcp__first__tool", serde_json::json!({}), None, Some(&second_scope)).await.unwrap_err().contains("unknown MCP tool"));
+        assert!(registry.dispatch_tool_call("mcp__second-local__tool", serde_json::json!({}), None).await.unwrap_err().contains("unknown MCP tool"));
+    }
+
+    #[tokio::test]
+    async fn worktrees_with_shared_approval_do_not_share_running_tools() {
+        let first = tempfile::tempdir().unwrap();
+        let second = tempfile::tempdir().unwrap();
+        let first_scope = McpProjectScope::new(first.path());
+        let second_scope = McpProjectScope {
+            checkout: std::fs::canonicalize(second.path()).unwrap(),
+            approval_root: first_scope.approval_root.clone(),
+        };
+        let registry = McpRegistry::new();
+        for (id, scope) in [("first", &first_scope), ("second", &second_scope)] {
+            registry
+                .insert_running_server_for_test_at(
+                    id,
+                    vec![McpConfigSource::OpenCodeProject],
+                    Some(scope),
+                )
+                .await;
+        }
+        let first_tools = registry.list_tools_for_workspace(&[], None, Some(&first_scope)).await;
+        let second_tools = registry.list_tools_for_workspace(&[], None, Some(&second_scope)).await;
+        assert_eq!(first_tools.len(), 1);
+        assert_eq!(first_tools[0].server_id, "first");
+        assert_eq!(second_tools.len(), 1);
+        assert_eq!(second_tools[0].server_id, "second");
+        assert!(registry
+            .dispatch_tool_call_scoped("mcp__first__tool", serde_json::json!({}), None, Some(&second_scope))
+            .await
+            .unwrap_err()
+            .contains("unknown MCP tool"));
+    }
+
+    #[tokio::test]
+    async fn equal_tool_names_dispatch_to_the_callers_project() {
+        let first = tempfile::tempdir().unwrap();
+        let second = tempfile::tempdir().unwrap();
+        let first_scope = McpProjectScope::new(first.path());
+        let second_scope = McpProjectScope::new(second.path());
+        let registry = McpRegistry::new();
+        for (id, scope) in [("first", &first_scope), ("second", &second_scope)] {
+            registry
+                .insert_running_server_for_test_at(
+                    id,
+                    vec![McpConfigSource::OpenCodeProject],
+                    Some(scope),
+                )
+                .await;
+        }
+        {
+            let mut inner = registry.inner.lock().await;
+            for id in ["first", "second"] {
+                inner.handles.get_mut(id).unwrap().tools[0].prefixed_name = "mcp__shared__tool".into();
+            }
+        }
+        for (scope, expected) in [(&first_scope, "first"), (&second_scope, "second")] {
+            let error = registry
+                .dispatch_tool_call_scoped("mcp__shared__tool", serde_json::json!({}), None, Some(scope))
+                .await
+                .unwrap_err();
+            assert!(error.contains(&format!("MCP server '{expected}' has no live transport")), "{error}");
+        }
+    }
+
     /// Regression guard: a large built-in tool surface must never
     /// crowd out user MCP tools. An earlier hard cap silently dropped
     /// every user tool once Codemux's own tools outgrew the budget,
@@ -2354,6 +2539,7 @@ mod tests {
             transport: McpTransport::Http,
             raw: serde_json::json!({}),
             project_root: None,
+            checkout_root: None,
         };
         let row = reg
             .ensure_started(None::<&tauri::AppHandle<tauri::Wry>>, config)
@@ -2732,6 +2918,7 @@ mod project_trust_tests {
             transport: super::super::McpTransport::Stdio,
             raw: serde_json::json!({}),
             project_root: None,
+            checkout_root: None,
         };
         let reg = McpRegistry::new();
         let row = reg
@@ -2883,6 +3070,7 @@ mod project_trust_tests {
             transport: super::super::McpTransport::Stdio,
             raw: serde_json::json!({}),
             project_root: (source == McpConfigSource::CodemuxProject).then(|| scratch.path().into()),
+            checkout_root: (source == McpConfigSource::CodemuxProject).then(|| scratch.path().into()),
         };
         let app = app();
         let reg = McpRegistry::new();

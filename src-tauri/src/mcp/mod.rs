@@ -94,11 +94,31 @@ pub struct McpServerConfig {
     /// Pass-through for unknown fields so we don't lose forward-compat info
     /// when round-tripping configs.
     pub raw: serde_json::Value,
-    /// Canonical root of the project whose own files define this server,
-    /// set by discovery for project sources (see [`is_project_source`]).
-    /// Approval is per project, so it is never read from a config file.
+    /// Canonical root used for project-file approval and Claude-local scope.
+    /// Set by discovery, never read from a config file or sent over IPC.
     #[serde(skip)]
     pub project_root: Option<std::path::PathBuf>,
+    /// Exact checkout where a project or Claude-local server was discovered.
+    /// Approval may be shared across Git worktrees, but tool access is not.
+    #[serde(skip)]
+    pub checkout_root: Option<std::path::PathBuf>,
+}
+
+/// The checkout a local chat was started in, fixed before it receives any
+/// registry tools. Project-file approvals follow registered Git worktrees;
+/// Claude's user-owned local entries are keyed to the exact checkout path.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct McpProjectScope {
+    pub checkout: std::path::PathBuf,
+    pub approval_root: std::path::PathBuf,
+}
+
+impl McpProjectScope {
+    pub fn new(path: &std::path::Path) -> Self {
+        let checkout = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+        let approval_root = project_trust::approval_root(&checkout);
+        Self { checkout, approval_root }
+    }
 }
 
 /// Sources read from files inside the project, which whoever wrote the
@@ -351,6 +371,7 @@ mod tests {
             transport: McpTransport::Stdio,
             raw: serde_json::Value::Null,
             project_root: None,
+            checkout_root: None,
         }
     }
 

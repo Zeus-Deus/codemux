@@ -60,6 +60,9 @@ pub struct GatewayCaller {
     /// Workspace that workspace-scoped tools (built-in ones, workspace-scoped
     /// plugin servers) act on and are listed for.
     pub workspace_id: Option<String>,
+    /// Fixed checkout for project-scoped MCP tools. An absent scope sees
+    /// global tools only, including the shared legacy OpenCode token.
+    pub project: Option<super::McpProjectScope>,
     /// Config sources the agent already loads itself, hidden from its
     /// `tools/list` so it doesn't see every such tool twice.
     pub native_sources: Vec<McpConfigSource>,
@@ -510,7 +513,7 @@ async fn handle_post(
                         None => {
                             state
                                 .registry
-                                .dispatch_tool_call(&name, arguments, workspace_id)
+                                .dispatch_tool_call_scoped(&name, arguments, workspace_id, caller.project.as_ref())
                                 .await
                         }
                     };
@@ -521,6 +524,7 @@ async fn handle_post(
                 let permit = actor.permit.clone();
                 let registry = state.registry.clone();
                 let workspace = workspace_id.map(str::to_owned);
+                let project = caller.project.clone();
                 let current = binding.clone();
                 let call_id = id.to_string();
                 let host_caller = binding.session.caller();
@@ -544,7 +548,7 @@ async fn handle_post(
                         Some(result) => result,
                         None => {
                             registry
-                                .dispatch_native_tool_call_with_id(&name, arguments, actor, Some(call_id))
+                                .dispatch_native_tool_call_with_id_scoped(&name, arguments, actor, Some(call_id), project.as_ref())
                                 .await
                         }
                     }
@@ -607,7 +611,11 @@ fn calling_session_matches(
 async fn caller_tools(state: &GatewayState, caller: &GatewayCaller) -> Vec<McpTool> {
     let mut tools = state
         .registry
-        .list_tools_for_workspace(&caller.native_sources, caller.workspace_id.as_deref())
+        .list_tools_for_workspace(
+            &caller.native_sources,
+            caller.workspace_id.as_deref(),
+            caller.project.as_ref(),
+        )
         .await;
     if let Some(binding) = &caller.native {
         let host = binding.session.caller();
@@ -630,6 +638,7 @@ fn authenticate(headers: &HeaderMap, state: &GatewayState) -> Option<GatewayCall
     if token == &*state.bearer_token {
         return Some(GatewayCaller {
             workspace_id: None,
+            project: None,
             native_sources: OPENCODE_SHARED_HIDDEN_SOURCES.to_vec(),
             flat_tool_names: false,
             native: None,
@@ -835,17 +844,43 @@ mod tests {
     #[tokio::test]
     async fn opencode_chat_token_routes_project_tools_through_registry() {
         let registry = McpRegistry::new();
+        let checkout = tempfile::tempdir().unwrap();
+        let project = super::super::McpProjectScope::new(checkout.path());
+        let other_checkout = tempfile::tempdir().unwrap();
+        let other_project = super::super::McpProjectScope::new(other_checkout.path());
         registry
             .insert_running_server_for_test("oc-user", vec![McpConfigSource::OpenCodeUser])
             .await;
         registry
-            .insert_running_server_for_test("oc-project", vec![McpConfigSource::OpenCodeProject])
+            .insert_running_server_for_test_at(
+                "oc-project",
+                vec![McpConfigSource::OpenCodeProject],
+                Some(&project),
+            )
+            .await;
+        registry
+            .insert_running_server_for_test_at(
+                "other-project",
+                vec![McpConfigSource::OpenCodeProject],
+                Some(&other_project),
+            )
             .await;
         let runtime = start_gateway(registry.clone()).await.unwrap();
         let connection = runtime.chat_connection(
             "thread-opencode",
             GatewayCaller {
                 workspace_id: Some("ws-1".into()),
+                project: Some(project),
+                native_sources: OPENCODE_NATIVE_SOURCES.to_vec(),
+                flat_tool_names: false,
+                native: None,
+            },
+        );
+        let other_connection = runtime.chat_connection(
+            "thread-other",
+            GatewayCaller {
+                workspace_id: Some("ws-1".into()),
+                project: Some(other_project),
                 native_sources: OPENCODE_NATIVE_SOURCES.to_vec(),
                 flat_tool_names: false,
                 native: None,
@@ -857,8 +892,10 @@ mod tests {
             grants: runtime.grants.clone(),
             calls: Default::default(),
         };
-        let (_, value) = tools_list_with_token(state, &connection.bearer_token).await;
+        let (_, value) = tools_list_with_token(state.clone(), &connection.bearer_token).await;
         assert_eq!(tool_names(&value), vec!["mcp__oc-project__tool"]);
+        let (_, value) = tools_list_with_token(state, &other_connection.bearer_token).await;
+        assert_eq!(tool_names(&value), vec!["mcp__other-project__tool"]);
     }
 
     fn tool_names(value: &Value) -> Vec<&str> {
@@ -910,6 +947,7 @@ mod tests {
             "thread-cursor",
             GatewayCaller {
                 workspace_id: Some("ws-1".into()),
+                project: None,
                 native_sources: vec![McpConfigSource::CursorUser],
                 flat_tool_names: false,
                 native: None,
@@ -939,6 +977,7 @@ mod tests {
         let first = runtime.chat_connection("thread", GatewayCaller::default());
         let caller = GatewayCaller {
             workspace_id: Some("ws-2".into()),
+            project: None,
             native_sources: vec![McpConfigSource::ClaudeUser],
             flat_tool_names: false,
             native: None,
@@ -992,7 +1031,7 @@ mod tests {
             .await
             .unwrap();
         tokio::time::timeout(std::time::Duration::from_secs(10), async {
-            while registry.list_tools_for_workspace(&[], Some("ws-a")).await.is_empty() {
+            while registry.list_tools_for_workspace(&[], Some("ws-a"), None).await.is_empty() {
                 tokio::time::sleep(std::time::Duration::from_millis(10)).await;
             }
         })
@@ -1009,7 +1048,7 @@ mod tests {
             runtime
                 .chat_connection(
                     key,
-                    GatewayCaller { workspace_id: Some(workspace.into()), native_sources: vec![], flat_tool_names: false,
+                    GatewayCaller { workspace_id: Some(workspace.into()), project: None, native_sources: vec![], flat_tool_names: false,
                         native: None,
                     },
                 )

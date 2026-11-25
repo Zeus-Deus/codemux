@@ -283,6 +283,7 @@ pub(crate) struct ChatMcp {
     keep_key: bool,
     sources: Vec<McpConfigSource>,
     flat: bool,
+    project: Option<crate::mcp::McpProjectScope>,
     gateway: std::sync::OnceLock<std::sync::Arc<crate::mcp::gateway::McpGatewayRuntime>>,
 }
 impl ChatMcp {
@@ -311,8 +312,14 @@ impl ChatMcp {
             key: key.unwrap_or_else(|| format!("chat:{}", uuid::Uuid::new_v4())),
             sources,
             flat,
+            project: None,
             gateway: Default::default(),
         }
+    }
+    /// Bind project MCP visibility to the directory this session opened.
+    pub(crate) fn for_project(mut self, cwd: Option<&std::path::Path>) -> Self {
+        self.project = cwd.map(crate::mcp::McpProjectScope::new);
+        self
     }
     /// Cursor, Grok, Antigravity and custom ACP agents run one process per
     /// chat, so their shell can carry this chat's credential for
@@ -343,6 +350,7 @@ impl ChatMcp {
             &self.key,
             GatewayCaller {
                 workspace_id: self.session.caller().workspace_id,
+                project: self.project.clone(),
                 native_sources: self.sources.clone(),
                 flat_tool_names: self.flat,
                 native: Some(crate::mcp::thread_gateway::GatewayBinding::new(

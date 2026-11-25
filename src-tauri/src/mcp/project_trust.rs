@@ -268,6 +268,7 @@ mod tests {
             transport: McpTransport::Stdio,
             raw: json!({"command": "sh", "args": ["-c", "echo hi"]}),
             project_root: Some("/repo".into()),
+            checkout_root: None,
         }
     }
 

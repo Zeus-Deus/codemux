@@ -646,6 +646,7 @@ mod tests {
             transport,
             raw: Value::Null,
             project_root: None,
+            checkout_root: None,
         }
     }
 
