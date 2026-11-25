@@ -93,31 +93,41 @@ pub(crate) async fn verify_stored_account_for_remote<R: tauri::Runtime>(
     app: &tauri::AppHandle<R>,
 ) {
     let db = app.state::<DatabaseStore>();
+    let auth_state = app.state::<AuthState>();
     let notifying_app = app.clone();
+    let cleanup_app = app.clone();
     verify_stored_account_for_remote_with_poll(
         &db,
+        &auth_state,
         Duration::from_secs(5),
         crate::database::ACCOUNT_AUTH_VERIFICATION_TTL / 2,
-        move |db, expected, cleanup_pending| {
-            notify_rejected_local_session(&notifying_app, db, expected, cleanup_pending);
+        move |db, generation, expected, cleanup_pending| {
+            notify_rejected_local_session(&notifying_app, db, generation, expected, cleanup_pending)
+        },
+        move |db, assigned| {
+            clear_rejected_local_session_warning(&cleanup_app, db, assigned);
         },
     )
     .await;
 }
 
-async fn verify_stored_account_for_remote_with_poll<F>(
+async fn verify_stored_account_for_remote_with_poll<F, C>(
     db: &DatabaseStore,
+    auth_state: &AuthState,
     poll: Duration,
     renew_after: Duration,
     on_rejected: F,
+    on_cleanup_complete: C,
 ) where
-    F: Fn(&DatabaseStore, &[u8], bool) + Send + Sync,
+    F: Fn(&DatabaseStore, u64, &[u8], bool) -> Option<u64> + Send + Sync,
+    C: Fn(&DatabaseStore, u64) + Send + Sync,
 {
     let mut attempted_record: Option<Vec<u8>> = None;
     let mut retry_after = Instant::now();
     let mut retry_delay = poll;
     loop {
-        if let Some(record) = load_auth_record(db).filter(|record| record.stored.user.is_some()) {
+        let (generation, record) = auth_state.session_snapshot(|| load_auth_record(db));
+        if let Some(record) = record.filter(|record| record.stored.user.is_some()) {
             if attempted_record.as_deref() != Some(record.encrypted()) {
                 attempted_record = Some(record.encrypted().to_vec());
                 retry_after = Instant::now();
@@ -145,15 +155,13 @@ async fn verify_stored_account_for_remote_with_poll<F>(
                         }
                     }
                     VerifyOutcome::Verified(_) | VerifyOutcome::Unauthorized => {
-                        let cleared = db.clear_auth_token_if_current(record.encrypted());
-                        on_rejected(db, record.encrypted(), cleared.is_err());
-                        if let Err(error) = cleared {
-                            log::warn!("[auth] Could not persist rejected account revocation: {error}");
-                            retry_rejected_auth_revocation(db, record.encrypted()).await;
-                            if matches!(db.load_raw_auth_token(), Ok(None)) {
-                                on_rejected(db, record.encrypted(), false);
-                            }
-                        }
+                        reject_stored_account(
+                            db,
+                            record.encrypted(),
+                            generation,
+                            &on_rejected,
+                            &on_cleanup_complete,
+                        ).await;
                         attempted_record = None;
                     }
                     VerifyOutcome::Offline => {
@@ -167,6 +175,34 @@ async fn verify_stored_account_for_remote_with_poll<F>(
             retry_delay = poll;
         }
         tokio::time::sleep(poll).await;
+    }
+}
+
+async fn reject_stored_account<F, C>(
+    db: &DatabaseStore,
+    expected: &[u8],
+    generation: u64,
+    on_rejected: &F,
+    on_cleanup_complete: &C,
+) where
+    F: Fn(&DatabaseStore, u64, &[u8], bool) -> Option<u64>,
+    C: Fn(&DatabaseStore, u64),
+{
+    match db.clear_auth_token_if_current(expected) {
+        Ok(true) => {
+            on_rejected(db, generation, expected, false);
+        }
+        Ok(false) => {} // Sign-out or replacement already changed this record.
+        Err(error) => {
+            let assigned = on_rejected(db, generation, expected, true);
+            log::warn!("[auth] Could not persist rejected account revocation: {error}");
+            retry_rejected_auth_revocation(db, expected).await;
+            if let Some(assigned) = assigned {
+                if matches!(db.load_raw_auth_token(), Ok(None)) {
+                    on_cleanup_complete(db, assigned);
+                }
+            }
+        }
     }
 }
 
@@ -226,16 +262,33 @@ const AUTH_CLEANUP_PENDING: &str =
 fn notify_rejected_local_session<R: tauri::Runtime>(
     app: &tauri::AppHandle<R>,
     db: &DatabaseStore,
+    generation: u64,
     expected: &[u8],
     cleanup_pending: bool,
-) {
+) -> Option<u64> {
     let auth_state = app.state::<AuthState>();
-    let generation = auth_state.session_snapshot(|| ()).0;
-    if let Err(error) = finish_rejected_local_session(
+    match finish_rejected_local_session(
         app, db, &auth_state, generation, expected, cleanup_pending,
     ) {
-        log::warn!("[auth] Could not finish rejected local sign-out: {error}");
+        Ok(assigned) => assigned,
+        Err(error) => {
+            log::warn!("[auth] Could not finish rejected local sign-out: {error}");
+            None
+        }
     }
+}
+
+fn clear_rejected_local_session_warning<R: tauri::Runtime>(
+    app: &tauri::AppHandle<R>,
+    db: &DatabaseStore,
+    assigned: u64,
+) {
+    let auth_state = app.state::<AuthState>();
+    auth_state.commit_if_session_current(assigned, || {
+        if matches!(db.load_raw_auth_token(), Ok(None)) {
+            emit_signed_out(app);
+        }
+    });
 }
 
 /// A definitive rejection ends this local session even if SQLite could not
@@ -911,7 +964,11 @@ mod tests {
         let _api = ApiUrlGuard::set(&server.url());
         let verifier_db = reopened.clone();
         let verifier = tokio::spawn(async move {
-            verify_stored_account_for_remote_with_poll(&verifier_db, Duration::from_millis(20), Duration::from_secs(30), |_, _, _| {}).await;
+            let auth_state = AuthState::default();
+            verify_stored_account_for_remote_with_poll(
+                &verifier_db, &auth_state, Duration::from_millis(20), Duration::from_secs(30),
+                |_, _, _, _| None, |_, _| {},
+            ).await;
         });
         wait_for_account_browser(&reopened, browser_token).await;
         verifier.abort();
@@ -942,7 +999,11 @@ mod tests {
         let _api = ApiUrlGuard::set(&server.url());
         let verifier_db = host.clone();
         let verifier = tokio::spawn(async move {
-            verify_stored_account_for_remote_with_poll(&verifier_db, Duration::from_millis(20), Duration::from_secs(30), |_, _, _| {}).await;
+            let auth_state = AuthState::default();
+            verify_stored_account_for_remote_with_poll(
+                &verifier_db, &auth_state, Duration::from_millis(20), Duration::from_secs(30),
+                |_, _, _, _| None, |_, _| {},
+            ).await;
         });
         tokio::time::sleep(Duration::from_millis(50)).await;
 
@@ -990,8 +1051,10 @@ mod tests {
         let _api = ApiUrlGuard::set(&valid_server.url());
         let verifier_db = host.clone();
         let verifier = tokio::spawn(async move {
+            let auth_state = AuthState::default();
             verify_stored_account_for_remote_with_poll(
-                &verifier_db, Duration::from_millis(20), Duration::from_millis(100), |_, _, _| {},
+                &verifier_db, &auth_state, Duration::from_millis(20), Duration::from_millis(100),
+                |_, _, _, _| None, |_, _| {},
             ).await;
         });
         wait_for_account_browser(&host, browser_token).await;
@@ -1139,12 +1202,15 @@ mod tests {
         let verifier_app = app.handle().clone();
         let verifier = tokio::spawn(async move {
             let db = verifier_app.state::<DatabaseStore>();
+            let auth_state = verifier_app.state::<AuthState>();
             let notifying_app = verifier_app.clone();
+            let cleanup_app = verifier_app.clone();
             verify_stored_account_for_remote_with_poll(
-                &db, Duration::from_millis(20), Duration::from_secs(30),
-                move |db, expected, pending| {
-                    notify_rejected_local_session(&notifying_app, db, expected, pending);
+                &db, &auth_state, Duration::from_millis(20), Duration::from_secs(30),
+                move |db, generation, expected, pending| {
+                    notify_rejected_local_session(&notifying_app, db, generation, expected, pending)
                 },
+                move |db, assigned| clear_rejected_local_session_warning(&cleanup_app, db, assigned),
             ).await;
         });
         tokio::time::timeout(Duration::from_secs(3), async {
@@ -1157,6 +1223,7 @@ mod tests {
                 tokio::time::sleep(Duration::from_millis(20)).await;
             }
         }).await.expect("watcher should sign out locally after a 401");
+        let signed_out_generation = auth_state.session_snapshot(|| ()).0;
         assert_eq!(auth_state.auth_method(), None);
         assert!(db.load_auth_token().is_none());
         assert_eq!(db.load_raw_auth_token().unwrap().as_deref(), Some(record.encrypted()));
@@ -1174,9 +1241,55 @@ mod tests {
                 tokio::time::sleep(Duration::from_millis(20)).await;
             }
         }).await.expect("watcher should clear the warning after revocation persists");
+        assert_eq!(auth_state.session_snapshot(|| ()).0, signed_out_generation);
         verifier.abort();
         let _ = verifier.await;
         rejecting_mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn stale_watcher_rejection_after_sign_out_preserves_new_oauth_launch() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("auth.sqlite");
+        let settings_dir = dir.path().join("settings");
+        std::fs::create_dir_all(&settings_dir).unwrap();
+        let app = tauri::test::mock_app();
+        assert!(app.manage(DatabaseStore::test_file(&path)));
+        assert!(app.manage(AuthState::with_test_settings_cache_dir(settings_dir.clone())));
+        let db = app.state::<DatabaseStore>();
+        let auth_state = app.state::<AuthState>();
+        let old = crate::auth::save_auth_with_method(
+            &db, "old-token", "2099-01-01T00:00:00Z", Some(&cached_user()), Some("email"),
+        ).unwrap();
+        auth_state.set_auth_method(Some("email"));
+        let (old_generation, ()) = auth_state.session_snapshot(|| ());
+
+        // The verifier captured the old record before the remote 401 arrived.
+        auth_state.try_replace_session(|| {
+            db.clear_auth_token()?;
+            auth_state.clear_local_session();
+            Ok(())
+        }).unwrap();
+        let csrf = auth_state.generate_csrf_state(&db).unwrap();
+        let (oauth_generation, ()) = auth_state.session_snapshot(|| ());
+        let new_cache = settings_dir.join("settings-cache.json");
+        std::fs::write(&new_cache, "new flow").unwrap();
+
+        reject_stored_account(
+            &db,
+            old.encrypted(),
+            old_generation,
+            &|db, generation, expected, pending| {
+                notify_rejected_local_session(app.handle(), db, generation, expected, pending)
+            },
+            &|db, assigned| clear_rejected_local_session_warning(app.handle(), db, assigned),
+        ).await;
+
+        assert_eq!(auth_state.session_snapshot(|| ()).0, oauth_generation);
+        assert!(new_cache.exists());
+        assert!(auth_state.validate_csrf_state(&csrf));
+        assert!(auth_state.replace_session_if_current(oauth_generation, || Ok(Some(()))).unwrap().is_some());
+        assert!(db.load_raw_auth_token().unwrap().is_none());
     }
 
     #[test]
