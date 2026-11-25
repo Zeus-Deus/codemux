@@ -1,17 +1,17 @@
 //! Keep the local images an assistant reply links to.
 //!
 //! Agents hand visual proof back as Markdown links to files they wrote under
-//! temp directories (`[Mockup](/tmp/shots/f1.png)`). Those files are routinely
-//! cleaned up, which left saved replies pointing at nothing. When a top-level
-//! reply completes, each linked local image gets a copy in the thread's
-//! chat-image folder, recorded on the reply as `retained_images` so live and
-//! replayed transcripts show the copy and fall back to the original path.
+//! temp directories (`[Mockup](/tmp/shots/f1.png)`). A path alone cannot prove
+//! that a source is on a local volume: following a mapped drive or symlink in
+//! a background copy could contact a network share without the reader's
+//! knowledge. Existing copies may be recovered, but new unverified sources
+//! are never opened by these background jobs.
 //!
 //! The event bridge only scans the text and names the destinations, and
-//! stores the reply together with a copy job. The copies run afterwards on a
-//! background task, which records the destinations that actually landed on
-//! the reply's row and retires the job. A job a quit cut short resumes on
-//! the next launch; a fork inherits the jobs of replies it copies.
+//! stores the reply together with a copy job. The job records copies that
+//! already landed before a quit and retires itself; a fork inherits the jobs
+//! of replies it copies. Original paths are loaded only after an explicit
+//! action in the chat UI.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, OnceLock};
@@ -21,9 +21,10 @@ use tauri::{AppHandle, Emitter, Manager, Runtime};
 
 use super::agent_chat::{
     chat_image_extension, chat_images_dir, chat_images_root, media_type_from_extension,
-    is_network_or_device_image_path, read_bounded_local_image, resolve_within,
-    write_thread_chat_image,
+    is_network_or_device_image_path, resolve_within,
 };
+#[cfg(test)]
+use super::agent_chat::read_bounded_local_image;
 use crate::database::DatabaseStore;
 
 /// Announces the copies a reply job recorded (their paths), so a card that
@@ -34,6 +35,7 @@ pub const REPLY_IMAGES_KEPT_EVENT: &str = "agent_chat_reply_images_kept";
 const MAX_RETAINED_PER_REPLY: usize = 8;
 /// Most bytes one reply keeps, across all of its images.
 const MAX_RETAINED_BYTES_PER_REPLY: usize = 64 * 1024 * 1024;
+const UNVERIFIED_SOURCE: &str = "unverified image source requires explicit loading";
 /// Replies copying at once. Each holds at most one image (≤ 25 MB) in memory.
 static COPY_PERMITS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(2);
 
@@ -71,15 +73,15 @@ pub(super) fn plan(thread_id: &str, text: &str) -> Vec<RetainedReplyImage> {
         .collect()
 }
 
-/// Copy reply `row_id`'s planned images in the background, then record the
-/// copies that landed on its row and retire its job.
+/// Settle reply `row_id`'s planned images, recording only copies that already
+/// landed and retiring the job without opening unverified source paths.
 pub(super) fn spawn_copies<R: Runtime>(app: &AppHandle<R>, row_id: i64) {
     let app = app.clone();
     tauri::async_runtime::spawn(async move { run_job(&app, row_id).await });
 }
 
-/// Resume every reply whose copies were not recorded yet: those cut short
-/// by a quit, and a fork's inherited replies that were still copying.
+/// Resume every reply whose copy records were not finalized before a quit,
+/// including a fork's inherited replies.
 pub fn resume_pending<R: Runtime>(app: &AppHandle<R>) {
     let Some(db) = app.try_state::<DatabaseStore>() else {
         return;
@@ -89,8 +91,8 @@ pub fn resume_pending<R: Runtime>(app: &AppHandle<R>) {
     }
 }
 
-/// Finish `thread_id`'s pending copies before it is forked, so the fork's
-/// file copy finds every kept image the source will have.
+/// Settle `thread_id`'s pending records before it is forked, so the fork's
+/// file copy finds every already-kept image the source has.
 pub(super) async fn settle_thread<R: Runtime>(app: &AppHandle<R>, thread_id: &str) {
     let rows = app.state::<DatabaseStore>().list_reply_image_jobs(Some(thread_id));
     for row_id in rows {
@@ -171,6 +173,7 @@ async fn retain_row<R: Runtime>(
     for image in planned {
         match keep_one(&root, &canonical_root, &image, &mut budget).await {
             Ok(()) => kept.push(image),
+            Err(error) if error == UNVERIFIED_SOURCE => {}
             Err(error) => eprintln!(
                 "[codemux::reply_images] not keeping {}: {error}",
                 image.source
@@ -198,8 +201,9 @@ fn planned_in_payload(payload: &str) -> Vec<RetainedReplyImage> {
         .unwrap_or_default()
 }
 
-/// Make sure `image.path` holds a copy of `image.source`, charging its size
-/// to the reply's `budget` (a copy an earlier run left counts too).
+/// Record a copy that already landed before a quit. New agent-authored source
+/// paths are never read in the background because path spelling cannot prove
+/// that a drive, mount or symlink is local.
 ///
 /// The destination comes from a stored row, so it must be exactly
 /// `<root>/<folder>/<stem>.<ext>` with `<folder>` a real directory inside
@@ -211,7 +215,7 @@ async fn keep_one(
     image: &RetainedReplyImage,
     budget: &mut usize,
 ) -> Result<(), String> {
-    let (folder, stem, extension) =
+    let (folder, _, _) =
         copy_target(root, &image.path).ok_or_else(|| "not a chat-image copy path".to_string())?;
     let dir = root.join(&folder);
     tokio::fs::create_dir_all(&dir)
@@ -230,16 +234,7 @@ async fn keep_one(
         *budget = budget.saturating_sub(existing.len() as usize);
         return Ok(());
     }
-    let read = read_bounded_local_image(&image.source).await?;
-    if chat_image_extension(&read.media_type) != extension {
-        return Err(format!("its content is {}, not .{extension}", read.media_type));
-    }
-    if read.bytes.len() > *budget {
-        return Err("this reply's image budget is spent".to_string());
-    }
-    *budget -= read.bytes.len();
-    write_thread_chat_image(&folder, &stem, &read.bytes).await?;
-    Ok(())
+    Err(UNVERIFIED_SOURCE.to_string())
 }
 
 /// Split a planned copy path into its chat-image folder, file stem and
@@ -1093,7 +1088,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_resumed_reply_charges_copies_already_landed_to_its_budget() {
+    async fn a_resumed_reply_charges_existing_copies_without_reading_new_sources() {
         let root = tempfile::tempdir().unwrap();
         let canonical = root.path().canonicalize().unwrap();
         let folder = root.path().join("t");
@@ -1101,7 +1096,7 @@ mod tests {
         // A copy the first run landed before the quit.
         let landed = std::fs::File::create(folder.join("landed.png")).unwrap();
         landed.set_len((MAX_RETAINED_BYTES_PER_REPLY - 1024 * 1024) as u64).unwrap();
-        // A source the resumed run has not copied yet, larger than what is left.
+        // A source the resumed run has not copied yet must not be opened.
         let sources = tempfile::tempdir().unwrap();
         let source = sources.path().join("big.png");
         std::fs::write(&source, b"\x89PNG\r\n\x1a\n").unwrap();
@@ -1117,7 +1112,7 @@ mod tests {
             .unwrap();
         assert_eq!(budget, 1024 * 1024);
         let refused = keep_one(root.path(), &canonical, &image("next.png", &source), &mut budget).await;
-        assert!(refused.unwrap_err().contains("budget"));
+        assert_eq!(refused.unwrap_err(), UNVERIFIED_SOURCE);
         assert!(!folder.join("next.png").exists());
     }
 
