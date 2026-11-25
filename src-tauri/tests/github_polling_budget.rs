@@ -202,6 +202,14 @@ exit 99
             ],
         );
         fs::write(repo.join(".fake-gh-mode"), mode).unwrap();
+        // Fixture hosts stand in for enterprise hosts signed in with gh; an
+        // unconfigured remote host is never queried.
+        let hosts = self.root.path().join("gh").join("hosts.yml");
+        let mut known = fs::read_to_string(&hosts).unwrap_or_default();
+        if !known.lines().any(|line| line == format!("{host}:")) {
+            known.push_str(&format!("{host}:\n    user: mock-user\n"));
+            fs::write(&hosts, known).unwrap();
+        }
         repo
     }
 

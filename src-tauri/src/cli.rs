@@ -208,9 +208,19 @@ pub enum CommandSet {
         /// Sign in with an already-issued session token instead of a
         /// password. The escape hatch for an account that has no password
         /// (signed up through GitHub): sign in on a machine with a browser,
-        /// copy the session token, and paste it here. The token is verified
-        /// against the Codemux API before anything is stored.
-        #[arg(long, conflicts_with = "email")]
+        /// copy the session token, then run `codemux login --token` and
+        /// paste it at the hidden prompt, or pipe it in
+        /// (`codemux login --token < token.txt`). Passing the token as a
+        /// value still works but is deprecated: other users on this machine
+        /// can read command lines. The token is verified against the
+        /// Codemux API before anything is stored.
+        #[arg(
+            long,
+            conflicts_with = "email",
+            num_args = 0..=1,
+            default_missing_value = crate::auth::cli_login::TOKEN_FROM_STDIN,
+            value_name = "TOKEN"
+        )]
         token: Option<String>,
         /// Print the current session instead of signing in (same output as
         /// `codemux whoami`).
@@ -1407,10 +1417,33 @@ mod tests {
             }
             _ => panic!("expected login"),
         }
+        // A bare `--token` and `--token -` both mean "read it from stdin",
+        // which keeps the secret out of the process command line.
+        for argv in [
+            &["codemux", "login", "--token"][..],
+            &["codemux", "login", "--token", "-"][..],
+        ] {
+            let cli = Cli::try_parse_from(argv).expect("stdin token form parses");
+            match cli.command {
+                Some(CommandSet::Login { token, status, .. }) => {
+                    assert_eq!(
+                        token.as_deref(),
+                        Some(crate::auth::cli_login::TOKEN_FROM_STDIN),
+                        "{argv:?}"
+                    );
+                    assert!(!status);
+                }
+                _ => panic!("expected login"),
+            }
+        }
         assert!(
             Cli::try_parse_from(["codemux", "login", "--email", "a@b.co", "--token", "t"])
                 .is_err(),
             "--email and --token must not be combined"
+        );
+        assert!(
+            Cli::try_parse_from(["codemux", "login", "--email", "a@b.co", "--token"]).is_err(),
+            "--email and a stdin --token must not be combined"
         );
 
         let cli =

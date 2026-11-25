@@ -291,7 +291,9 @@ fn remote_repository(url: &str) -> Option<String> {
     })?;
     let (host, path) = if url.contains("://") {
         let parsed = url::Url::parse(url).ok()?;
-        let host = if matches!(parsed.scheme(), "http" | "https") {
+        // github.com's web origin has no port, so `:443` must not turn it
+        // into a different (untrusted) host.
+        let host = if matches!(parsed.scheme(), "http" | "https") && endpoint.host != "github.com" {
             parsed.port().map_or_else(
                 || endpoint.host.clone(),
                 |port| format!("{}:{port}", endpoint.host),
@@ -351,12 +353,14 @@ fn context(path: &Path, args: &[&str]) -> Result<(String, Vec<String>), String> 
         }
     });
     let env_host = std::env::var("GH_HOST").ok();
-    let host = explicit_host
+    let configured_host = explicit_host
         .map(str::to_string)
         .or(repo_host)
         .or_else(|| env_host.filter(|h| !h.trim().is_empty()))
         // OWNER/REPO selects the default host, not a host named OWNER.
-        .or_else(|| selected_repo.map(|_| "github.com".to_string()))
+        .or_else(|| selected_repo.map(|_| "github.com".to_string()));
+    let inferred_from_remote = configured_host.is_none();
+    let host = configured_host
         .or_else(|| {
             repository
                 .as_ref()
@@ -365,6 +369,15 @@ fn context(path: &Path, args: &[&str]) -> Result<(String, Vec<String>), String> 
         .or_else(|| detected.and_then(|d| d.host))
         .unwrap_or_else(|| "github.com".into());
     let host = clean_host(&host).ok_or("Invalid GitHub hostname")?;
+    // gh keys credentials and quota by `github.com`, never its service hosts.
+    let host =
+        crate::git_provider::detect::github_canonical_host(&host).map_or(host, str::to_string);
+    // A remote URL comes from the repository, not the user. Pinning gh to
+    // an unconfigured host would hand it an enterprise env token, so such a
+    // host is refused before any gh call or credential lookup.
+    if inferred_from_remote && !crate::github::gh_host_is_trusted(&host) {
+        return Err(untrusted_host_message(&host));
+    }
     let mut pinned: Vec<String> = args.iter().map(|s| s.to_string()).collect();
     if let (Some(explicit), Some(repo)) = (explicit_repo, repository.as_ref()) {
         let repo_path = if repo.split('/').count() == 3 {
@@ -409,6 +422,17 @@ fn context(path: &Path, args: &[&str]) -> Result<(String, Vec<String>), String> 
         }
     }
     Ok((host, pinned))
+}
+
+/// The host comes from repository content, so it is named only as data and
+/// never spliced into the suggested command: a copy-pasted
+/// `gh auth login --hostname <attacker host>` would hand that host a login.
+fn untrusted_host_message(host: &str) -> String {
+    format!(
+        "GitHub host \"{host}\" from this repository's remote is not configured, so no \
+         GitHub credential is used for it. If you trust it, sign in with \
+         `gh auth login --hostname <host>` or map it to GitHub in Settings → Source Control."
+    )
 }
 
 /// Auth and budget probes must use the same offline host resolution as reads.
@@ -3255,7 +3279,11 @@ mod tests {
             "ssh://git@github-personal/a/b.git",
             "https://github.com/a/b",
         ] {
-            assert_eq!(remote_repository(alias), Some("github.com/a/b".into()), "{alias}");
+            assert_eq!(
+                remote_repository(alias),
+                Some("github.com/a/b".into()),
+                "{alias}"
+            );
         }
         for real in ["github.mycorp.com", "github.com-work.corp.example"] {
             assert_eq!(
@@ -3268,6 +3296,56 @@ mod tests {
         assert_eq!(retry_epoch("x-ratelimit-reset: 2000", 1000), Some(2000));
         assert_eq!(retry_epoch("Retry after 2 seconds", 1000), Some(1060));
         assert_eq!(retry_epoch("x-ratelimit-reset: 999", 1000), None);
+    }
+
+    #[test]
+    fn github_service_host_remotes_are_github_com_repositories() {
+        for url in [
+            "ssh://git@ssh.github.com:443/a/b.git",
+            "git@ssh.github.com:a/b.git",
+            "https://www.github.com/a/b.git",
+            "https://WWW.GitHub.com:8443/a/b",
+            "https://api.github.com/a/b",
+            "https://github.com:443/a/b.git",
+        ] {
+            assert_eq!(
+                remote_repository(url),
+                Some("github.com/a/b".into()),
+                "{url}"
+            );
+        }
+        // Lookalikes keep their own host, so the trust gate still sees them.
+        for (url, expected) in [
+            ("https://github.com.evil.io/a/b", "github.com.evil.io/a/b"),
+            ("https://evilgithub.com/a/b", "evilgithub.com/a/b"),
+            (
+                "https://www.github.com.evil.io:8443/a/b",
+                "www.github.com.evil.io:8443/a/b",
+            ),
+            (
+                "git@ssh.github.com.evil.io:a/b.git",
+                "ssh.github.com.evil.io/a/b",
+            ),
+        ] {
+            assert_eq!(remote_repository(url), Some(expected.into()), "{url}");
+            let host = expected.rsplit_once("/a/b").unwrap().0;
+            assert!(!crate::github::gh_host_is_trusted(host), "{host}");
+        }
+    }
+
+    #[test]
+    fn untrusted_host_hint_never_puts_the_remote_host_in_a_command() {
+        let message = untrusted_host_message("github-mirror.attacker.example");
+        assert!(
+            message.contains("\"github-mirror.attacker.example\""),
+            "{message}"
+        );
+        assert!(
+            message.contains("`gh auth login --hostname <host>`"),
+            "{message}"
+        );
+        let command = message.split('`').nth(1).unwrap();
+        assert!(!command.contains("attacker"), "{message}");
     }
 
     #[test]

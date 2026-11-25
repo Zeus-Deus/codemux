@@ -17,6 +17,7 @@ struct Fixture {
     root: tempfile::TempDir,
     path: Option<OsString>,
     token: Option<OsString>,
+    gh_config: Option<OsString>,
 }
 
 impl Fixture {
@@ -52,11 +53,22 @@ esac
         fs::set_permissions(&gh, fs::Permissions::from_mode(0o755)).unwrap();
         let path = std::env::var_os("PATH");
         let token = std::env::var_os("GH_TOKEN");
+        let gh_config = std::env::var_os("GH_CONFIG_DIR");
+        // The fixture host stands in for an enterprise host signed in with
+        // gh; an unconfigured remote host is never queried.
+        let config = root.path().join("gh-config");
+        fs::create_dir(&config).unwrap();
+        fs::write(
+            config.join("hosts.yml"),
+            "github-freshness.example.test:\n    user: fixture-user\n",
+        )
+        .unwrap();
+        std::env::set_var("GH_CONFIG_DIR", &config);
         let mut paths = vec![bin];
         paths.extend(std::env::split_paths(path.as_deref().unwrap_or_default()));
         std::env::set_var("PATH", std::env::join_paths(paths).unwrap());
         std::env::set_var("GH_TOKEN", format!("synthetic-freshness-{}", root.path().display()));
-        Self { root, path, token }
+        Self { root, path, token, gh_config }
     }
 
     fn repo(&self, name: &str) -> PathBuf {
@@ -73,7 +85,11 @@ esac
 
 impl Drop for Fixture {
     fn drop(&mut self) {
-        for (name, value) in [("PATH", &self.path), ("GH_TOKEN", &self.token)] {
+        for (name, value) in [
+            ("PATH", &self.path),
+            ("GH_TOKEN", &self.token),
+            ("GH_CONFIG_DIR", &self.gh_config),
+        ] {
             if let Some(value) = value {
                 std::env::set_var(name, value);
             } else {

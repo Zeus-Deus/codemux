@@ -170,7 +170,7 @@ pub(crate) async fn sign_in(
 // and the OAuth flow itself needs a browser + a loopback callback, which
 // a headless VPS reached over SSH has neither of. `codemux login --token`
 // closes that gap — sign in on a machine that *does* have a browser, copy
-// the session bearer, and paste it here.
+// the session bearer, and paste it at the hidden prompt (or pipe it in).
 //
 // The token is not trusted on faith: it is verified against
 // `/api/auth/desktop/verify` (the same endpoint a cold-start `check_auth`
@@ -449,6 +449,73 @@ fn resolve_password() -> Result<String, String> {
     }
 }
 
+/// The `--token` value meaning "read the token from stdin". Also what a
+/// bare `--token` parses to, so the token never has to sit in argv, where
+/// any local user can read it from `/proc/<pid>/cmdline`.
+pub(crate) const TOKEN_FROM_STDIN: &str = "-";
+
+/// A session token is a few hundred bytes; cap a mistaken pipe.
+const MAX_TOKEN_INPUT: u64 = 8 * 1024;
+
+/// Where the session token comes from.
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+pub(crate) enum TokenSource {
+    /// A literal `--token <value>`: still accepted, with a warning.
+    Argv,
+    Tty,
+    PipedStdin,
+}
+
+pub(crate) fn token_source(arg: &str, stdin_is_tty: bool) -> TokenSource {
+    if arg != TOKEN_FROM_STDIN {
+        TokenSource::Argv
+    } else if stdin_is_tty {
+        TokenSource::Tty
+    } else {
+        TokenSource::PipedStdin
+    }
+}
+
+/// Read one line of token from piped input, capped and trimmed. An empty
+/// read fails here, before any network call.
+fn read_token_from(reader: impl std::io::Read) -> Result<String, String> {
+    let mut line = String::new();
+    std::io::BufReader::new(reader.take(MAX_TOKEN_INPUT))
+        .read_line(&mut line)
+        .map_err(|e| format!("Could not read the token from stdin: {e}"))?;
+    let token = line.trim();
+    if token.is_empty() {
+        return Err("No token on stdin. Pipe the session token in, for example \
+                    `codemux login --token < token.txt`."
+            .to_string());
+    }
+    Ok(token.to_string())
+}
+
+/// Resolve `--token`: a hidden prompt on a terminal, one line from piped
+/// stdin, or (deprecated) the literal value from argv.
+fn resolve_token(arg: String) -> Result<String, String> {
+    match token_source(&arg, std::io::stdin().is_terminal()) {
+        TokenSource::Argv => {
+            eprintln!(
+                "warning: a token passed on the command line is visible to other users \
+                 on this machine and is saved in shell history. Run `codemux login --token` \
+                 and paste it at the prompt, or pipe it in, instead."
+            );
+            Ok(arg)
+        }
+        TokenSource::Tty => {
+            eprint!("Session token: ");
+            let _ = std::io::stderr().flush();
+            let token =
+                rpassword::read_password().map_err(|e| format!("Could not read the token: {e}"))?;
+            eprintln!();
+            Ok(token)
+        }
+        TokenSource::PipedStdin => read_token_from(std::io::stdin().lock()),
+    }
+}
+
 // ── Command entry points ─────────────────────────────────────────
 
 /// Open the same SQLite store the desktop app and `codemux serve` use.
@@ -459,7 +526,7 @@ fn open_db() -> Result<DatabaseStore, String> {
     crate::database::init_database()
 }
 
-/// `codemux login [--email <addr>] [--token <bearer>] [--status]`.
+/// `codemux login [--email <addr>] [--token [-]] [--status]`.
 pub async fn run_login(
     email: Option<String>,
     token: Option<String>,
@@ -472,7 +539,7 @@ pub async fn run_login(
     }
 
     let user = match token {
-        Some(token) => sign_in_with_token(&db, &token)
+        Some(token) => sign_in_with_token(&db, &resolve_token(token)?)
             .await
             .map_err(|e| e.user_message())?,
         None => {
@@ -557,7 +624,8 @@ pub(crate) async fn ensure_signed_in(
         // escape hatch here rather than after a failed attempt.
         _ => prompt_email().map_err(|e| {
             format!(
-                "{e}\nFor an account with no password, run `codemux login --token <token>` first."
+                "{e}\nFor an account with no password, run `codemux login --token` first \
+                 and paste the session token at the prompt."
             )
         })?,
     };
@@ -1131,6 +1199,40 @@ mod tests {
             password_source(false, false),
             PasswordSource::PipedStdin,
             "a headless harness with no TTY and no env var reads stdin"
+        );
+    }
+
+    #[test]
+    fn token_source_keeps_the_token_out_of_argv_unless_given_literally() {
+        assert_eq!(token_source(TOKEN_FROM_STDIN, true), TokenSource::Tty);
+        assert_eq!(
+            token_source(TOKEN_FROM_STDIN, false),
+            TokenSource::PipedStdin
+        );
+        assert_eq!(token_source("sess_abc", true), TokenSource::Argv);
+        assert_eq!(token_source("sess_abc", false), TokenSource::Argv);
+    }
+
+    #[test]
+    fn piped_token_is_trimmed_and_empty_input_is_rejected() {
+        assert_eq!(
+            read_token_from(std::io::Cursor::new("  sess_abc\r\n")).unwrap(),
+            "sess_abc"
+        );
+        assert_eq!(
+            read_token_from(std::io::Cursor::new("sess_abc\nsecond line\n")).unwrap(),
+            "sess_abc",
+            "only the first line is the token"
+        );
+        for empty in ["", "\n", "   \n"] {
+            let err = read_token_from(std::io::Cursor::new(empty)).unwrap_err();
+            assert!(err.contains("No token on stdin"), "{empty:?}: {err}");
+        }
+        // A runaway pipe is capped instead of read to the end.
+        let huge = "x".repeat(MAX_TOKEN_INPUT as usize * 4);
+        assert_eq!(
+            read_token_from(std::io::Cursor::new(huge)).unwrap().len(),
+            MAX_TOKEN_INPUT as usize
         );
     }
 }

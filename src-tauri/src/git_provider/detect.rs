@@ -210,7 +210,7 @@ fn resolve_with(
         // Only ssh's own answer redirects the remote: a dotless name may
         // just as well be a real host reached through corporate DNS.
         if let Some(real) = ssh_hostname(&endpoint.host).filter(|real| *real != endpoint.host) {
-            let real = if real == "ssh.github.com" { "github.com".to_string() } else { real };
+            let real = github_canonical_host(&real).map_or(real, str::to_string);
             endpoint.base_url = format!("https://{real}");
             endpoint.host = real;
         }
@@ -341,6 +341,16 @@ pub(crate) fn parse_remote_endpoint(url: &str) -> Option<RemoteEndpoint> {
     if host.is_empty() {
         return None;
     }
+    // GitHub's own service hosts (`ssh.github.com:443`, `www.github.com`)
+    // are github.com: gh, the API, the web UI and credential checks only
+    // know that name, and its web origin never carries a port.
+    if let Some(canonical) = github_canonical_host(&host) {
+        return Some(RemoteEndpoint {
+            host: canonical.to_string(),
+            base_url: format!("https://{canonical}"),
+            ssh_alias: false,
+        });
+    }
     let ssh_alias = matches!(scheme.as_str(), "ssh" | "git+ssh" | "ssh+git")
         && looks_like_github_ssh_alias(&host);
 
@@ -357,6 +367,23 @@ pub(crate) fn parse_remote_endpoint(url: &str) -> Option<RemoteEndpoint> {
         base_url,
         ssh_alias,
     })
+}
+
+/// `github.com` when `host` (optionally `host:port`) is exactly one of
+/// GitHub's own service hostnames, matched case-insensitively and never by
+/// substring or suffix, so `github.com.evil.io` or `evilgithub.com` stay
+/// themselves.
+pub(crate) fn github_canonical_host(host: &str) -> Option<&'static str> {
+    let host = host.trim();
+    let name = match host.rsplit_once(':') {
+        Some((name, port)) if !port.is_empty() && port.chars().all(|c| c.is_ascii_digit()) => name,
+        _ => host,
+    };
+    matches!(
+        name.to_ascii_lowercase().as_str(),
+        "github.com" | "www.github.com" | "ssh.github.com" | "api.github.com"
+    )
+    .then_some("github.com")
 }
 
 /// Whether an SSH remote host may be a GitHub SSH config alias.
@@ -417,7 +444,9 @@ pub(crate) fn classify_host(
     }
 
     match host.as_str() {
-        "github.com" | "www.github.com" | "ssh.github.com" => return ProviderKind::GitHub,
+        "github.com" | "www.github.com" | "ssh.github.com" | "api.github.com" => {
+            return ProviderKind::GitHub
+        }
         "gitlab.com" | "www.gitlab.com" | "altssh.gitlab.com" => return ProviderKind::GitLab,
         "bitbucket.org" | "www.bitbucket.org" | "altssh.bitbucket.org" => {
             return ProviderKind::Bitbucket
@@ -429,6 +458,8 @@ pub(crate) fn classify_host(
     if host.ends_with(".dev.azure.com") || host.ends_with(".visualstudio.com") {
         return ProviderKind::AzureDevOps;
     }
+    // A label only: credentials are gated separately on exact, configured
+    // hosts (`github::gh_host_is_trusted`), never on this substring rule.
     if host.contains("github") {
         return ProviderKind::GitHub;
     }
@@ -842,6 +873,49 @@ mod tests {
         let unmapped = detect_from_remotes(&remotes, None, &no_custom());
         assert_eq!(unmapped.kind, ProviderKind::GitHub);
         assert_eq!(unmapped.host.as_deref(), Some("github.com"));
+    }
+
+    #[test]
+    fn github_service_hosts_are_github_com_and_lookalikes_are_not() {
+        for url in [
+            "ssh://git@ssh.github.com:443/a/b.git",
+            "git@ssh.github.com:a/b.git",
+            "https://www.github.com/a/b.git",
+            "https://WWW.GITHUB.COM:443/a/b",
+            "https://api.github.com/repos/a/b",
+            "https://github.com:443/a/b",
+        ] {
+            let endpoint = parse_remote_endpoint(url).unwrap_or_else(|| panic!("{url}"));
+            assert_eq!(endpoint.host, "github.com", "{url}");
+            assert_eq!(endpoint.base_url, "https://github.com", "{url}");
+        }
+        for host in [
+            "github.com",
+            "www.github.com",
+            "SSH.GitHub.com:443",
+            "api.github.com",
+        ] {
+            assert_eq!(github_canonical_host(host), Some("github.com"), "{host}");
+        }
+        for host in [
+            "github.com.evil.io",
+            "www.github.com.evil.io",
+            "ssh.github.com.evil.io",
+            "evilgithub.com",
+            "evil.github.com",
+            "github.co",
+            "github.com:",
+            "github.com:x",
+            "",
+        ] {
+            assert_eq!(github_canonical_host(host), None, "{host:?}");
+        }
+        let endpoint = parse_remote_endpoint("https://github.com.evil.io/a/b").unwrap();
+        assert_eq!(endpoint.host, "github.com.evil.io");
+        // ssh -G answering with a service host is github.com too.
+        test_ssh_config::set(&[("github-alt", "www.github.com")]);
+        let endpoint = resolve_remote_endpoint("git@github-alt:a/b.git", &no_custom()).unwrap();
+        assert_eq!(endpoint.host, "github.com");
     }
 
     #[test]
