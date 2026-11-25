@@ -141,11 +141,12 @@ fn lock(
 /// payload string is the JSON the emitter serialised; we re-embed it
 /// verbatim (parsed back to a value so it nests, not double-encodes).
 fn fan_out(inner: &Arc<Mutex<HashMap<String, EventEntry>>>, event: &str, payload: &str) {
-    let data: Value = serde_json::from_str(payload).unwrap_or(Value::Null);
-    if event == crate::mcp::registry::MCP_STATUS_CHANGED_EVENT
-        && super::dispatch::plugin_mcp_row(&data)
-    {
-        return;
+    let mut data: Value = serde_json::from_str(payload).unwrap_or(Value::Null);
+    if event == crate::mcp::registry::MCP_STATUS_CHANGED_EVENT {
+        if super::dispatch::plugin_mcp_row(&data) {
+            return;
+        }
+        super::dispatch::redact_remote_mcp_row(&mut data);
     }
     let frame = json!({ "t": "event", "event": event, "payload": data }).to_string();
     let map = lock(inner);
@@ -263,6 +264,18 @@ mod plugins_boundary_tests {
         assert!(frames.try_recv().is_err());
         fan_out(&inner, "mcp-status-changed", r#"{"id":"user"}"#);
         assert!(frames.try_recv().is_ok());
+        fan_out(
+            &inner,
+            "mcp-status-changed",
+            r#"{"id":"repo","status":{"kind":"needsApproval","fingerprint":"fp","summary":"node x.js --token sk-1"}}"#,
+        );
+        let Ok(Message::Text(frame)) = frames.try_recv() else {
+            panic!("expected a text frame");
+        };
+        assert_eq!(
+            serde_json::from_str::<Value>(&frame).unwrap()["payload"],
+            json!({"id":"repo","status":{"kind":"needsApproval"}})
+        );
     }
     #[test]
     fn plugin_streams_never_register_remote_subscribers() {

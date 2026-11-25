@@ -26,7 +26,7 @@ use serde_json::{json, Value};
 
 use crate::json_rpc_child::{JsonRpcChild, RpcChildError, SpawnConfig};
 
-use super::http_client::HttpMcpClient;
+use super::http_client::{HttpMcpClient, HttpRequestAdmission};
 use super::{McpConfigSource, McpServerConfig, McpTransport};
 
 /// The revision this client offers in `initialize`. A server answers with it
@@ -105,6 +105,14 @@ pub struct McpServerInfo {
 pub enum McpServerStatus {
     /// Config loaded, child not yet spawned. The default after parsing.
     Discovered,
+    /// Defined by the project's own files and not yet approved for this
+    /// project, or changed since. Never spawned or contacted in this state
+    /// (see `mcp::project_trust`). `summary` is what approving would start.
+    #[serde(rename = "needsApproval")]
+    NeedsApproval {
+        fingerprint: String,
+        summary: String,
+    },
     /// Child spawned, handshake in progress.
     Starting,
     /// `initialize` + `tools/list` succeeded; ready for `tools/call`.
@@ -170,18 +178,23 @@ impl McpServerHandle {
 /// `None` (we drop the child handle so the watchdog reaps it).
 ///
 pub async fn start_mcp_server(config: McpServerConfig) -> McpServerHandle {
-    start_mcp_server_cancellable(config, None).await
+    start_mcp_server_cancellable(config, None, (), None).await
 }
 
-pub async fn start_mcp_server_cancellable(
+pub(crate) async fn start_mcp_server_cancellable<G: Send>(
     config: McpServerConfig,
     mut cancelled: Option<tokio::sync::watch::Receiver<bool>>,
+    spawn_guards: G,
+    http_admission: Option<HttpRequestAdmission>,
 ) -> McpServerHandle {
     if matches!(config.transport, McpTransport::Http) {
+        // Each outbound request acquires its own approval gate in the HTTP
+        // transport. The connection and response must not hold registry locks.
+        drop(spawn_guards);
         return tokio::select! {
             biased;
             _ = cancellation(&mut cancelled) => stopped_handle(config.clone()),
-            handle = start_http_mcp_server(config.clone()) => handle,
+            handle = start_http_mcp_server(config.clone(), http_admission) => handle,
         };
     }
 
@@ -216,8 +229,14 @@ pub async fn start_mcp_server_cancellable(
         default_timeout: DEFAULT_REQUEST_TIMEOUT,
     };
 
+    if cancelled.as_ref().is_some_and(|rx| *rx.borrow() || rx.has_changed().is_err()) {
+        return stopped_handle(config);
+    }
     let immediate = config.raw.get("pluginImmediateShutdown").and_then(Value::as_bool) == Some(true);
     let spawned = if immediate { JsonRpcChild::spawn_immediate(spawn).await } else { JsonRpcChild::spawn(spawn).await };
+    // Process creation is now ordered against approval revocation and stop.
+    // Release the guards before the potentially long MCP handshake.
+    drop(spawn_guards);
     let child = match spawned {
         Ok(c) => Arc::new(c),
         Err(err) => {
@@ -295,7 +314,10 @@ fn stopped_handle(config: McpServerConfig) -> McpServerHandle {
     handle
 }
 
-async fn start_http_mcp_server(config: McpServerConfig) -> McpServerHandle {
+async fn start_http_mcp_server(
+    config: McpServerConfig,
+    admission: Option<HttpRequestAdmission>,
+) -> McpServerHandle {
     if config.command.is_empty() {
         return McpServerHandle {
             stderr_tail: None,
@@ -310,7 +332,7 @@ async fn start_http_mcp_server(config: McpServerConfig) -> McpServerHandle {
             config,
         };
     }
-    let connected = tokio::time::timeout(HANDSHAKE_TIMEOUT, HttpMcpClient::connect(&config)).await;
+    let connected = tokio::time::timeout(HANDSHAKE_TIMEOUT, HttpMcpClient::connect_with_admission(&config, admission)).await;
     match connected {
         Err(_) => McpServerHandle {
             stderr_tail: None,
@@ -637,6 +659,7 @@ mod tests {
             disabled: false,
             transport,
             raw: Value::Null,
+            project_root: None,
         }
     }
 

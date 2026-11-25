@@ -1,6 +1,7 @@
 //! Minimal MCP Streamable HTTP client owned by the cross-provider registry.
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::Arc;
 
 use crate::json_rpc_child::Notification;
 use futures_util::StreamExt;
@@ -15,6 +16,11 @@ const MCP_PROTOCOL_VERSION: &str = "2025-06-18";
 pub(super) const NOTIFICATION_STREAM_ERROR: &str = "codemux/notification_stream_error";
 pub(super) const NOTIFICATION_STREAM_OPENED: &str = "codemux/notification_stream_opened";
 const INITIAL_GET_ATTEMPTS: usize = 6;
+
+#[cfg(test)]
+tokio::task_local! {
+    static BEFORE_INITIALIZED_SEND_GATE: (Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>);
+}
 
 pub(super) struct CatalogRefresh<'a> {
     client: &'a HttpMcpClient,
@@ -45,9 +51,24 @@ struct HttpSession {
     needs_initialization: bool,
 }
 
+/// Serializes admission of each project HTTP request with approval revocation.
+/// Responses and retries never hold the approval lock.
+#[derive(Debug)]
+pub(crate) struct HttpRequestAdmission {
+    approval_lock: Arc<Mutex<()>>,
+    cancelled: watch::Receiver<bool>,
+}
+
+impl HttpRequestAdmission {
+    pub(crate) fn new(approval_lock: Arc<Mutex<()>>, cancelled: watch::Receiver<bool>) -> Self {
+        Self { approval_lock, cancelled }
+    }
+}
+
 #[derive(Debug)]
 pub struct HttpMcpClient {
     http: reqwest::Client,
+    admission: Option<HttpRequestAdmission>,
     url: String,
     headers: HeaderMap,
     session: Mutex<HttpSession>,
@@ -61,6 +82,13 @@ pub struct HttpMcpClient {
 
 impl HttpMcpClient {
     pub async fn connect(config: &McpServerConfig) -> Result<Self, String> {
+        Self::connect_with_admission(config, None).await
+    }
+
+    pub(crate) async fn connect_with_admission(
+        config: &McpServerConfig,
+        admission: Option<HttpRequestAdmission>,
+    ) -> Result<Self, String> {
         let headers = headers_from_config(config)?;
         let mut http = reqwest::Client::builder().redirect(reqwest::redirect::Policy::none());
         // Local MCP credentials must never travel through an environment
@@ -72,6 +100,7 @@ impl HttpMcpClient {
             http: http
                 .build()
                 .map_err(|error| format!("build HTTP client: {error}"))?,
+            admission,
             url: config.command.clone(),
             headers,
             session: Mutex::new(HttpSession {
@@ -169,7 +198,7 @@ impl HttpMcpClient {
                 request = request.header("mcp-session-id", id);
             }
             let response = tokio::select! {
-                response = tokio::time::timeout(Duration::from_secs(5), request.send()) => response.ok().and_then(Result::ok),
+                response = tokio::time::timeout(Duration::from_secs(5), self.send_with_admission(request)) => response.ok().and_then(Result::ok),
                 _ = changes.changed() => continue,
             };
             if let Some(response) = response {
@@ -416,10 +445,45 @@ impl HttpMcpClient {
         if let Some(id) = session_id {
             request = request.header("mcp-session-id", id);
         }
-        request
-            .send()
-            .await
-            .map_err(|error| format!("HTTP request failed: {error}"))
+        #[cfg(test)]
+        if message.get("method").and_then(Value::as_str) == Some("notifications/initialized") {
+            if let Ok((entered, release)) = BEFORE_INITIALIZED_SEND_GATE.try_with(Clone::clone) {
+                entered.notify_one();
+                release.notified().await;
+            }
+        }
+        self.send_with_admission(request).await
+    }
+
+    async fn send_with_admission(
+        &self,
+        request: reqwest::RequestBuilder,
+    ) -> Result<reqwest::Response, String> {
+        let Some(admission) = &self.admission else {
+            return request.send().await.map_err(|error| format!("HTTP request failed: {error}"));
+        };
+        let guard = admission.approval_lock.lock().await;
+        let mut cancelled = admission.cancelled.clone();
+        if *cancelled.borrow() || cancelled.has_changed().is_err() {
+            return Err("MCP server stopped before HTTP request admission".into());
+        }
+        let send = request.send();
+        tokio::pin!(send);
+        // Poll the request once while revocation is excluded. Later network
+        // progress may await a response, so release the lock immediately.
+        let first = std::future::poll_fn(|cx| {
+            std::task::Poll::Ready(std::future::Future::poll(send.as_mut(), cx))
+        }).await;
+        drop(guard);
+        let result = match first {
+            std::task::Poll::Ready(result) => result,
+            std::task::Poll::Pending => tokio::select! {
+                biased;
+                _ = cancelled.changed() => return Err("MCP server stopped during HTTP request".into()),
+                result = send => result,
+            },
+        };
+        result.map_err(|error| format!("HTTP request failed: {error}"))
     }
 
     async fn read_response(
@@ -589,18 +653,47 @@ fn insert_header(headers: &mut HeaderMap, name: &str, value: &str) -> Result<(),
     Ok(())
 }
 
-fn expand_env_markers(value: &str) -> String {
-    let mut output = value.to_string();
-    while let Some(start) = output.find("{env:") {
-        let Some(relative_end) = output[start + 5..].find('}') else {
-            break;
-        };
-        let end = start + 5 + relative_end;
-        let name = &output[start + 5..end];
-        let replacement = std::env::var(name).unwrap_or_default();
-        output.replace_range(start..=end, &replacement);
+/// One piece of a header template: text sent as written, or the name in
+/// an `{env:NAME}` marker.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum HeaderTemplatePart<'a> {
+    Text(&'a str),
+    Env(&'a str),
+}
+
+/// `template` split into text and `{env:NAME}` markers in one left-to-right
+/// pass. A marker without a closing `}` is text. The header Codemux sends
+/// and the approval summary of what it sends both read this, so a value
+/// can never expand to a variable the summary does not name.
+pub(crate) fn header_template_parts(template: &str) -> Vec<HeaderTemplatePart<'_>> {
+    let mut parts = Vec::new();
+    let mut rest = template;
+    while let Some(start) = rest.find("{env:") {
+        let after = &rest[start + 5..];
+        let Some(end) = after.find('}') else { break };
+        if start > 0 {
+            parts.push(HeaderTemplatePart::Text(&rest[..start]));
+        }
+        parts.push(HeaderTemplatePart::Env(&after[..end]));
+        rest = &after[end + 1..];
     }
-    output
+    if !rest.is_empty() {
+        parts.push(HeaderTemplatePart::Text(rest));
+    }
+    parts
+}
+
+/// `value` with each `{env:NAME}` marker replaced by that variable (empty
+/// when unset). Substituted text is never scanned again, so text around a
+/// marker cannot join into a new one.
+fn expand_env_markers(value: &str) -> String {
+    header_template_parts(value)
+        .into_iter()
+        .map(|part| match part {
+            HeaderTemplatePart::Text(text) => text.to_string(),
+            HeaderTemplatePart::Env(name) => std::env::var(name).unwrap_or_default(),
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -625,6 +718,82 @@ mod tests {
         );
         std::env::remove_var("CODEMUX_MCP_HTTP_TEST");
     }
+
+    fn http_config(source: crate::mcp::McpConfigSource, headers: Value) -> McpServerConfig {
+        McpServerConfig {
+            id: "id".into(),
+            name: "remote".into(),
+            sources: vec![source],
+            command: "http://example.test/mcp".into(),
+            args: Vec::new(),
+            env: Default::default(),
+            disabled: false,
+            transport: super::super::McpTransport::Http,
+            raw: json!({ "headers": headers }),
+            project_root: None,
+        }
+    }
+
+    #[test]
+    fn splits_header_templates_in_one_pass() {
+        use HeaderTemplatePart::{Env, Text};
+        assert_eq!(
+            header_template_parts("Bearer {env:A}-{env:B}"),
+            vec![Text("Bearer "), Env("A"), Text("-"), Env("B")]
+        );
+        assert_eq!(
+            header_template_parts("{en{env:UNSET}v:SECRET}"),
+            vec![Text("{en"), Env("UNSET"), Text("v:SECRET}")]
+        );
+        assert_eq!(header_template_parts("{env:open"), vec![Text("{env:open")]);
+        assert_eq!(header_template_parts(""), vec![]);
+    }
+
+    /// Expanding one marker cannot join the text around it into another,
+    /// and the approval summary names exactly the variables that are sent.
+    #[test]
+    fn substituted_text_never_forms_a_new_marker() {
+        std::env::set_var("CODEMUX_MCP_SPLICE_SECRET", "hunter2");
+        std::env::remove_var("CODEMUX_MCP_SPLICE_UNSET");
+        let config = http_config(
+            crate::mcp::McpConfigSource::ClaudeProject,
+            json!({ "X-Key": "{en{env:CODEMUX_MCP_SPLICE_UNSET}v:CODEMUX_MCP_SPLICE_SECRET}" }),
+        );
+        let headers = headers_from_config(&config).unwrap();
+        assert_eq!(headers["x-key"], "{env:CODEMUX_MCP_SPLICE_SECRET}");
+        assert_eq!(
+            super::super::project_trust::summary(&config),
+            "http://example.test/mcp · sends CODEMUX_MCP_SPLICE_UNSET"
+        );
+
+        // A variable's value is sent as written, not expanded again.
+        std::env::set_var(
+            "CODEMUX_MCP_SPLICE_OUTER",
+            "{env:CODEMUX_MCP_SPLICE_SECRET}",
+        );
+        let config = http_config(
+            crate::mcp::McpConfigSource::ClaudeProject,
+            json!({ "X-Key": "{env:CODEMUX_MCP_SPLICE_OUTER}" }),
+        );
+        let headers = headers_from_config(&config).unwrap();
+        assert_eq!(headers["x-key"], "{env:CODEMUX_MCP_SPLICE_SECRET}");
+        std::env::remove_var("CODEMUX_MCP_SPLICE_SECRET");
+        std::env::remove_var("CODEMUX_MCP_SPLICE_OUTER");
+    }
+
+    /// User-owned HTTP entries keep expanding ordinary markers.
+    #[test]
+    fn user_http_headers_expand_env_markers() {
+        std::env::set_var("CODEMUX_MCP_USER_TOKEN", "token");
+        let config = http_config(
+            crate::mcp::McpConfigSource::ClaudeUser,
+            json!({ "Authorization": "Bearer {env:CODEMUX_MCP_USER_TOKEN}", "X-Plain": "plain" }),
+        );
+        let headers = headers_from_config(&config).unwrap();
+        assert_eq!(headers["authorization"], "Bearer token");
+        assert_eq!(headers["x-plain"], "plain");
+        std::env::remove_var("CODEMUX_MCP_USER_TOKEN");
+    }
 }
 
 #[cfg(test)]
@@ -639,6 +808,51 @@ mod live_tests {
     };
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
+
+    #[tokio::test]
+    async fn revocation_before_initialized_request_sends_no_second_header() {
+        use mockito::Matcher;
+        let mut server = mockito::Server::new_async().await;
+        let initialize = server.mock("POST", "/mcp")
+            .match_body(Matcher::PartialJson(json!({"method": "initialize"})))
+            .with_header("content-type", "application/json")
+            .with_body(json!({"jsonrpc":"2.0","id":1,"result":{
+                "protocolVersion":"2025-06-18","capabilities":{},
+                "serverInfo":{"name":"fixture","version":"1"}
+            }}).to_string())
+            .expect(1).create_async().await;
+        let initialized = server.mock("POST", "/mcp")
+            .match_body(Matcher::PartialJson(json!({"method": "notifications/initialized"})))
+            .expect(0).create_async().await;
+        let config = McpServerConfig {
+            id: "project-http".into(), name: "project-http".into(), sources: vec![],
+            command: format!("{}/mcp", server.url()), args: vec![], env: Default::default(),
+            disabled: false, transport: super::super::McpTransport::Http,
+            raw: json!({"headers":{"x-secret":"fixture-secret"}}), project_root: None,
+        };
+        let approval_lock = Arc::new(Mutex::new(()));
+        let (cancel, cancelled) = watch::channel(false);
+        let admission = HttpRequestAdmission::new(approval_lock.clone(), cancelled);
+        let (entered, release) = (Arc::new(tokio::sync::Notify::new()), Arc::new(tokio::sync::Notify::new()));
+        let connect = BEFORE_INITIALIZED_SEND_GATE.scope(
+            (entered.clone(), release.clone()),
+            HttpMcpClient::connect_with_admission(&config, Some(admission)),
+        );
+        tokio::pin!(connect);
+        tokio::select! {
+            result = &mut connect => panic!("connect completed before initialized gate: {result:?}"),
+            _ = entered.notified() => {},
+        }
+        let guard = approval_lock.lock().await;
+        cancel.send_replace(true);
+        drop(guard);
+        release.notify_one();
+        let error = tokio::time::timeout(Duration::from_secs(5), connect)
+            .await.unwrap().unwrap_err();
+        assert!(error.contains("MCP server stopped"), "{error}");
+        initialize.assert_async().await;
+        initialized.assert_async().await;
+    }
 
     #[derive(Clone)]
     struct Fixture {
@@ -744,6 +958,7 @@ mod live_tests {
             disabled: false,
             transport: super::super::McpTransport::Http,
             raw: json!({"headers":{"x-api-key":"fixture-only"}}),
+            project_root: None,
         };
         let error = HttpMcpClient::connect(&config).await.unwrap_err();
         assert!(
@@ -795,6 +1010,7 @@ mod live_tests {
                 disabled: false,
                 transport: super::super::McpTransport::Http,
                 raw: json!({}),
+                project_root: None,
             };
             let server = tokio::spawn(async move {
                 axum::serve(socket, app).await.unwrap();
@@ -864,6 +1080,7 @@ mod live_tests {
             disabled: false,
             transport: super::super::McpTransport::Http,
             raw: json!({}),
+            project_root: None,
         };
         let server = tokio::spawn(async move {
             axum::serve(socket, app).await.unwrap();
@@ -942,6 +1159,7 @@ mod live_tests {
                 disabled: false,
                 transport: super::super::McpTransport::Http,
                 raw: json!({}),
+                project_root: None,
             };
             let server = tokio::spawn(async move {
                 axum::serve(socket, app).await.unwrap();
@@ -1002,6 +1220,7 @@ mod live_tests {
                 disabled: false,
                 transport: super::super::McpTransport::Http,
                 raw: json!({}),
+                project_root: None,
             };
             let server = tokio::spawn(async move {
                 axum::serve(socket, app).await.unwrap();
@@ -1581,6 +1800,7 @@ mod live_tests {
             disabled: false,
             transport: super::super::McpTransport::Http,
             raw: json!({}),
+            project_root: None,
         };
         let server = tokio::spawn(async move {
             axum::serve(socket, app).await.unwrap();
@@ -1742,6 +1962,7 @@ mod live_tests {
             disabled: false,
             transport: super::super::McpTransport::Http,
             raw: json!({"headers":{"Authorization":format!("Bearer {token}")}}),
+            project_root: None,
         };
         let client = HttpMcpClient::connect(&config(format!("{target}/mcp"), "loopback-test"))
             .await

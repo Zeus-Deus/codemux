@@ -449,6 +449,31 @@ pub(super) fn plugin_mcp_row(row: &Value) -> bool {
         .is_some_and(|sources| sources.iter().any(|source| source == "plugin"))
 }
 
+/// A runtime row as paired devices see it. Approval details stay on the
+/// host, where Settings or `codemux mcp-approve` can show them.
+pub(super) fn redact_remote_mcp_row(row: &mut Value) {
+    if let Some(status) = row.get_mut("status").and_then(Value::as_object_mut) {
+        if status.get("kind").and_then(Value::as_str) == Some("needsApproval") {
+            status.remove("summary");
+            status.remove("fingerprint");
+        }
+    }
+}
+
+/// The host's redacted config still carries pass-through `raw` fields from
+/// provider files. Send only fields the paired UI needs, and hide the entire
+/// command rather than trying to recognize every secret-bearing argument.
+fn redact_remote_mcp_config(row: &mut Value) {
+    if let Some(config) = row.as_object_mut() {
+        config.retain(|key, _| {
+            matches!(key.as_str(), "id" | "name" | "sources" | "disabled" | "transport")
+        });
+        config.insert("command".into(), Value::String("[redacted]".into()));
+        config.insert("args".into(), json!([]));
+        config.insert("env".into(), json!({}));
+    }
+}
+
 fn remote_mcp_response(command: &str, body: InvokeResponseBody) -> InvokeResponseBody {
     if matches!(
         command,
@@ -457,8 +482,18 @@ fn remote_mcp_response(command: &str, body: InvokeResponseBody) -> InvokeRespons
         if let InvokeResponseBody::Json(ref text) = body {
             if let Ok(mut rows) = serde_json::from_str::<Vec<Value>>(text) {
                 rows.retain(|row| !plugin_mcp_row(row));
+                rows.iter_mut().for_each(redact_remote_mcp_row);
+                if command == "list_mcp_servers" {
+                    rows.retain(Value::is_object);
+                    rows.iter_mut().for_each(redact_remote_mcp_config);
+                }
                 return InvokeResponseBody::Json(serde_json::to_string(&rows).unwrap());
             }
+        }
+        if command == "list_mcp_servers" {
+            // A changed host response shape must not bypass the paired-device
+            // allowlist and forward arbitrary provider config fields.
+            return InvokeResponseBody::Json("[]".into());
         }
     }
     body
@@ -810,11 +845,64 @@ mod plugins_boundary_tests {
             let InvokeResponseBody::Json(body) = remote_mcp_response(command, body) else {
                 panic!("JSON expected");
             };
+            let expected = if command == "list_mcp_servers" {
+                json!([{"id":"user","command":"[redacted]","args":[],"env":{}}])
+            } else {
+                json!([{"id":"user"}])
+            };
+            assert_eq!(serde_json::from_str::<Value>(&body).unwrap(), expected);
+        }
+    }
+    #[test]
+    fn project_server_definitions_stay_on_this_computer() {
+        let waiting = json!({"id":"repo","status":{"kind":"needsApproval","fingerprint":"fp","summary":"node x.js --api-key sk-1 · env TOKEN=t"}});
+        let running = json!({"id":"user","status":{"kind":"running","toolCount":2}});
+        for command in ["get_mcp_runtime_status", "prime_mcp_runtime"] {
+            let body = InvokeResponseBody::Json(json!([waiting, running]).to_string());
+            let InvokeResponseBody::Json(body) = remote_mcp_response(command, body) else {
+                panic!("JSON expected");
+            };
             assert_eq!(
                 serde_json::from_str::<Value>(&body).unwrap(),
-                json!([{"id":"user"}])
+                json!([{"id":"repo","status":{"kind":"needsApproval"}}, running])
             );
         }
+    }
+    #[test]
+    fn opencode_raw_mcp_definitions_stay_off_paired_devices() {
+        let local = json!({
+            "id":"local", "name":"local", "sources":["openCodeProject"],
+            "command":"/bin/sh", "args":["…"], "env":{"TOKEN":"[redacted]"},
+            "disabled":false, "transport":"stdio",
+            "raw":{"type":"local","command":["/bin/sh","-c","echo secret-argument"],
+                "environment":{"TOKEN":"secret-environment"}}
+        });
+        let remote = json!({
+            "id":"remote", "name":"remote", "sources":["openCodeProject"],
+            "command":"https://example.test/mcp", "args":[], "env":{},
+            "disabled":false, "transport":"http",
+            "raw":{"type":"remote","url":"https://example.test/mcp?token=secret-url",
+                "headers":{"Authorization":"secret-header"}}
+        });
+        let body = InvokeResponseBody::Json(json!([local, remote]).to_string());
+        let InvokeResponseBody::Json(body) = remote_mcp_response("list_mcp_servers", body) else {
+            panic!("JSON expected");
+        };
+        assert!(!body.contains("secret-"), "{body}");
+        assert_eq!(
+            serde_json::from_str::<Value>(&body).unwrap(),
+            json!([
+                {"id":"local","name":"local","sources":["openCodeProject"],
+                    "command":"[redacted]","args":[],"env":{},"disabled":false,"transport":"stdio"},
+                {"id":"remote","name":"remote","sources":["openCodeProject"],
+                    "command":"[redacted]","args":[],"env":{},"disabled":false,"transport":"http"}
+            ])
+        );
+        let malformed = InvokeResponseBody::Json(json!({"raw":{"environment":{"TOKEN":"secret"}}}).to_string());
+        let InvokeResponseBody::Json(body) = remote_mcp_response("list_mcp_servers", malformed) else {
+            panic!("JSON expected");
+        };
+        assert_eq!(body, "[]");
     }
     #[tokio::test]
     async fn plugin_mcp_admin_is_denied_before_desktop_dispatch() {

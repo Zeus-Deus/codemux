@@ -2929,6 +2929,7 @@ fn build_core_app<R: tauri::Runtime>(
             commands::start_mcp_server_cmd,
             commands::stop_mcp_server_cmd,
             commands::restart_mcp_server_cmd,
+            commands::approve_mcp_server,
             commands::list_mcp_tools,
             commands::list_mcp_tools_for_server,
             commands::create_workspace_with_preset,

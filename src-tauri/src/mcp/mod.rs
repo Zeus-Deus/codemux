@@ -12,6 +12,7 @@ pub mod gateway;
 pub mod http_client;
 pub mod parser;
 pub mod paths;
+pub mod project_trust;
 pub mod protocol;
 pub mod registry;
 pub mod runtime;
@@ -57,7 +58,7 @@ pub enum McpConfigSource {
     CodexUser,
     /// `~/.config/opencode/opencode.json{,c}`
     OpenCodeUser,
-    /// `<project>/opencode.json{,c}`
+    /// `<project>/opencode.json{,c}` or `<project>/.opencode/opencode.json{,c}`
     OpenCodeProject,
 }
 
@@ -93,6 +94,24 @@ pub struct McpServerConfig {
     /// Pass-through for unknown fields so we don't lose forward-compat info
     /// when round-tripping configs.
     pub raw: serde_json::Value,
+    /// Canonical root of the project whose own files define this server,
+    /// set by discovery for project sources (see [`is_project_source`]).
+    /// Approval is per project, so it is never read from a config file.
+    #[serde(skip)]
+    pub project_root: Option<std::path::PathBuf>,
+}
+
+/// Sources read from files inside the project, which whoever wrote the
+/// repository controls. Servers from these need the user's approval before
+/// Codemux starts them (see [`project_trust`]).
+pub fn is_project_source(source: McpConfigSource) -> bool {
+    matches!(
+        source,
+        McpConfigSource::CodemuxProject
+            | McpConfigSource::ClaudeProject
+            | McpConfigSource::CursorProject
+            | McpConfigSource::OpenCodeProject
+    )
 }
 
 impl McpServerConfig {
@@ -208,7 +227,11 @@ pub fn source_rank(s: McpConfigSource) -> u8 {
 
 /// Merge identical configs across sources into single rows.
 ///
-/// **Dedupe key:** `(name, command, args, env)`. Two entries with the
+/// **Dedupe key:** `(name, command, args, env, transport, headers, cwd)`.
+/// Merged entries start exactly the same thing. When a user-owned file
+/// defines the row too, that entry is canonical, so the row needs no
+/// approval (see [`project_trust::fingerprint`]) and a project's copy
+/// cannot re-enable or reconfigure it. Two entries with the
 /// same name but different command/args stay as two separate rows so the
 /// UI can show a source disambiguator (e.g. two different versions of
 /// the same MCP).
@@ -231,6 +254,7 @@ pub fn dedupe_servers(servers: Vec<McpServerConfig>) -> Vec<McpServerConfig> {
         Vec<(String, String)>,
         u8,
         Vec<(String, String)>,
+        Option<String>,
     );
     let mut by_key: Map<Key, usize> = Map::new();
     let mut out: Vec<McpServerConfig> = Vec::with_capacity(servers.len());
@@ -279,9 +303,20 @@ pub fn dedupe_servers(servers: Vec<McpServerConfig>) -> Vec<McpServerConfig> {
             env_pairs,
             transport,
             http_headers,
+            srv.raw.get("cwd").and_then(serde_json::Value::as_str).map(str::to_string),
         );
 
         if let Some(&idx) = by_key.get(&key) {
+            // A user-owned entry outranks a project file's copy of it, so
+            // the merged row keeps the user's id (Settings' off switch),
+            // `disabled` flag and remaining fields, whichever ranks first.
+            let user_owned = |sources: &[McpConfigSource]| {
+                sources.iter().any(|source| !is_project_source(*source))
+            };
+            let mut srv = srv;
+            if user_owned(&srv.sources) && !user_owned(&out[idx].sources) {
+                std::mem::swap(&mut out[idx], &mut srv);
+            }
             // Merge: append the additional source(s) onto the canonical
             // row, deduplicating in case the input already had a merged
             // entry for some reason.
@@ -315,6 +350,7 @@ mod tests {
             disabled: false,
             transport: McpTransport::Stdio,
             raw: serde_json::Value::Null,
+            project_root: None,
         }
     }
 

@@ -196,39 +196,74 @@ pub async fn list_mcp_tools_for_server(
     Ok(registry.list_tools_for_server(&id).await)
 }
 
-/// Re-discover the config for a single server id by walking the same
-/// paths `list_mcp_servers` walks. Returns the first match. Used by
-/// the start command when the registry doesn't already hold a handle.
+/// Re-discover the config for a single server id, deduplicated and tagged
+/// the same way chat priming discovers it. Used by the start command when
+/// the registry doesn't already hold a handle.
 fn find_config(id: &str, project_root: Option<&Path>) -> Option<McpServerConfig> {
-    if id == "codemux-self" {
-        return Some(codemux_self_config());
+    crate::mcp::registry::discover_configs(project_root)
+        .into_iter()
+        .find(|config| config.id == id)
+}
+
+/// Approve a server defined by the project's own files after the user
+/// reviewed it in Settings, then start it. `fingerprint` comes from the
+/// row's `needsApproval` status; the approval is stored locally only.
+#[tauri::command]
+pub async fn approve_mcp_server<R: Runtime>(
+    app: AppHandle<R>,
+    registry: State<'_, McpRegistry>,
+    id: String,
+    fingerprint: String,
+) -> Result<McpServerRuntime, String> {
+    registry.approve_project_server(&app, &id, &fingerprint).await
+}
+
+/// `codemux mcp-approve` on the host, the only way to approve on a headless
+/// `codemux serve`. Without `fingerprint` or `revoke`: the servers
+/// `checkout`'s own files define, those that wait for approval with their
+/// full definition and those already approved. With `fingerprint`: approve
+/// the waiting server whose definition it names and start it. With
+/// `revoke`: forget that approval and stop the servers running it.
+pub(crate) async fn project_approval<R: Runtime>(
+    app: &AppHandle<R>,
+    checkout: &Path,
+    fingerprint: Option<&str>,
+    revoke: Option<&str>,
+) -> Result<serde_json::Value, String> {
+    use crate::mcp::project_trust;
+    use tauri::Manager;
+    let registry = app
+        .try_state::<McpRegistry>()
+        .ok_or("The MCP runtime is not running")?;
+    if let Some(revoke) = revoke {
+        let revoked = registry.revoke_project_approval(app, revoke).await?;
+        return Ok(serde_json::json!({ "revoked": revoked }));
     }
-
-    let project_path: Option<PathBuf> = project_root.map(|p| p.to_path_buf());
-    let scan = enumerate_mcp_paths(project_path.as_deref());
-
-    for (path, source) in scan.paths {
-        let parsed = if is_claude_wrapped_path(&path) {
-            parse_claude_wrapped_config(&path, project_path.as_deref())
-        } else if source == McpConfigSource::CodexUser {
-            parse_codex_config_file(&path)
-        } else if matches!(
-            source,
-            McpConfigSource::OpenCodeUser | McpConfigSource::OpenCodeProject
-        ) {
-            parse_opencode_config_file(&path, source)
-        } else {
-            parse_mcp_config_file(&path, source)
+    let (approved, pending): (Vec<_>, Vec<_>) = crate::mcp::registry::discover_configs(Some(checkout))
+        .into_iter()
+        .filter_map(|config| Some((project_trust::fingerprint(&config)?, config)))
+        .partition(|(fingerprint, _)| project_trust::is_approved(Some(app), fingerprint));
+    let Some(wanted) = fingerprint else {
+        let rows = |rows: Vec<(String, McpServerConfig)>| -> Vec<serde_json::Value> {
+            rows.into_iter()
+                .map(|(fingerprint, config)| {
+                    serde_json::json!({
+                        "name": project_trust::escape(&config.name),
+                        "fingerprint": fingerprint,
+                        "summary": project_trust::summary(&config),
+                    })
+                })
+                .collect()
         };
-        if let Ok(parsed) = parsed {
-            for srv in parsed {
-                if srv.id == id {
-                    return Some(srv);
-                }
-            }
-        }
-    }
-    None
+        return Ok(serde_json::json!({ "pending": rows(pending), "approved": rows(approved) }));
+    };
+    let (_, config) = pending
+        .into_iter()
+        .find(|(fingerprint, _)| fingerprint == wanted)
+        .ok_or("No server in this folder waits for that approval. It may have changed or already be approved; list them again.")?;
+    let name = project_trust::escape(&config.name);
+    let row = registry.approve_definition(app, config, wanted).await?;
+    Ok(serde_json::json!({ "approved": name, "status": row.status }))
 }
 
 #[cfg(test)]
@@ -360,5 +395,66 @@ mod tests {
         assert!(!result.iter().any(|s| s.name == "cmux"), "codemux mcp leaked in as its own row: {result:?}");
         assert!(result.iter().any(|s| s.name == "notify"));
         assert!(result.iter().any(|s| s.name == "demo"));
+    }
+
+    /// `codemux mcp-approve`: lists what waits with its full definition,
+    /// approves only a fingerprint it listed, lists it as approved, and
+    /// `--revoke` stops it and makes it wait again.
+    #[tokio::test]
+    async fn host_approval_lists_approves_and_revokes_the_exact_definition() {
+        use crate::mcp::runtime::McpServerStatus;
+        use tauri::Manager;
+        let (project, scratch) = (TempDir::new().unwrap(), TempDir::new().unwrap());
+        let pid_file = scratch.path().join("pid");
+        let fixture = format!("{}/tests/fixtures/plugin_mcp.py", env!("CARGO_MANIFEST_DIR"));
+        fs::write(
+            project.path().join(".mcp.json"),
+            serde_json::json!({ "mcpServers": { "lint": {
+                "command": "python3",
+                "args": [fixture, "--pid-file", pid_file.display().to_string()],
+                "env": { "NODE_OPTIONS": "--require ./x.js" },
+            }}})
+            .to_string(),
+        )
+        .unwrap();
+        let app = tauri::test::mock_app();
+        app.manage(crate::database::DatabaseStore::new_in_memory());
+        app.manage(McpRegistry::new());
+
+        let listed = project_approval(app.handle(), project.path(), None, None).await.unwrap();
+        let pending = listed["pending"].as_array().unwrap();
+        assert_eq!(pending.len(), 1, "{listed}");
+        assert_eq!(listed["approved"], serde_json::json!([]));
+        assert_eq!(pending[0]["name"], "lint");
+        let summary = pending[0]["summary"].as_str().unwrap();
+        let env = if cfg!(windows) { r#"NODE_OPTIONS="--require ./x.js""# } else { "NODE_OPTIONS='--require ./x.js'" };
+        assert!(summary.contains(&format!("env {env}")), "{summary}");
+        assert!(project_approval(app.handle(), project.path(), Some("stale"), None).await.is_err());
+        assert!(!pid_file.exists());
+
+        let fingerprint = pending[0]["fingerprint"].as_str().unwrap().to_string();
+        let approved = project_approval(app.handle(), project.path(), Some(&fingerprint), None)
+            .await
+            .unwrap();
+        assert_eq!(approved["approved"], "lint");
+        assert_eq!(approved["status"]["kind"], "running", "{approved}");
+        assert!(pid_file.exists(), "the approved server did not start");
+        let listed = project_approval(app.handle(), project.path(), None, None).await.unwrap();
+        assert_eq!(listed["pending"], serde_json::json!([]));
+        assert_eq!(listed["approved"][0]["fingerprint"], fingerprint.as_str());
+
+        let revoked = project_approval(app.handle(), project.path(), None, Some(&fingerprint))
+            .await
+            .unwrap();
+        assert_eq!(revoked["revoked"], true);
+        let registry = app.state::<McpRegistry>();
+        let rows = registry.list_runtime().await;
+        assert!(
+            matches!(&rows[0].status, McpServerStatus::NeedsApproval { fingerprint: shown, .. } if *shown == fingerprint),
+            "{rows:?}"
+        );
+        let listed = project_approval(app.handle(), project.path(), None, None).await.unwrap();
+        assert_eq!(listed["pending"][0]["fingerprint"], fingerprint.as_str());
+        registry.shutdown_all().await;
     }
 }

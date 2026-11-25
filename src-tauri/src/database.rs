@@ -3,6 +3,7 @@ pub mod automation_triggers;
 pub mod agent_control;
 pub mod message_delivery;
 pub mod mcp_connector;
+mod mcp_project_approvals;
 pub mod delegated_tasks;
 pub mod delegation_tasks;
 pub mod follow_ups;
@@ -638,6 +639,7 @@ fn create_schema(conn: &Connection) -> Result<(), String> {
     conn.execute_batch(local_sessions::SCHEMA).map_err(|e|e.to_string())?;
     hermes::migrate(conn).map_err(|e| e.to_string())?;
     custom_acp::migrate(conn).map_err(|e| e.to_string())?;
+    mcp_project_approvals::migrate(conn).map_err(|e| e.to_string())?;
     conn.execute_batch(
         "
         CREATE TABLE IF NOT EXISTS schema_version (
@@ -1531,6 +1533,12 @@ impl DatabaseStore {
     #[cfg(all(test, unix))]
     pub(crate) fn test_busy_handler(&self, handler: fn(i32) -> bool) {
         self.conn.lock().unwrap().busy_handler(Some(handler)).unwrap();
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_query_only(&self, enabled: bool) {
+        let statement = if enabled { "PRAGMA query_only=ON" } else { "PRAGMA query_only=OFF" };
+        self.conn.lock().unwrap().execute_batch(statement).unwrap();
     }
 
     /// Create an in-memory database (fallback if file DB fails, and for tests).

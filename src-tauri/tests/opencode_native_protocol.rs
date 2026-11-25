@@ -6,8 +6,9 @@ use std::{path::PathBuf, sync::Arc, time::Duration};
 use codemux_lib::agent_provider::{
     events::{CompletedItem, ContentDelta, ProviderRuntimeEvent, TurnStatus},
     opencode::{
-        api::OpenCodeApi, OpenCodeAgentProvider, OpenCodeClient, OpenCodeClientConfig,
-        OpenCodeProviderConfig, OpenCodeServer, OpenCodeServerManager,
+        api::OpenCodeApi, capabilities::harvest_opencode_capabilities, OpenCodeAgentProvider,
+        OpenCodeClient, OpenCodeClientConfig, OpenCodeProviderConfig, OpenCodeServer,
+        OpenCodeServerManager,
     },
     provider::{AgentProvider, ProviderEventStream},
     ApprovalDecision, SendTurnInput, StartSessionInput, ThreadId, TurnId,
@@ -78,6 +79,16 @@ async fn assert_single_completion(stream: &mut ProviderEventStream, turn: &TurnI
 async fn real_opencode_models_approvals_tools_interrupt_and_resume() {
     let manager = Arc::new(OpenCodeServerManager::new());
     let handle = manager.ensure_running().await.unwrap();
+    let capabilities = harvest_opencode_capabilities(manager.as_ref())
+        .await
+        .unwrap();
+    assert!(
+        capabilities
+            .models
+            .iter()
+            .any(|model| model.id == "compatibility/fixture"),
+        "The shipped cold catalog loader must find the real fixture model"
+    );
     let expected = if std::env::var("CODEMUX_TEST_OPENCODE_API").unwrap() == "2" {
         OpenCodeApi::V2
     } else {
@@ -87,6 +98,9 @@ async fn real_opencode_models_approvals_tools_interrupt_and_resume() {
     let mut config = OpenCodeClientConfig::new(handle.base_url.clone());
     config.api = handle.api;
     config.server_password = Some(handle.server_password.clone());
+    // A cold real CLI can spend more than the UI's five-second budget
+    // loading its catalog on a busy runner. Keep acceptance bounded.
+    config.request_timeout = Duration::from_secs(20);
     let client = OpenCodeClient::new(config).unwrap();
     let providers = client.list_models().await.unwrap();
     let models = &providers

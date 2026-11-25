@@ -71,6 +71,8 @@ pub fn enumerate_mcp_paths_with_home(
         all.push((root.join(".cursor").join("mcp.json"), McpConfigSource::CursorProject));
         all.push((root.join("opencode.json"), McpConfigSource::OpenCodeProject));
         all.push((root.join("opencode.jsonc"), McpConfigSource::OpenCodeProject));
+        all.push((root.join(".opencode").join("opencode.json"), McpConfigSource::OpenCodeProject));
+        all.push((root.join(".opencode").join("opencode.jsonc"), McpConfigSource::OpenCodeProject));
     }
 
     // Skip non-existent paths — discovery is silent.

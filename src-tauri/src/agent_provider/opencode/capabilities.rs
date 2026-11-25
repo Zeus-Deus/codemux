@@ -56,8 +56,9 @@ pub fn opencode_stage1_placeholder() -> ProviderChatCapabilities {
 /// Caching strategy: `manager.ensure_running()` is the spawn-once
 /// boundary, so subsequent calls reuse the same child. Each
 /// `harvest_opencode_capabilities()` call still issues a fresh
-/// `GET /provider` round-trip — ~30 ms on the dev box, so the
-/// frontend store calling it once per app session is negligible.
+/// `GET /provider` round-trip — ~30 ms on the dev box. A cold catalog
+/// that exceeds the client's five-second request deadline is retried
+/// twice; other errors surface immediately.
 /// Stage 6 will add an explicit "refresh providers" button that
 /// re-uses this same entry point.
 pub async fn harvest_opencode_capabilities(
@@ -68,10 +69,27 @@ pub async fn harvest_opencode_capabilities(
     config.api = handle.api;
     config.server_password = Some(handle.server_password);
     let client = OpenCodeClient::new(config)?;
-    let providers = client.list_models().await?;
+    let providers = list_models_with_cold_retries(&client).await?;
     let capabilities = build_capabilities(providers);
     manager.remember_catalog(handle.api, capabilities.clone());
     Ok(capabilities)
+}
+
+/// The ready banner means the HTTP server is listening, but its first
+/// provider catalog can still be loading. Retry only this idempotent GET
+/// after a timeout; each attempt keeps the normal five-second limit.
+async fn list_models_with_cold_retries(
+    client: &OpenCodeClient,
+) -> Result<Vec<OpenCodeProviderEntry>, String> {
+    let mut retries_left = 2;
+    loop {
+        match client.list_models().await {
+            Err(error) if error == "request_timed_out" && retries_left > 0 => {
+                retries_left -= 1;
+            }
+            result => return result,
+        }
+    }
 }
 
 /// Pure constructor exposed for tests — wraps
@@ -245,6 +263,104 @@ mod tests {
             supports_images,
             is_free: false,
             cost: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn cold_catalog_retries_a_timed_out_request() {
+        use std::time::Duration;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            for request_number in 0..2 {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                tokio::spawn(async move {
+                    let mut request = [0u8; 1024];
+                    stream.read(&mut request).await.unwrap();
+                    if request_number == 0 {
+                        tokio::time::sleep(Duration::from_millis(2500)).await;
+                    }
+                    let body = r#"{"all":[],"default":{},"connected":[]}"#;
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    let _ = stream.write_all(response.as_bytes()).await;
+                });
+            }
+        });
+        let mut config = OpenCodeClientConfig::new(format!("http://{address}"));
+        config.request_timeout = Duration::from_secs(1);
+        let client = OpenCodeClient::new(config).unwrap();
+
+        assert!(list_models_with_cold_retries(&client)
+            .await
+            .unwrap()
+            .is_empty());
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn cold_catalog_retries_stalled_response_bodies() {
+        use super::super::api::OpenCodeApi;
+        use std::time::Duration;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let legacy_body = r#"{"all":[],"default":{},"connected":[]}"#;
+        let v2_body = r#"{"data":[]}"#;
+        for api in [OpenCodeApi::Legacy, OpenCodeApi::V2] {
+            let replies = match api {
+                OpenCodeApi::Legacy => vec![
+                    ("/provider", legacy_body, true),
+                    ("/provider", legacy_body, false),
+                ],
+                OpenCodeApi::V2 => vec![
+                    ("/api/provider", v2_body, false),
+                    ("/api/model", v2_body, true),
+                    ("/api/provider", v2_body, false),
+                    ("/api/model", v2_body, false),
+                ],
+            };
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let server = tokio::spawn(async move {
+                for (path, body, stalled) in replies {
+                    let (mut stream, _) = listener.accept().await.unwrap();
+                    let mut request = [0u8; 1024];
+                    let length = stream.read(&mut request).await.unwrap();
+                    assert!(
+                        String::from_utf8_lossy(&request[..length])
+                            .starts_with(&format!("GET {path} HTTP/1.1")),
+                        "Unexpected catalog request for {api:?}"
+                    );
+                    let headers = format!(
+                        "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                        body.len()
+                    );
+                    stream.write_all(headers.as_bytes()).await.unwrap();
+                    if stalled {
+                        stream.write_all(&body.as_bytes()[..body.len() / 2]).await.unwrap();
+                        tokio::spawn(async move {
+                            tokio::time::sleep(Duration::from_secs(2)).await;
+                            drop(stream);
+                        });
+                    } else {
+                        stream.write_all(body.as_bytes()).await.unwrap();
+                    }
+                }
+            });
+            let mut config = OpenCodeClientConfig::new(format!("http://{address}"));
+            config.api = api;
+            config.request_timeout = Duration::from_secs(1);
+            let client = OpenCodeClient::new(config).unwrap();
+
+            assert!(list_models_with_cold_retries(&client)
+                .await
+                .unwrap()
+                .is_empty());
+            server.await.unwrap();
         }
     }
 

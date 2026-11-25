@@ -362,13 +362,16 @@ impl OpenCodeServer {
         // v2 prefers OPENCODE_PASSWORD over the legacy alias. Bind both to
         // this child so an ambient CLI/service password cannot override it.
         cmd.env("OPENCODE_PASSWORD", &server_password);
-        // Echo OpenCode's documented "use upstream defaults, ignore
-        // user config" knob — the reference clone does this at line
-        // 340. Without it OpenCode honours
-        // `~/.config/opencode/config.json`, which
-        // could surprise a user whose Codemux pane suddenly behaves
-        // differently from their CLI.
+        // Add Codemux's default permission to OpenCode's config. This is an
+        // overlay; it does not erase the user's global configuration.
         cmd.env("OPENCODE_CONFIG_CONTENT", CONFIG_CONTENT);
+        // The inline content is an overlay: OpenCode would still load a
+        // workspace's opencode.json and .opencode config and start its MCP
+        // servers before Codemux can ask for approval. Project MCP tools are
+        // instead supplied by the approval-gated registry gateway.
+        cmd.env("OPENCODE_DISABLE_PROJECT_CONFIG", "true");
+        // OpenCode 2 reads this newer name first when both are present.
+        cmd.env("OPENCODE_CONFIG_PROJECT_DISABLE", "true");
         // The shared server runs every OpenCode chat's tools.
         cmd.env(crate::control_identity::AGENT_PROCESS_ENV, "opencode");
         cmd.stdin(Stdio::null());
@@ -1034,7 +1037,7 @@ mod tests {
         std::fs::write(
             &script,
             format!(
-                "#!/bin/sh\n[ \"$1\" = probe ] && exit 0\n(trap '' TERM; exec sleep 600) &\necho $! > \"$(dirname \"$0\")/pid\"\n{banner}\nwait\n"
+                "#!/bin/sh\n[ \"$1\" = probe ] && exit 0\nprintf '%s %s' \"$OPENCODE_DISABLE_PROJECT_CONFIG\" \"$OPENCODE_CONFIG_PROJECT_DISABLE\" > \"$(dirname \"$0\")/project-config\"\n(trap '' TERM; exec sleep 600) &\necho $! > \"$(dirname \"$0\")/pid\"\n{banner}\nwait\n"
             ),
         )
         .unwrap();
@@ -1097,6 +1100,10 @@ mod tests {
         let mut server = OpenCodeServer::spawn_with_timeout(&script, Duration::from_secs(5))
             .await
             .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("project-config")).unwrap(),
+            "true true"
+        );
         server.shutdown().await.unwrap();
         assert_eq!(server.pid(), None);
         assert_descendant_stopped(dir.path()).await;

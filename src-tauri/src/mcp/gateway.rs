@@ -24,18 +24,24 @@ use super::registry::McpRegistry;
 use super::runtime::McpTool;
 use super::McpConfigSource;
 
-/// Sources OpenCode loads itself, mirroring the native-source exclusions the
-/// Claude and Codex paths apply: `opencode serve` already spawns the servers
-/// from its own config, so serving them back would double every tool. The
-/// shared token hides them; per-chat tokens carry their own list.
+/// OpenCode still loads its user config, but project config discovery is
+/// disabled on the embedded server. Approved project MCP servers therefore
+/// reach its chats through this gateway instead of OpenCode's native loader.
+/// The shared token has no workspace, so it hides every project source.
+/// Per-chat tokens exclude only native user servers and expose approved
+/// registry-managed project servers.
 ///
 /// Identity rides on the token, never on the request: each chat (and each
 /// directory-scoped OpenCode registration) has a token that the app maps to
 /// a [`GatewayCaller`]. The shared token, used by OpenCode's legacy
-/// instance-global registration, has no workspace and so sees only globally
-/// visible plugin tools.
-pub const OPENCODE_NATIVE_SOURCES: [McpConfigSource; 2] = [
+/// instance-global registration, has no workspace and cannot see project
+/// servers.
+pub const OPENCODE_NATIVE_SOURCES: [McpConfigSource; 1] = [McpConfigSource::OpenCodeUser];
+const OPENCODE_SHARED_HIDDEN_SOURCES: [McpConfigSource; 5] = [
     McpConfigSource::OpenCodeUser,
+    McpConfigSource::CodemuxProject,
+    McpConfigSource::ClaudeProject,
+    McpConfigSource::CursorProject,
     McpConfigSource::OpenCodeProject,
 ];
 
@@ -624,7 +630,7 @@ fn authenticate(headers: &HeaderMap, state: &GatewayState) -> Option<GatewayCall
     if token == &*state.bearer_token {
         return Some(GatewayCaller {
             workspace_id: None,
-            native_sources: OPENCODE_NATIVE_SOURCES.to_vec(),
+            native_sources: OPENCODE_SHARED_HIDDEN_SOURCES.to_vec(),
             flat_tool_names: false,
             native: None,
         });
@@ -774,7 +780,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn tools_list_hides_opencode_native_servers() {
+    async fn shared_token_hides_native_and_project_servers() {
         let registry = McpRegistry::new();
         registry
             .insert_running_server_for_test("shared", vec![McpConfigSource::CodemuxUser])
@@ -784,6 +790,9 @@ mod tests {
             .await;
         registry
             .insert_running_server_for_test("oc-project", vec![McpConfigSource::OpenCodeProject])
+            .await;
+        registry
+            .insert_running_server_for_test("other-project", vec![McpConfigSource::ClaudeProject])
             .await;
         let state = GatewayState {
             registry,
@@ -821,6 +830,35 @@ mod tests {
             ],
             "{value}"
         );
+    }
+
+    #[tokio::test]
+    async fn opencode_chat_token_routes_project_tools_through_registry() {
+        let registry = McpRegistry::new();
+        registry
+            .insert_running_server_for_test("oc-user", vec![McpConfigSource::OpenCodeUser])
+            .await;
+        registry
+            .insert_running_server_for_test("oc-project", vec![McpConfigSource::OpenCodeProject])
+            .await;
+        let runtime = start_gateway(registry.clone()).await.unwrap();
+        let connection = runtime.chat_connection(
+            "thread-opencode",
+            GatewayCaller {
+                workspace_id: Some("ws-1".into()),
+                native_sources: OPENCODE_NATIVE_SOURCES.to_vec(),
+                flat_tool_names: false,
+                native: None,
+            },
+        );
+        let state = GatewayState {
+            registry,
+            bearer_token: Arc::from(runtime.connection().bearer_token.as_str()),
+            grants: runtime.grants.clone(),
+            calls: Default::default(),
+        };
+        let (_, value) = tools_list_with_token(state, &connection.bearer_token).await;
+        assert_eq!(tool_names(&value), vec!["mcp__oc-project__tool"]);
     }
 
     fn tool_names(value: &Value) -> Vec<&str> {

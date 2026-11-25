@@ -94,6 +94,22 @@ pub enum CommandSet {
         #[arg(long, value_enum, value_name = "LEVEL")]
         access: Option<args::AccessArg>,
     },
+    /// Review the MCP servers a project's own files define (`.mcp.json`,
+    /// `.cursor/mcp.json`, `.codemux/mcp.json`, `opencode.json`) and approve
+    /// one to run on this computer. Lists what waits for approval and what
+    /// is approved; with `--fingerprint`, approves that exact definition and
+    /// starts it; with `--revoke`, forgets an approval and stops the server.
+    /// Settings approves the same way on the desktop.
+    McpApprove {
+        /// The project folder or worktree (default: the current directory).
+        path: Option<std::path::PathBuf>,
+        /// The fingerprint the list printed for the server to approve.
+        #[arg(long, conflicts_with = "revoke")]
+        fingerprint: Option<String>,
+        /// The fingerprint of an approval to forget.
+        #[arg(long)]
+        revoke: Option<String>,
+    },
     /// Send a notification to the user
     Notify { message: String },
     /// Generate a project handoff summary
@@ -508,6 +524,74 @@ where
     })
 }
 
+/// The folder `codemux mcp-approve` reviews, spelled the way the desktop
+/// opened it so server ids match the chat's: absolute but not
+/// canonicalized, and for the current directory the shell's `$PWD` when it
+/// names the same folder (the OS reports the current directory with
+/// symlinks resolved).
+fn mcp_approve_folder(path: Option<std::path::PathBuf>) -> Result<std::path::PathBuf, String> {
+    let path = match path {
+        Some(path) => std::path::absolute(&path).map_err(|error| format!("{}: {error}", path.display()))?,
+        None => {
+            let cwd = std::env::current_dir().map_err(|error| error.to_string())?;
+            std::env::var_os("PWD")
+                .map(std::path::PathBuf::from)
+                .filter(|pwd| {
+                    pwd.is_absolute()
+                        && matches!(
+                            (std::fs::canonicalize(pwd), std::fs::canonicalize(&cwd)),
+                            (Ok(pwd), Ok(cwd)) if pwd == cwd
+                        )
+                })
+                .unwrap_or(cwd)
+        }
+    };
+    if !path.is_dir() {
+        return Err(format!("{}: not a folder", path.display()));
+    }
+    Ok(path)
+}
+
+/// `codemux mcp-approve` output: each waiting server's full definition and
+/// the command that approves it, the approved ones and how to revoke them,
+/// or what one call changed. Everything the repository wrote is escaped, so
+/// it cannot rewrite the terminal.
+fn mcp_approval_text(path: &std::path::Path, data: &Value) -> String {
+    use crate::mcp::project_trust::escape;
+    use std::fmt::Write as _;
+    if let Some(name) = data.get("approved").and_then(Value::as_str) {
+        let status = data.pointer("/status/kind").and_then(Value::as_str).unwrap_or("unknown");
+        return format!("Approved {} for this project on this computer. Status: {}.\n", escape(name), escape(status));
+    }
+    if let Some(revoked) = data.get("revoked").and_then(Value::as_bool) {
+        return if revoked {
+            "Approval revoked. Servers running that definition stopped and wait for approval again.\n".into()
+        } else {
+            "No such approval on this computer.\n".into()
+        };
+    }
+    let list = |key: &str| data.get(key).and_then(Value::as_array).cloned().unwrap_or_default();
+    let (pending, approved) = (list("pending"), list("approved"));
+    let folder = escape(&path.to_string_lossy());
+    let mut out = String::new();
+    if pending.is_empty() {
+        let _ = writeln!(out, "No MCP servers from {folder}'s own files wait for approval.");
+    }
+    for server in pending {
+        let field = |key: &str| escape(server.get(key).and_then(Value::as_str).unwrap_or_default());
+        let _ = writeln!(out, "{} waits for approval. Approving runs:", field("name"));
+        let _ = writeln!(out, "  {}", field("summary"));
+        let _ = writeln!(out, "  To approve, run in {folder}: codemux mcp-approve --fingerprint {}", field("fingerprint"));
+        out.push('\n');
+    }
+    for server in approved {
+        let field = |key: &str| escape(server.get(key).and_then(Value::as_str).unwrap_or_default());
+        let _ = writeln!(out, "{} is approved: {}", field("name"), field("summary"));
+        let _ = writeln!(out, "  To revoke: codemux mcp-approve --revoke {}", field("fingerprint"));
+    }
+    out
+}
+
 /// Print a control reply as the legacy verbs always have, failing the
 /// process when it is not ok. The reply still goes to stdout either way, so
 /// scripts keep reading the error from it.
@@ -535,6 +619,7 @@ impl CommandSet {
             | CommandSet::Connector { .. }
             | CommandSet::Mcp { .. }
             | CommandSet::Notify { .. }
+            | CommandSet::McpApprove { .. }
             | CommandSet::Handoff
             | CommandSet::Memory { .. }
             | CommandSet::Index { .. }
@@ -641,6 +726,28 @@ async fn run_control_cli(cli: Cli) -> Result<Exit, String> {
             })
             .await?;
             print_response(&response)
+        }
+        Some(CommandSet::McpApprove { path, fingerprint, revoke }) => {
+            let path = mcp_approve_folder(path)?;
+            let mut params = json!({ "path": path });
+            if let Some(fingerprint) = &fingerprint {
+                params["fingerprint"] = json!(fingerprint);
+            }
+            if let Some(revoke) = &revoke {
+                params["revoke"] = json!(revoke);
+            }
+            let response = send_control_request(ControlRequest {
+                command: "mcp_project_approval".into(),
+                params,
+            })
+            .await?;
+            if !response.ok {
+                return Err(response
+                    .error
+                    .unwrap_or_else(|| "Unknown error from control endpoint".to_string()));
+            }
+            print!("{}", mcp_approval_text(&path, &response.data.unwrap_or(json!(null))));
+            Ok(Exit::Done)
         }
         Some(CommandSet::Handoff) => {
             let response = send_control_request(ControlRequest {
@@ -1354,6 +1461,31 @@ fn normalize_memory_kind(kind: &str) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A repository cannot rewrite the review with terminal escapes, and the
+    /// approve and revoke hints need no shell-specific quoting of the folder.
+    #[test]
+    fn mcp_approve_output_escapes_repository_text() {
+        let folder = std::path::Path::new("/work/my project");
+        let text = mcp_approval_text(
+            folder,
+            &json!({
+                "pending": [{"name": "lint\u{1b}[2K", "summary": "node \u{1b}[2K\r  safe", "fingerprint": "fp1"}],
+                "approved": [{"name": "docs", "summary": "npx docs", "fingerprint": "fp2"}],
+            }),
+        );
+        assert!(!text.contains('\u{1b}') && !text.contains('\r'), "{text:?}");
+        assert!(text.contains("lint\\u{1b}[2K waits for approval"), "{text}");
+        assert!(text.contains("  node \\u{1b}[2K\\u{d}  safe\n"), "{text}");
+        assert!(text.contains("To approve, run in /work/my project: codemux mcp-approve --fingerprint fp1"), "{text}");
+        assert!(text.contains("To revoke: codemux mcp-approve --revoke fp2"), "{text}");
+        let parsed = Cli::try_parse_from(["codemux", "mcp-approve", "--revoke", "fp2"]).unwrap();
+        assert!(matches!(
+            parsed.command,
+            Some(CommandSet::McpApprove { revoke: Some(ref fp), fingerprint: None, .. }) if fp == "fp2"
+        ));
+        assert!(Cli::try_parse_from(["codemux", "mcp-approve", "--revoke", "a", "--fingerprint", "b"]).is_err());
+    }
 
     #[test]
     fn render_qr_encodes_the_pairing_url() {

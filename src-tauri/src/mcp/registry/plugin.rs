@@ -297,6 +297,7 @@ impl PluginMcpServer {
             disabled: false,
             transport,
             raw,
+            project_root: None,
         })
     }
 }

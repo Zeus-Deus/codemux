@@ -17,6 +17,7 @@ import { toast } from "@/lib/toast";
 import { cn } from "@/lib/utils";
 import { useMcpStore } from "@/stores/mcp-store";
 import {
+  approveMcpServer,
   listMcpServers,
   MCP_CODEMUX_SELF_ID,
   primeMcpRuntime,
@@ -138,7 +139,7 @@ function OutboundMcpSection({ projectRoot }: Props) {
     <div>
       <SectionHeader
         title="MCP Servers"
-        description="Model Context Protocol servers expose tools to your agent. Configured servers start when needed; plugin servers start when their plugin registers them. Toggle a row off to stop it. Codemux's own MCP is always on."
+        description="Model Context Protocol servers expose tools to your agent. Configured servers start when needed; plugin servers start when their plugin registers them. Toggle a row off to stop it. Servers defined in a project's own files start only after you approve them. OpenCode 1.x chats receive no Codemux MCP tools; use OpenCode 2.x for approved project servers."
         action={
           <Button
             variant="outline"
@@ -300,8 +301,12 @@ function ServerRow({
 }) {
   const additionalSources = server.sources.slice(1);
   const isCodemuxSelf = server.id === MCP_CODEMUX_SELF_ID;
+  const approval =
+    runtime?.status.kind === "needsApproval" && !disabled ? runtime.status : null;
+  // Paired devices get no fingerprint: approving happens on the host.
+  const approveFingerprint = approval?.fingerprint ?? null;
 
-  const reportFailure = (verb: "start" | "stop" | "restart") => (err: unknown) => {
+  const reportFailure = (verb: "start" | "stop" | "restart" | "approve") => (err: unknown) => {
     console.warn(`[mcp] ${verb} ${server.id} failed:`, err);
     toast.error(`Couldn't ${verb} ${server.name}`, {
       description: err instanceof Error ? err.message : String(err),
@@ -383,10 +388,41 @@ function ServerRow({
             </span>
           )}
         </div>
-        <p className="mt-0.5 truncate font-mono text-label text-muted-foreground">
-          {commandPreview(server)}
+        {/* While it waits, the whole definition shows, wrapped, so nothing
+            the approval covers hides past the row's edge. */}
+        <p
+          className={cn(
+            "mt-0.5 font-mono text-label text-muted-foreground",
+            approval?.summary ? "whitespace-pre-wrap break-words" : "truncate",
+          )}
+          data-testid={`mcp-row-${server.id}-command`}
+        >
+          {approval?.summary ?? commandPreview(server)}
         </p>
+        {approval && !approveFingerprint && (
+          <p
+            className="mt-0.5 text-caption text-muted-foreground"
+            data-testid={`mcp-row-${server.id}-approve-on-host`}
+          >
+            Approve it on the host computer: in Settings there, or with{" "}
+            <code className="font-mono">codemux mcp-approve</code> in the project folder.
+          </p>
+        )}
       </div>
+      {approveFingerprint && (
+        <Button
+          variant="outline"
+          size="sm"
+          onClick={() =>
+            void approveMcpServer(server.id, approveFingerprint).catch(
+              reportFailure("approve"),
+            )
+          }
+          data-testid={`mcp-row-${server.id}-approve`}
+        >
+          Approve
+        </Button>
+      )}
       {/* Revealed on row hover or keyboard focus, always shown on touch. */}
       <Button
         variant="ghost"
@@ -455,6 +491,28 @@ function McpStatusBadge({
         <span className="size-1.5 rounded-full bg-muted-foreground/40" />
         discovered
       </span>
+    );
+  }
+
+  if (runtime.status.kind === "needsApproval") {
+    return (
+      <Tooltip>
+        <TooltipTrigger asChild>
+          <span
+            className="inline-flex items-center gap-1 rounded-md px-1.5 py-0.5 text-caption text-warning cursor-help"
+            data-testid={`mcp-row-${server.id}-status`}
+            data-status="needs-approval"
+          >
+            <span className="size-1.5 rounded-full bg-warning" />
+            needs approval
+          </span>
+        </TooltipTrigger>
+        <TooltipContent className="max-w-xs">
+          This server is defined in the project's files. Review the command
+          below, then approve it to start it on this computer. Codemux asks
+          again if it changes.
+        </TooltipContent>
+      </Tooltip>
     );
   }
 
