@@ -104,6 +104,24 @@ afterEach(() => {
 });
 
 describe("BrowserPane start failures", () => {
+  it("shows a confirmation raised by an agent while the pane is connected", async () => {
+    vi.useFakeTimers();
+    mocks.startBrowserStream.mockResolvedValue("ws://127.0.0.1:9223");
+    renderPane();
+    await act(async () => { await vi.advanceTimersByTimeAsync(1); });
+    expect(FakeWebSocket.urls).toHaveLength(1);
+    mocks.agentBrowserPendingConfirmation.mockResolvedValue({
+      id: "c_agent",
+      description: "navigation: agent.example",
+      expires_at_ms: Date.now() + 60_000,
+    });
+
+    await act(async () => { await vi.advanceTimersByTimeAsync(2_000); });
+    expect(screen.getByText("navigation: agent.example")).toBeInTheDocument();
+    expect(FakeWebSocket.lastSocket?.readyState).toBe(3);
+    expect(FakeWebSocket.urls).toHaveLength(1);
+  });
+
   it("keeps the bridge closed until a pending browser action is approved", async () => {
     mocks.startBrowserStream
       .mockRejectedValueOnce("Browser confirmation is pending for session browser-1")

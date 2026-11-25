@@ -704,6 +704,32 @@ export const BrowserPane = memo(function BrowserPane({ browserId, focused, visib
     setStatus("error");
   };
 
+  useEffect(() => {
+    if (!visible || isRemoteClient()) return;
+    let active = true;
+    let checking = false;
+    const checkPending = async () => {
+      if (checking || pendingConfirmationRef.current) return;
+      checking = true;
+      try {
+        const pending = await agentBrowserPendingConfirmation(effectiveSessionId);
+        if (active && pending && !pendingConfirmationRef.current) {
+          showPendingConfirmation(effectiveSessionId, pending);
+        }
+      } catch {
+        // The stream retry path reports backend failures to the pane.
+      } finally {
+        checking = false;
+      }
+    };
+    void checkPending();
+    const timer = setInterval(checkPending, 2000);
+    return () => {
+      active = false;
+      clearInterval(timer);
+    };
+  }, [visible, effectiveSessionId]);
+
   const respondToConfirmation = async (approve: boolean) => {
     const pending = pendingConfirmation;
     if (!pending?.details.id || confirmationBusy || isRemoteClient()) return;
