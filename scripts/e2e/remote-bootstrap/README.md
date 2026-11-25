@@ -40,7 +40,7 @@ printed at the end.
 |------|-----------|----------------|
 | a | `CODEMUX_ARTIFACT=… sh install.sh` | the installer works from a local artifact, resolves runtime deps through the package manager, and `codemux capabilities` reports the expected version |
 | b | `CODEMUX_PASSWORD=… codemux login --email …` | headless sign-in against the API; `codemux whoami` reads the persisted session back; the mock recorded the signin POST |
-| c | `codemux connect` | unit file written with `Environment=CODEMUX_API_URL`, `systemctl --user is-active` = `active`, `is-enabled` = `enabled`, linger on, port 4377 bound, `/api/health` OK locally **and from another container** |
+| c | `codemux connect` | unit file written with `CODEMUX_API_URL`, `systemctl --user is-active` = `active`, `is-enabled` = `enabled`, linger on, port 4377 bound, `/api/health` OK locally **and from another container** |
 | c2 | `curl http://localhost:4377/` | the release build really embeds the web UI (HTML + `/assets/` bundle), not just the pairing API |
 | d | `codemux remote pair` | the control socket is up, so a second SSH session can mint a pairing code against the running unit — and the pairing URL host is the container's eth0 IP, **not** `127.0.0.1` |
 | d2 | a second `codemux serve` | it exits non-zero with the mutual-exclusion message, **not** `Address already in use` — the guard keys off the control endpoint, so it only works if `serve` took it |
@@ -176,13 +176,14 @@ logged in is the only way linger is actually under test.
 
 ### Never the real API
 
-Every container has `CODEMUX_API_URL=http://mock-api:8787` in its environment,
-`codemux connect` propagates that into the unit file it writes
-(`Environment=CODEMUX_API_URL=…`), and the mock lives on an internal compose
-network with no egress requirement. No real credentials exist anywhere: the
-password is a fixture string and the mock accepts it structurally (the wire
-value is the Argon2-derived `AuthSecret`, which would mean vendoring the KDF to
-verify).
+Every target container has `CODEMUX_API_URL=http://127.0.0.1:8787` in its
+environment, and `codemux connect` propagates it into the unit file it writes.
+A systemd service forwards this loopback port to the mock on the internal
+Compose network. This exercises the production rule that permits plain HTTP
+only on loopback, including after a container reboot. The proxy's bridge hop
+is plain HTTP, so the harness uses fixture credentials only. The mock accepts
+the password structurally (the wire value is the Argon2-derived `AuthSecret`,
+which would mean vendoring the KDF to verify).
 
 The mock records every request it receives to
 `/var/log/mock-api/requests.jsonl`, which is what makes step (e) an assertion
@@ -202,7 +203,7 @@ What must never happen is an *account API* call to the production host, and the
 harness asserts that rather than assuming it (step e1b):
 
 - the **live** `codemux serve` process's `/proc/<pid>/environ` must contain
-  `CODEMUX_API_URL=http://mock-api:8787` and must not mention
+  `CODEMUX_API_URL=http://127.0.0.1:8787` and must not mention
   `api.codemux.org`;
 - no file under `~/.config/systemd/user/` may reference `api.codemux.org`.
 

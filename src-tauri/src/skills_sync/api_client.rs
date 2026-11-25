@@ -20,7 +20,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::auth::api_base_url;
+use crate::auth::{api_base_url, api_client};
 
 /// Wire-format skill row, returned by GET / POST / PUT.
 /// `remote_id` is a stringified BIGSERIAL (Stage 1 contract).
@@ -68,8 +68,8 @@ struct CreateUpdateResponse {
 /// `GET /api/skills` — list every skill the user has synced,
 /// newest-updated first. Names + contents come back as plaintext.
 pub async fn list_skills(token: &str) -> Result<Vec<SkillWire>, String> {
-    let base = api_base_url();
-    let resp = reqwest::Client::new()
+    let base = api_base_url()?;
+    let resp = api_client(&base)?
         .get(format!("{base}/api/skills"))
         .bearer_auth(token)
         .send()
@@ -91,8 +91,8 @@ pub async fn create_skill(
     token: &str,
     upload: &SkillUpload,
 ) -> Result<SkillWire, String> {
-    let base = api_base_url();
-    let resp = reqwest::Client::new()
+    let base = api_base_url()?;
+    let resp = api_client(&base)?
         .post(format!("{base}/api/skills"))
         .bearer_auth(token)
         .json(upload)
@@ -120,8 +120,8 @@ pub async fn update_skill(
     remote_id: &str,
     upload: &SkillUpload,
 ) -> Result<SkillWire, String> {
-    let base = api_base_url();
-    let resp = reqwest::Client::new()
+    let base = api_base_url()?;
+    let resp = api_client(&base)?
         .put(format!("{base}/api/skills/{remote_id}"))
         .bearer_auth(token)
         .json(upload)
@@ -141,8 +141,8 @@ pub async fn update_skill(
 /// `DELETE /api/skills/:id` — drop one skill. 404 is treated as
 /// success (idempotent intent).
 pub async fn delete_skill(token: &str, remote_id: &str) -> Result<(), String> {
-    let base = api_base_url();
-    let resp = reqwest::Client::new()
+    let base = api_base_url()?;
+    let resp = api_client(&base)?
         .delete(format!("{base}/api/skills/{remote_id}"))
         .bearer_auth(token)
         .send()
@@ -159,8 +159,8 @@ pub async fn delete_skill(token: &str, remote_id: &str) -> Result<(), String> {
 /// Stage 4's reset-sync flow. Idempotent — wiping an empty store
 /// is fine.
 pub async fn wipe_skills(token: &str) -> Result<(), String> {
-    let base = api_base_url();
-    let resp = reqwest::Client::new()
+    let base = api_base_url()?;
+    let resp = api_client(&base)?
         .delete(format!("{base}/api/skills"))
         .bearer_auth(token)
         .send()

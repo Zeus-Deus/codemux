@@ -670,11 +670,8 @@ struct ApiSettingsResponse {
 
 const SETTINGS_REMOTE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
-fn settings_client() -> Result<reqwest::Client, String> {
-    reqwest::Client::builder()
-        .timeout(SETTINGS_REMOTE_TIMEOUT)
-        .build()
-        .map_err(|e| format!("HTTP client: {e}"))
+fn settings_client(base: &str) -> Result<reqwest::Client, String> {
+    crate::auth::api_client(base)
 }
 
 async fn fetch_settings_in_scope(
@@ -683,11 +680,12 @@ async fn fetch_settings_in_scope(
     observed_write_generation: u64,
 ) -> Result<UserSettings, String> {
     ensure_scope_current(scope)?;
-    let base = crate::auth::api_base_url();
-    let client = settings_client()?;
+    let base = crate::auth::api_base_url()?;
+    let client = settings_client(&base)?;
     let resp = client
         .get(format!("{base}/api/settings"))
         .header("Authorization", format!("Bearer {token}"))
+        .timeout(SETTINGS_REMOTE_TIMEOUT)
         .send()
         .await
         .map_err(|e| format!("Network error: {e}"))?;
@@ -712,14 +710,15 @@ async fn push_settings_in_scope(
     accept_offline_local_write: bool,
 ) -> Result<SettingsPersistence, String> {
     ensure_scope_current(scope)?;
-    let base = crate::auth::api_base_url();
-    let client = settings_client()?;
+    let base = crate::auth::api_base_url()?;
+    let client = settings_client(&base)?;
 
     let body = serde_json::json!({ "settings": settings });
     let resp = client
         .put(format!("{base}/api/settings"))
         .header("Authorization", format!("Bearer {token}"))
         .json(&body)
+        .timeout(SETTINGS_REMOTE_TIMEOUT)
         .send()
         .await;
 
@@ -764,14 +763,15 @@ async fn patch_settings_in_scope(
     scope: &CacheScope,
 ) -> Result<UserSettings, String> {
     ensure_scope_current(scope)?;
-    let base = crate::auth::api_base_url();
-    let client = settings_client()?;
+    let base = crate::auth::api_base_url()?;
+    let client = settings_client(&base)?;
 
     let body = serde_json::json!({ "settings": partial });
     let resp = client
         .patch(format!("{base}/api/settings"))
         .header("Authorization", format!("Bearer {token}"))
         .json(&body)
+        .timeout(SETTINGS_REMOTE_TIMEOUT)
         .send()
         .await
         .map_err(|e| format!("Network error: {e}"))?;
@@ -800,12 +800,13 @@ pub async fn patch_settings_for_owner(
 
 async fn delete_settings_in_scope(token: &str, scope: &CacheScope) -> Result<UserSettings, String> {
     ensure_scope_current(scope)?;
-    let base = crate::auth::api_base_url();
-    let client = settings_client()?;
+    let base = crate::auth::api_base_url()?;
+    let client = settings_client(&base)?;
 
     let resp = client
         .delete(format!("{base}/api/settings"))
         .header("Authorization", format!("Bearer {token}"))
+        .timeout(SETTINGS_REMOTE_TIMEOUT)
         .send()
         .await
         .map_err(|e| format!("Network error: {e}"))?;

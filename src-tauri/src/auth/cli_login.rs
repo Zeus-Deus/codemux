@@ -38,7 +38,7 @@ use std::io::{BufRead, IsTerminal, Write};
 use serde::Deserialize;
 
 use crate::auth::{
-    api_base_url, clear_token, derive_auth_secret, is_token_expired, load_cached_user,
+    api_base_url, api_client, clear_token, derive_auth_secret, is_token_expired, load_cached_user,
     load_stored_auth_method, load_token, login_email_api, save_auth, save_stored_auth_method,
     AuthUser,
 };
@@ -69,6 +69,8 @@ pub(crate) enum LoginError {
     /// [`LoginError::Credentials`], carries no server detail — expired and
     /// invalid must be indistinguishable from the outside.
     Token,
+    /// The local API URL policy rejected the configured origin before a request.
+    Config(String),
     /// Something local went wrong (no TTY, derivation failure, DB write).
     Local(String),
 }
@@ -80,7 +82,8 @@ impl LoginError {
                 "Could not reach the Codemux API at {base} ({detail}). \
                  Check the network connection, or set CODEMUX_API_URL if \
                  you are pointing at a different server.",
-                base = crate::auth::api_base_url(),
+                base =
+                    crate::auth::api_base_url().unwrap_or_else(|_| "the configured server".into()),
             ),
             LoginError::Credentials => "Sign-in failed. Check the email address \
                  and password, and make sure the address has been verified."
@@ -89,6 +92,7 @@ impl LoginError {
                  token again from a machine that is signed in — tokens expire, \
                  and a truncated paste looks the same as an invalid one."
                 .to_string(),
+            LoginError::Config(detail) => detail.clone(),
             LoginError::Local(detail) => detail.clone(),
         }
     }
@@ -131,6 +135,9 @@ pub(crate) async fn sign_in(
             "Email and password are required.".to_string(),
         ));
     }
+    // A local URL policy error must not be classified as a server-side
+    // rejection of the user's credentials.
+    api_base_url().map_err(LoginError::Config)?;
 
     // Same zero-knowledge derivation the GUI runs: the server only ever
     // sees the stretched secret. `login_email_api` takes `&AuthSecret`,
@@ -208,15 +215,22 @@ struct VerifySession {
 /// transport problems are echoed, a rejected token is not (the CLI must
 /// not become an oracle for which tokens are live).
 async fn verify_bearer(token: &str) -> Result<(AuthUser, String), LoginError> {
-    let base = api_base_url();
+    let base = api_base_url().map_err(LoginError::Config)?;
     let url = format!("{base}/api/auth/desktop/verify");
-    let resp = reqwest::Client::new()
+    let resp = api_client(&base)
+        .map_err(LoginError::Config)?
         .get(&url)
         .header("Authorization", format!("Bearer {token}"))
         .send()
         .await
         .map_err(|e| LoginError::Network(e.to_string()))?;
 
+    if resp.status().is_redirection() {
+        return Err(LoginError::Config(
+            "The token verification endpoint redirected. Check CODEMUX_API_URL or your proxy configuration."
+                .into(),
+        ));
+    }
     if !resp.status().is_success() {
         return Err(LoginError::Token);
     }
@@ -768,6 +782,21 @@ mod tests {
         assert!(load_token(&db).is_none());
     }
 
+    #[tokio::test]
+    #[serial_test::serial(mockserver)]
+    async fn invalid_api_url_reports_local_configuration_error() {
+        let _guard = ApiUrlGuard::set("http://example.com");
+        let db = test_db();
+        let err = sign_in(&db, "someone@example.com", "pw".to_string())
+            .await
+            .expect_err("nonloopback HTTP must be refused before the request");
+        assert!(matches!(err, LoginError::Config(_)), "got {err:?}");
+        let message = err.user_message();
+        assert!(message.contains("CODEMUX_API_URL requires HTTPS"), "{message}");
+        assert!(!message.contains("Check the email address"), "{message}");
+        assert!(load_token(&db).is_none());
+    }
+
     #[test]
     fn error_classification_splits_transport_from_credentials() {
         assert!(matches!(
@@ -913,6 +942,41 @@ mod tests {
         // No half-written session.
         assert!(load_token(&db).is_none());
         assert!(load_stored_auth_method(&db).is_none());
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(mockserver)]
+    async fn a_redirected_token_endpoint_reports_configuration_not_token_rejection() {
+        let mut destination = mockito::Server::new_async().await;
+        let forwarded = destination
+            .mock("GET", "/api/auth/desktop/verify")
+            .expect(0)
+            .create_async()
+            .await;
+        let mut server = mockito::Server::new_async().await;
+        let redirect = server
+            .mock("GET", "/api/auth/desktop/verify")
+            .with_status(302)
+            .with_header(
+                "location",
+                &format!("{}/api/auth/desktop/verify", destination.url()),
+            )
+            .create_async()
+            .await;
+        let _guard = ApiUrlGuard::set(&server.url());
+
+        let db = test_db();
+        let err = sign_in_with_token(&db, "sess_private")
+            .await
+            .expect_err("the token endpoint must not redirect");
+        assert!(matches!(err, LoginError::Config(_)), "got {err:?}");
+        let message = err.user_message();
+        assert!(message.contains("CODEMUX_API_URL"), "{message}");
+        assert!(!message.contains("sess_private"), "{message}");
+        assert!(!message.contains("not accepted"), "{message}");
+        assert!(load_token(&db).is_none());
+        redirect.assert_async().await;
+        forwarded.assert_async().await;
     }
 
     #[tokio::test]

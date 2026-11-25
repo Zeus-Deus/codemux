@@ -25,13 +25,15 @@ pub(crate) struct SyncRequest<'a> {
 }
 
 impl<'a> SyncRequest<'a> {
-    pub(crate) fn linked(token: &'a str, guard: SyncGuard<'a>) -> Self {
-        Self {
+    pub(crate) fn linked(token: &'a str, guard: SyncGuard<'a>) -> Result<Self, String> {
+        let base = api_base_url()?;
+        let client = crate::auth::api_client(&base)?;
+        Ok(Self {
             token,
-            base: api_base_url(),
+            base,
             guard: guard.within(LINKED_BUDGET),
-            client: reqwest::Client::new(),
-        }
+            client,
+        })
     }
 
     pub(crate) fn request(&self, method: reqwest::Method, path: &str) -> reqwest::RequestBuilder {

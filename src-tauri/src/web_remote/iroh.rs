@@ -458,7 +458,7 @@ struct GrantIdentity {
 /// the same `CODEMUX_API_URL` base every other API call reads.
 async fn verify_grant(base: &str, grant: &str) -> Result<GrantVerifyResponse, String> {
     let url = format!("{base}/api/devices/grant/verify");
-    let resp = reqwest::Client::new()
+    let resp = crate::auth::api_client(base)?
         .post(&url)
         .json(&json!({ "grant": grant }))
         .send()
@@ -550,7 +550,7 @@ async fn authorize_account_handshake(
     };
     let own_user_id = crate::auth::load_cached_user(db).map(|u| u.id);
 
-    let base = crate::auth::api_base_url();
+    let base = crate::auth::api_base_url().map_err(|_| AccountHandshakeReject::Unverified)?;
     let resp = verify_grant(&base, &hello.grant)
         .await
         .map_err(|_| AccountHandshakeReject::Unverified)?;

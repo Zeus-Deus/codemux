@@ -17,7 +17,7 @@
 
 use serde::Deserialize;
 
-use crate::auth::{api_base_url, AuthSecret};
+use crate::auth::{api_base_url, api_client, AuthSecret};
 
 // ── Wire types ───────────────────────────────────────────────────
 //
@@ -78,10 +78,10 @@ pub(crate) async fn login_email_api(
     email: &str,
     secret: &AuthSecret,
 ) -> Result<ApiAuthResp, String> {
-    let base = api_base_url();
+    let base = api_base_url()?;
     let url = format!("{base}/api/auth/desktop/signin");
 
-    let resp = reqwest::Client::new()
+    let resp = api_client(&base)?
         .post(&url)
         .json(&build_signin_body(email, secret))
         .send()
@@ -107,10 +107,10 @@ pub(crate) async fn signup_email_api(
     secret: &AuthSecret,
     name: &str,
 ) -> Result<(), String> {
-    let base = api_base_url();
+    let base = api_base_url()?;
     let url = format!("{base}/api/auth/desktop/signup");
 
-    let resp = reqwest::Client::new()
+    let resp = api_client(&base)?
         .post(&url)
         .json(&build_signup_body(email, secret, name))
         .send()

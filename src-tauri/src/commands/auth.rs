@@ -2,7 +2,7 @@ use std::time::Instant;
 use tauri::{Emitter, State};
 
 use crate::auth::{
-    api_base_url, clear_token, derive_auth_secret, is_token_expired, load_cached_user,
+    api_base_url, api_client, clear_token, derive_auth_secret, is_token_expired, load_cached_user,
     load_stored_auth_method, load_token, login_email_api, save_auth, save_stored_auth_method,
     signup_email_api, AuthResponse, AuthState, AuthStatePayload, AuthUser,
 };
@@ -53,17 +53,17 @@ enum VerifyOutcome {
 }
 
 async fn verify_token(token: &str) -> VerifyOutcome {
-    let client = match reqwest::Client::builder()
-        .timeout(AUTH_REMOTE_TIMEOUT)
-        .build()
-    {
-        Ok(client) => client,
-        Err(_) => return VerifyOutcome::Offline,
+    let Ok(base) = api_base_url() else {
+        return VerifyOutcome::Offline;
     };
-    let url = format!("{}/api/auth/desktop/verify", api_base_url());
+    let Ok(client) = api_client(&base) else {
+        return VerifyOutcome::Offline;
+    };
+    let url = format!("{base}/api/auth/desktop/verify");
     match client
         .get(url)
         .header("Authorization", format!("Bearer {token}"))
+        .timeout(AUTH_REMOTE_TIMEOUT)
         .send()
         .await
     {
@@ -379,6 +379,7 @@ pub async fn start_oauth_flow<R: tauri::Runtime>(
     app: tauri::AppHandle<R>,
     auth_state: State<'_, AuthState>,
 ) -> Result<(), String> {
+    let base = api_base_url()?;
     let csrf_state = auth_state.generate_csrf_state();
 
     // The callback server reads the managed AuthState through the AppHandle.
@@ -386,7 +387,6 @@ pub async fn start_oauth_flow<R: tauri::Runtime>(
     // OAuth callback an atomic replacement with respect to startup refresh.
     let port = crate::auth::start_callback_server(app.clone())?;
 
-    let base = api_base_url();
     let url = format!(
         "{base}/api/auth/desktop/connect?provider=github&state={state}&port={port}",
         state = urlencoding::encode(&csrf_state),
@@ -499,10 +499,10 @@ pub async fn forgot_password(email: String) -> Result<(), String> {
         return Err("Email is required".into());
     }
 
-    let base = api_base_url();
+    let base = api_base_url()?;
     let url = format!("{base}/api/auth/desktop/forgot-password");
 
-    let client = reqwest::Client::new();
+    let client = api_client(&base)?;
     let resp = client
         .post(&url)
         .json(&serde_json::json!({ "email": email }))
@@ -526,10 +526,10 @@ pub async fn resend_verification_email(email: String) -> Result<(), String> {
         return Err("Email is required".into());
     }
 
-    let base = api_base_url();
+    let base = api_base_url()?;
     let url = format!("{base}/api/auth/send-verification-email");
 
-    let resp = reqwest::Client::new()
+    let resp = api_client(&base)?
         .post(&url)
         .json(&serde_json::json!({ "email": email }))
         .send()
