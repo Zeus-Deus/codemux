@@ -674,22 +674,35 @@ impl FolderWalkFilter {
         rule_lines: &mut usize,
     ) -> Result<Gitignore, String> {
         let mut builder = GitignoreBuilder::new(dir);
+        let mut rejected_lines = 0;
+        let mut first_rejected_line = None;
         for (index, line) in bytes.split(|byte| *byte == b'\n').enumerate() {
             *rule_lines += 1;
             if *rule_lines > MAX_ATTACHMENT_IGNORE_RULE_LINES {
                 return Err("attachment ignore rules exceed 10,000 lines".to_string());
             }
-            let line = std::str::from_utf8(line)
-                .map_err(|_| format!("invalid attachment ignore rules at {}", file.display()))?;
+            let Ok(line) = std::str::from_utf8(line) else {
+                rejected_lines += 1;
+                first_rejected_line.get_or_insert(index + 1);
+                continue;
+            };
             let line = line.trim_end_matches('\r');
             let line = if index == 0 {
                 line.trim_start_matches('\u{feff}')
             } else {
                 line
             };
-            builder.add_line(None, line).map_err(|error| {
-                format!("invalid attachment ignore rules at {}: {error}", file.display())
-            })?;
+            if builder.add_line(None, line).is_err() {
+                rejected_lines += 1;
+                first_rejected_line.get_or_insert(index + 1);
+            }
+        }
+        if rejected_lines > 0 {
+            log::warn!(
+                "Skipped {rejected_lines} malformed attachment ignore rules in {} (first at line {})",
+                file.display(),
+                first_rejected_line.expect("a rejected line was counted")
+            );
         }
         let matcher = builder.build().map_err(|error| {
             format!("invalid attachment ignore rules at {}: {error}", file.display())
@@ -2561,6 +2574,25 @@ mod tests {
         )
         .unwrap_err();
         assert!(error.contains("exceed 10,000 lines"));
+    }
+
+    #[test]
+    fn malformed_ignore_line_keeps_valid_exclusions() {
+        let dir = tempdir().unwrap();
+        fs::create_dir(dir.path().join(".git")).unwrap();
+        let mut builder = GitignoreBuilder::new(dir.path());
+        assert!(builder.add_line(None, "{broken").is_err());
+        fs::write(dir.path().join(".gitignore"), b"{broken\n\xff\n*.secret\n").unwrap();
+        fs::write(dir.path().join("hidden.secret"), "x").unwrap();
+        fs::write(dir.path().join("visible.txt"), "x").unwrap();
+        let info = read_folder_for_attachment_blocking(
+            dir.path().to_string_lossy().into_owned(),
+            None,
+            1,
+        )
+        .unwrap();
+        assert!(info.tree.contains("visible.txt"));
+        assert!(!info.tree.contains("hidden.secret"));
     }
 
     #[cfg(unix)]
