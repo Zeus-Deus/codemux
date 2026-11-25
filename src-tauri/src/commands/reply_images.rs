@@ -21,7 +21,8 @@ use tauri::{AppHandle, Emitter, Manager, Runtime};
 
 use super::agent_chat::{
     chat_image_extension, chat_images_dir, chat_images_root, media_type_from_extension,
-    read_bounded_local_image, resolve_within, write_thread_chat_image,
+    is_network_or_device_image_path, read_bounded_local_image, resolve_within,
+    write_thread_chat_image,
 };
 use crate::database::DatabaseStore;
 
@@ -586,6 +587,9 @@ fn local_image_path(destination: &str) -> Option<String> {
         let normalized = normalize_uri(destination);
         decode_uri(&normalized, ";/?:@&=+$,#").unwrap_or(normalized)
     };
+    if is_network_or_device_image_path(&path) {
+        return None;
+    }
     let bytes = path.as_bytes();
     let absolute = path.starts_with('/')
         || (bytes.len() > 2
@@ -688,6 +692,24 @@ mod tests {
                     [host](file://server/g.png) [doc](/tmp/h.pdf) [dir](/tmp/)\n\
                     [kept](/tmp/i.png)";
         assert_eq!(local_image_sources(text), ["/tmp/i.png"]);
+    }
+
+    #[test]
+    fn network_image_paths_are_never_planned_for_retention() {
+        let text = "[unc](//server/share/a.png) [file](file:////server/share/b.png) \
+                    [device](//?/UNC/server/share/c.png) [local](/tmp/screenshot.png)";
+        assert_eq!(local_image_sources(text), ["/tmp/screenshot.png"]);
+        for path in ["//server/share/a.png", r"\\server\share\a.png", r"\\?\C:\a.png"] {
+            assert!(local_image_path(path).is_none(), "{path}");
+        }
+    }
+
+    #[tokio::test]
+    async fn network_image_paths_are_rejected_before_reading() {
+        for path in ["//server/share/a.png", r"\\server\share\a.png", r"\\?\C:\a.png", r"\??\UNC\server\a.png"] {
+            let error = read_bounded_local_image(path).await.unwrap_err();
+            assert!(error.contains("network or device"), "{path}: {error}");
+        }
     }
 
     #[test]

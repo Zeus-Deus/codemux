@@ -4842,11 +4842,27 @@ pub(crate) async fn write_thread_chat_image(
     Ok((path, media_type))
 }
 
+/// Reject path spellings that can select a network share or device namespace
+/// before any filesystem operation is allowed to resolve them.
+pub(super) fn is_network_or_device_image_path(path: &str) -> bool {
+    let bytes = path.as_bytes();
+    // Windows treats mixed leading separators as UNC or device namespaces.
+    // POSIX gives `//` implementation-defined meaning too. Check this before
+    // canonicalize or metadata can contact a remote share.
+    let separator = |byte: u8| matches!(byte, b'/' | b'\\');
+    (bytes.len() >= 2 && separator(bytes[0]) && separator(bytes[1]))
+        || path.starts_with("\\??\\")
+        || path.starts_with("/??/")
+}
+
 /// Read an absolute local image path with the same bounds as
 /// [`agent_chat_read_local_image`]: an existing regular file with an image
 /// extension, at most the attachment cap even if it grows mid-read, and
 /// image content by magic bytes.
 pub(super) async fn read_bounded_local_image(path: &str) -> Result<ChatImageBytes, String> {
+    if is_network_or_device_image_path(path) {
+        return Err("validation_error: network or device image paths are not allowed".to_string());
+    }
     let candidate = std::path::Path::new(path);
     if !candidate.is_absolute() {
         return Err("validation_error: local image path must be absolute".to_string());

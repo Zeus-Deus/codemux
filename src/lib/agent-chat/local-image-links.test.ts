@@ -23,6 +23,12 @@ describe("localImagePath", () => {
     "/tmp/notes.txt",
     "file://other-host/tmp/proof.png",
     "javascript:/tmp/proof.png",
+    "//server/share/proof.png",
+    "\\\\server\\share\\proof.png",
+    "\\\\?\\C:\\proof.png",
+    "file:////server/share/proof.png",
+    "/%5Cserver/share/proof.png",
+    "/??/UNC/server/share/proof.png",
   ])("rejects a non-local or unsupported destination: %s", (input) => {
     expect(localImagePath(input)).toBeNull();
   });

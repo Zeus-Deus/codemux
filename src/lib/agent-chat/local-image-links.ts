@@ -52,6 +52,10 @@ export function localImagePath(destination: unknown): string | null {
     path = decodePath(path);
   }
 
+  // A double separator denotes a Windows UNC/device path (and is
+  // implementation-defined on POSIX). Never turn a chat reference into a
+  // network-share read just because it looks like an absolute image path.
+  if (/^[\\/]{2}/.test(path) || /^[\\/]\?\?[\\/]/.test(path)) return null;
   const absolute = path.startsWith("/") || /^[a-zA-Z]:[\\/]/.test(path);
   return absolute && SUPPORTED_IMAGE_EXTENSION.test(path) ? path : null;
 }

@@ -128,6 +128,31 @@ describe("ChatMarkdown rich external links", () => {
     );
   });
 
+  it.each([
+    "[![Badge](https://images.example/badge.png)](https://example.com/docs)",
+    "[![Screenshot](/tmp/screenshot.png)](https://example.com/docs)",
+  ])("keeps a linked image's outer destination as the only action (%s)", (markdown) => {
+    const { container } = render(<ChatMarkdown>{markdown}</ChatMarkdown>);
+    const links = container.querySelectorAll('a[data-streamdown="link"]');
+    expect(links).toHaveLength(1);
+    expect(links[0]).toHaveAttribute("href", "https://example.com/docs");
+    expect(links[0]).toHaveTextContent(/Badge|Screenshot/);
+    expect(links[0]?.querySelector("a, button, img")).toBeNull();
+    expect(container.querySelector("[data-chat-local-image]")).toBeNull();
+
+    fireEvent.click(links[0]!);
+    expect(screen.getByText("https://example.com/docs")).toBeInTheDocument();
+    expect(screen.queryByText("https://images.example/badge.png")).toBeNull();
+  });
+
+  it("leaves a network-share image inert without starting a local preview", () => {
+    const { container } = render(
+      <ChatMarkdown>{"![Share](//server/share/proof.png)"}</ChatMarkdown>,
+    );
+    expect(container.querySelector("[data-chat-local-image], img")).toBeNull();
+    expect(container).toHaveTextContent("Share");
+  });
+
   it("never navigates an external link itself, not even on middle click", () => {
     const { container } = render(
       <ChatMarkdown>{"[Reference](https://example.com/reference)"}</ChatMarkdown>,
