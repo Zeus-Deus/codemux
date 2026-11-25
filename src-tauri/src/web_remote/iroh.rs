@@ -1826,7 +1826,7 @@ mod windows_key_security {
 
     fn open_app_root(root: &Path, create: bool, security: &PrivateDacl) -> Result<std::fs::File, String> {
         let mut components = root.components();
-        let (Some(Component::Prefix(prefix)), Some(Component::RootDir(separator))) =
+        let (Some(Component::Prefix(prefix)), Some(Component::RootDir)) =
             (components.next(), components.next())
         else {
             return Err("iroh app directory must have an absolute Windows path".to_string());
@@ -1837,7 +1837,7 @@ mod windows_key_security {
             return Err("iroh app directory uses an unsupported Windows path prefix".to_string());
         }
         let mut anchor_path = PathBuf::from(prefix.as_os_str());
-        anchor_path.push(separator.as_os_str());
+        anchor_path.push("\\");
         let mut names = Vec::<OsString>::new();
         for component in components {
             match component {
