@@ -6810,7 +6810,10 @@ mod tests {
                 );",
                 )
                 .unwrap();
-            DatabaseStore::write_auth_token(&legacy, b"legacy-token").unwrap();
+            legacy.execute(
+                "INSERT INTO auth_tokens (id, encrypted_data) VALUES (1, ?1)",
+                params![b"legacy-token".as_slice()],
+            ).unwrap();
         }
 
         let desktop = DatabaseStore::test_file(&path);
