@@ -37,7 +37,7 @@ execution are currently unavailable.
 | --- | --- | --- |
 | Claude | Existing SDK/CLI authentication; isolated managed SDK tools | Native paid coordination canary and fake SDK tests |
 | Codex | App-server API accepting the empty native environment and startup policy | Token-free native readiness and fake RPC tests |
-| Cursor | Shipped official SDK 1.0.37; `CURSOR_API_KEY` or existing SDK-owned login; effort unset | Fake SDK, compiled official native workspace/parser probe and host bridge tests |
+| Cursor | Shipped official SDK 1.0.38; `CURSOR_API_KEY` or existing SDK-owned login; effort unset | Fake SDK, compiled official native workspace/parser probe and host bridge tests |
 | OpenCode | Prepared native 1.18.35; explicit built-in `provider/model`; environment API key; no administrator config | Actual native readiness/private MCP/session policy with dummy key, plus fake HTTP tests |
 | Hermes | Prepared official source and Python 3.14 venv via `CODEMUX_HERMES_SOURCE` and `CODEMUX_HERMES_PYTHON`; explicit API-key/local profile route | Fake official-library/RPC tests; local installed Python 3.11 correctly rejected |
 | Grok | Unavailable pending an upstream catalog/fanout contract or a separately reviewed native wrapper | Official source audit; fails closed |
@@ -532,7 +532,8 @@ normal RPATH relocation. A copied x64 SDK tree passed the actual GTK packaging
 pass and zero-model native readiness. Ripgrep and the sandbox helper remained
 byte-identical and executable, while the parser binding received its normal
 RPATH. [Local packaging proof](assets/dynamic-workflows/packaging-readiness.json)
-records this fixture's hashes and limits. Seven focused packaging regressions and
+records the SDK 1.0.37 fixture's hashes and limits; release CI is configured
+to verify the current SDK 1.0.38 payload. Seven focused packaging regressions and
 four release-policy checks passed. Installer verification now compares each
 extracted managed sidecar with its staged hash and runs Linux native readiness
 against the extracted payload; final archive results are reported from CI.

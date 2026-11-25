@@ -34,7 +34,7 @@ for line in sys.stdin:
   early=json.loads(sys.stdin.readline())
   if 'error' not in early: raise RuntimeError('Host admitted a pre-ready call')
   if mode=='never-ready':continue
-  emit({'id':i,'result':{'protocolVersion':1,'provider':'cursor','adapterVersion':'unreviewed' if mode=='wrong-version' else 'cursor-sdk-1.0.37','sessionId':'fresh','tools':[t['name'] for t in p['tools']],'isolation':{'nativeTools':[],'nativeFanout':False,'ambientConfig':False}}})
+  emit({'id':i,'result':{'protocolVersion':1,'provider':'cursor','adapterVersion':'unreviewed' if mode=='wrong-version' else 'cursor-sdk-1.0.38','sessionId':'fresh','tools':[t['name'] for t in p['tools']],'isolation':{'nativeTools':[],'nativeFanout':False,'ambientConfig':False}}})
  elif method=='startTurn':
   turn=p['turnId'];emit({'id':i,'result':{}})
   emit({'id':'tool','method':'managed/tool_call','params':{'name':'shell' if mode=='forged-tool' else 'workflow_result','arguments':{'run_id':'forged-run','attempt_id':'forged-attempt'}}})
@@ -59,7 +59,7 @@ async fn spawn(mode: &str, captured: Arc<Captured>) -> Result<(Arc<ManagedBridge
     let cwd = tempfile::tempdir().unwrap();
     let thread = ThreadId(format!("bridge-{}", uuid::Uuid::new_v4()));
     let (tx, rx) = broadcast::channel(32);
-    let session = ManagedBridgeSession::spawn(start(thread, cwd.path()), ProviderKind::Cursor, "cursor-sdk-1.0.37",
+    let session = ManagedBridgeSession::spawn(start(thread, cwd.path()), ProviderKind::Cursor, "cursor-sdk-1.0.38",
         Arc::new(ManagedSession { handler: captured, read_only: true }),
         SpawnConfig { program: "python3".into(), args: vec!["-u".into(), "-c".into(), SIDECAR.into(), mode.into()],
             env: HashMap::new(), cwd: Some(cwd.path().into()), default_timeout: Duration::from_secs(5) }, json!({}), tx).await?;

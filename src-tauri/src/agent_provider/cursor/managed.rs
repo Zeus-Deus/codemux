@@ -30,7 +30,7 @@ pub async fn spawn(
     ManagedBridgeSession::spawn(
         input,
         ProviderKind::Cursor,
-        "cursor-sdk-1.0.37",
+        "cursor-sdk-1.0.38",
         context,
         config,
         serde_json::json!({}),
