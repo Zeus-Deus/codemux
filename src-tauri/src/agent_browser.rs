@@ -2059,6 +2059,14 @@ fn shell_binary(binary: &str) -> String {
 }
 
 #[cfg(not(target_os = "windows"))]
+fn require_unix_browser_launcher(binary: &str) -> Result<(), String> {
+    let program = if binary == "npx agent-browser" { "npx" } else { binary };
+    which::which(program)
+        .map(|_| ())
+        .map_err(|_| "Browser launcher is unavailable".to_string())
+}
+
+#[cfg(not(target_os = "windows"))]
 fn browser_open_command(bin: &str, session: &str, port: u16) -> Result<std::process::Command, String> {
     let mut cmd = if bin == "npx agent-browser" {
         let mut cmd = std::process::Command::new("npx");
@@ -2830,11 +2838,11 @@ fn run_agent_browser_native_with_status(
     let (record, started_here) = ensure_owned_browser_daemon_with_status(bin, session, stream_port, timeout)?;
     // Retain the verified process handle across command teardown so an exit
     // check cannot accidentally observe a later occupant of the numeric PID.
-    let retained = if started_here { open_verified_browser_handle(&record, session) } else { None };
+    let retained = open_verified_browser_handle(&record, session);
     track_browser_daemon_before_command(session, bin, &record, started_here)
         .map_err(|error| NativeBrowserLaunchFailure {
             error,
-            may_have_launched: !started_here || !browser_daemon_exit_confirmed(&record, retained.as_ref()),
+            may_have_launched: !browser_daemon_exit_confirmed(&record, retained.as_ref()),
         })?;
     let remaining = timeout.saturating_sub(started.elapsed());
     let result = run_agent_browser_native_with_record(
@@ -2859,7 +2867,7 @@ fn finish_browser_command_with_status(
     retained: Option<&std::os::windows::io::OwnedHandle>,
 ) -> Result<NativeBrowserCommandOutput, NativeBrowserLaunchFailure> {
     let result = finish_browser_command(result, session, bin, record, started_here);
-    let may_have_launched = !started_here || !browser_daemon_exit_confirmed(record, retained);
+    let may_have_launched = !browser_daemon_exit_confirmed(record, retained);
     result
         .map(|output| NativeBrowserCommandOutput { output, may_have_launched })
         .map_err(|error| NativeBrowserLaunchFailure { error, may_have_launched })
@@ -3338,7 +3346,18 @@ fn relay_browser_command(
 
 #[cfg(not(target_os = "windows"))]
 fn build_agent_browser_command(session: &str, action: &str, params: &serde_json::Value) -> Result<String, String> {
-    let bin = shell_binary(&resolve_binary());
+    build_agent_browser_command_for_binary(&resolve_binary(), session, action, params)
+}
+
+#[cfg(not(target_os = "windows"))]
+fn build_agent_browser_command_for_binary(
+    resolved: &str,
+    session: &str,
+    action: &str,
+    params: &serde_json::Value,
+) -> Result<String, String> {
+    require_unix_browser_launcher(resolved)?;
+    let bin = shell_binary(resolved);
     let session = shell_quote(session);
     let command = match action {
         "open_url" | "open" => {
@@ -3979,6 +3998,19 @@ impl AgentBrowserManager {
         }
     }
 
+    #[cfg(not(windows))]
+    async fn prepare_unix_action(
+        &self,
+        browser_id: &str,
+        session: &str,
+        action: &str,
+        params: &serde_json::Value,
+        binary: &str,
+    ) -> Result<bool, String> {
+        build_agent_browser_command_for_binary(binary, session, action, params)?;
+        Ok(self.note_action_start(browser_id, action).await)
+    }
+
     /// Reset session state after a "close" action so the next command sees a
     /// fresh daemon (and re-applies the default viewport). Called
     /// unconditionally — even if the close reported an error the daemon
@@ -4042,10 +4074,14 @@ impl AgentBrowserManager {
         // Reject an invalid requested action before a configured viewport
         // could launch a daemon for a command that will never run.
         #[cfg(windows)]
-        build_agent_browser_argv_groups(&session, action, &params)?;
+        let was_running = {
+            build_agent_browser_argv_groups(&session, action, &params)?;
+            self.note_action_start(browser_id, action).await
+        };
         #[cfg(not(windows))]
-        build_agent_browser_command(&session, action, &params)?;
-        let was_running = self.note_action_start(browser_id, action).await;
+        let was_running = self.prepare_unix_action(
+            browser_id, &session, action, &params, &resolve_binary(),
+        ).await?;
 
         // User-configured default viewport (`browser.default_viewport`,
         // synced settings): apply it to a freshly launched daemon BEFORE the
@@ -5123,6 +5159,67 @@ mod tests {
     }
 
     #[cfg(windows)]
+    #[tokio::test]
+    async fn reused_browser_daemon_exit_allows_first_action_retry() {
+        struct ChildGuard(std::process::Child);
+        impl Drop for ChildGuard {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+
+        let temp = tempfile::tempdir().unwrap();
+        let binary = temp.path().join("agent-browser.exe");
+        std::fs::copy(which::which("ping").unwrap(), &binary).unwrap();
+        let session = format!("browser-reused-exit-{}", uuid::Uuid::new_v4().simple());
+        let manager = AgentBrowserManager::new();
+        manager.allocate_port(&session).await.unwrap();
+        let was_running = manager.note_action_start(&session, "open").await;
+        assert!(!was_running);
+
+        let prior_owner = uuid::Uuid::new_v4().simple().to_string();
+        let child = std::process::Command::new(&binary)
+            .args(["-t", "127.0.0.1"])
+            .env("CODEMUX_BROWSER_OWNER", &prior_owner)
+            .env("CODEMUX_BROWSER_SESSION", &session)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        let mut child = ChildGuard(child);
+        let pid = child.0.id();
+        let started_waiting = Instant::now();
+        let start_time = loop {
+            if let Some(start) = browser_process_start(pid, &session, &prior_owner) {
+                break start;
+            }
+            assert!(started_waiting.elapsed() < Duration::from_secs(3));
+            std::thread::sleep(Duration::from_millis(25));
+        };
+        let record = test_browser_record(pid, start_time, prior_owner);
+        let retained = open_verified_browser_handle(&record, &session).expect("verified reused daemon handle");
+
+        child.0.kill().unwrap();
+        child.0.wait().unwrap();
+        let failure = finish_browser_command_with_status(
+            Err(std::io::Error::new(std::io::ErrorKind::BrokenPipe, "daemon exited during command")),
+            &session,
+            "unused.exe",
+            &record,
+            false,
+            Some(&retained),
+        ).err().expect("failed command must be reported");
+        assert!(!failure.may_have_launched, "reused daemon exit must release provisional state");
+        let result = Err(BrowserActionFailure {
+            message: failure.error.to_string(),
+            may_have_launched: failure.may_have_launched,
+        });
+        manager.reconcile_action_attempt(&session, &session, "open", was_running, false, &result).await;
+        assert!(!manager.note_action_start(&session, "open").await, "next launch must be fresh");
+    }
+
+    #[cfg(windows)]
     #[test]
     fn control_listener_must_belong_to_browser_daemon() {
         let temp = tempfile::tempdir().unwrap();
@@ -5491,6 +5588,29 @@ mod tests {
                 version
             );
         }
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    #[tokio::test]
+    async fn missing_unix_launcher_is_rejected_before_command_build_and_can_retry() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        let launcher = temp.path().join("agent-browser");
+        let session = "browser-launcher-retry";
+        let params = serde_json::json!({"url": "about:blank"});
+        let manager = AgentBrowserManager::new();
+        manager.allocate_port(session).await.unwrap();
+        let binary = launcher.to_str().unwrap();
+        assert!(manager.prepare_unix_action(session, session, "open", &params, binary).await.is_err());
+        assert!(!manager.sessions.lock().await.get(session).unwrap().running);
+
+        std::fs::write(&launcher, "#!/bin/sh\nexit 0\n").unwrap();
+        std::fs::set_permissions(&launcher, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let command = build_agent_browser_command_for_binary(binary, session, "open", &params).unwrap();
+        assert!(command.contains("open 'about:blank' --session 'browser-launcher-retry'"));
+        assert!(!manager.prepare_unix_action(session, session, "open", &params, binary).await.unwrap(),
+            "the same session must accept a fresh first action");
     }
 
     #[cfg(not(target_os = "windows"))]
