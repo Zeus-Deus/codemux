@@ -894,7 +894,17 @@ fn ancestor_entry_may_be_new(parent: &std::fs::File, created_child: bool) -> Res
         return Ok(true);
     }
     let error = std::io::Error::last_os_error();
-    if matches!(error.raw_os_error(), Some(libc::EACCES | libc::EPERM)) {
+    ancestor_write_access_result(Err(error))
+}
+
+#[cfg(unix)]
+fn ancestor_write_access_result(result: std::io::Result<()>) -> Result<bool, String> {
+    let Err(error) = result else {
+        return Ok(true);
+    };
+    // EROFS also means this process could not have created the ancestor's
+    // entry, even if the directory mode itself grants write permission.
+    if matches!(error.raw_os_error(), Some(libc::EACCES | libc::EPERM | libc::EROFS)) {
         return Ok(false);
     }
     Err(format!("check iroh key ancestor write access: {error}"))
@@ -1419,15 +1429,24 @@ fn persist_secret_key(path: &Path, key: &SecretKey) -> Result<(), String> {
 
 #[cfg(windows)]
 mod windows_key_security {
-    use std::ffi::OsStr;
-    use std::io::Read;
+    use std::ffi::{OsStr, OsString};
+    use std::io::{Read, Write};
     use std::os::windows::ffi::OsStrExt;
     use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
-    use std::path::{Path, PathBuf};
+    use std::path::{Component, Path, PathBuf, Prefix};
     use std::ptr::{null, null_mut};
 
+    use windows_sys::Wdk::Foundation::OBJECT_ATTRIBUTES;
+    use windows_sys::Wdk::Storage::FileSystem::{
+        FileRenameInformation, NtCreateFile, NtSetInformationFile, FILE_CREATE,
+        FILE_DIRECTORY_FILE, FILE_NON_DIRECTORY_FILE, FILE_OPEN, FILE_OPEN_IF,
+        FILE_OPEN_REPARSE_POINT, FILE_RENAME_INFORMATION, FILE_RENAME_INFORMATION_0,
+        FILE_SYNCHRONOUS_IO_NONALERT,
+    };
     use windows_sys::Win32::Foundation::{
-        LocalFree, ERROR_ALREADY_EXISTS, GENERIC_ALL, GENERIC_WRITE, HANDLE, INVALID_HANDLE_VALUE,
+        LocalFree, GENERIC_ALL, GENERIC_WRITE, HANDLE, INVALID_HANDLE_VALUE,
+        STATUS_ACCESS_DENIED, STATUS_OBJECT_NAME_NOT_FOUND, STATUS_OBJECT_PATH_NOT_FOUND,
+        STATUS_INVALID_PARAMETER, STATUS_SHARING_VIOLATION, UNICODE_STRING,
     };
     use windows_sys::Win32::Security::Authorization::{
         ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW,
@@ -1437,18 +1456,19 @@ mod windows_key_security {
         EqualSid, GetAce, GetSecurityDescriptorControl, GetSecurityDescriptorDacl,
         GetTokenInformation, IsValidSid, IsWellKnownSid, TokenUser, ACL, ACCESS_ALLOWED_ACE,
         DACL_SECURITY_INFORMATION, OWNER_SECURITY_INFORMATION, PROTECTED_DACL_SECURITY_INFORMATION,
-        PSECURITY_DESCRIPTOR, PSID, SE_DACL_PROTECTED, SECURITY_ATTRIBUTES, TOKEN_QUERY,
+        PSECURITY_DESCRIPTOR, PSID, SE_DACL_PROTECTED, TOKEN_QUERY,
         TOKEN_USER, WinBuiltinAdministratorsSid, WinLocalSystemSid, INHERIT_ONLY_ACE,
     };
     use windows_sys::Win32::Storage::FileSystem::{
-        CreateDirectoryW, CreateFileW, GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION,
-        CREATE_NEW, DELETE, FILE_ADD_FILE, FILE_ADD_SUBDIRECTORY, FILE_ATTRIBUTE_DIRECTORY,
+        CreateFileW, FileDispositionInfo, GetFileInformationByHandle, SetFileInformationByHandle,
+        BY_HANDLE_FILE_INFORMATION, DELETE, FILE_ADD_FILE, FILE_ADD_SUBDIRECTORY, FILE_ATTRIBUTE_DIRECTORY,
         FILE_ATTRIBUTE_NORMAL, FILE_ATTRIBUTE_REPARSE_POINT, FILE_DELETE_CHILD,
         FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_GENERIC_READ,
-        FILE_GENERIC_WRITE, FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_READ,
-        FILE_SHARE_WRITE, FILE_WRITE_ATTRIBUTES, FILE_WRITE_EA, OPEN_EXISTING, READ_CONTROL,
-        WRITE_DAC, WRITE_OWNER,
+        FILE_GENERIC_WRITE, FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
+        FILE_TRAVERSE, FILE_WRITE_ATTRIBUTES, FILE_WRITE_EA, FILE_DISPOSITION_INFO,
+        OPEN_EXISTING, READ_CONTROL, SYNCHRONIZE, WRITE_DAC, WRITE_OWNER,
     };
+    use windows_sys::Win32::System::IO::{IO_STATUS_BLOCK, IO_STATUS_BLOCK_0};
     use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
 
     fn wide(value: &OsStr) -> Vec<u16> {
@@ -1533,14 +1553,6 @@ mod windows_key_security {
             Ok(Self { descriptor, dacl, user_info })
         }
 
-        fn attributes(&self) -> SECURITY_ATTRIBUTES {
-            SECURITY_ATTRIBUTES {
-                nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
-                lpSecurityDescriptor: self.descriptor,
-                bInheritHandle: 0,
-            }
-        }
-
         fn user_sid(&self) -> PSID {
             unsafe { (*self.user_info.as_ptr().cast::<TOKEN_USER>()).User.Sid }
         }
@@ -1550,8 +1562,27 @@ mod windows_key_security {
                 EqualSid(owner, self.user_sid()) != 0
                     || IsWellKnownSid(owner, WinBuiltinAdministratorsSid) != 0
                     || IsWellKnownSid(owner, WinLocalSystemSid) != 0
-            }
+            } || trusted_installer_owner(owner)
         }
+    }
+
+    fn trusted_installer_owner(owner: PSID) -> bool {
+        // Windows-managed ancestors can be owned by the Modules Installer.
+        // Treat only that exact service SID as a trusted OS owner.
+        const SID: &str = "S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464";
+        let mut text = null_mut();
+        if owner.is_null() || unsafe { ConvertSidToStringSidW(owner, &mut text) } == 0 {
+            return false;
+        }
+        let mut length = 0usize;
+        while length < 128 && unsafe { *text.add(length) } != 0 {
+            length += 1;
+        }
+        let trusted = length < 128
+            && String::from_utf16(unsafe { std::slice::from_raw_parts(text, length) })
+                .is_ok_and(|value| value == SID);
+        unsafe { LocalFree(text.cast()) };
+        trusted
     }
 
     impl Drop for PrivateDacl {
@@ -1664,40 +1695,82 @@ mod windows_key_security {
         result
     }
 
-    fn open_existing(path: &Path, directory: bool, security: &PrivateDacl, tighten: bool) -> Result<Option<std::fs::File>, String> {
-        let flags = FILE_FLAG_OPEN_REPARSE_POINT
-            | if directory { FILE_FLAG_BACKUP_SEMANTICS } else { FILE_ATTRIBUTE_NORMAL };
-        let access = FILE_READ_ATTRIBUTES | READ_CONTROL | if tighten { WRITE_DAC } else { 0 }
-            | if directory { 0 } else { FILE_GENERIC_READ };
-        let handle = unsafe {
-            CreateFileW(wide(path.as_os_str()).as_ptr(), access,
-                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-                null(), OPEN_EXISTING, flags, null_mut())
-        };
-        if handle == INVALID_HANDLE_VALUE {
-            let error = std::io::Error::last_os_error();
-            if error.kind() == std::io::ErrorKind::NotFound {
-                return Ok(None);
-            }
-            return Err(format!("open iroh key storage: {error}"));
+    const OBJ_CASE_INSENSITIVE: u32 = 0x40;
+
+    // A single name is resolved against a live directory handle. In particular,
+    // neither an ancestor nor the private directory is looked up by path again.
+    fn open_relative(
+        parent: &std::fs::File,
+        name: &OsStr,
+        access: u32,
+        share: u32,
+        disposition: u32,
+        options: u32,
+        security: Option<&PrivateDacl>,
+    ) -> Result<std::fs::File, i32> {
+        let mut name: Vec<u16> = name.encode_wide().collect();
+        if name.is_empty() || name == [b'.' as u16] || name == [b'.' as u16, b'.' as u16]
+            || name.iter().any(|value| matches!(*value, 0 | 47 | 58 | 92))
+        {
+            return Err(STATUS_INVALID_PARAMETER);
         }
-        let file = unsafe { std::fs::File::from_raw_handle(handle) };
+        let bytes = u16::try_from(name.len().checked_mul(2).ok_or(STATUS_INVALID_PARAMETER)?)
+            .map_err(|_| STATUS_INVALID_PARAMETER)?;
+        let unicode = UNICODE_STRING { Length: bytes, MaximumLength: bytes, Buffer: name.as_mut_ptr() };
+        let attributes = OBJECT_ATTRIBUTES {
+            Length: std::mem::size_of::<OBJECT_ATTRIBUTES>() as u32,
+            RootDirectory: parent.as_raw_handle(),
+            ObjectName: &unicode,
+            Attributes: OBJ_CASE_INSENSITIVE,
+            SecurityDescriptor: security.map_or(null(), |security| security.descriptor.cast()),
+            SecurityQualityOfService: null(),
+        };
+        let mut status_block = IO_STATUS_BLOCK { Anonymous: IO_STATUS_BLOCK_0 { Status: 0 }, Information: 0 };
+        let mut handle: HANDLE = null_mut();
+        let status = unsafe {
+            NtCreateFile(
+                &mut handle, access | SYNCHRONIZE, &attributes, &mut status_block,
+                null(), FILE_ATTRIBUTE_NORMAL, share, disposition,
+                options | FILE_OPEN_REPARSE_POINT | FILE_SYNCHRONOUS_IO_NONALERT,
+                null(), 0,
+            )
+        };
+        if status < 0 {
+            return Err(status);
+        }
+        Ok(unsafe { std::fs::File::from_raw_handle(handle) })
+    }
+
+    fn missing(status: i32) -> bool {
+        matches!(status, STATUS_OBJECT_NAME_NOT_FOUND | STATUS_OBJECT_PATH_NOT_FOUND)
+    }
+
+    fn open_existing(
+        parent: &std::fs::File,
+        name: &OsStr,
+        directory: bool,
+        security: &PrivateDacl,
+        tighten: bool,
+    ) -> Result<Option<std::fs::File>, String> {
+        let access = FILE_READ_ATTRIBUTES | READ_CONTROL | if tighten { WRITE_DAC } else { 0 }
+            | if directory { FILE_TRAVERSE } else { FILE_GENERIC_READ };
+        let share = FILE_SHARE_READ | FILE_SHARE_WRITE
+            | if directory { 0 } else { FILE_SHARE_DELETE };
+        let options = if directory { FILE_DIRECTORY_FILE } else { FILE_NON_DIRECTORY_FILE };
+        let file = match open_relative(parent, name, access, share, FILE_OPEN, options, None) {
+            Ok(file) => file,
+            Err(status) if missing(status) => return Ok(None),
+            Err(status) => return Err(format!("open iroh key storage: NTSTATUS {status:#010x}")),
+        };
         validate_handle(&file, directory, security, tighten)?;
         Ok(Some(file))
     }
 
-    fn validate_app_root(root: &Path, security: &PrivateDacl) -> Result<(), String> {
+    fn validate_app_directory(file: &std::fs::File, security: &PrivateDacl, app_root: bool) -> Result<(), String> {
         const MUTATE: u32 = GENERIC_ALL | GENERIC_WRITE | FILE_ADD_FILE | FILE_ADD_SUBDIRECTORY
             | FILE_DELETE_CHILD | FILE_WRITE_EA | FILE_WRITE_ATTRIBUTES | DELETE | WRITE_DAC | WRITE_OWNER;
-        let handle = unsafe {
-            CreateFileW(wide(root.as_os_str()).as_ptr(), FILE_READ_ATTRIBUTES | READ_CONTROL,
-                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, null(), OPEN_EXISTING,
-                FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT, null_mut())
-        };
-        if handle == INVALID_HANDLE_VALUE {
-            return Err(format!("open iroh app directory: {}", std::io::Error::last_os_error()));
-        }
-        let file = unsafe { std::fs::File::from_raw_handle(handle) };
+        const REPLACE_CHILD: u32 = GENERIC_ALL | FILE_DELETE_CHILD | DELETE | WRITE_DAC | WRITE_OWNER;
+        let handle = file.as_raw_handle();
         let mut info = unsafe { std::mem::zeroed::<BY_HANDLE_FILE_INFORMATION>() };
         if unsafe { GetFileInformationByHandle(handle, &mut info) } == 0 {
             return Err(format!("inspect iroh app directory: {}", std::io::Error::last_os_error()));
@@ -1736,8 +1809,9 @@ mod windows_key_security {
                 }
                 let grant = unsafe { &*(ace.cast::<ACCESS_ALLOWED_ACE>()) };
                 let sid: PSID = (&grant.SidStart as *const u32).cast_mut().cast();
+                let forbidden = if app_root { MUTATE } else { REPLACE_CHILD };
                 if unsafe { IsValidSid(sid) } == 0
-                    || (!security.owner_allowed(sid) && grant.Mask & MUTATE != 0)
+                    || (!security.owner_allowed(sid) && grant.Mask & forbidden != 0)
                 {
                     return Err("iroh app directory grants another user write access".to_string());
                 }
@@ -1750,66 +1824,62 @@ mod windows_key_security {
         result
     }
 
-    fn canonical_app_root(root: &Path, create: bool) -> Result<PathBuf, String> {
-        if create {
-            std::fs::create_dir_all(root).map_err(|e| format!("create iroh app directory: {e}"))?;
+    fn open_app_root(root: &Path, create: bool, security: &PrivateDacl) -> Result<std::fs::File, String> {
+        let mut components = root.components();
+        let (Some(Component::Prefix(prefix)), Some(Component::RootDir(separator))) =
+            (components.next(), components.next())
+        else {
+            return Err("iroh app directory must have an absolute Windows path".to_string());
+        };
+        if !matches!(prefix.kind(), Prefix::Disk(_) | Prefix::VerbatimDisk(_)
+            | Prefix::UNC(_, _) | Prefix::VerbatimUNC(_, _))
+        {
+            return Err("iroh app directory uses an unsupported Windows path prefix".to_string());
         }
-        let root = std::fs::canonicalize(root).map_err(|e| format!("resolve iroh app directory: {e}"))?;
-        let security = PrivateDacl::new(true)?;
-        if let Some(parent) = root.parent() {
-            validate_app_root(parent, &security)?;
-        }
-        validate_app_root(&root, &security)?;
-        Ok(root)
-    }
-
-    pub(super) fn private_directory(parent: &Path) -> Result<PathBuf, String> {
-        let root = parent.parent().ok_or("iroh key directory has no app root")?;
-        let root = canonical_app_root(root, true)?;
-        let parent = root.join(parent.file_name().ok_or("iroh key directory has no name")?);
-        let security = PrivateDacl::new(true)?;
-        let attributes = security.attributes();
-        if unsafe { CreateDirectoryW(wide(parent.as_os_str()).as_ptr(), &attributes) } == 0 {
-            let error = std::io::Error::last_os_error();
-            if error.raw_os_error() != Some(ERROR_ALREADY_EXISTS as i32) {
-                return Err(format!("create private iroh key directory: {error}"));
+        let mut anchor_path = PathBuf::from(prefix.as_os_str());
+        anchor_path.push(separator.as_os_str());
+        let mut names = Vec::<OsString>::new();
+        for component in components {
+            match component {
+                Component::Normal(name) => names.push(name.to_os_string()),
+                _ => return Err("iroh app directory contains an unsafe path component".to_string()),
             }
         }
-        open_existing(&parent, true, &security, true)?
-            .ok_or("private iroh key directory disappeared")?;
-        Ok(parent)
-    }
-
-    pub(super) fn existing_private_directory(parent: &Path) -> Result<(PathBuf, Option<PathBuf>), String> {
-        let root = canonical_app_root(parent.parent().ok_or("iroh key directory has no app root")?, false)?;
-        let parent = root.join(parent.file_name().ok_or("iroh key directory has no name")?);
-        let security = PrivateDacl::new(true)?;
-        let private = if open_existing(&parent, true, &security, false)?.is_some() {
-            Some(parent)
-        } else {
-            None
-        };
-        Ok((root, private))
-    }
-
-    pub(super) fn private_temp_file(path: &Path) -> Result<std::fs::File, String> {
-        let security = PrivateDacl::new(false)?;
-        let attributes = security.attributes();
+        if names.is_empty() {
+            return Err("iroh app directory cannot be a volume root".to_string());
+        }
         let handle = unsafe {
-            CreateFileW(wide(path.as_os_str()).as_ptr(), FILE_GENERIC_WRITE | FILE_READ_ATTRIBUTES | READ_CONTROL | WRITE_DAC,
-                0, &attributes, CREATE_NEW, FILE_ATTRIBUTE_NORMAL, null_mut())
+            CreateFileW(wide(anchor_path.as_os_str()).as_ptr(),
+                FILE_READ_ATTRIBUTES | READ_CONTROL | FILE_TRAVERSE,
+                FILE_SHARE_READ | FILE_SHARE_WRITE, null(), OPEN_EXISTING,
+                FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT, null_mut())
         };
         if handle == INVALID_HANDLE_VALUE {
-            return Err(format!("create private iroh key temp file: {}", std::io::Error::last_os_error()));
+            return Err(format!("open iroh volume root: {}", std::io::Error::last_os_error()));
         }
-        let file = unsafe { std::fs::File::from_raw_handle(handle) };
-        validate_handle(&file, false, &security, true)?;
-        Ok(file)
+        let anchor = unsafe { std::fs::File::from_raw_handle(handle) };
+        validate_app_directory(&anchor, security, false)?;
+        // Keep every parent open without delete sharing until its child is
+        // validated. A path component cannot be swapped during the walk.
+        let mut held = vec![anchor];
+        for (index, name) in names.iter().enumerate() {
+            let file = open_relative(
+                held.last().unwrap(), name,
+                FILE_READ_ATTRIBUTES | READ_CONTROL | FILE_TRAVERSE,
+                FILE_SHARE_READ | FILE_SHARE_WRITE,
+                if create { FILE_OPEN_IF } else { FILE_OPEN },
+                FILE_DIRECTORY_FILE,
+                if create { Some(security) } else { None },
+            ).map_err(|status| format!("open iroh app directory component: NTSTATUS {status:#010x}"))?;
+            validate_app_directory(&file, security, index + 1 == names.len())?;
+            held.push(file);
+        }
+        Ok(held.pop().unwrap())
     }
 
-    pub(super) fn read_existing_key(path: &Path) -> Result<Option<Vec<u8>>, String> {
+    fn read_key(parent: &std::fs::File, name: &OsStr, tighten: bool) -> Result<Option<Vec<u8>>, String> {
         let security = PrivateDacl::new(false)?;
-        let Some(mut file) = open_existing(path, false, &security, true)? else {
+        let Some(mut file) = open_existing(parent, name, false, &security, tighten)? else {
             return Ok(None);
         };
         let mut sealed = Vec::new();
@@ -1817,20 +1887,108 @@ mod windows_key_security {
         Ok(Some(sealed))
     }
 
-    pub(super) fn read_existing_key_readonly(path: &Path) -> Result<Option<Vec<u8>>, String> {
-        let security = PrivateDacl::new(false)?;
-        let Some(mut file) = open_existing(path, false, &security, false)? else {
-            return Ok(None);
-        };
-        let mut sealed = Vec::new();
-        file.read_to_end(&mut sealed).map_err(|e| format!("read iroh key file: {e}"))?;
-        Ok(Some(sealed))
+    fn discard(file: &std::fs::File) {
+        let info = FILE_DISPOSITION_INFO { DeleteFile: 1 };
+        unsafe {
+            SetFileInformationByHandle(file.as_raw_handle(), FileDispositionInfo,
+                std::ptr::addr_of!(info).cast(), std::mem::size_of::<FILE_DISPOSITION_INFO>() as u32);
+        }
     }
 
-    pub(super) fn secure_existing_key(path: &Path) -> Result<(), String> {
-        let security = PrivateDacl::new(false)?;
-        drop(open_existing(path, false, &security, true)?);
-        Ok(())
+    fn publish(file: &std::fs::File, parent: &std::fs::File, name: &OsStr) -> Result<(), String> {
+        let wide: Vec<u16> = name.encode_wide().collect();
+        let size = std::mem::size_of::<FILE_RENAME_INFORMATION>() + wide.len() * 2;
+        let mut buffer = vec![0u64; size.div_ceil(8)];
+        let info = buffer.as_mut_ptr().cast::<FILE_RENAME_INFORMATION>();
+        unsafe {
+            (*info).Anonymous = FILE_RENAME_INFORMATION_0 { ReplaceIfExists: 1 };
+            (*info).RootDirectory = parent.as_raw_handle();
+            (*info).FileNameLength = (wide.len() * 2) as u32;
+            std::ptr::copy_nonoverlapping(
+                wide.as_ptr(), std::ptr::addr_of_mut!((*info).FileName).cast::<u16>(), wide.len());
+        }
+        let mut attempts = 0;
+        loop {
+            let mut status_block = IO_STATUS_BLOCK { Anonymous: IO_STATUS_BLOCK_0 { Status: 0 }, Information: 0 };
+            let status = unsafe {
+                NtSetInformationFile(file.as_raw_handle(), &mut status_block, info.cast(), size as u32,
+                    FileRenameInformation)
+            };
+            attempts += 1;
+            if status >= 0 {
+                return Ok(());
+            }
+            if !matches!(status, STATUS_ACCESS_DENIED | STATUS_SHARING_VIOLATION) || attempts == 50 {
+                return Err(format!("publish iroh key file: NTSTATUS {status:#010x}"));
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+
+    pub(super) struct KeyStore {
+        root: std::fs::File,
+        private: Option<std::fs::File>,
+        name: OsString,
+    }
+
+    impl KeyStore {
+        pub(super) fn open(path: &Path, create: bool) -> Result<Self, String> {
+            let parent = path.parent().ok_or("iroh key path has no parent")?;
+            let root = parent.parent().ok_or("iroh key directory has no app root")?;
+            let name = path.file_name().ok_or("iroh key path has no filename")?.to_os_string();
+            let private_name = parent.file_name().ok_or("iroh key directory has no name")?;
+            let directory_security = PrivateDacl::new(true)?;
+            let root = open_app_root(root, create, &directory_security)?;
+            let private = if create {
+                let file = open_relative(&root, private_name,
+                    FILE_READ_ATTRIBUTES | READ_CONTROL | WRITE_DAC | FILE_TRAVERSE,
+                    FILE_SHARE_READ | FILE_SHARE_WRITE, FILE_OPEN_IF, FILE_DIRECTORY_FILE,
+                    Some(&directory_security),
+                ).map_err(|status| format!("open private iroh key directory: NTSTATUS {status:#010x}"))?;
+                validate_handle(&file, true, &directory_security, true)?;
+                Some(file)
+            } else {
+                open_existing(&root, private_name, true, &directory_security, false)?
+            };
+            Ok(Self { root, private, name })
+        }
+
+        pub(super) fn read_private(&self, tighten: bool) -> Result<Option<Vec<u8>>, String> {
+            match self.private.as_ref() {
+                Some(parent) => read_key(parent, &self.name, tighten),
+                None => Ok(None),
+            }
+        }
+
+        pub(super) fn read_legacy(&self, tighten: bool) -> Result<Option<Vec<u8>>, String> {
+            read_key(&self.root, &self.name, tighten)
+        }
+
+        pub(super) fn persist(&self, key: &super::SecretKey) -> Result<(), String> {
+            let parent = self.private.as_ref().ok_or("private iroh key directory is missing")?;
+            let security = PrivateDacl::new(false)?;
+            drop(open_existing(parent, &self.name, false, &security, true)?);
+            let sealed = crate::auth::encrypt_data(&key.to_bytes())?;
+            let temp_name = OsString::from(format!(".{}.{}.tmp", super::KEY_FILE, uuid::Uuid::new_v4()));
+            let mut file = open_relative(parent, &temp_name,
+                FILE_GENERIC_WRITE | FILE_READ_ATTRIBUTES | READ_CONTROL | WRITE_DAC | DELETE,
+                0, FILE_CREATE, FILE_NON_DIRECTORY_FILE, Some(&security),
+            ).map_err(|status| format!("create private iroh key temp file: NTSTATUS {status:#010x}"))?;
+            let mut published = false;
+            let result = (|| {
+                validate_handle(&file, false, &security, true)?;
+                file.write_all(&sealed).map_err(|e| format!("write iroh key temp file: {e}"))?;
+                file.sync_all().map_err(|e| format!("sync iroh key temp file: {e}"))?;
+                publish(&file, parent, &self.name)?;
+                published = true;
+                file.sync_all().map_err(|e| format!("sync published iroh key file: {e}"))?;
+                Ok(())
+            })();
+            if result.is_err() && !published {
+                discard(&file);
+            }
+            result
+        }
     }
 
     #[cfg(test)]
@@ -1883,46 +2041,9 @@ mod windows_key_security {
     }
 }
 
-#[cfg(windows)]
+#[cfg(all(windows, test))]
 fn persist_secret_key(path: &Path, key: &SecretKey) -> Result<(), String> {
-    use std::io::Write;
-    use std::os::windows::ffi::OsStrExt;
-    use windows_sys::Win32::Storage::FileSystem::{
-        MoveFileExW, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH,
-    };
-
-    let parent = path.parent().ok_or("iroh key path has no parent")?;
-    // The final directory is created with a private DACL before any key is
-    // written. Its canonicalized root gives the move verbatim Win32 paths.
-    let parent = windows_key_security::private_directory(parent)?;
-    let path = parent.join(path.file_name().ok_or("iroh key path has no filename")?);
-    secure_existing_key_file(&path)?;
-    let sealed = crate::auth::encrypt_data(&key.to_bytes())?;
-    let temporary = parent.join(format!(".{KEY_FILE}.{}.tmp", uuid::Uuid::new_v4()));
-    let result = (|| {
-        let mut file = windows_key_security::private_temp_file(&temporary)?;
-        file.write_all(&sealed).map_err(|e| format!("write iroh key temp file: {e}"))?;
-        file.sync_all().map_err(|e| format!("sync iroh key temp file: {e}"))?;
-        drop(file);
-        let source: Vec<u16> = temporary.as_os_str().encode_wide().chain(Some(0)).collect();
-        let destination: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
-        // Same-directory WRITE_THROUGH keeps a partially written replacement
-        // out of the visible key path and waits for the move to reach disk.
-        if unsafe {
-            MoveFileExW(
-                source.as_ptr(),
-                destination.as_ptr(),
-                MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
-            )
-        } == 0 {
-            return Err(format!("publish iroh key file: {}", std::io::Error::last_os_error()));
-        }
-        Ok(())
-    })();
-    if result.is_err() {
-        let _ = std::fs::remove_file(&temporary);
-    }
-    result
+    windows_key_security::KeyStore::open(path, true)?.persist(key)
 }
 
 #[cfg(all(not(unix), not(windows)))]
@@ -1933,11 +2054,6 @@ fn persist_secret_key(path: &Path, key: &SecretKey) -> Result<(), String> {
     secure_existing_key_file(path)?;
     let sealed = crate::auth::encrypt_data(&key.to_bytes())?;
     std::fs::write(path, &sealed).map_err(|e| format!("write iroh key: {e}"))
-}
-
-#[cfg(windows)]
-fn secure_existing_key_file(path: &Path) -> Result<(), String> {
-    windows_key_security::secure_existing_key(path)
 }
 
 #[cfg(all(not(unix), not(windows)))]
@@ -1978,18 +2094,18 @@ fn migrate_legacy_secret_key(
 }
 
 #[cfg(windows)]
-fn migrate_legacy_secret_key(path: &Path) -> Result<Option<SecretKey>, String> {
-    let Some(legacy) = legacy_key_file_path(path) else {
+fn migrate_legacy_secret_key(path: &Path, store: &windows_key_security::KeyStore) -> Result<Option<SecretKey>, String> {
+    if legacy_key_file_path(path).is_none() {
         return Ok(None);
-    };
-    let Some(sealed) = windows_key_security::read_existing_key(&legacy)? else {
+    }
+    let Some(sealed) = store.read_legacy(true)? else {
         return Ok(None);
     };
     let Some(key) = decode_secret_key(&sealed) else {
         log::warn!("[codemux::web_remote] legacy iroh identity key is unreadable; regenerating");
         return Ok(None);
     };
-    persist_secret_key(path, &key)?;
+    store.persist(&key)?;
     // The original remains for crash recovery only after its DACL is private.
     Ok(Some(key))
 }
@@ -2038,6 +2154,7 @@ fn load_or_create_secret_key_at_with_sync(
     path: &Path,
     #[cfg(unix)] directory_sync: &dyn Fn(&std::fs::File) -> std::io::Result<()>,
 ) -> Result<SecretKey, String> {
+    #[cfg(not(windows))]
     let parent = path.parent().ok_or("iroh key path has no parent")?;
     #[cfg(unix)]
     let (legacy_root, root_parents) = if let Some(legacy) = legacy_key_file_path(path) {
@@ -2059,14 +2176,9 @@ fn load_or_create_secret_key_at_with_sync(
     #[cfg(unix)]
     let sealed = read_private_key_in(&directory, true)?;
     #[cfg(windows)]
-    let canonical_path = {
-        let private_parent = windows_key_security::private_directory(parent)?;
-        private_parent.join(path.file_name().ok_or("iroh key has no filename")?)
-    };
+    let store = windows_key_security::KeyStore::open(path, true)?;
     #[cfg(windows)]
-    let path = canonical_path.as_path();
-    #[cfg(windows)]
-    let sealed = windows_key_security::read_existing_key(path)?;
+    let sealed = store.read_private(true)?;
     #[cfg(all(not(unix), not(windows)))]
     let sealed = {
         std::fs::create_dir_all(parent).map_err(|e| format!("create iroh key directory: {e}"))?;
@@ -2097,7 +2209,11 @@ fn load_or_create_secret_key_at_with_sync(
             return Ok(key);
         }
     }
-    #[cfg(not(unix))]
+    #[cfg(windows)]
+    if let Some(key) = migrate_legacy_secret_key(path, &store)? {
+        return Ok(key);
+    }
+    #[cfg(all(not(unix), not(windows)))]
     if let Some(key) = migrate_legacy_secret_key(path)? {
         return Ok(key);
     }
@@ -2111,7 +2227,9 @@ fn load_or_create_secret_key_at_with_sync(
     let key = SecretKey::generate();
     #[cfg(unix)]
     persist_secret_key_in_with_sync(&directory, &key, directory_sync)?;
-    #[cfg(not(unix))]
+    #[cfg(windows)]
+    store.persist(&key)?;
+    #[cfg(all(not(unix), not(windows)))]
     persist_secret_key(path, &key)?;
     Ok(key)
 }
@@ -2150,15 +2268,10 @@ fn persisted_node_id_at(path: &Path) -> Option<String> {
         (current, root)
     };
     #[cfg(windows)]
-    let (current, legacy_root) = {
-        let (root, private_parent) = windows_key_security::existing_private_directory(path.parent()?).ok()?;
-        let current = match private_parent {
-            Some(parent) => windows_key_security::read_existing_key_readonly(
-                &parent.join(path.file_name()?),
-            ).ok()?,
-            None => None,
-        };
-        (current, root)
+    let (current, store) = {
+        let store = windows_key_security::KeyStore::open(path, false).ok()?;
+        let current = store.read_private(false).ok()?;
+        (current, store)
     };
     #[cfg(all(not(unix), not(windows)))]
     let current = {
@@ -2180,7 +2293,7 @@ fn persisted_node_id_at(path: &Path) -> Option<String> {
     #[cfg(unix)]
     let sealed = read_private_key_in(&legacy_root, false).ok()??;
     #[cfg(windows)]
-    let sealed = windows_key_security::read_existing_key_readonly(&legacy_root.join(KEY_FILE)).ok()??;
+    let sealed = store.read_legacy(false).ok()??;
     #[cfg(all(not(unix), not(windows)))]
     let sealed = {
         let legacy = legacy_key_file_path(path)?;
@@ -2852,6 +2965,14 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn iroh_identity_key_read_only_ancestor_stops_sync_walk() {
+        assert!(!ancestor_write_access_result(Err(std::io::Error::from_raw_os_error(libc::EROFS))).unwrap());
+        assert!(ancestor_write_access_result(Ok(())).unwrap());
+        assert!(ancestor_write_access_result(Err(std::io::Error::from_raw_os_error(libc::EIO))).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn iroh_identity_key_retry_syncs_key_left_by_failed_publication() {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("codemux").join(KEY_DIR).join(KEY_FILE);
@@ -3188,9 +3309,29 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let shared = temp.path().join("shared");
         std::fs::create_dir(&shared).unwrap();
-        windows_key_security::inherited_grant_fixture(&shared, "GW").unwrap();
+        windows_key_security::inherited_grant_fixture(&shared, "DC").unwrap();
         let app_dir = shared.join("codemux");
         std::fs::create_dir(&app_dir).unwrap();
+        windows_key_security::inherited_grant_fixture(&app_dir, "GR").unwrap();
+        let path = app_dir.join(KEY_DIR).join(KEY_FILE);
+
+        let error = load_or_create_secret_key_at(&path).unwrap_err();
+        assert!(error.contains("grants another user write access"), "{error}");
+        assert!(!path.exists());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn iroh_identity_key_rejects_replaceable_earlier_ancestor() {
+        let temp = tempfile::tempdir().unwrap();
+        let outer = temp.path().join("outer");
+        let inner = outer.join("inner");
+        let app_dir = inner.join("codemux");
+        std::fs::create_dir_all(&app_dir).unwrap();
+        // The immediate parent and app root are safe. A different user can
+        // replace the earlier entry through DELETE_CHILD on its parent.
+        windows_key_security::inherited_grant_fixture(&outer, "DC").unwrap();
+        windows_key_security::inherited_grant_fixture(&inner, "GR").unwrap();
         windows_key_security::inherited_grant_fixture(&app_dir, "GR").unwrap();
         let path = app_dir.join(KEY_DIR).join(KEY_FILE);
 
