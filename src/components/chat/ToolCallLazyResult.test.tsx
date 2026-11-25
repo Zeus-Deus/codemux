@@ -199,6 +199,21 @@ describe("lazy tool-result body", () => {
     expect(URL.revokeObjectURL).toHaveBeenCalledWith("blob:tool-image");
   });
 
+  it("returns focus to the retry control when an open image fallback fails", async () => {
+    vi.mocked(agentChatGetToolResultImage)
+      .mockResolvedValueOnce({ src: "/managed/tool.png", local: true })
+      .mockRejectedValueOnce(new Error("inline image unavailable"));
+    render(<ToolCallBody item={imageStub()} />);
+
+    await waitFor(() => expect(screen.getByRole("img")).toHaveAttribute("src", "asset:/managed/tool.png"));
+    await userEvent.click(screen.getByRole("button", { name: "Open image" }));
+    fireEvent.error(within(screen.getByRole("dialog")).getByRole("img"));
+
+    await waitFor(() => expect(screen.queryByRole("dialog", { name: "Tool result image" })).not.toBeInTheDocument());
+    await waitFor(() => expect(screen.getByRole("button", { name: "Image preview unavailable — retry" })).toHaveFocus());
+    expect(agentChatGetToolResultImage).toHaveBeenLastCalledWith(ROW_ID, "/1", true);
+  });
+
   it("evicts over-budget compressed bytes only after every mounted owner releases them", async () => {
     vi.mocked(agentChatGetToolResultImage).mockImplementation(async (rowId, _pointer, inline) =>
       inline ? { src: "data:image/png;base64,AQID", local: false } : { src: `/managed/${rowId}.png`, local: true });
