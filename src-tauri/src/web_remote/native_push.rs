@@ -14,6 +14,7 @@
 //! clear reason, the phone app stays live only while open, and browser Web
 //! Push keeps working exactly as before. The contract lives in
 //! `services/push-relay/README.md`.
+use super::auth::{session_status, SessionStatus};
 use crate::database::{mobile_push::MobilePushDevice, DatabaseStore};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
@@ -311,8 +312,8 @@ async fn send<R: Runtime>(
         .acquire()
         .await
         .map_err(|_| "Push delivery stopped")?;
-    if !super::push::active_session(app, &device.session_id) {
-        return Err("Remote session is no longer approved".into());
+    if !session_status(&app.state::<DatabaseStore>(), &device.session_id).is_approved() {
+        return Err("Remote session is no longer active".into());
     }
     if !remote_access_on(app) {
         return Err("Remote access is disabled".into());
@@ -355,31 +356,37 @@ async fn send<R: Runtime>(
 /// a slow or missing relay never holds up the agent event that caused it.
 pub fn deliver<R: Runtime>(app: &AppHandle<R>, notice: Notice) {
     let app = app.clone();
-    tauri::async_runtime::spawn(async move {
-        let db = app.state::<DatabaseStore>();
-        let Some(relay) = relay_url(&db) else {
+    tauri::async_runtime::spawn(async move { deliver_notice(&app, notice).await });
+}
+
+async fn deliver_notice<R: Runtime>(app: &AppHandle<R>, notice: Notice) {
+    let db = app.state::<DatabaseStore>();
+    let Some(relay) = relay_url(&db) else {
+        return;
+    };
+    let devices = match db.mobile_push_devices() {
+        Ok(devices) => devices,
+        Err(error) => {
+            eprintln!("[native-push] {error}");
             return;
-        };
-        let devices = match db.mobile_push_devices() {
-            Ok(devices) => devices,
-            Err(error) => {
-                eprintln!("[native-push] {error}");
-                return;
-            }
-        };
-        for device in devices {
-            if !super::push::active_session(&app, &device.session_id) {
+        }
+    };
+    for device in devices {
+        match session_status(&db, &device.session_id) {
+            SessionStatus::Gone => {
                 let _ = db.delete_mobile_push_device(&device.session_id);
                 continue;
             }
-            if device.relay_url != relay || !categories_of(&device).allows(notice.kind) {
-                continue;
-            }
-            if let Err(error) = send(&app, &relay, &device, &notice).await {
-                eprintln!("[native-push] {error}");
-            }
+            status if status.is_approved() => {}
+            _ => continue,
         }
-    });
+        if device.relay_url != relay || !categories_of(&device).allows(notice.kind) {
+            continue;
+        }
+        if let Err(error) = send(app, &relay, &device, &notice).await {
+            eprintln!("[native-push] {error}");
+        }
+    }
 }
 
 /// PR-watch news for the chat's phone owners. The sweep has already
@@ -547,6 +554,78 @@ mod tests {
         invoke(handle, "phone", "web_push_native_register", &register).await.unwrap();
         app.state::<DatabaseStore>().web_remote_revoke_session("phone").unwrap();
         assert!(super::super::push::invoke(handle, "phone", "web_push_native_status", &json!({})).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn account_push_pauses_on_expiration_and_prunes_on_revocation() {
+        let app = tauri::test::mock_app();
+        let db = DatabaseStore::new_in_memory();
+        let owner = crate::auth::AuthUser {
+            id: "owner".into(),
+            email: "owner@example.test".into(),
+            name: None,
+            image: None,
+        };
+        let active_expiry = "2099-01-01T00:00:00Z";
+        crate::auth::save_auth(&db, "active-token", active_expiry, Some(&owner)).unwrap();
+        db.web_remote_insert_account_session("account", None, None, "account-hash", true, &owner.id)
+            .unwrap();
+        db.web_remote_insert_session("paired", None, None, "pair-hash", true)
+            .unwrap();
+
+        let (relay, seen, _) = fake_relay().await;
+        db.set_setting(RELAY_URL_SETTING, &relay).unwrap();
+        for (session_id, device_id) in [
+            ("account", "AAAAAAAAAAAAAAAAAAAAAA"),
+            ("paired", "BBBBBBBBBBBBBBBBBBBBBB"),
+        ] {
+            db.upsert_mobile_push_device(&MobilePushDevice {
+                session_id: session_id.into(),
+                relay_url: relay.clone(),
+                device_id: device_id.into(),
+                ..device()
+            })
+            .unwrap();
+        }
+        app.manage(db);
+        app.manage(super::super::WebRemoteState::default());
+        let shared = app.state::<super::super::WebRemoteState>().shared();
+        shared.config.lock().unwrap().enabled = true;
+        let db = app.state::<DatabaseStore>();
+        let notice = Notice {
+            kind: Kind::Test,
+            title: "Test notification".into(),
+            body: "Test".into(),
+            collapse_key: "test".into(),
+            data: BTreeMap::new(),
+        };
+        let take_delivered_sessions = || {
+            let mut sessions: Vec<_> = seen
+                .lock()
+                .unwrap()
+                .drain(..)
+                .map(|(_, _, body)| body["data"]["sessionId"].as_str().unwrap().to_owned())
+                .collect();
+            sessions.sort();
+            sessions
+        };
+
+        deliver_notice(app.handle(), notice.clone()).await;
+        assert_eq!(take_delivered_sessions(), ["account", "paired"]);
+
+        crate::auth::save_auth(&db, "expired-token", "2000-01-01T00:00:00Z", Some(&owner)).unwrap();
+        deliver_notice(app.handle(), notice.clone()).await;
+        assert_eq!(take_delivered_sessions(), ["paired"]);
+        assert!(db.mobile_push_device("account").unwrap().is_some());
+
+        crate::auth::save_auth(&db, "refreshed-token", active_expiry, Some(&owner)).unwrap();
+        deliver_notice(app.handle(), notice.clone()).await;
+        assert_eq!(take_delivered_sessions(), ["account", "paired"]);
+
+        db.clear_auth_token().unwrap();
+        deliver_notice(app.handle(), notice).await;
+        assert_eq!(take_delivered_sessions(), ["paired"]);
+        assert!(db.mobile_push_device("account").unwrap().is_none());
     }
 
     #[test]

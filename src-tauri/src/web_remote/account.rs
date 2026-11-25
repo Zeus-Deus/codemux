@@ -46,6 +46,8 @@ pub(crate) enum AccountPairError {
     /// The credentials authenticated, but to a *different* account than the one
     /// the desktop is signed into. → 403.
     Mismatch,
+    /// The desktop account session changed during verification. → 409.
+    SessionChanged,
     /// An internal failure minting the session row. → 500.
     Internal(String),
 }
@@ -91,25 +93,17 @@ pub(crate) async fn verify_and_mint(
     device_name: Option<String>,
     user_agent: Option<String>,
 ) -> Result<AccountPairOutcome, AccountPairError> {
-    // Snapshot the config values up front so the non-Send `std::sync::Mutex`
-    // guard is never held across the `.await` below.
-    let (account_mode_enabled, approved) = {
-        let cfg = shared.config.lock().unwrap();
-        (
-            cfg.account_mode_enabled,
-            super::account_session_approved(&cfg),
-        )
-    };
-
     // 1. Master toggle. Off → refuse before touching the account at all.
-    if !account_mode_enabled {
+    if !shared.config.lock().unwrap().account_mode_enabled {
         return Err(AccountPairError::Disabled);
     }
 
-    // 2. The desktop must be signed in — account mode verifies "same account"
-    //    against the desktop's own cached user, and there's nothing to compare
-    //    to when it's signed out.
-    let cached_id = crate::auth::load_active_account_id(db).ok_or(AccountPairError::DesktopSignedOut)?;
+    // 2. Bind verification to the desktop session that started it.
+    let auth_record = db
+        .load_auth_token()
+        .ok_or(AccountPairError::DesktopSignedOut)?;
+    let account_id = crate::auth::active_account_id_from_record(&auth_record)
+        .ok_or(AccountPairError::DesktopSignedOut)?;
 
     // 3. Server-side sign-in with the client-derived secret. The typed
     //    `AuthSecret` boundary is preserved: a derived secret, never a raw
@@ -119,28 +113,36 @@ pub(crate) async fn verify_and_mint(
         .await
         .map_err(|_| AccountPairError::AuthFailed)?;
 
-    // 4. Same-account gate. Credentials for a *different* account get nothing —
-    //    a browser reaches only devices under its own account.
-    let current_id = crate::auth::load_active_account_id(db).ok_or(AccountPairError::DesktopSignedOut)?;
-    if resolved.user.id != cached_id || current_id != cached_id {
+    // 4. Use the current admission policy after the verification request.
+    let cfg = shared.config.lock().unwrap();
+    if !cfg.account_mode_enabled {
+        return Err(AccountPairError::Disabled);
+    }
+    if resolved.user.id != account_id {
         return Err(AccountPairError::Mismatch);
     }
+    let approved = super::account_session_approved(&cfg);
 
-    // 5. Mint the session, tagged `source = "account"` + the verified user id,
-    //    returning the plaintext token once (only its hash is stored).
+    // 5. Compare the original auth record and mint in one database operation.
+    //    A sign-out followed by sign-in to the same account changes the record.
     let session_id = uuid::Uuid::new_v4().to_string();
     let session_token = super::auth::random_token();
     let token_hash = super::auth::sha256_hex(&session_token);
     let name = device_name.filter(|s| !s.trim().is_empty());
-    db.web_remote_insert_account_session(
-        &session_id,
-        name.as_deref(),
-        user_agent.as_deref(),
-        &token_hash,
-        approved,
-        &cached_id,
-    )
-    .map_err(AccountPairError::Internal)?;
+    let inserted = db
+        .web_remote_insert_account_session_if_unchanged(
+            &session_id,
+            name.as_deref(),
+            user_agent.as_deref(),
+            &token_hash,
+            approved,
+            &account_id,
+            &auth_record,
+        )
+        .map_err(AccountPairError::Internal)?;
+    if !inserted {
+        return Err(AccountPairError::SessionChanged);
+    }
 
     Ok(AccountPairOutcome {
         session_id,
@@ -184,20 +186,22 @@ mod tests {
         shared
     }
 
+    fn signin_response(user_id: &str) -> String {
+        serde_json::json!({
+            "token": "resolved-token",
+            "expiresAt": "2099-01-01T00:00:00Z",
+            "user": { "id": user_id, "email": "x@example.com", "name": null, "image": null }
+        })
+        .to_string()
+    }
+
     /// Mock `POST /api/auth/desktop/signin` to succeed and resolve to `user_id`.
     async fn mock_signin_ok(server: &mut mockito::Server, user_id: &str) -> mockito::Mock {
         server
             .mock("POST", "/api/auth/desktop/signin")
             .with_status(200)
             .with_header("content-type", "application/json")
-            .with_body(
-                serde_json::json!({
-                    "token": "resolved-token",
-                    "expiresAt": "2099-01-01T00:00:00Z",
-                    "user": { "id": user_id, "email": "x@example.com", "name": null, "image": null }
-                })
-                .to_string(),
-            )
+            .with_body(signin_response(user_id))
             .create_async()
             .await
     }
@@ -273,6 +277,36 @@ mod tests {
             db.web_remote_list_sessions().is_empty(),
             "no session row on mismatch"
         );
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(mockserver)]
+    async fn rejects_pairing_if_owner_signs_out_and_back_in_during_verification() {
+        let db = Arc::new(init_test_database());
+        let owner = "desktop-owner";
+        seed_cached_user(&db, owner);
+        let shared = shared_with_account_mode(true, true);
+
+        let mut server = mockito::Server::new_async().await;
+        let mock_db = Arc::clone(&db);
+        let mock = server
+            .mock("POST", "/api/auth/desktop/signin")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body_from_request(move |_| {
+                mock_db.clear_auth_token().unwrap();
+                seed_cached_user(&mock_db, owner);
+                signin_response(owner).into_bytes()
+            })
+            .create_async()
+            .await;
+
+        let err = run_verify(&server.url(), &db, &shared, "browser@example.com")
+            .await
+            .expect_err("pairing must still belong to the desktop session that started it");
+        mock.assert_async().await;
+        assert!(matches!(err, AccountPairError::SessionChanged));
+        assert!(db.web_remote_list_sessions().is_empty());
     }
 
     #[tokio::test]

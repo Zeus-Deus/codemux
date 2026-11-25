@@ -1,5 +1,6 @@
 //! Encrypted Web Push, owned by an approved remote session. The desktop sends
 //! directly to the browser's push service; no open phone socket is required.
+use super::auth::{session_status, SessionStatus};
 use crate::{
     database::DatabaseStore,
     state::{AppStateStore, PaneNodeSnapshot, PaneStatus},
@@ -86,11 +87,6 @@ fn write_store(store: &Store) -> Result<(), String> {
         .map_err(|_| "Cannot save push configuration")?;
     std::fs::rename(temp, path).map_err(|_| "Cannot save push configuration".into())
 }
-pub(super) fn active_session<R: Runtime>(app: &AppHandle<R>, session: &str) -> bool {
-    app.state::<DatabaseStore>()
-        .web_remote_get_session(session)
-        .is_some_and(|s| s.approved && !s.revoked)
-}
 /// A subscription must never turn the desktop into an arbitrary HTTP client.
 fn valid_endpoint(endpoint: &str) -> bool {
     let Ok(url) = reqwest::Url::parse(endpoint) else {
@@ -124,8 +120,8 @@ pub async fn invoke<R: Runtime>(
     cmd: &str,
     args: &Value,
 ) -> Result<Value, String> {
-    if !active_session(app, session) {
-        return Err("Remote session is no longer approved".into());
+    if !session_status(&app.state::<DatabaseStore>(), session).is_approved() {
+        return Err("Remote session is no longer active".into());
     }
     if cmd.starts_with("web_push_native_") {
         return super::native_push::invoke(app, session, cmd, args).await;
@@ -214,8 +210,8 @@ async fn send<R: Runtime>(
         .acquire()
         .await
         .map_err(|_| "Push delivery stopped")?;
-    if !active_session(app, &subscriber.session) {
-        return Err("Remote session is no longer approved".into());
+    if !session_status(&app.state::<DatabaseStore>(), &subscriber.session).is_approved() {
+        return Err("Remote session is no longer active".into());
     }
     let shared = app.state::<super::WebRemoteState>().shared();
     {
@@ -417,13 +413,19 @@ fn agent_event<R: Runtime>(app: &AppHandle<R>, source: &str, category: &'static 
                 return;
             };
             let before = store.subscribers.len();
-            store
-                .subscribers
-                .retain(|s| active_session(&app, &s.session));
+            let db = app.state::<DatabaseStore>();
+            let mut eligible = Vec::new();
+            store.subscribers.retain(|subscriber| {
+                let status = session_status(&db, &subscriber.session);
+                if status.is_approved() {
+                    eligible.push(subscriber.clone());
+                }
+                !matches!(status, SessionStatus::Gone)
+            });
             if before != store.subscribers.len() {
                 let _ = write_store(&store);
             }
-            store.subscribers
+            eligible
         };
         for subscriber in subscribers {
             let enabled = match category {

@@ -17,6 +17,7 @@ import {
 } from "@/stores/synced-settings-store";
 import { useProviderRuntimeIntent } from "@/stores/provider-runtime-intent-store";
 import { resetProviderCapabilities } from "@/stores/provider-capabilities-store";
+import { toast } from "@/lib/toast";
 
 export type AuthMethod = "email" | "github" | null;
 
@@ -329,7 +330,12 @@ export const useAuthStore = create<AuthStore>((set, get) => ({
     try {
       await signOutCmd();
     } catch {
-      // Ignore errors — clear local state regardless
+      // The native token may still be stored. Keep the signed-in shell until
+      // the backend confirms it was removed, and make the failure visible.
+      const message = "Your session is still active. Try signing out again.";
+      set({ error: message });
+      toast.error("Couldn't sign out", { description: message });
+      return;
     }
     invalidateInFlightSessionRefresh();
     clearOAuthTimeout();

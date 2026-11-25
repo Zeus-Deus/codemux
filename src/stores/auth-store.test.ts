@@ -31,6 +31,7 @@ import {
 } from "@/tauri/commands";
 import { DEFAULT_SETTINGS } from "./synced-settings-store";
 import { useProviderRuntimeIntent } from "./provider-runtime-intent-store";
+import { toast } from "@/lib/toast";
 import {
   PROVIDER_CAPABILITIES_STORAGE_KEY,
   useProviderCapabilities,
@@ -202,6 +203,35 @@ describe("auth store", () => {
     const state = useAuthStore.getState();
     expect(state.isAuthenticated).toBe(false);
     expect(state.user).toBeNull();
+  });
+
+  it("keeps the session active and reports a failed native sign-out", async () => {
+    mockSignOut.mockRejectedValueOnce(new Error("database locked"));
+    const failureToast = vi.spyOn(toast, "error").mockImplementation(() => "sign-out-error");
+    useAuthStore.setState({
+      user: mockUser,
+      isAuthenticated: true,
+      isLoading: false,
+      sessionStatus: "verified",
+      syncAvailable: true,
+      authMethod: "email",
+    });
+
+    try {
+      await useAuthStore.getState().signOut();
+      const state = useAuthStore.getState();
+      expect(state.user).toEqual(mockUser);
+      expect(state.isAuthenticated).toBe(true);
+      expect(state.sessionStatus).toBe("verified");
+      expect(state.syncAvailable).toBe(true);
+      expect(state.authMethod).toBe("email");
+      expect(state.error).toBe("Your session is still active. Try signing out again.");
+      expect(failureToast).toHaveBeenCalledWith("Couldn't sign out", {
+        description: state.error,
+      });
+    } finally {
+      failureToast.mockRestore();
+    }
   });
 
   it("does not carry provider runtime intent across sign-out and sign-in", async () => {

@@ -515,16 +515,6 @@ fn evaluate_grant(
     })
 }
 
-/// Reuse an existing non-revoked account session for `uid` so repeated relay
-/// dials (e.g. retries while a session is pending approval) don't pile up
-/// duplicate `web_remote_sessions` rows. Returns `(session_id, approved)`.
-fn existing_account_session(db: &DatabaseStore, uid: &str) -> Option<(String, bool)> {
-    db.web_remote_list_sessions()
-        .into_iter()
-        .find(|s| s.source == "account" && s.account_user_id.as_deref() == Some(uid))
-        .map(|s| (s.id, s.approved))
-}
-
 /// Admit an account (grant) handshake: verify the grant with the control plane,
 /// run the accept matrix against this desktop's own identity, then mint (or
 /// reuse) an account-tagged session row. Returns the `session_id` to bind the
@@ -542,42 +532,34 @@ async fn authorize_account_handshake(
     own_node_id: &str,
     hello: &AccountHello,
 ) -> Result<String, AccountHandshakeReject> {
-    // Snapshot the approval policy up front so the non-Send config mutex guard
-    // is never held across the verify await.
-    let approve_policy = {
-        let cfg = shared.config.lock().unwrap();
-        super::account_session_approved(&cfg)
-    };
+    // Bind grant verification to the desktop session that started it.
+    let auth_record = db
+        .load_auth_token()
+        .ok_or(AccountHandshakeReject::WrongAccount)?;
+    let own_user_id = crate::auth::active_account_id_from_record(&auth_record)
+        .ok_or(AccountHandshakeReject::WrongAccount)?;
     let base = crate::auth::api_base_url();
     let resp = verify_grant(&base, &hello.grant)
         .await
         .map_err(|_| AccountHandshakeReject::Unverified)?;
 
-    let own_user_id = crate::auth::load_active_account_id(db);
-    let identity = evaluate_grant(&resp, own_node_id, own_user_id.as_deref(), &hello.nonce)?;
+    let identity = evaluate_grant(&resp, own_node_id, Some(&own_user_id), &hello.nonce)?;
 
-    // Mint once per account (reuse an existing row on retry), tagged
-    // `source="account"` + the verified account user id. The plaintext token is
-    // discarded — the iroh stream binds directly to `session_id`, so no bearer
-    // is ever presented on this transport.
-    let (session_id, approved) = match existing_account_session(db, &identity.user_id) {
-        Some(existing) => existing,
-        None => {
-            let id = uuid::Uuid::new_v4().to_string();
-            let token = super::auth::random_token();
-            let token_hash = super::auth::sha256_hex(&token);
-            db.web_remote_insert_account_session(
-                &id,
-                None,
-                None,
-                &token_hash,
-                approve_policy,
-                &identity.user_id,
-            )
-            .map_err(AccountHandshakeReject::Internal)?;
-            (id, approve_policy)
-        }
-    };
+    // The auth record comparison, lookup, and possible insert are atomic.
+    // Relay streams bind directly to the session ID, so discard the bearer.
+    let id = uuid::Uuid::new_v4().to_string();
+    let token_hash = super::auth::sha256_hex(&super::auth::random_token());
+    let cfg = shared.config.lock().unwrap();
+    let (session_id, approved) = db
+        .web_remote_get_or_insert_relay_account_session_if_unchanged(
+            &id,
+            &token_hash,
+            super::account_session_approved(&cfg),
+            &identity.user_id,
+            &auth_record,
+        )
+        .map_err(AccountHandshakeReject::Internal)?
+        .ok_or(AccountHandshakeReject::WrongAccount)?;
 
     if !approved {
         return Err(AccountHandshakeReject::Pending);
@@ -1374,22 +1356,24 @@ mod tests {
         shared
     }
 
+    fn grant_admit_response(nonce: &str) -> String {
+        json!({
+            "valid": true,
+            "userId": OWN_UID,
+            "deviceId": "dev-1",
+            "nodeId": OWN_NODE,
+            "nonce": nonce,
+        })
+        .to_string()
+    }
+
     /// Mock the verify endpoint to echo a full admit response for `grant`.
     async fn mock_verify_admit(server: &mut mockito::Server, nonce: &str) -> mockito::Mock {
         server
             .mock("POST", "/api/devices/grant/verify")
             .with_status(200)
             .with_header("content-type", "application/json")
-            .with_body(
-                json!({
-                    "valid": true,
-                    "userId": OWN_UID,
-                    "deviceId": "dev-1",
-                    "nodeId": OWN_NODE,
-                    "nonce": nonce,
-                })
-                .to_string(),
-            )
+            .with_body(grant_admit_response(nonce))
             .create_async()
             .await
     }
@@ -1461,6 +1445,39 @@ mod tests {
         let row = db.web_remote_list_sessions().into_iter().next().expect("a pending row");
         assert_eq!(row.source, "account");
         assert!(!row.approved);
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(mockserver)]
+    async fn account_handshake_rejects_if_owner_signs_out_and_back_in_during_verification() {
+        let db = Arc::new(init_test_database());
+        seed_owner(&db);
+        let shared = shared_with_trust(true);
+
+        let mut server = mockito::Server::new_async().await;
+        let mock_db = Arc::clone(&db);
+        let mock = server
+            .mock("POST", "/api/devices/grant/verify")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body_from_request(move |_| {
+                mock_db.clear_auth_token().unwrap();
+                seed_owner(&mock_db);
+                grant_admit_response("n").into_bytes()
+            })
+            .create_async()
+            .await;
+
+        let hello = AccountHello {
+            grant: "g".into(),
+            nonce: "n".into(),
+        };
+        let err = run_account_admit(&server.url(), &db, &shared, &hello)
+            .await
+            .expect_err("the grant must be verified against an unchanged desktop session");
+        mock.assert_async().await;
+        assert_eq!(err, AccountHandshakeReject::WrongAccount);
+        assert!(db.web_remote_list_sessions().is_empty());
     }
 
     #[tokio::test]
