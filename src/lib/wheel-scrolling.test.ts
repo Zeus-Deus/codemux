@@ -269,7 +269,10 @@ describe("responsive wheel animation", () => {
   });
 });
 
-afterEach(() => vi.restoreAllMocks());
+afterEach(() => {
+  vi.restoreAllMocks();
+  vi.unstubAllGlobals();
+});
 
 describe("WebKit mouse source recognition", () => {
   it.each([
@@ -372,10 +375,10 @@ describe("wheel input ownership", () => {
   });
 
   it("does not animate forwarded rail input with reduced motion enabled", () => {
-    vi.spyOn(window, "matchMedia").mockReturnValue({
+    vi.stubGlobal("matchMedia", vi.fn().mockReturnValue({
       matches: true,
       addEventListener: vi.fn(), removeEventListener: vi.fn(),
-    } as unknown as MediaQueryList);
+    } as unknown as MediaQueryList));
     const stop = installWheelScrolling();
     expect(tryAnimatedWheelScroll(document.body, 100)).toBe(false);
     stop();
