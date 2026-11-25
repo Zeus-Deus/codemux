@@ -43,9 +43,13 @@ pub fn approval_root(checkout: &Path) -> PathBuf {
     };
     let registered = || {
         crate::git::git_list_worktrees(&root).is_ok_and(|worktrees| {
-            worktrees.iter().filter(|worktree| !worktree.is_bare).any(|worktree| {
-                std::fs::canonicalize(&worktree.path).ok().as_deref() == Some(canonical.as_path())
-            })
+            worktrees
+                .iter()
+                .filter(|worktree| !worktree.is_bare)
+                .any(|worktree| {
+                    std::fs::canonicalize(&worktree.path).ok().as_deref()
+                        == Some(canonical.as_path())
+                })
         })
     };
     if canonical.starts_with(&root) || registered() {
@@ -63,7 +67,12 @@ pub fn approval_root(checkout: &Path) -> PathBuf {
 /// user-owned entry canonical, so a row that any user-owned file also
 /// defines starts exactly what the user wrote there.
 pub fn fingerprint(config: &McpServerConfig) -> Option<String> {
-    if config.sources.is_empty() || !config.sources.iter().all(|source| is_project_source(*source)) {
+    if config.sources.is_empty()
+        || !config
+            .sources
+            .iter()
+            .all(|source| is_project_source(*source))
+    {
         return None;
     }
     let mut raw = config.raw.clone();
@@ -133,11 +142,14 @@ pub fn summary(config: &McpServerConfig) -> String {
     let mut parts = Vec::new();
     match config.transport {
         McpTransport::Stdio => {
-            let line = std::iter::once(config.command.as_str()).chain(config.args.iter().map(String::as_str));
+            let line = std::iter::once(config.command.as_str())
+                .chain(config.args.iter().map(String::as_str));
             parts.push(line.map(quote).collect::<Vec<_>>().join(" "));
             let env: BTreeMap<&String, &String> = config.env.iter().collect();
             if !env.is_empty() {
-                let env = env.iter().map(|(name, value)| format!("{}={}", quote(name), quote(value)));
+                let env = env
+                    .iter()
+                    .map(|(name, value)| format!("{}={}", quote(name), quote(value)));
                 parts.push(format!("env {}", env.collect::<Vec<_>>().join(" ")));
             }
             if let Some(cwd) = config.raw.get("cwd").and_then(Value::as_str) {
@@ -179,9 +191,15 @@ pub fn escape(text: &str) -> String {
 /// then [`escape`]d.
 fn quote(part: &str) -> String {
     // Windows paths read best unquoted, and `\` is not an escape there.
-    let plain_extra = if cfg!(windows) { "-_./=:@,+%\\" } else { "-_./=:@,+%" };
+    let plain_extra = if cfg!(windows) {
+        "-_./=:@,+%\\"
+    } else {
+        "-_./=:@,+%"
+    };
     let plain = !part.is_empty()
-        && part.chars().all(|c| c.is_ascii_alphanumeric() || plain_extra.contains(c));
+        && part
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || plain_extra.contains(c));
     let quoted = if plain {
         part.to_string()
     } else if cfg!(windows) {
@@ -196,7 +214,12 @@ fn quote(part: &str) -> String {
 fn header_env_names(raw: &Value) -> Vec<String> {
     let mut names = Vec::new();
     for key in ["headers", "http_headers"] {
-        for value in raw.get(key).and_then(Value::as_object).into_iter().flat_map(|m| m.values()) {
+        for value in raw
+            .get(key)
+            .and_then(Value::as_object)
+            .into_iter()
+            .flat_map(|m| m.values())
+        {
             // The same tokenizer the HTTP client expands headers with.
             names.extend(
                 header_template_parts(value.as_str().unwrap_or_default())
@@ -296,7 +319,10 @@ mod tests {
             assert!(row.disabled);
             assert!(row.raw.get("description").is_none());
             assert_eq!(row.project_root, None);
-            assert_eq!(row.sources, vec![user_source, McpConfigSource::CodemuxProject]);
+            assert_eq!(
+                row.sources,
+                vec![user_source, McpConfigSource::CodemuxProject]
+            );
             assert!(fingerprint(row).is_none());
         }
         let rows = crate::mcp::dedupe_servers(vec![
@@ -347,10 +373,18 @@ mod tests {
 
     #[test]
     fn summary_shows_the_whole_definition() {
-        let q = |word: &str| if cfg!(windows) { format!("\"{word}\"") } else { format!("'{word}'") };
+        let q = |word: &str| {
+            if cfg!(windows) {
+                format!("\"{word}\"")
+            } else {
+                format!("'{word}'")
+            }
+        };
         let mut stdio = project(McpConfigSource::ClaudeProject);
         assert_eq!(summary(&stdio), format!("sh -c {}", q("echo hi")));
-        stdio.env.insert("NODE_OPTIONS".into(), "--require ./x.js".into());
+        stdio
+            .env
+            .insert("NODE_OPTIONS".into(), "--require ./x.js".into());
         stdio.env.insert("A".into(), "1".into());
         stdio.raw["cwd"] = json!("./tools dir");
         assert_eq!(
@@ -363,8 +397,15 @@ mod tests {
             )
         );
         stdio.args = vec!["it's".into()];
-        let expected = if cfg!(windows) { r#""it's""# } else { r"'it'\''s'" };
-        assert_eq!(summary(&stdio).split(" · ").next().unwrap(), format!("sh {expected}"));
+        let expected = if cfg!(windows) {
+            r#""it's""#
+        } else {
+            r"'it'\''s'"
+        };
+        assert_eq!(
+            summary(&stdio).split(" · ").next().unwrap(),
+            format!("sh {expected}")
+        );
         let mut http = project(McpConfigSource::ClaudeProject);
         http.transport = McpTransport::Http;
         http.command = "http://example.test/mcp".into();
@@ -388,7 +429,12 @@ mod tests {
             "a\u{200b}b".into(),
         ];
         let shown = summary(&stdio);
-        assert!(!shown.chars().any(|c| c.is_control() || matches!(c, '\u{202e}' | '\u{200b}')), "{shown:?}");
+        assert!(
+            !shown
+                .chars()
+                .any(|c| c.is_control() || matches!(c, '\u{202e}' | '\u{200b}')),
+            "{shown:?}"
+        );
         assert!(shown.contains("\\u{1b}[2K\\u{d}  npx"), "{shown}");
         assert!(shown.contains("evil\\u{202e}txt.js"), "{shown}");
         assert!(shown.contains("a\\u{200b}b"), "{shown}");
