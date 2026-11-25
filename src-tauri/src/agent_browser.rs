@@ -5592,7 +5592,7 @@ mod tests {
             false,
             Duration::from_secs(5),
         ).unwrap_err();
-        assert_eq!(failure.error.kind(), std::io::ErrorKind::NotFound);
+        assert!(failure.error.to_string().contains("Cannot verify browser CLI version"));
         assert!(!failure.may_have_launched);
         let result = Err(BrowserActionFailure::before_launch(failure.error.to_string()));
         manager.reconcile_action_attempt(&session, &session, "open", was_running, false, &result).await;
