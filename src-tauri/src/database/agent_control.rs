@@ -509,7 +509,8 @@ mod tests {
                     |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
                 )
                 .unwrap();
-            assert_eq!(validity, (0, 1, "3.45.0".into()));
+            assert_eq!((validity.0, validity.1), (0, 1));
+            assert_eq!(validity.2, rusqlite::version());
             let rows = json5_rows(&db, "t");
             assert_eq!(rows, json5_rows(&control, "t"));
             let original = original_last_run(&control, "t");
