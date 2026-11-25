@@ -499,17 +499,9 @@ impl FolderWalkFilter {
             .unwrap_or_else(|| PathBuf::from("/etc/gitconfig"));
         let mut exclude = None;
         for file in [
-            global_config.clone(),
-            if global_config.is_none() {
-                home.as_ref().map(|path| path.join(".gitconfig"))
-            } else {
-                None
-            },
-            if global_config.is_none() {
-                xdg.as_ref().map(|path| path.join("git/config"))
-            } else {
-                None
-            },
+            global_config,
+            home.as_ref().map(|path| path.join(".gitconfig")),
+            xdg.as_ref().map(|path| path.join("git/config")),
             Some(system_config),
         ]
         .into_iter()
@@ -604,7 +596,9 @@ impl FolderWalkFilter {
                 dot_git.display()
             ));
         }
-        let bytes = Self::read_bounded_file(&dot_git, &mut self.rule_bytes, false)?
+        // The picker follows linked-worktree pointer symlinks. This read is
+        // still capped and validates the opened handle as a regular file.
+        let bytes = Self::read_bounded_file(&dot_git, &mut self.rule_bytes, true)?
             .ok_or_else(|| format!("missing attachment Git directory: {}", dot_git.display()))?;
         let git_dir_line = Self::rule_line(&bytes)?
             .ok_or_else(|| format!("invalid attachment Git directory: {}", dot_git.display()))?;
@@ -2826,6 +2820,39 @@ mod tests {
         assert!(!info.tree.contains("hidden.secret"));
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn symlinked_worktree_pointer_excludes_files_in_attached_subfolder() {
+        let dir = tempdir().unwrap();
+        let common = dir.path().join("common-git");
+        fs::create_dir_all(common.join("info")).unwrap();
+        fs::write(common.join("info/exclude"), "*.secret\n").unwrap();
+        let worktree_git = dir.path().join("worktree-git");
+        fs::create_dir(&worktree_git).unwrap();
+        fs::write(worktree_git.join("commondir"), common.to_string_lossy().as_bytes()).unwrap();
+        let pointer = dir.path().join("git-pointer");
+        fs::write(&pointer, format!("gitdir: {}\n", worktree_git.display())).unwrap();
+
+        let project = dir.path().join("project");
+        let child = project.join("child");
+        fs::create_dir_all(&child).unwrap();
+        std::os::unix::fs::symlink(&pointer, project.join(".git")).unwrap();
+        fs::write(child.join("hidden.secret"), "x").unwrap();
+        fs::write(child.join("visible.txt"), "x").unwrap();
+
+        let picked = walk_project(&child);
+        assert!(picked.paths.iter().any(|path| path == "visible.txt"));
+        assert!(!picked.paths.iter().any(|path| path == "hidden.secret"));
+        let info = read_folder_for_attachment_blocking(
+            child.to_string_lossy().into_owned(),
+            None,
+            1,
+        )
+        .unwrap();
+        assert!(info.tree.contains("visible.txt"));
+        assert!(!info.tree.contains("hidden.secret"));
+    }
+
     #[test]
     fn child_gitignore_negation_overrides_parent() {
         let dir = tempdir().unwrap();
@@ -3041,6 +3068,68 @@ mod tests {
         .unwrap();
         assert!(info.tree.contains("visible.txt"));
         assert!(!info.tree.contains("hidden.secret"));
+    }
+
+    #[test]
+    fn empty_global_override_falls_through_to_xdg_config() {
+        let dir = tempdir().unwrap();
+        let override_config = dir.path().join("empty-override");
+        fs::write(&override_config, "").unwrap();
+        let xdg = dir.path().join("xdg");
+        fs::create_dir_all(xdg.join("git")).unwrap();
+        let selected_ignore = dir.path().join("selected-ignore");
+        fs::write(&selected_ignore, "*.secret\n").unwrap();
+        fs::write(
+            xdg.join("git/config"),
+            format!("[core]\nexcludesFile = {}\n", selected_ignore.display()),
+        )
+        .unwrap();
+        fs::write(xdg.join("git/ignore"), "*.default\n").unwrap();
+        let system_config = dir.path().join("system-git-config");
+        fs::write(&system_config, "").unwrap();
+
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "commands::project_files::tests::empty_global_override_fallback_child",
+                "--nocapture",
+            ])
+            .env("CODEMUX_ATTACHMENT_EMPTY_OVERRIDE_CHILD", "1")
+            .env("GIT_CONFIG_GLOBAL", override_config)
+            .env("GIT_CONFIG_SYSTEM", system_config)
+            .env("XDG_CONFIG_HOME", xdg)
+            .env("HOME", dir.path())
+            .env("USERPROFILE", dir.path())
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "stdout: {}\nstderr: {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[test]
+    fn empty_global_override_fallback_child() {
+        if std::env::var_os("CODEMUX_ATTACHMENT_EMPTY_OVERRIDE_CHILD").is_none() {
+            return;
+        }
+        let dir = tempdir().unwrap();
+        fs::create_dir(dir.path().join(".git")).unwrap();
+        fs::write(dir.path().join("hidden.secret"), "x").unwrap();
+        fs::write(dir.path().join("visible.default"), "x").unwrap();
+        let picked = walk_project(dir.path());
+        assert!(!picked.paths.iter().any(|path| path == "hidden.secret"));
+        assert!(picked.paths.iter().any(|path| path == "visible.default"));
+        let info = read_folder_for_attachment_blocking(
+            dir.path().to_string_lossy().into_owned(),
+            None,
+            1,
+        )
+        .unwrap();
+        assert!(!info.tree.contains("hidden.secret"));
+        assert!(info.tree.contains("visible.default"));
     }
 
     #[test]
