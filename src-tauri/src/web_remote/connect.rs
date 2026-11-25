@@ -27,8 +27,10 @@
 //! change; a direct settings-row write would be silently clobbered by the next
 //! toggle. With nothing running there is no such owner, so the headless
 //! load-modify-save in [`super::update_config_headless`] is the only way to
-//! configure a box *before* anything is up. `connect off` stops its managed
-//! service and takes the layout lock before using that local write path.
+//! configure a box *before* anything is up. `connect off` stops an active
+//! managed service when systemd is available, then takes the layout lock
+//! before using that local write path. Without a user bus, it still disables
+//! relay once ownership is clear and reports the unit left installed.
 //!
 //! ## Relay is config-driven, not flag-driven
 //!
@@ -1196,12 +1198,8 @@ fn disconnect_with_host<G>(
     acquire_layout_lock: impl FnOnce() -> Result<G, String>,
 ) -> Result<DisconnectReport, String> {
     let service_supported = unsupported_reason(host).is_none();
-    if let Some(host) = host.filter(|host| host.unit_exists()) {
-        if !service_supported {
-            return Err(format!(
-                "Cannot remove {UNIT_NAME} while `systemctl --user` is unavailable. Stop the service and retry."
-            ));
-        }
+    let unit_installed = host.is_some_and(|host| host.unit_exists());
+    if let Some(host) = host.filter(|_| service_supported && unit_installed) {
         let state = host.run("systemctl", &["--user", "is-active", UNIT_NAME])?;
         if matches!(state.stdout.trim(), "active" | "activating" | "deactivating") {
             stop_managed_service(host)?;
@@ -1223,8 +1221,15 @@ fn disconnect_with_host<G>(
         apply_disconnect_request(cfg);
         Ok(())
     })?;
-    let service_removed = match (service_supported, host) {
-        (true, Some(host)) => uninstall_service(host)?,
+    let service_removed = match (service_supported, host, unit_installed) {
+        (true, Some(host), _) => uninstall_service(host).map_err(|error| {
+            format!("From-anywhere access is off, but {UNIT_NAME} could not be removed: {error}")
+        })?,
+        (false, Some(_), true) => {
+            return Err(format!(
+                "From-anywhere access is off, but {UNIT_NAME} remains installed because `systemctl --user` is unavailable. Run `codemux connect off` again when the user bus is available to remove it."
+            ));
+        }
         _ => false,
     };
     Ok(DisconnectReport {
@@ -1239,7 +1244,7 @@ fn disconnect_with_host<G>(
 mod tests {
     use super::*;
     use std::path::Path;
-    use std::cell::RefCell;
+    use std::cell::{Cell, RefCell};
 
     // ── Unit file ────────────────────────────────────────────────
 
@@ -1764,6 +1769,35 @@ mod tests {
         assert!(host.ran("stop codemux.service"));
         assert!(host.unit_exists(), "a failed ownership check retains the unit");
         assert!(super::super::load_config_from_db(&db).relay_mode_enabled);
+    }
+
+    #[test]
+    fn connect_off_disables_relay_when_an_installed_unit_has_no_user_bus() {
+        let db = crate::database::init_test_database();
+        let mut config = WebRemoteConfig::default();
+        config.relay_mode_enabled = true;
+        super::super::save_config_to_db(&db, &config).unwrap();
+        let host = FakeHost::new()
+            .with_unit_installed()
+            .script("show-environment", fail("Failed to connect to bus"));
+        let layout_checked = Cell::new(false);
+
+        let error = disconnect_with_host(&db, Some(&host), || false, || {
+            assert!(host.unit_exists());
+            assert!(super::super::load_config_from_db(&db).relay_mode_enabled);
+            layout_checked.set(true);
+            Ok(())
+        })
+        .unwrap_err();
+
+        assert!(layout_checked.get(), "exclusive layout ownership was checked");
+        assert!(!super::super::load_config_from_db(&db).relay_mode_enabled);
+        assert!(error.contains("From-anywhere access is off"), "{error}");
+        assert!(error.contains("remains installed"), "{error}");
+        assert!(host.unit_exists());
+        assert!(!host.ran("is-active"), "an unavailable user bus cannot report service state");
+        assert!(!host.ran("stop codemux.service"));
+        assert!(!host.ran("disable --now codemux.service"));
     }
 
     // ── Availability probe ───────────────────────────────────────
