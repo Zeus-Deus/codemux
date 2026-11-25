@@ -140,13 +140,22 @@ pub fn meta_path_for(workspace_id: &str, pane_id: &str) -> PathBuf {
 // Scrollback is full terminal output, which often holds tokens and `env`
 // dumps, so the tree is owner-only: directories 0700 and files 0600.
 
-/// Create `dir` owner-only, tightening it if it already exists.
+/// Create `dir` owner-only, tightening it if it already exists. Creating it
+/// is fatal; tightening an existing one is best-effort with a warning, so a
+/// dir this user cannot chmod (owned by someone else, or on a filesystem
+/// that rejects it) does not cost the scrollback.
 fn private_dir(dir: &Path) -> std::io::Result<()> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
         fs::DirBuilder::new().recursive(true).mode(0o700).create(dir)?;
-        fs::set_permissions(dir, fs::Permissions::from_mode(0o700))
+        if let Err(e) = fs::set_permissions(dir, fs::Permissions::from_mode(0o700)) {
+            eprintln!(
+                "[codemux::scrollback] Could not make {} private: {e}",
+                dir.display()
+            );
+        }
+        Ok(())
     }
     #[cfg(not(unix))]
     fs::create_dir_all(dir)
@@ -168,9 +177,7 @@ fn write_private(path: &Path, contents: &[u8]) -> std::io::Result<()> {
 /// enough for files that are not rewritten again. Does not create it.
 fn secure_existing_base(base: &Path) {
     if base.is_dir() {
-        if let Err(e) = private_dir(base) {
-            eprintln!("[codemux::scrollback] Failed to make scrollback dir private: {e}");
-        }
+        let _ = private_dir(base);
     }
 }
 
@@ -798,6 +805,43 @@ mod tests {
         assert_eq!(mode(&ws_dir), 0o700);
         assert_eq!(mode(&data), 0o600);
         assert_eq!(fs::read_to_string(&data).unwrap(), test_payload("ws-old", "pane-1").data);
+    }
+
+    /// Tightening a directory that already exists is best-effort. Here the
+    /// workspace dir resolves to a shared temp dir another user owns, so the
+    /// chmod fails with EPERM; the save must still land instead of failing
+    /// with "Failed to create scrollback dir" and losing the scrollback.
+    #[cfg(unix)]
+    #[test]
+    fn save_survives_a_dir_it_cannot_chmod() {
+        use std::os::unix::fs::MetadataExt;
+        if crate::test_isolation::isolated("scrollback::tests::save_survives_a_dir_it_cannot_chmod") {
+            return;
+        }
+        let base = scrollback_base();
+        fs::create_dir_all(&base).unwrap();
+        // Root may chmod anything, so it would make the shared dir 0700.
+        let me = fs::metadata(&base).unwrap().uid();
+        if me == 0 {
+            return;
+        }
+        let Some(shared) = ["/tmp", "/var/tmp", "/dev/shm"].into_iter().map(Path::new).find(|dir| {
+            fs::metadata(dir).is_ok_and(|m| m.is_dir() && m.uid() != me && m.mode() & 0o1777 == 0o1777)
+        }) else {
+            return;
+        };
+        let shared_mode = fs::metadata(shared).unwrap().mode();
+        std::os::unix::fs::symlink(shared, workspace_dir("ws-foreign")).unwrap();
+
+        let pane = format!("codemux-scrollback-test-{}", std::process::id());
+        let saved = save_scrollback(&test_payload("ws-foreign", &pane));
+        let loaded = load_scrollback("ws-foreign", &pane);
+        let _ = fs::remove_file(data_path("ws-foreign", &pane));
+        let _ = fs::remove_file(meta_path("ws-foreign", &pane));
+
+        saved.unwrap();
+        assert!(loaded.is_some());
+        assert_eq!(fs::metadata(shared).unwrap().mode(), shared_mode);
     }
 
     #[test]
