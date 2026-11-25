@@ -725,9 +725,9 @@ impl FolderWalkFilter {
         Ok(matcher)
     }
 
-    fn is_ignored(&self, path: &Path, is_dir: bool) -> bool {
+    fn is_ignored(&mut self, path: &Path, is_dir: bool) -> Result<bool, String> {
         if let Some(ignored) = self.match_source(path, is_dir, FolderRuleSource::Ignore, None) {
-            return ignored;
+            return Ok(ignored);
         }
         let git_root = path.parent().and_then(|parent| {
             parent.ancestors().find(|directory| {
@@ -737,16 +737,18 @@ impl FolderWalkFilter {
             })
         });
         let Some(git_root) = git_root else {
-            return false;
+            return Ok(false);
         };
         for source in [FolderRuleSource::Gitignore, FolderRuleSource::GitExclude] {
             if let Some(ignored) = self.match_source(path, is_dir, source, Some(git_root)) {
-                return ignored;
+                return Ok(ignored);
             }
         }
-        self.global_rules
+        self.check_global_rule_files()?;
+        Ok(self
+            .global_rules
             .as_ref()
-            .is_some_and(|rules| rules.matched(path, is_dir).is_ignore())
+            .is_some_and(|rules| rules.matched(path, is_dir).is_ignore()))
     }
 
     fn match_source(
@@ -944,9 +946,6 @@ fn read_folder_for_attachment_with_limit(
     let git_root = path
         .ancestors()
         .find(|ancestor| FolderWalkFilter::has_repository_marker(ancestor));
-    if git_root.is_some() {
-        filter_state.check_global_rule_files()?;
-    }
     for ancestor in path.ancestors() {
         let load_git_rules = git_root.is_some_and(|root| ancestor.starts_with(root));
         filter_state.check_rule_files(ancestor, load_git_rules)?;
@@ -991,12 +990,6 @@ fn read_folder_for_attachment_with_limit(
                         state.rules.get(ancestor).is_some_and(|rules| rules.has_git)
                     })
                     || FolderWalkFilter::has_repository_marker(parent);
-                if load_git_rules {
-                    if let Err(error) = state.check_global_rule_files() {
-                        state.fatal_error = Some(error);
-                        return true;
-                    }
-                }
                 if let Err(error) = state.check_rule_files(parent, load_git_rules) {
                     state.fatal_error = Some(error);
                     return true;
@@ -1006,7 +999,13 @@ fn read_folder_for_attachment_with_limit(
                 return true;
             }
             let is_dir = entry.file_type().map(|kind| kind.is_dir()).unwrap_or(false);
-            !state.is_ignored(entry.path(), is_dir)
+            match state.is_ignored(entry.path(), is_dir) {
+                Ok(ignored) => !ignored,
+                Err(error) => {
+                    state.fatal_error = Some(error);
+                    true
+                }
+            }
         });
 
     let mut entries: Vec<(PathBuf, bool)> = Vec::new();
@@ -2838,8 +2837,8 @@ mod tests {
         };
         state.check_rule_files(dir.path(), true).unwrap();
         fs::write(&rules, vec![b'x'; MAX_ATTACHMENT_IGNORE_FILE_BYTES as usize + 1]).unwrap();
-        assert!(state.is_ignored(&dir.path().join("ignored.txt"), false));
-        assert!(!state.is_ignored(&dir.path().join("visible.txt"), false));
+        assert!(state.is_ignored(&dir.path().join("ignored.txt"), false).unwrap());
+        assert!(!state.is_ignored(&dir.path().join("visible.txt"), false).unwrap());
     }
 
     #[test]
@@ -3057,6 +3056,7 @@ mod tests {
         }
         let dir = tempdir().unwrap();
         fs::create_dir(dir.path().join(".git")).unwrap();
+        fs::write(dir.path().join("visible.txt"), "x").unwrap();
         let error = read_folder_for_attachment_blocking(
             dir.path().to_string_lossy().into_owned(),
             None,
@@ -3126,6 +3126,24 @@ mod tests {
             dir.path().to_string_lossy().into_owned(),
             None,
             2,
+        )
+        .unwrap_err();
+        assert!(error.contains("ignore rule file exceeds 1 MiB"));
+
+        let empty = dir.path().join("empty");
+        fs::create_dir_all(empty.join(".git")).unwrap();
+        let info = read_folder_for_attachment_blocking(
+            empty.to_string_lossy().into_owned(),
+            None,
+            1,
+        )
+        .unwrap();
+        assert_eq!(info.item_count, 0);
+        fs::write(empty.join("entry.txt"), "x").unwrap();
+        let error = read_folder_for_attachment_blocking(
+            empty.to_string_lossy().into_owned(),
+            None,
+            1,
         )
         .unwrap_err();
         assert!(error.contains("ignore rule file exceeds 1 MiB"));
@@ -3387,6 +3405,7 @@ mod tests {
             return;
         }
         let dir = tempdir().unwrap();
+        fs::create_dir(dir.path().join(".git")).unwrap();
         fs::write(dir.path().join("visible.txt"), "x").unwrap();
         let info = read_folder_for_attachment_blocking(
             dir.path().to_string_lossy().into_owned(),
