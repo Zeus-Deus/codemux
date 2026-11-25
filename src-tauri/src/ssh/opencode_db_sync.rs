@@ -272,25 +272,25 @@ pub async fn sync_opencode_session(
     let upload = upload_file(ssh_target, local_bundle.path(), &remote_bundle).await;
     drop(local_bundle);
     if upload.is_err() {
-        let _ = run_remote_rm(ssh_target, &remote_bundle).await;
+        remove_remote_bundle(ssh_target, &remote_bundle).await;
     }
     upload?;
 
     let script = remote_import_script(&remote_cwd.to_string_lossy(), &remote_bundle);
-    let (ok, output) = match run_remote_login_script(ssh_target, &script).await {
-        Ok(result) => result,
-        Err(error) => {
-            // The script may never have run its cleanup; try once more and
-            // report the original failure.
-            let _ = run_remote_rm(ssh_target, &remote_bundle).await;
-            return Err(error);
-        }
-    };
-    if !ok {
-        return Err(format!(
+    let import = match run_remote_login_script(ssh_target, &script).await {
+        Ok((true, _)) => Ok(()),
+        Ok((false, output)) => Err(format!(
             "remote `opencode import` failed: {}",
             output.trim()
-        ));
+        )),
+        Err(error) => Err(error),
+    };
+    if let Err(error) = import {
+        // A non-zero exit also covers ssh itself failing (say the connection
+        // dropped) before the script's exit trap ran, so try once more and
+        // report the original failure.
+        remove_remote_bundle(ssh_target, &remote_bundle).await;
+        return Err(error);
     }
     eprintln!(
         "[hosts] synced OpenCode session {session_id} → {ssh_target}:{}",
@@ -340,7 +340,7 @@ pub async fn pull_opencode_session(
     };
 
     let download = download_file(ssh_target, &remote_bundle, local_bundle.as_file()).await;
-    let _ = run_remote_rm(ssh_target, &remote_bundle).await;
+    remove_remote_bundle(ssh_target, &remote_bundle).await;
     download?;
 
     import_session_local(&bin, local_cwd, local_bundle.path()).await?;
@@ -508,18 +508,51 @@ async fn download_file(
     Ok(())
 }
 
-/// Best-effort remote `rm -f`.
-async fn run_remote_rm(ssh_target: &str, remote_path: &str) -> Result<(), String> {
-    let _ = Command::new("ssh")
-        .arg("-o")
+/// Ceiling for one cleanup attempt. It runs after a failure, often on a
+/// connection that just dropped, so it must never stall the caller for long:
+/// the SSH connect itself already gets `ConnectTimeout=10`.
+const REMOTE_CLEANUP_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// Whether `path` names one bundle file directly inside [`REMOTE_BUNDLE_DIR`],
+/// the only remote files cleanup may delete.
+fn is_remote_bundle_path(path: &str) -> bool {
+    path.strip_prefix(REMOTE_BUNDLE_DIR)
+        .and_then(|rest| rest.strip_prefix('/'))
+        .is_some_and(|name| !name.is_empty() && !name.contains('/') && !name.contains(".."))
+}
+
+/// Best-effort removal of a remote bundle, bounded by
+/// [`REMOTE_CLEANUP_TIMEOUT`]. Refuses any path outside the bundle folder.
+async fn remove_remote_bundle(ssh_target: &str, remote_path: &str) {
+    if !is_remote_bundle_path(remote_path) {
+        eprintln!("[hosts] refusing to remove {remote_path}: not an OpenCode sync bundle");
+        return;
+    }
+    let mut cmd = Command::new("ssh");
+    cmd.arg("-o")
         .arg("BatchMode=yes")
         .arg("-o")
         .arg("ConnectTimeout=10")
         .arg(ssh_target)
-        .arg(format!("rm -f {}", remote_quote(remote_path)))
-        .stdin(Stdio::null())
-        .status()
-        .await;
+        .arg(format!("rm -f {}", remote_quote(remote_path)));
+    if let Err(error) = run_bounded(cmd, REMOTE_CLEANUP_TIMEOUT).await {
+        eprintln!("[hosts] could not remove remote bundle {remote_path}: {error}");
+    }
+}
+
+/// Run `cmd` to completion within `limit`, killing it if it runs over.
+async fn run_bounded(mut cmd: Command, limit: Duration) -> Result<(), String> {
+    cmd.stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .kill_on_drop(true);
+    let status = timeout(limit, cmd.status())
+        .await
+        .map_err(|_| format!("timed out after {}s", limit.as_secs_f32()))?
+        .map_err(|e| format!("spawn: {e}"))?;
+    if !status.success() {
+        return Err(format!("exited {status}"));
+    }
     Ok(())
 }
 
@@ -752,6 +785,41 @@ mod tests {
         let b = local_bundle().unwrap();
         assert_ne!(a.path(), b.path());
         assert!(a.path().to_string_lossy().contains("codemux-opencode-"));
+    }
+
+    #[test]
+    fn cleanup_only_targets_bundles_inside_the_bundle_folder() {
+        assert!(is_remote_bundle_path(&unique_remote_bundle()));
+        assert!(is_remote_bundle_path("~/.cache/codemux/opencode-sync/b.json"));
+        for path in [
+            "~/.cache/codemux/opencode-sync",
+            "~/.cache/codemux/opencode-sync/",
+            "~/.cache/codemux/opencode-sync/../x.json",
+            "~/.cache/codemux/opencode-sync/a/../../x.json",
+            "~/.cache/codemux/opencode-sync/sub/b.json",
+            "~/.cache/codemux/opencode-syncx/b.json",
+            "/tmp/codemux-opencode-1.json",
+            "~/.ssh/authorized_keys",
+            "",
+        ] {
+            assert!(!is_remote_bundle_path(path), "{path}");
+        }
+    }
+
+    #[tokio::test]
+    async fn bounded_cleanup_gives_up_on_a_hung_command() {
+        let mut cmd = Command::new("sleep");
+        cmd.arg("30");
+        let started = std::time::Instant::now();
+        let result = run_bounded(cmd, Duration::from_millis(200)).await;
+        assert!(result.unwrap_err().contains("timed out"));
+        assert!(started.elapsed() < Duration::from_secs(5));
+    }
+
+    #[tokio::test]
+    async fn bounded_cleanup_reports_a_failed_command() {
+        assert!(run_bounded(Command::new("false"), Duration::from_secs(5)).await.is_err());
+        assert!(run_bounded(Command::new("true"), Duration::from_secs(5)).await.is_ok());
     }
 
     #[test]
