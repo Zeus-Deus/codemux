@@ -3349,6 +3349,8 @@ fn build_core_app<R: tauri::Runtime>(
             web_remote::web_remote_revoke_session,
             web_remote::web_remote_approve_session,
             web_remote::web_remote_reject_session,
+            web_remote::web_remote_list_blocked_relay_browsers,
+            web_remote::web_remote_restore_relay_browser,
             web_remote::web_remote_publish_update_available,
             web_remote::web_remote_request_update,
             web_remote::web_remote_iroh_node_id,

@@ -52,6 +52,8 @@ const cmds = vi.hoisted(() => ({
   webRemoteSetConfig: vi.fn(),
   webRemoteCreatePairing: vi.fn(),
   webRemoteListEndpoints: vi.fn(),
+  webRemoteListBlockedRelayBrowsers: vi.fn(),
+  webRemoteRestoreRelayBrowser: vi.fn(),
   webRemoteListSessions: vi.fn(),
   webRemoteRevokeSession: vi.fn(),
   webRemoteApproveSession: vi.fn(),
@@ -192,6 +194,8 @@ beforeEach(() => {
   vi.mocked(toast.info).mockReset();
   cmds.webRemoteStatus.mockResolvedValue(status({}));
   cmds.webRemoteListEndpoints.mockResolvedValue(endpoints());
+  cmds.webRemoteListBlockedRelayBrowsers.mockResolvedValue([]);
+  cmds.webRemoteRestoreRelayBrowser.mockResolvedValue(enabledStatus());
   cmds.webRemoteEnable.mockResolvedValue(enabledStatus());
   cmds.webRemoteDisable.mockResolvedValue(status({}));
   cmds.webRemoteApproveSession.mockResolvedValue(enabledStatus());
@@ -392,6 +396,29 @@ describe("RemoteAccessSection — enabled", () => {
     await waitFor(() =>
       expect(cmds.webRemoteApproveSession).toHaveBeenCalledWith("pending1"),
     );
+  });
+
+  it("moves a blocked relay browser to pending and keeps other approvals", async () => {
+    const user = userEvent.setup();
+    const browser = { id: "blocked", name: "Relay browser 7C91AB23" };
+    const ready = { ...enabledStatus(), account_signed_in: true };
+    cmds.webRemoteStatus.mockResolvedValue(ready);
+    cmds.webRemoteListBlockedRelayBrowsers
+      .mockResolvedValueOnce([browser])
+      .mockResolvedValue([]);
+    cmds.webRemoteRestoreRelayBrowser.mockResolvedValue({
+      ...ready,
+      sessions: [...ready.sessions, sess({ ...browser, approved: false, source: "account" })],
+    });
+
+    render(<RemoteAccessSection />);
+    await user.click(await screen.findByRole("button", { name: "Move to pending" }));
+    expect(cmds.webRemoteRestoreRelayBrowser).toHaveBeenCalledWith(browser.id);
+    expect(cmds.webRemoteApproveSession).not.toHaveBeenCalled();
+    await waitFor(() => expect(screen.queryByText("Blocked relay browsers")).not.toBeInTheDocument());
+    expect(screen.getByText(browser.name)).toBeInTheDocument();
+    expect(screen.getAllByRole("button", { name: "Approve" })).toHaveLength(2);
+    expect(screen.getByText("MacBook Air")).toBeInTheDocument();
   });
 
   it("rejects a pending device", async () => {

@@ -68,5 +68,9 @@ export function seedEnvironmentsFromSearch(search: string): void {
     status: "offline",
     appState: state([workspace("st-1", "launch-video", "marketing", { git_additions: 12 })], {}),
   });
-  store.update("env-pi", { status: "pending-approval", appState: null });
+  store.update("env-pi", {
+    status: "pending-approval",
+    pendingBrowserLabel: "Relay browser 7C91AB23",
+    appState: null,
+  });
 }

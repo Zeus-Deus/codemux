@@ -25,6 +25,7 @@ function view(
   return {
     device: { id, deviceId: id, nodeId: `node-${id}`, name, platform: "linux", lastSeenAt: null },
     status,
+    pendingBrowserLabel: null,
     appState: workspaces
       ? ({
           workspaces,

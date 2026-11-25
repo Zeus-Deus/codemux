@@ -93,6 +93,7 @@ import {
 import { Eyebrow } from "@/components/ui/eyebrow";
 import { PresenceList, PresenceRow } from "@/components/ui/presence";
 import { useRemoteWorkspaces } from "@/environments/remote-workspaces";
+import { useEnvironmentsStore } from "@/environments/store";
 import { SidebarEmptyState } from "./sidebar-empty-state";
 import { SidebarHeaderActions } from "./sidebar-action-row";
 import { InboxDragList, SortableInboxCard } from "./sidebar-inbox-drag";
@@ -842,6 +843,27 @@ function activeRowIn(root: HTMLElement | null, workspaceId: string): HTMLElement
     root?.querySelector<HTMLElement>(
       `[data-inbox-card="${id}"],[data-settled-row="${id}"],[data-snoozed-row="${id}"]`,
     ) ?? null
+  );
+}
+
+function EnvironmentApprovalRequests() {
+  const pending = useEnvironmentsStore(useShallow((state) =>
+    Object.values(state.environments).filter((view) => view.status === "pending-approval"),
+  ));
+  if (pending.length === 0) return null;
+  return (
+    <ul className="space-y-1 px-1 pb-2" aria-label="Environment access requests">
+      {pending.map(({ device, pendingBrowserLabel }) => (
+        <li key={device.deviceId} className="rounded-md border border-status-working/30 px-2.5 py-2">
+          <p className="break-words text-label font-medium text-status-working">
+            Waiting for approval on {device.name}
+          </p>
+          {pendingBrowserLabel && (
+            <p className="mt-0.5 text-body-sm text-muted-foreground">{pendingBrowserLabel}</p>
+          )}
+        </li>
+      ))}
+    </ul>
   );
 }
 
@@ -1928,6 +1950,8 @@ export function SidebarInbox() {
           filterPath={filter}
           frozenActive={frozenActiveDraftRow}
         />
+
+        <EnvironmentApprovalRequests />
 
         {visibleDraftCount === 0 &&
           orderedActiveCards.length === 0 &&

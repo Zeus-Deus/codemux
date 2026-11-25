@@ -371,8 +371,53 @@ describe("openEnvironmentConnection", () => {
       onUpdate,
     });
     await settle();
-    expect(patches).toContainEqual({ status: "pending-approval", error: null });
+    expect(patches).toContainEqual({
+      status: "pending-approval",
+      pendingBrowserLabel: null,
+      error: null,
+    });
     connection.close();
+  });
+
+  it("keeps the approval references separate for two clients reaching one machine", async () => {
+    const first = "Relay browser 1234ABCD";
+    const second = "Relay browser 8765DCBA";
+    const { patches, onUpdate } = collect();
+    const secondUpdate = vi.fn();
+    const pendingMachine = (label: string) => new FakeMachine((frame) =>
+      frame.t === "hello-account"
+        ? { t: "unauthorized", reason: "pending_approval", browser_label: label }
+        : null,
+    );
+    const connection = openEnvironmentConnection({
+      device,
+      registry: { connectDevice: async () => grant },
+      dialer: { dial: async () => pendingMachine(first) },
+      onUpdate,
+    });
+    const otherConnection = openEnvironmentConnection({
+      device,
+      registry: { connectDevice: async () => grant },
+      dialer: { dial: async () => pendingMachine(second) },
+      onUpdate: secondUpdate,
+    });
+
+    try {
+      await settle();
+      expect(patches).toEqual([{ status: "pending-approval", pendingBrowserLabel: first, error: null }]);
+      expect(secondUpdate).toHaveBeenCalledExactlyOnceWith({
+        status: "pending-approval",
+        pendingBrowserLabel: second,
+        error: null,
+      });
+      const store = useEnvironmentsStore.getState();
+      expect(store.environments[device.deviceId].pendingBrowserLabel).toBe(first);
+      store.update(device.deviceId, { status: "connected" });
+      expect(useEnvironmentsStore.getState().environments[device.deviceId].pendingBrowserLabel).toBeNull();
+    } finally {
+      connection.close();
+      otherConnection.close();
+    }
   });
 
   it.each([

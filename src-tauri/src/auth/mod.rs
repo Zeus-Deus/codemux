@@ -428,6 +428,13 @@ pub fn load_token(db: &DatabaseStore) -> Option<(String, String)> {
     Some((stored.token, stored.expires_at))
 }
 
+/// Account that currently authorizes account-managed remote access.
+pub(crate) fn active_account_id_from_record(record: &[u8]) -> Option<String> {
+    let decrypted = decrypt_data(record).ok()?;
+    let stored: StoredAuth = serde_json::from_slice(&decrypted).ok()?;
+    (!is_token_expired(&stored.expires_at)).then_some(stored.user?.id)
+}
+
 pub fn load_cached_user(db: &DatabaseStore) -> Option<AuthUser> {
     let data = db.load_auth_token()?;
     let decrypted = decrypt_data(&data).ok()?;

@@ -6232,6 +6232,46 @@ impl DatabaseStore {
         Ok(removed > 0)
     }
 
+    pub(crate) fn web_remote_blocked_relay_browsers(
+        &self,
+        account_id: &str,
+        auth_record: &[u8],
+    ) -> Result<Vec<(String, Option<String>)>, String> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT id, name FROM web_remote_sessions
+             WHERE source = 'account' AND relay_browser_hash IS NOT NULL
+               AND revoked = 1 AND account_user_id = ?1
+               AND EXISTS (SELECT 1 FROM auth_tokens WHERE id = 1 AND encrypted_data = ?2)
+             ORDER BY created_at DESC, id",
+        ).map_err(|error| format!("Failed to list blocked relay browsers: {error}"))?;
+        let rows = stmt
+            .query_map(params![account_id, auth_record], |row| Ok((row.get(0)?, row.get(1)?)))
+            .map_err(|error| format!("Failed to list blocked relay browsers: {error}"))?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(|error| format!("Failed to list blocked relay browsers: {error}"))
+    }
+
+    /// Restore this exact browser's request. A second, explicit approval is
+    /// still required, even when the host usually trusts new account browsers.
+    pub(crate) fn web_remote_restore_relay_browser(
+        &self,
+        id: &str,
+        account_id: &str,
+        auth_record: &[u8],
+    ) -> Result<bool, String> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE web_remote_sessions SET approved = 0, revoked = 0
+             WHERE id = ?1 AND source = 'account' AND relay_browser_hash IS NOT NULL
+               AND revoked = 1 AND account_user_id = ?2
+               AND EXISTS (SELECT 1 FROM auth_tokens WHERE id = 1 AND encrypted_data = ?3)",
+            params![id, account_id, auth_record],
+        )
+        .map(|updated| updated != 0)
+        .map_err(|error| format!("Failed to restore blocked relay browser: {error}"))
+    }
+
     /// Reject a pending device. Keep a revoked row for relay browsers so
     /// automatic reconnect does not immediately recreate their request.
     pub fn web_remote_reject_session(&self, id: &str) -> Result<(), String> {

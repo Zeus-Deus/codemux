@@ -160,7 +160,8 @@ export function openEnvironmentConnection(
     registry: opts.registry,
     deviceId: opts.device.id,
     dialer: opts.dialer,
-    onPending: () => update({ status: "pending-approval", error: null }),
+    onPending: (browserLabel) =>
+      update({ status: "pending-approval", pendingBrowserLabel: browserLabel ?? null, error: null }),
     onBrowserRejected: (reason) => {
       browserRejection = reason === "session_revoked"
         ? "This machine revoked access for this client."

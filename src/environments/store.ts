@@ -30,6 +30,7 @@ export type EnvironmentStatus =
 export interface EnvironmentView {
   device: RegisteredDevice;
   status: EnvironmentStatus;
+  pendingBrowserLabel: string | null;
   /** Last app state received from the machine; kept while it is offline. */
   appState: AppStateSnapshot | null;
   error: string | null;
@@ -57,7 +58,7 @@ export const useEnvironmentsStore = create<EnvironmentsState>((set) => ({
         const existing = state.environments[device.deviceId];
         environments[device.deviceId] = existing
           ? { ...existing, device }
-          : { device, status: "connecting", appState: null, error: null };
+          : { device, status: "connecting", pendingBrowserLabel: null, appState: null, error: null };
       }
       return { environments };
     }),
@@ -65,6 +66,8 @@ export const useEnvironmentsStore = create<EnvironmentsState>((set) => ({
     set((state) => {
       const existing = state.environments[id];
       if (!existing) return state;
+      const next = { ...existing, ...patch };
+      if (next.status !== "pending-approval") next.pendingBrowserLabel = null;
       // A snapshot from a restarted or older backend is accepted; within one
       // backend instance a lower revision is a stale delivery.
       const incoming = patch.appState;
@@ -76,10 +79,9 @@ export const useEnvironmentsStore = create<EnvironmentsState>((set) => ({
         incoming.snapshot_instance === current.snapshot_instance &&
         (incoming.snapshot_revision ?? 0) < (current.snapshot_revision ?? 0)
       ) {
-        const { appState: _stale, ...rest } = patch;
-        return { environments: { ...state.environments, [id]: { ...existing, ...rest } } };
+        next.appState = current;
       }
-      return { environments: { ...state.environments, [id]: { ...existing, ...patch } } };
+      return { environments: { ...state.environments, [id]: next } };
     }),
   reset: () => set({ self: null, environments: {} }),
 }));

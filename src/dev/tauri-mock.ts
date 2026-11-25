@@ -175,6 +175,7 @@ import type {
   UserSettings,
   WebRemoteBindScope,
   WebRemoteRegistrationStatus,
+  BlockedRelayBrowser,
   WebRemoteSessionView,
   WebRemoteStatus,
   WorkspaceSnapshot,
@@ -4430,6 +4431,25 @@ function buildWebRemoteRegistration(): WebRemoteRegistrationStatus {
   };
 }
 let webRemoteSessions: WebRemoteSessionView[] = mockWebRemoteSessions();
+let webRemoteBlockedRelayBrowsers: BlockedRelayBrowser[] =
+  new URLSearchParams(location.search).get("webRemoteMock") === "approval-recovery"
+    ? [{ id: "mock-blocked-relay", name: "Relay browser 7C91AB23" }]
+    : [];
+const mockRelayBrowserIds = new Set(webRemoteBlockedRelayBrowsers.map((browser) => browser.id));
+
+function blockMockRemoteBrowser(sessionId: string): WebRemoteStatus {
+  const session = webRemoteSessions.find((session) => session.id === sessionId);
+  if (session && mockRelayBrowserIds.has(sessionId)) {
+    webRemoteBlockedRelayBrowsers = [
+      ...webRemoteBlockedRelayBrowsers,
+      { id: session.id, name: session.name },
+    ];
+  }
+  webRemoteSessions = webRemoteSessions.filter((session) => session.id !== sessionId);
+  emitWebRemoteState();
+  return buildWebRemoteStatus();
+}
+
 let webRemoteLiveSeq = 0;
 
 function buildWebRemoteStatus(): WebRemoteStatus {
@@ -7415,8 +7435,21 @@ const handlers: Record<string, Handler> = {
   web_remote_create_pairing: () => mockWebRemotePairing(),
   web_remote_list_endpoints: () => mockWebRemoteEndpoints(webRemotePort),
   web_remote_list_sessions: () => webRemoteSessions,
-  web_remote_revoke_session: (a) => {
-    webRemoteSessions = webRemoteSessions.filter((s) => s.id !== a.sessionId);
+  web_remote_revoke_session: (a) => blockMockRemoteBrowser(String(a.sessionId)),
+  web_remote_list_blocked_relay_browsers: () => webRemoteBlockedRelayBrowsers,
+  web_remote_restore_relay_browser: (a) => {
+    const browser = webRemoteBlockedRelayBrowsers.find((browser) => browser.id === a.sessionId);
+    if (!browser) throw new Error("Blocked relay browser is no longer available.");
+    webRemoteBlockedRelayBrowsers = webRemoteBlockedRelayBrowsers.filter((entry) => entry !== browser);
+    webRemoteSessions = [...webRemoteSessions, {
+      ...browser,
+      user_agent: null,
+      created_at: new Date().toISOString(),
+      last_seen_at: null,
+      approved: false,
+      connected: false,
+      source: "account",
+    }];
     emitWebRemoteState();
     return buildWebRemoteStatus();
   },
@@ -7427,11 +7460,7 @@ const handlers: Record<string, Handler> = {
     emitWebRemoteState();
     return buildWebRemoteStatus();
   },
-  web_remote_reject_session: (a) => {
-    webRemoteSessions = webRemoteSessions.filter((s) => s.id !== a.sessionId);
-    emitWebRemoteState();
-    return buildWebRemoteStatus();
-  },
+  web_remote_reject_session: (a) => blockMockRemoteBrowser(String(a.sessionId)),
 
   // ── Cross-device workspace sync registry ──
   //

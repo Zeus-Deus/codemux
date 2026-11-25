@@ -48,10 +48,6 @@ fn isolate(cmd: &mut Command, root: &Path) {
     }
 }
 
-fn free_loopback_port() -> u16 {
-    std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port()
-}
-
 impl Serve {
     fn start(env: &[(&str, &str)]) -> Self {
         let root = tempfile::tempdir().unwrap();
@@ -64,7 +60,9 @@ impl Serve {
             .env("CODEMUX_API_URL", "http://127.0.0.1:1")
             .env("SHELL", "/bin/sh")
             .envs(env.iter().copied())
-            .args(["serve", "--scope", "loopback", "--port", &free_loopback_port().to_string()])
+            // The tests talk to the Unix socket. Let the OS allocate and bind
+            // the HTTP port when the child starts.
+            .args(["serve", "--scope", "loopback", "--port", "0"])
             .stdin(Stdio::null())
             .stdout(log.try_clone().unwrap())
             .stderr(log);

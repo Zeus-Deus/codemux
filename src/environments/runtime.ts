@@ -79,6 +79,7 @@ export function startEnvironmentRuntime(opts: EnvironmentRuntimeOptions): Enviro
         continue;
       }
       disconnect(device.deviceId);
+      useEnvironmentsStore.getState().update(device.deviceId, { status: "connecting", error: null });
       connections.set(device.deviceId, {
         device,
         connection: openEnvironmentConnection({

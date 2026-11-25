@@ -1464,6 +1464,10 @@ mod tests {
     async fn account_handshake_pends_untrusted_account_browser() {
         let db = init_test_database();
         seed_owner(&db);
+        let app = tauri::test::mock_app();
+        app.manage(db);
+        app.manage(super::super::WebRemoteState::default());
+        let db = app.state::<DatabaseStore>();
         let shared = shared_with_trust(false); // approval on (default) → pends
 
         let mut server = mockito::Server::new_async().await;
@@ -1486,7 +1490,7 @@ mod tests {
         assert_eq!(row.source, "account");
         assert_eq!(row.name.as_deref(), Some(browser_label.as_str()));
         db.web_remote_set_session_approved(&row.id, true).unwrap();
-        assert_eq!(run_account_admit(&url, &db, &shared, &hello).await, Ok(row.id));
+        assert_eq!(run_account_admit(&url, &db, &shared, &hello).await, Ok(row.id.clone()));
 
         let second_browser = account_hello("g", "n");
         let Err(AccountHandshakeReject::Pending { browser_label: second_label }) =
@@ -1505,6 +1509,49 @@ mod tests {
             Err(AccountHandshakeReject::Revoked)
         );
         assert_eq!(db.web_remote_list_sessions().len(), 2);
+
+        let blocked = super::super::web_remote_list_blocked_relay_browsers(app.handle().clone())
+            .unwrap();
+        assert_eq!(blocked.len(), 1);
+        assert_eq!(blocked[0].id, pending.id);
+        assert_eq!(blocked[0].name.as_deref(), Some(second_label.as_str()));
+
+        // A different signed-in account cannot see or restore this browser.
+        let other_owner = crate::auth::AuthUser {
+            id: "other-owner".into(),
+            email: "other@example.test".into(),
+            name: None,
+            image: None,
+        };
+        crate::auth::save_auth(&db, "other-token", "2099-01-01T00:00:00Z", Some(&other_owner)).unwrap();
+        assert!(super::super::web_remote_list_blocked_relay_browsers(app.handle().clone())
+            .unwrap().is_empty());
+        assert!(super::super::web_remote_restore_relay_browser(app.handle().clone(), pending.id.clone())
+            .is_err());
+        seed_owner(&db);
+
+        // A host that changed its default trust policy still needs to approve
+        // this specific browser after moving its blocked request to pending.
+        shared.config.lock().unwrap().trust_account_browsers = true;
+        let status = super::super::web_remote_restore_relay_browser(
+            app.handle().clone(),
+            pending.id.clone(),
+        ).unwrap();
+        assert!(status.sessions.iter().any(|session| session.id == pending.id && !session.approved));
+        assert_eq!(
+            run_account_admit(&url, &db, &shared, &second_browser).await,
+            Err(AccountHandshakeReject::Pending { browser_label: second_label.clone() })
+        );
+        assert_eq!(run_account_admit(&url, &db, &shared, &hello).await, Ok(row.id));
+        assert!(db.web_remote_get_session("approved-lan").unwrap().approved);
+
+        db.web_remote_set_session_approved(&pending.id, true).unwrap();
+        db.web_remote_revoke_session(&pending.id).unwrap();
+        super::super::web_remote_restore_relay_browser(app.handle().clone(), pending.id.clone()).unwrap();
+        assert_eq!(
+            run_account_admit(&url, &db, &shared, &second_browser).await,
+            Err(AccountHandshakeReject::Pending { browser_label: second_label })
+        );
     }
 
     #[tokio::test]
