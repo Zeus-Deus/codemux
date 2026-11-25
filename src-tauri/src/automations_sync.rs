@@ -115,7 +115,7 @@ pub async fn try_sync_with_app<R: tauri::Runtime>(app: &tauri::AppHandle<R>) -> 
         return Ok(());
     };
     let guard = SyncGuard::session(&auth, generation);
-    let request = SyncRequest::linked(&token, guard);
+    let request = SyncRequest::linked(&token, guard)?;
     let pull = pull_locked(&request, &db, None).await;
     let linked = push_linked(&request, &db).await;
     drop(linked_lock);
@@ -139,7 +139,7 @@ pub async fn pull(
     host_filter: Option<&str>,
 ) -> Result<(), String> {
     let _linked = SYNC_LOCK.lock().await;
-    let request = SyncRequest::linked(token, SyncGuard::unchecked());
+    let request = SyncRequest::linked(token, SyncGuard::unchecked())?;
     pull_locked(&request, db, host_filter).await
 }
 
@@ -264,7 +264,7 @@ async fn sync_fixed(
     linked_lock: tokio::sync::MutexGuard<'_, ()>,
     pull_first: bool,
 ) -> Result<(), String> {
-    let request = SyncRequest::linked(token, SyncGuard::unchecked());
+    let request = SyncRequest::linked(token, SyncGuard::unchecked())?;
     if pull_first {
         pull_locked(&request, db, None).await?;
     }
@@ -332,7 +332,7 @@ fn upsert_body<'a>(
 }
 
 async fn push_unlinked(token: &str, db: &DatabaseStore) -> Result<(), String> {
-    let base = api_base_url();
+    let base = api_base_url()?;
     let client = reqwest::Client::new();
     let (local_to_server, _) = host_maps(db);
     let dirty = db.list_dirty_automations();

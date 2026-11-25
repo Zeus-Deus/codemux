@@ -276,8 +276,11 @@ async fn register_once<R: Runtime>(app: &AppHandle<R>, shared: &Arc<Shared>) -> 
         Some(b) => b,
     };
 
-    let base = crate::auth::api_base_url();
-    let ok = match post_registration(&base, &bearer, &reg).await {
+    let registration = match crate::auth::api_base_url() {
+        Ok(base) => post_registration(&base, &bearer, &reg).await,
+        Err(error) => Err(error),
+    };
+    let ok = match registration {
         Ok(()) => {
             shared.registration.record_success(&reg);
             true

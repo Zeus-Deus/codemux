@@ -249,8 +249,45 @@ impl AuthState {
 
 // ── API base URL ─────────────────────────────────────────────────
 
-pub fn api_base_url() -> String {
-    std::env::var("CODEMUX_API_URL").unwrap_or_else(|_| "https://api.codemux.org".into())
+fn validate_api_base_url(raw: &str) -> Result<String, String> {
+    if raw.chars().any(char::is_whitespace)
+        || raw.chars().any(char::is_control)
+        || raw.contains('\\')
+    {
+        return Err("CODEMUX_API_URL must not contain whitespace, controls, or backslashes".into());
+    }
+    let url =
+        url::Url::parse(raw).map_err(|_| "CODEMUX_API_URL must be a valid URL".to_string())?;
+    if url.host().is_none()
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.query().is_some()
+        || url.fragment().is_some()
+    {
+        return Err(
+            "CODEMUX_API_URL must not contain credentials, a query, or a fragment".into(),
+        );
+    }
+
+    let loopback = match url.host() {
+        Some(url::Host::Domain("localhost")) => true,
+        Some(url::Host::Ipv4(address)) => address.is_loopback(),
+        Some(url::Host::Ipv6(address)) => address.is_loopback(),
+        _ => false,
+    };
+    if url.scheme() != "https" && !(url.scheme() == "http" && loopback) {
+        return Err("CODEMUX_API_URL requires HTTPS except for loopback HTTP".into());
+    }
+    Ok(url.as_str().trim_end_matches('/').to_string())
+}
+
+/// Resolve the credential-bearing API origin before building any request.
+pub fn api_base_url() -> Result<String, String> {
+    match std::env::var("CODEMUX_API_URL") {
+        Ok(raw) => validate_api_base_url(&raw),
+        Err(std::env::VarError::NotPresent) => Ok("https://api.codemux.org".into()),
+        Err(std::env::VarError::NotUnicode(_)) => Err("CODEMUX_API_URL must be UTF-8".into()),
+    }
 }
 
 // ── Encrypted token storage ──────────────────────────────────────
@@ -679,36 +716,40 @@ fn emit_auth_state<R: tauri::Runtime>(
 ) {
     let auth_state: tauri::State<'_, AuthState> = app.state();
     // Fetch user data from API to populate the event
-    let base = api_base_url();
-    let url = format!("{base}/api/auth/desktop/verify");
-    let outcome = match reqwest::blocking::Client::builder()
-        .timeout(std::time::Duration::from_secs(5))
-        .build()
-    {
-        Ok(client) => match client
-            .get(&url)
-            .header("Authorization", format!("Bearer {token}"))
-            .send()
-        {
-            Ok(response) => {
-                let status = response.status();
-                let user = if status.is_success() {
-                    response
-                        .json::<VerifyResponse>()
-                        .ok()
-                        .map(|verified| AuthUser {
-                            id: verified.user.id,
-                            email: verified.user.email,
-                            name: verified.user.name,
-                            image: verified.user.image,
-                        })
-                } else {
-                    None
-                };
-                classify_callback_verify(status, user)
+    let outcome = match api_base_url() {
+        Ok(base) => {
+            let url = format!("{base}/api/auth/desktop/verify");
+            match reqwest::blocking::Client::builder()
+                .timeout(std::time::Duration::from_secs(5))
+                .build()
+            {
+                Ok(client) => match client
+                    .get(&url)
+                    .header("Authorization", format!("Bearer {token}"))
+                    .send()
+                {
+                    Ok(response) => {
+                        let status = response.status();
+                        let user = if status.is_success() {
+                            response
+                                .json::<VerifyResponse>()
+                                .ok()
+                                .map(|verified| AuthUser {
+                                    id: verified.user.id,
+                                    email: verified.user.email,
+                                    name: verified.user.name,
+                                    image: verified.user.image,
+                                })
+                        } else {
+                            None
+                        };
+                        classify_callback_verify(status, user)
+                    }
+                    Err(_) => CallbackVerifyOutcome::Offline,
+                },
+                Err(_) => CallbackVerifyOutcome::Offline,
             }
-            Err(_) => CallbackVerifyOutcome::Offline,
-        },
+        }
         Err(_) => CallbackVerifyOutcome::Offline,
     };
 
@@ -787,6 +828,45 @@ p{opacity:.6;font-size:.9rem}
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn api_url_accepts_https_and_loopback_http() {
+        assert_eq!(
+            validate_api_base_url("https://api.example.test:8443/").unwrap(),
+            "https://api.example.test:8443"
+        );
+        assert_eq!(
+            validate_api_base_url("https://api.example.test/prefix/").unwrap(),
+            "https://api.example.test/prefix"
+        );
+        for url in [
+            "http://localhost:3000",
+            "http://127.0.0.1:3000",
+            "http://127.0.0.2:3000",
+            "http://[::1]:3000",
+        ] {
+            assert_eq!(validate_api_base_url(url).unwrap(), url);
+        }
+    }
+
+    #[test]
+    fn api_url_rejects_insecure_or_ambiguous_overrides() {
+        for url in [
+            "http://api.example.test",
+            "http://192.168.1.5:3000",
+            "http://mock-api:8787",
+            "http://localhost.example.test:3000",
+            "file:///tmp/api",
+            "https://user:password@api.example.test",
+            "https://api.example.test?target=other",
+            "https://api.example.test#fragment",
+            "https://api.example.test\nOther-Header: value",
+            "https://api.example.test\\@other.example.test",
+            "",
+        ] {
+            assert!(validate_api_base_url(url).is_err(), "accepted {url:?}");
+        }
+    }
 
     fn test_db() -> DatabaseStore {
         DatabaseStore::new_in_memory()

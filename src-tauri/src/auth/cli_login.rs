@@ -80,7 +80,8 @@ impl LoginError {
                 "Could not reach the Codemux API at {base} ({detail}). \
                  Check the network connection, or set CODEMUX_API_URL if \
                  you are pointing at a different server.",
-                base = crate::auth::api_base_url(),
+                base =
+                    crate::auth::api_base_url().unwrap_or_else(|_| "the configured server".into()),
             ),
             LoginError::Credentials => "Sign-in failed. Check the email address \
                  and password, and make sure the address has been verified."
@@ -208,7 +209,7 @@ struct VerifySession {
 /// transport problems are echoed, a rejected token is not (the CLI must
 /// not become an oracle for which tokens are live).
 async fn verify_bearer(token: &str) -> Result<(AuthUser, String), LoginError> {
-    let base = api_base_url();
+    let base = api_base_url().map_err(LoginError::Network)?;
     let url = format!("{base}/api/auth/desktop/verify");
     let resp = reqwest::Client::new()
         .get(&url)

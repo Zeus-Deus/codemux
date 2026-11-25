@@ -550,7 +550,7 @@ async fn authorize_account_handshake(
     };
     let own_user_id = crate::auth::load_cached_user(db).map(|u| u.id);
 
-    let base = crate::auth::api_base_url();
+    let base = crate::auth::api_base_url().map_err(|_| AccountHandshakeReject::Unverified)?;
     let resp = verify_grant(&base, &hello.grant)
         .await
         .map_err(|_| AccountHandshakeReject::Unverified)?;

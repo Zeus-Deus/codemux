@@ -683,7 +683,7 @@ async fn fetch_settings_in_scope(
     observed_write_generation: u64,
 ) -> Result<UserSettings, String> {
     ensure_scope_current(scope)?;
-    let base = crate::auth::api_base_url();
+    let base = crate::auth::api_base_url()?;
     let client = settings_client()?;
     let resp = client
         .get(format!("{base}/api/settings"))
@@ -712,7 +712,7 @@ async fn push_settings_in_scope(
     accept_offline_local_write: bool,
 ) -> Result<SettingsPersistence, String> {
     ensure_scope_current(scope)?;
-    let base = crate::auth::api_base_url();
+    let base = crate::auth::api_base_url()?;
     let client = settings_client()?;
 
     let body = serde_json::json!({ "settings": settings });
@@ -764,7 +764,7 @@ async fn patch_settings_in_scope(
     scope: &CacheScope,
 ) -> Result<UserSettings, String> {
     ensure_scope_current(scope)?;
-    let base = crate::auth::api_base_url();
+    let base = crate::auth::api_base_url()?;
     let client = settings_client()?;
 
     let body = serde_json::json!({ "settings": partial });
@@ -800,7 +800,7 @@ pub async fn patch_settings_for_owner(
 
 async fn delete_settings_in_scope(token: &str, scope: &CacheScope) -> Result<UserSettings, String> {
     ensure_scope_current(scope)?;
-    let base = crate::auth::api_base_url();
+    let base = crate::auth::api_base_url()?;
     let client = settings_client()?;
 
     let resp = client

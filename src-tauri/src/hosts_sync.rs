@@ -215,7 +215,7 @@ fn valid_token(db: &DatabaseStore) -> Option<String> {
 /// but missing from the server response is treated as a server-side
 /// deletion the local hasn't observed yet.
 async fn pull(token: &str, db: &DatabaseStore, session: &SyncSession<'_>) -> Result<(), String> {
-    let base = api_base_url();
+    let base = api_base_url()?;
     let client = reqwest::Client::new();
     let resp = client
         .get(format!("{base}/api/hosts"))
@@ -298,7 +298,7 @@ fn apply_server_hosts(db: &DatabaseStore, hosts: &[ServerHost]) -> Result<(), St
 /// rows; the failure is logged and the row stays dirty for the next
 /// sync to retry.
 async fn push(token: &str, db: &DatabaseStore, session: &SyncSession<'_>) -> Result<(), String> {
-    let base = api_base_url();
+    let base = api_base_url()?;
     let client = reqwest::Client::new();
     // Read under the session guard, so every row sent with this token
     // existed while its account was signed in.

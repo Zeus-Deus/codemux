@@ -60,7 +60,10 @@ async fn verify_token(token: &str) -> VerifyOutcome {
         Ok(client) => client,
         Err(_) => return VerifyOutcome::Offline,
     };
-    let url = format!("{}/api/auth/desktop/verify", api_base_url());
+    let Ok(base) = api_base_url() else {
+        return VerifyOutcome::Offline;
+    };
+    let url = format!("{base}/api/auth/desktop/verify");
     match client
         .get(url)
         .header("Authorization", format!("Bearer {token}"))
@@ -386,7 +389,7 @@ pub async fn start_oauth_flow<R: tauri::Runtime>(
     // OAuth callback an atomic replacement with respect to startup refresh.
     let port = crate::auth::start_callback_server(app.clone())?;
 
-    let base = api_base_url();
+    let base = api_base_url()?;
     let url = format!(
         "{base}/api/auth/desktop/connect?provider=github&state={state}&port={port}",
         state = urlencoding::encode(&csrf_state),
@@ -499,7 +502,7 @@ pub async fn forgot_password(email: String) -> Result<(), String> {
         return Err("Email is required".into());
     }
 
-    let base = api_base_url();
+    let base = api_base_url()?;
     let url = format!("{base}/api/auth/desktop/forgot-password");
 
     let client = reqwest::Client::new();
@@ -526,7 +529,7 @@ pub async fn resend_verification_email(email: String) -> Result<(), String> {
         return Err("Email is required".into());
     }
 
-    let base = api_base_url();
+    let base = api_base_url()?;
     let url = format!("{base}/api/auth/send-verification-email");
 
     let resp = reqwest::Client::new()

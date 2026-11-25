@@ -130,7 +130,7 @@ pub async fn try_sync_with_app<R: tauri::Runtime>(app: &tauri::AppHandle<R>) -> 
         return Ok(());
     };
     let guard = SyncGuard::session(&auth, generation);
-    let request = SyncRequest::linked(&token, guard);
+    let request = SyncRequest::linked(&token, guard)?;
     let pull = pull_locked(&request, &db).await;
     let linked = push_linked(&request, &db).await;
     drop(linked_lock);
@@ -153,7 +153,7 @@ pub async fn try_sync_with_app<R: tauri::Runtime>(app: &tauri::AppHandle<R>) -> 
 /// server-side deletion the local hasn't observed yet.
 pub async fn pull(token: &str, db: &DatabaseStore) -> Result<(), String> {
     let _linked = SYNC_LOCK.lock().await;
-    let request = SyncRequest::linked(token, SyncGuard::unchecked());
+    let request = SyncRequest::linked(token, SyncGuard::unchecked())?;
     pull_locked(&request, db).await
 }
 
@@ -332,7 +332,7 @@ async fn sync_fixed(
     linked_lock: tokio::sync::MutexGuard<'_, ()>,
     pull_first: bool,
 ) -> Result<(), String> {
-    let request = SyncRequest::linked(token, SyncGuard::unchecked());
+    let request = SyncRequest::linked(token, SyncGuard::unchecked())?;
     if pull_first {
         pull_locked(&request, db).await?;
     }
@@ -381,7 +381,7 @@ async fn push_linked(request: &SyncRequest<'_>, db: &DatabaseStore) -> Result<()
 }
 
 async fn push_unlinked(token: &str, db: &DatabaseStore) -> Result<(), String> {
-    let base = api_base_url();
+    let base = api_base_url()?;
     let client = reqwest::Client::new();
     let dirty = db.list_dirty_workspaces_sync();
     let mut any_failed = false;
