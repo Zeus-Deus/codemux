@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { useAgentChatStore } from "@/stores/agent-chat-store";
 import type { AgentChatMessageRow } from "@/tauri/commands";
@@ -26,6 +26,8 @@ import { enqueueAgentChatEvent, flushAllAgentChatEvents } from "./event-batcher"
 
 const THREAD = "thread-race";
 const PROVIDER = "claude" as const;
+
+afterEach(() => vi.restoreAllMocks());
 
 /** A persisted, transcript-affecting event: one assistant message. */
 function assistantEvent(text: string, turnId = "turn-1"): ProviderRuntimeEvent {
@@ -1029,8 +1031,8 @@ describe("cursor hydrate — tail-first cold open", () => {
   it("previews the tail, backfills, then does one full replay with the cursor at the head", async () => {
     useAgentChatStore.getState().ensureThread(THREAD);
     const store = useAgentChatStore.getState();
-    const hydrateThread = vi.spyOn(store, "hydrateThread");
-    const hydrateThreadTail = vi.spyOn(store, "hydrateThreadTail");
+    const hydrateThread = vi.spyOn(store, "hydrateThread").mockClear();
+    const hydrateThreadTail = vi.spyOn(store, "hydrateThreadTail").mockClear();
     const { deps, calls, releasePage } = tailFirstDeps();
 
     const running = hydrateThreadByCursor(THREAD, PROVIDER, () => false, deps);
@@ -1131,7 +1133,7 @@ describe("cursor hydrate — tail-first cold open", () => {
   it("a cancel mid-backfill drops the held events and leaves the slice cold", async () => {
     useAgentChatStore.getState().ensureThread(THREAD);
     const store = useAgentChatStore.getState();
-    const hydrateThread = vi.spyOn(store, "hydrateThread");
+    const hydrateThread = vi.spyOn(store, "hydrateThread").mockClear();
     const { deps, releasePage, awaitPageRequest } = tailFirstDeps();
     let cancelled = false;
     const running = hydrateThreadByCursor(THREAD, PROVIDER, () => cancelled, deps);
@@ -1183,8 +1185,8 @@ describe("cursor hydrate — tail-first cold open", () => {
   it("a complete tail is the plain full replay — no preview, no backfill", async () => {
     useAgentChatStore.getState().ensureThread(THREAD);
     const store = useAgentChatStore.getState();
-    const hydrateThread = vi.spyOn(store, "hydrateThread");
-    const hydrateThreadTail = vi.spyOn(store, "hydrateThreadTail");
+    const hydrateThread = vi.spyOn(store, "hydrateThread").mockClear();
+    const hydrateThreadTail = vi.spyOn(store, "hydrateThreadTail").mockClear();
     const listBefore = vi.fn<NonNullable<CursorHydrateDeps["listBefore"]>>();
     await hydrateThreadByCursor(THREAD, PROVIDER, () => false, {
       listAfter: async () => {
