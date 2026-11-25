@@ -295,6 +295,18 @@ else
     is "signature URL must use http(s)" "$?" "1"
     contains "unsupported signature URL has a clear error" "$OUT" "must be an http(s) URL"
 
+    OUT=$(CODEMUX_SIGNATURE_URL='https://signatures.example/codemux_9.9.9_amd64.deb.sig?key=signature-secret' \
+          run_dry "$UBUNTU" 'https://downloads.example/codemux_9.9.9_amd64.deb?key=artifact-secret')
+    is "authenticated URL dry run succeeds" "$?" "0"
+    contains "dry run shows the artifact download" "$OUT" "would download: <redacted URL>"
+    contains "dry run shows the signature check" "$OUT" "would verify: codemux_9.9.9_amd64.deb against <redacted URL>"
+    not_contains "dry run hides artifact credential" "$OUT" "artifact-secret"
+    not_contains "dry run hides signature credential" "$OUT" "signature-secret"
+    OUT=$(run_dry "$UBUNTU" 'https://downloads.example/unknown.bin?key=unknown-secret')
+    is "unknown authenticated artifact is rejected" "$?" "1"
+    contains "unknown artifact error redacts its URL" "$OUT" "from its name: <redacted URL>"
+    not_contains "unknown artifact error hides credential" "$OUT" "unknown-secret"
+
     FEDORA=$(mock_os_release fedora2 'ID=fedora' 'VERSION_ID=40' 'PRETTY_NAME="Fedora Linux 40"')
     FAKE_RPM="${TMPROOT}/codemux-9.9.9-1.x86_64.rpm"
     : > "$FAKE_RPM"
@@ -831,7 +843,7 @@ OUT=$(env -u CODEMUX_INSTALL_SH_NO_MAIN NO_COLOR=1 PATH="${STUB_BIN}:${PATH}" \
       CODEMUX_OS_RELEASE_PATH="$UBUNTU" CODEMUX_INSTALL_VERSION=9.9.9 \
       CODEMUX_INSTALL_DIR="${TMPROOT}/opt/bin" \
       bash "$INSTALL_SH" --dry-run 2>&1)
-contains "dry run plans the signature check" "$OUT" "would verify: codemux_9.9.9_amd64.deb against https://github.com/Zeus-Deus/codemux/releases/download/v9.9.9/codemux_9.9.9_amd64.deb.sig"
+contains "dry run plans the signature check" "$OUT" "would verify: codemux_9.9.9_amd64.deb against <redacted URL>"
 # A fresh installer process on a host with no openssl at all (minimal
 # container images): every tool on PATH except openssl and sudo.
 NOSSL_BIN="${TMPROOT}/no-openssl-bin"

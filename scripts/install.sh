@@ -596,6 +596,15 @@ remove_fallback_install() {
 
 # ── Download ─────────────────────────────────────────────────────────────────
 
+# Download URLs may carry credentials in any component, including the path.
+# Show the planned action without copying those credentials into dry-run logs.
+display_source() {
+    case "$1" in
+        http://*|https://*) printf '%s' '<redacted URL>' ;;
+        *) printf '%s' "$1" ;;
+    esac
+}
+
 fetch_text() {
     if have curl; then
         curl -fsSL "$1"
@@ -610,7 +619,7 @@ download_to() {
     _url="$1"
     _dest="$2"
     if [ "$DRY_RUN" = "1" ]; then
-        printf '%b\n' "  ${C_DIM}would download:${C_RESET} ${_url}"
+        printf '%b\n' "  ${C_DIM}would download:${C_RESET} $(display_source "$_url")"
         return 0
     fi
     if have curl; then
@@ -686,7 +695,7 @@ signature_tools_help() {
 verify_release_artifact() { # <file> <signature-url> <name>
     step "Checking the release signature"
     if [ "$DRY_RUN" = "1" ]; then
-        printf '%b\n' "  ${C_DIM}would verify:${C_RESET} ${3} against ${2}"
+        printf '%b\n' "  ${C_DIM}would verify:${C_RESET} ${3} against $(display_source "$2")"
         return 0
     fi
     _va_dir="${WORKDIR}/verify"
@@ -1086,7 +1095,7 @@ main() {
             http://*|https://*) _method_name=$(codemux_url_path "$_method_name") ;;
         esac
         METHOD=$(codemux_kind_from_filename "$_method_name")
-        [ "$METHOD" = "unknown" ] && die "cannot tell what CODEMUX_ARTIFACT is from its name: ${CODEMUX_ARTIFACT}"
+        [ "$METHOD" = "unknown" ] && die "cannot tell what CODEMUX_ARTIFACT is from its name: $(display_source "$CODEMUX_ARTIFACT")"
         note "CODEMUX_ARTIFACT is a .${METHOD} — installing that"
     else
         METHOD=$(codemux_method_for_family "$FAMILY")
