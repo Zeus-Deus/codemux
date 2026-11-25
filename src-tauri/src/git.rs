@@ -1882,6 +1882,59 @@ fn worktree_listing(repo_path: &Path) -> Result<(Vec<u8>, u8), String> {
     ))
 }
 
+/// Whether Git lists this exact checkout as a live worktree of the project.
+pub(crate) fn is_registered_worktree(repo_path: &Path, checkout: &Path) -> bool {
+    let Ok((listing, separator)) = worktree_listing(repo_path) else {
+        return false;
+    };
+    if separator != 0 {
+        // Older Git cannot list every path unambiguously. Instead verify
+        // the checkout and the repository's worktree metadata agree.
+        return registered_worktree_backlink(repo_path, checkout).is_some();
+    }
+    let mut path = None;
+    let mut live = true;
+    for field in listing.split(|&byte| byte == 0) {
+        if let Some(raw_path) = field.strip_prefix(b"worktree ") {
+            path = path_from_git_bytes(raw_path.to_vec());
+        } else if field == b"bare" || field == b"prunable" || field.starts_with(b"prunable ") {
+            live = false;
+        } else if field.is_empty() {
+            let path = path.take();
+            if live && path.is_some_and(|path| {
+                path.canonicalize().is_ok_and(|registered| registered == checkout)
+            }) {
+                return true;
+            }
+            live = true;
+        }
+    }
+    false
+}
+
+/// Check the two ends of Git's registration without parsing the old listing.
+fn registered_worktree_backlink(repo_path: &Path, checkout: &Path) -> Option<()> {
+    let marker = checkout.join(".git");
+    if !std::fs::symlink_metadata(&marker).ok()?.is_file() {
+        return None;
+    }
+    let admin = git_path(checkout, "--git-dir")?;
+    if !std::fs::symlink_metadata(&admin).ok()?.is_dir() {
+        return None;
+    }
+    let admin = admin.canonicalize().ok()?;
+    let worktrees = repo_path.join(".git").canonicalize().ok()?.join("worktrees");
+    if admin.parent()? != worktrees {
+        return None;
+    }
+    let backlink = admin.join("gitdir");
+    if !std::fs::symlink_metadata(&backlink).ok()?.is_file() {
+        return None;
+    }
+    let backlink = path_from_git_bytes(strip_git_line_ending(std::fs::read(backlink).ok()?))?;
+    (admin.join(backlink).canonicalize().ok()? == marker).then_some(())
+}
+
 /// Where a porcelain worktree listing has a branch checked out.
 #[derive(Debug, PartialEq)]
 enum Registered {
@@ -1948,7 +2001,7 @@ fn is_checkout_of(path: &Path, repo_path: &Path, branch_ref: &str) -> bool {
 
 /// One absolute path from `git rev-parse <flag>` in `dir`, byte for byte
 /// (see [`git_line`]).
-fn git_path(dir: &Path, flag: &str) -> Option<PathBuf> {
+pub(crate) fn git_path(dir: &Path, flag: &str) -> Option<PathBuf> {
     path_from_git_bytes(git_line(dir, &["rev-parse", "--path-format=absolute", flag])?)
 }
 
@@ -1963,7 +2016,10 @@ fn git_line(dir: &Path, args: &[&str]) -> Option<Vec<u8>> {
         .output()
         .ok()
         .filter(|o| o.status.success())?;
-    let mut bytes = output.stdout;
+    Some(strip_git_line_ending(output.stdout))
+}
+
+fn strip_git_line_ending(mut bytes: Vec<u8>) -> Vec<u8> {
     if bytes.last() == Some(&b'\n') {
         bytes.pop();
         #[cfg(not(unix))]
@@ -1971,7 +2027,7 @@ fn git_line(dir: &Path, args: &[&str]) -> Option<Vec<u8>> {
             bytes.pop();
         }
     }
-    Some(bytes)
+    bytes
 }
 
 /// Whether any worktree of `repo_path`'s repository is paused mid-rebase
@@ -7321,6 +7377,32 @@ mod tests {
         assert_eq!(run_git(&stale, &["rev-parse", "HEAD"]).unwrap(), clone_before, "the clone must not move");
         assert!(!stale.join("feature.txt").exists());
         assert_eq!(run_git(&repo, &["rev-parse", "release"]).unwrap(), release_before);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn old_git_worktree_validation_requires_a_lossless_backlink() {
+        use std::os::unix::ffi::OsStrExt;
+
+        let (dir, repo) = setup_test_repo();
+        let linked = dir.path().join(std::ffi::OsStr::from_bytes(b"linked\nworktree-\xff"));
+        let output = git_command()
+            .args(["worktree", "add", "--detach"])
+            .arg(&linked)
+            .current_dir(&repo)
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{output:?}");
+        let checkout = linked.canonicalize().unwrap();
+        assert!(registered_worktree_backlink(&repo, &checkout).is_some());
+
+        let moved = dir.path().join("moved");
+        std::fs::rename(&linked, &moved).unwrap();
+        assert!(registered_worktree_backlink(&repo, &moved.canonicalize().unwrap()).is_none());
+
+        let admin = git_path(&moved, "--git-dir").unwrap();
+        assert!(std::fs::read(admin.join("gitdir")).unwrap().ends_with(b"/.git\n"));
+        assert!(registered_worktree_backlink(&repo, &checkout).is_none());
     }
 
     #[cfg(unix)]

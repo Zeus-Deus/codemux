@@ -1,5 +1,5 @@
 use crate::config::workspace_config::{
-    find_git_root, read_effective_config, read_workspace_config, WorkspaceConfig,
+    read_effective_config, read_workspace_config, WorkspaceConfig,
 };
 use crate::database::DatabaseStore;
 use crate::workspace_service::Checkpoint;
@@ -96,8 +96,6 @@ pub struct IncludeResult {
     pub source: IncludeSource,
 }
 
-use crate::workspace_paths::paths_equal;
-
 /// Process worktree includes: copy gitignored files matching patterns from the
 /// main worktree into the new worktree.
 ///
@@ -106,23 +104,30 @@ use crate::workspace_paths::paths_equal;
 ///   2. `worktree_includes` from project settings
 ///   3. Hardcoded defaults (`DEFAULT_WORKTREE_INCLUDES`)
 ///
-/// Skip the copy when both paths resolve to the same checkout.
+/// Copy only between distinct checkouts that Git lists for this repository.
 pub fn process_worktree_includes(
     root_path: &Path,
     worktree_path: &Path,
     setting_patterns: &[String],
 ) -> Result<IncludeResult, String> {
-    if paths_equal(root_path, worktree_path) {
-        eprintln!(
-            "[codemux::scripts] worktree includes skipped: workspace path == project root ({})",
-            root_path.display()
-        );
-        return Ok(IncludeResult {
-            copied: Vec::new(),
-            source: IncludeSource::Defaults,
-        });
+    // Recheck at copy time, including when a background setup has been waiting
+    // to start. An ordinary project subdirectory is still the same checkout.
+    if let (Ok(root), Ok(workspace)) = (root_path.canonicalize(), worktree_path.canonicalize()) {
+        if nearest_checkout(&workspace).and_then(registered_project_root).as_ref() == Some(&root) {
+            return copy_worktree_includes(&root, &workspace, setting_patterns);
+        }
     }
+    Ok(IncludeResult {
+        copied: Vec::new(),
+        source: IncludeSource::Defaults,
+    })
+}
 
+fn copy_worktree_includes(
+    root_path: &Path,
+    worktree_path: &Path,
+    setting_patterns: &[String],
+) -> Result<IncludeResult, String> {
     let include_file = root_path.join(".codemuxinclude");
 
     // Determine source and write a temp exclude file for non-file sources
@@ -297,28 +302,42 @@ fn is_regular_include(metadata: &cap_std::fs::Metadata) -> bool {
     metadata.is_file()
 }
 
-/// Resolve a workspace's git root. A checkout outside that root must be
-/// registered with Git before it can use the root as an include source.
+/// Nearest checkout, before following the metadata of a linked worktree.
+fn nearest_checkout(workspace: &Path) -> Option<&Path> {
+    workspace.ancestors().find(|parent| {
+        let marker = parent.join(".git");
+        marker.is_dir() || marker.is_file()
+    })
+}
+
+/// Resolve the project root for an ordinary subdirectory or a registered
+/// linked worktree. A linked checkout's pointer alone grants no access.
 pub fn resolve_root_path(workspace_path: &Path) -> PathBuf {
-    let Some(root) = find_git_root(workspace_path) else {
-        return workspace_path.to_path_buf();
+    let fallback = || workspace_path.to_path_buf();
+    let Ok(workspace) = workspace_path.canonicalize() else {
+        return fallback();
     };
-    let (Ok(checkout), Ok(canonical_root)) = (workspace_path.canonicalize(), root.canonicalize())
-    else {
-        return workspace_path.to_path_buf();
+    let Some(checkout) = nearest_checkout(&workspace) else {
+        return fallback();
     };
-    if checkout.starts_with(&canonical_root)
-        || crate::git::git_list_worktrees(&canonical_root).is_ok_and(|worktrees| {
-            worktrees.into_iter().any(|worktree| {
-                !worktree.is_bare
-                    && Path::new(&worktree.path).canonicalize().ok().as_ref() == Some(&checkout)
-            })
-        })
-    {
-        root
-    } else {
-        workspace_path.to_path_buf()
+    if checkout.join(".git").is_dir() {
+        return checkout.to_path_buf();
     }
+    registered_project_root(checkout).unwrap_or_else(fallback)
+}
+
+fn registered_project_root(checkout: &Path) -> Option<PathBuf> {
+    if !checkout.join(".git").is_file() {
+        return None;
+    }
+    // Ask Git for the actual common directory without interpreting the
+    // checkout's pointer as UTF-8 or assuming the pointer is absolute.
+    let common = crate::git::git_path(checkout, "--git-common-dir")?;
+    if common.file_name()? != ".git" {
+        return None;
+    }
+    let root = common.parent()?.canonicalize().ok()?;
+    (root != checkout && crate::git::is_registered_worktree(&root, checkout)).then_some(root)
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -940,7 +959,7 @@ mod tests {
         fs::write(root.path().join(".gitignore"), ".env\n").unwrap();
 
         // No .codemuxinclude, no setting patterns — should use defaults
-        let result = process_worktree_includes(root.path(), worktree.path(), &[]);
+        let result = copy_worktree_includes(root.path(), worktree.path(), &[]);
         let result = result.unwrap();
         assert_eq!(result.source, IncludeSource::Defaults);
     }
@@ -961,7 +980,7 @@ mod tests {
 
         // No .codemuxinclude file, but setting patterns provided
         let patterns = vec![".env".to_string()];
-        let result = process_worktree_includes(root.path(), worktree.path(), &patterns).unwrap();
+        let result = copy_worktree_includes(root.path(), worktree.path(), &patterns).unwrap();
 
         assert_eq!(result.source, IncludeSource::Setting);
         assert!(result.copied.contains(&".env".to_string()));
@@ -1031,35 +1050,89 @@ mod tests {
         assert_eq!(fs::read_dir(worktree.path()).unwrap().count(), 1);
     }
 
-    #[test]
-    fn worktree_includes_resolve_only_registered_external_checkouts() {
-        let fixture = tempfile::tempdir().unwrap();
-        let root = fixture.path().join("project");
-        let registered = fixture.path().join("registered");
-        let unregistered = fixture.path().join("unregistered");
-        fs::create_dir(&root).unwrap();
-        fs::create_dir(&unregistered).unwrap();
-        let git = |args: &[&str]| {
-            let output = std::process::Command::new("git")
-                .current_dir(&root)
+    fn include_source_project(root: &Path) {
+        fs::create_dir(root).unwrap();
+        for args in [
+            &["init", "-b", "main"][..],
+            &[
+                "-c", "user.name=Fixture", "-c", "user.email=fixture@example.test",
+                "-c", "commit.gpgsign=false", "commit", "--allow-empty", "-m", "Fixture",
+            ],
+        ] {
+            let output = crate::git::git_command()
+                .current_dir(root)
                 .args(args)
                 .output()
                 .unwrap();
-            assert!(output.status.success(), "{:?}", output);
-        };
-        git(&["init", "-b", "main"]);
-        git(&[
-            "-c", "user.name=Fixture", "-c", "user.email=fixture@example.test",
-            "-c", "commit.gpgsign=false", "commit", "--allow-empty", "-m", "Fixture",
-        ]);
-        git(&["worktree", "add", "--detach", registered.to_str().unwrap()]);
-        fs::copy(registered.join(".git"), unregistered.join(".git")).unwrap();
+            assert!(output.status.success(), "{output:?}");
+        }
+        fs::write(root.join(".env"), "INCLUDE_FIXTURE=local").unwrap();
+    }
 
-        assert_eq!(
-            resolve_root_path(&registered).canonicalize().unwrap(),
-            root.canonicalize().unwrap()
-        );
-        assert_eq!(resolve_root_path(&unregistered), unregistered);
+    fn register_include_fixture(root: &Path, checkout: &Path) {
+        let output = crate::git::git_command()
+            .current_dir(root)
+            .args(["worktree", "add", "--detach"])
+            .arg(checkout)
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{output:?}");
+    }
+
+    #[test]
+    fn worktree_includes_require_registration_for_external_and_nested_checkouts() {
+        let fixture = tempfile::tempdir().unwrap();
+        let root = fixture.path().join("project");
+        let registered = fixture.path().join("registered");
+        let nested_registered = root.join("linked");
+        let subdirectory = root.join("subdirectory");
+        include_source_project(&root);
+        fs::create_dir(&subdirectory).unwrap();
+        register_include_fixture(&root, &registered);
+        register_include_fixture(&root, &nested_registered);
+
+        let canonical_root = root.canonicalize().unwrap();
+        assert_eq!(resolve_root_path(&subdirectory), canonical_root);
+        assert!(process_worktree_includes(&root, &subdirectory, &[]).unwrap().copied.is_empty());
+        assert!(!subdirectory.join(".env").exists());
+
+        for checkout in [&registered, &nested_registered] {
+            assert_eq!(resolve_root_path(checkout), canonical_root);
+            let includes = process_worktree_includes(&root, checkout, &[]).unwrap();
+            assert_eq!(includes.copied, [".env"]);
+        }
+        for checkout in [fixture.path().join("unregistered"), root.join("nested")] {
+            fs::create_dir(&checkout).unwrap();
+            fs::copy(registered.join(".git"), checkout.join(".git")).unwrap();
+            assert_eq!(resolve_root_path(&checkout), checkout);
+
+            // The copy entry point verifies membership even if an earlier
+            // setup step passed the parent repository directly.
+            let includes = process_worktree_includes(&root, &checkout, &[]).unwrap();
+            assert!(includes.copied.is_empty());
+            assert!(!checkout.join(".env").exists());
+        }
+        assert_eq!(fs::read_to_string(root.join(".env")).unwrap(), "INCLUDE_FIXTURE=local");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn worktree_includes_register_paths_with_newlines_and_non_utf8_bytes() {
+        use std::os::unix::ffi::OsStrExt;
+
+        let fixture = tempfile::tempdir().unwrap();
+        let root = fixture.path().join("project");
+        let checkout = fixture.path().join(std::ffi::OsStr::from_bytes(b"linked\nworkspace-\xff"));
+        include_source_project(&root);
+        register_include_fixture(&root, &checkout);
+
+        let subdirectory = checkout.join("nested");
+        fs::create_dir(&subdirectory).unwrap();
+        let source = resolve_root_path(&subdirectory);
+        assert_eq!(source, root.canonicalize().unwrap());
+        let includes = process_worktree_includes(&source, &checkout, &[]).unwrap();
+        assert_eq!(includes.copied, [".env"]);
+        assert_eq!(fs::read_to_string(checkout.join(".env")).unwrap(), "INCLUDE_FIXTURE=local");
     }
 
     #[test]
@@ -1085,7 +1158,7 @@ mod tests {
 
         // Even though setting patterns are provided, file should win
         let patterns = vec!["something-else".to_string()];
-        let result = process_worktree_includes(root.path(), worktree.path(), &patterns).unwrap();
+        let result = copy_worktree_includes(root.path(), worktree.path(), &patterns).unwrap();
 
         assert_eq!(result.source, IncludeSource::File);
         assert!(result.copied.contains(&".env".to_string()));
@@ -1116,7 +1189,7 @@ mod tests {
         // .codemuxinclude asks for files that don't exist
         fs::write(root.path().join(".codemuxinclude"), "nonexistent.txt\n").unwrap();
 
-        let result = process_worktree_includes(root.path(), worktree.path(), &[]).unwrap();
+        let result = copy_worktree_includes(root.path(), worktree.path(), &[]).unwrap();
         assert_eq!(result.source, IncludeSource::File);
         assert!(result.copied.is_empty());
     }
@@ -1139,7 +1212,7 @@ mod tests {
         // listed by git ls-files but deleted before the copy step
         fs::write(root.path().join(".env"), "DB_URL=postgres://...").unwrap();
 
-        let result = process_worktree_includes(root.path(), worktree.path(), &[]).unwrap();
+        let result = copy_worktree_includes(root.path(), worktree.path(), &[]).unwrap();
         assert_eq!(result.source, IncludeSource::File);
         // Only .env should be copied; the missing file is silently skipped
         assert_eq!(result.copied, vec![".env"]);
@@ -1161,7 +1234,7 @@ mod tests {
         fs::write(root.path().join(".gitignore"), ".env\n").unwrap();
 
         // Empty setting patterns should fall through to defaults
-        let result = process_worktree_includes(root.path(), worktree.path(), &[]).unwrap();
+        let result = copy_worktree_includes(root.path(), worktree.path(), &[]).unwrap();
         assert_eq!(result.source, IncludeSource::Defaults);
     }
 
@@ -1293,7 +1366,7 @@ mod tests {
         fs::write(root.path().join(".gitignore"), ".env\n").unwrap();
         fs::write(root.path().join(".env"), "FROM_ROOT=ok").unwrap();
 
-        let result = process_worktree_includes(root.path(), worktree.path(), &[]).unwrap();
+        let result = copy_worktree_includes(root.path(), worktree.path(), &[]).unwrap();
         assert!(result.copied.contains(&".env".to_string()));
         assert_eq!(
             fs::read_to_string(worktree.path().join(".env")).unwrap(),
@@ -1324,7 +1397,7 @@ mod tests {
                 .unwrap();
         }
 
-        let result = process_worktree_includes(root.path(), worktree.path(), &[]).unwrap();
+        let result = copy_worktree_includes(root.path(), worktree.path(), &[]).unwrap();
         assert_eq!(result.copied.len(), names.len());
         for name in names {
             assert!(result.copied.iter().any(|copied| copied == name));
@@ -1350,7 +1423,7 @@ mod tests {
         fs::write(root.path().join(".env.local"), "LOCAL=val").unwrap();
 
         // No file, no settings — defaults should pick up .env and .env.local
-        let result = process_worktree_includes(root.path(), worktree.path(), &[]).unwrap();
+        let result = copy_worktree_includes(root.path(), worktree.path(), &[]).unwrap();
         assert_eq!(result.source, IncludeSource::Defaults);
         assert!(result.copied.contains(&".env".to_string()));
         assert!(result.copied.contains(&".env.local".to_string()));
