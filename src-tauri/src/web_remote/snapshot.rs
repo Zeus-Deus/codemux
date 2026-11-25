@@ -54,10 +54,28 @@ pub const API_VERSION: u32 = 1;
 
 /// `GET /api/snapshot` — authenticated one-shot state bootstrap.
 pub async fn serve<R: Runtime>(State(app): State<AppHandle<R>>, headers: HeaderMap) -> Response {
-    if let Err(resp) = super::server::require_session(&app, &headers) {
-        return resp;
-    }
+    authorized_snapshot(&app, &headers, || build_snapshot(&app))
+}
 
+fn authorized_snapshot<R: Runtime>(
+    app: &AppHandle<R>,
+    headers: &HeaderMap,
+    build: impl FnOnce() -> Response,
+) -> Response {
+    let session = match super::server::require_session(app, headers) {
+        Ok(session) => session,
+        Err(response) => return response,
+    };
+    let response = build();
+    // Reading state and serializing the snapshot may outlast the session.
+    if super::server::session_active(app, &session.id) {
+        response
+    } else {
+        StatusCode::UNAUTHORIZED.into_response()
+    }
+}
+
+fn build_snapshot<R: Runtime>(app: &AppHandle<R>) -> Response {
     // The *same* snapshot the `get_app_state` command returns — one code path,
     // no duplicated serialization. Reads label the revision they already
     // reflect and consume none, so this bootstrap gives the client a baseline
@@ -66,7 +84,7 @@ pub async fn serve<R: Runtime>(State(app): State<AppHandle<R>>, headers: HeaderM
         .state::<crate::state::AppStateStore>()
         .snapshot_at_current_revision();
     let shared = app.state::<WebRemoteState>().shared();
-    let status = super::build_status(&app, &shared);
+    let status = super::build_status(app, &shared);
     let body = snapshot_json(&app_state, &status);
 
     (
@@ -152,6 +170,39 @@ mod tests {
         h.insert(header::AUTHORIZATION, format!("Bearer {token}").parse().unwrap());
         let session = authorize_headers(&db, &h).expect("approved session is admitted");
         assert!(session.approved);
+    }
+
+    #[tokio::test]
+    async fn snapshot_discards_the_buffered_response_if_the_account_signs_out() {
+        use crate::database::DatabaseStore;
+        use crate::web_remote::auth;
+
+        let app = tauri::test::mock_app();
+        let db = DatabaseStore::new_in_memory();
+        auth::seed_account_browser(&db, "account", "account-browser");
+        let paired = insert_session(&db, true);
+        app.manage(db);
+        app.manage(crate::state::AppStateStore::default());
+        app.manage(WebRemoteState::default());
+
+        let headers = |token| {
+            let mut headers = HeaderMap::new();
+            headers.insert(header::AUTHORIZATION, format!("Bearer {token}").parse().unwrap());
+            headers
+        };
+        let handle = app.handle();
+        let response = authorized_snapshot(handle, &headers("account-browser"), || {
+            let response = build_snapshot(handle);
+            assert_eq!(response.status(), StatusCode::OK);
+            app.state::<DatabaseStore>().clear_auth_token().unwrap();
+            response
+        });
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        assert!(axum::body::to_bytes(response.into_body(), 1024).await.unwrap().is_empty());
+
+        let response = serve(State(handle.clone()), headers(&paired)).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers()[header::CACHE_CONTROL], "no-store");
     }
 
     #[test]

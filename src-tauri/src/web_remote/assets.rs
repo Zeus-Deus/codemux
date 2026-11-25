@@ -18,7 +18,7 @@
 //! non-regular files return 404 — the route never produces a directory
 //! listing.
 
-use std::path::Path;
+use std::{io, path::Path};
 
 use axum::http::HeaderMap;
 use axum::{
@@ -26,7 +26,7 @@ use axum::{
     http::{header, StatusCode},
     response::{IntoResponse, Response},
 };
-use futures_util::StreamExt as _;
+use futures_util::TryStreamExt as _;
 use serde::Deserialize;
 use tauri::{AppHandle, Runtime};
 
@@ -57,10 +57,19 @@ pub async fn serve<R: Runtime>(
 
     match opened {
         Ok(asset) => {
-            // Check after each read so a sign-out during I/O drops that
-            // chunk and ends the stream. Code pairing survives host sign-out.
+            // Check after each read. A body error aborts the transfer even
+            // when compression has removed the Content-Length header.
             let stream = tokio_util::io::ReaderStream::with_capacity(asset.file, ASSET_CHUNK_SIZE)
-                .take_while(move |_| std::future::ready(session_active(&app, &session.id)));
+                .and_then(move |chunk| {
+                    std::future::ready(if session_active(&app, &session.id) {
+                        Ok(chunk)
+                    } else {
+                        Err(io::Error::new(
+                            io::ErrorKind::PermissionDenied,
+                            "asset session revoked",
+                        ))
+                    })
+                });
             let body = axum::body::Body::from_stream(stream);
             asset_response(asset.mime, asset.len, body)
         }
@@ -188,10 +197,15 @@ mod tests {
     use super::*;
 
     #[tokio::test]
-    async fn sign_out_stops_an_active_account_asset_stream_and_keeps_code_pairing() {
+    async fn sign_out_aborts_a_gzip_account_asset_stream_and_keeps_code_pairing() {
         use crate::database::DatabaseStore;
-        use crate::web_remote::auth;
+        use crate::web_remote::{auth, server};
+        use axum::{body::Body, http::Request};
+        use futures_util::StreamExt as _;
+        use rand::{rngs::StdRng, RngCore, SeedableRng};
+        use std::io::Read as _;
         use tauri::Manager as _;
+        use tower::ServiceExt as _;
 
         let app = tauri::test::mock_app();
         let db = DatabaseStore::new_in_memory();
@@ -208,24 +222,30 @@ mod tests {
 
         let fixture = tempfile::tempdir().unwrap();
         let path = fixture.path().join("asset.txt");
-        let contents = vec![b'a'; ASSET_CHUNK_SIZE * 3];
+        // Ensure gzip yields data before it can consume the whole input.
+        let mut contents = vec![0; ASSET_CHUNK_SIZE * 8];
+        StdRng::seed_from_u64(1).fill_bytes(&mut contents);
         tokio::fs::write(&path, &contents).await.unwrap();
 
-        let request = |token: &'static str| {
-            let mut headers = HeaderMap::new();
-            headers.insert(header::AUTHORIZATION, token.parse().unwrap());
-            serve(
-                State(app.handle().clone()),
-                headers,
-                Query(AssetQuery {
-                    path: path.to_string_lossy().into_owned(),
-                }),
+        let route = server::router(app.handle().clone());
+        let uri = format!("/api/assets?path={}", urlencoding::encode(&path.to_string_lossy()));
+        let request = |token| {
+            route.clone().oneshot(
+                Request::builder()
+                    .uri(uri.as_str())
+                    .header(header::AUTHORIZATION, token)
+                    .header(header::ACCEPT_ENCODING, "gzip")
+                    .body(Body::empty())
+                    .unwrap(),
             )
         };
-        let account = request("Bearer account-browser").await;
-        let paired = request("Bearer paired-browser").await;
-        assert_eq!(account.status(), StatusCode::OK);
-        assert_eq!(paired.status(), StatusCode::OK);
+        let account = request("Bearer account-browser").await.unwrap();
+        let paired = request("Bearer paired-browser").await.unwrap();
+        for response in [&account, &paired] {
+            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(response.headers()[header::CONTENT_ENCODING], "gzip");
+            assert!(!response.headers().contains_key(header::CONTENT_LENGTH));
+        }
         let mut account = account.into_body().into_data_stream();
         let mut paired = paired.into_body().into_data_stream();
         let account_first = account.next().await.unwrap().unwrap();
@@ -235,13 +255,17 @@ mod tests {
 
         app.state::<DatabaseStore>().clear_auth_token().unwrap();
 
-        assert!(account.next().await.is_none());
+        assert!(account.any(|chunk| std::future::ready(chunk.is_err())).await);
         while let Some(chunk) = paired.next().await {
             paired_bytes.extend(chunk.unwrap());
         }
-        assert_eq!(paired_bytes, contents);
+        let mut decoded = Vec::new();
+        flate2::read::GzDecoder::new(paired_bytes.as_slice())
+            .read_to_end(&mut decoded)
+            .unwrap();
+        assert_eq!(decoded, contents);
         assert_eq!(
-            request("Bearer account-browser").await.status(),
+            request("Bearer account-browser").await.unwrap().status(),
             StatusCode::UNAUTHORIZED
         );
     }
