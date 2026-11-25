@@ -53,7 +53,7 @@ export function ToolResultImages({ images, onImageError }: {
     <div className="flex flex-wrap gap-2">
       {images.map((image, i) => (
         <ToolResultThumbnail
-          key={`${image.src.slice(0, 48)}-${i}`}
+          key={`${image.src}-${i}`}
           image={image}
           approved={!needsRemoteConfirmation(image) || approvedRemoteSources[i] === image.src}
           onConfirm={() => setApprovedRemoteSources((current) => ({ ...current, [i]: image.src }))}
@@ -69,7 +69,7 @@ export function ToolResultImages({ images, onImageError }: {
         }}
         title="Tool result image"
       >
-        {lightboxImage ? <LightboxImage key={`${lightboxImage.src.slice(0, 48)}-${lightboxIndex}`} image={lightboxImage} onImageError={onImageError} /> : null}
+        {lightboxImage ? <LightboxImage key={`${lightboxImage.src}-${lightboxIndex}`} image={lightboxImage} onImageError={onImageError} /> : null}
       </ImageLightbox>
     </div>
   );

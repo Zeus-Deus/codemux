@@ -566,10 +566,15 @@ describe("Tool result images", () => {
     fireEvent.click(screen.getByRole("button", { name: "Load remote image" }));
     fireEvent.click(screen.getByRole("button", { name: "Load image" }));
     expect(screen.getByRole("img")).toHaveAttribute("src", `${prefix}one.png`);
+    fireEvent.error(screen.getByRole("img"));
+    expect(screen.getByRole("button", { name: "Retry image" })).toBeInTheDocument();
 
     view.rerender(<ToolCallBody item={item(`${prefix}two.png`)} />);
     expect(screen.queryByRole("img")).not.toBeInTheDocument();
-    expect(screen.getByRole("button", { name: "Load remote image" })).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Load remote image" }));
+    fireEvent.click(screen.getByRole("button", { name: "Load image" }));
+    expect(screen.getByRole("img")).toHaveAttribute("src", `${prefix}two.png`);
+    expect(screen.queryByRole("button", { name: "Retry image" })).not.toBeInTheDocument();
   });
 
   it("renders a valid image block as a thumbnail without dumping its base64 payload", () => {
