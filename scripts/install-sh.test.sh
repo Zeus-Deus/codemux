@@ -673,9 +673,11 @@ CURL
     not_contains "a URL artifact is not called unchecked" "$(cat "${SIGROOT}/release.log")" "not checked"
 
     # An authenticated mirror may require a different query token for the
-    # signature. The default public sibling must fail closed in that case.
+    # signature, and may use a different signature filename. The default
+    # public sibling must fail closed in that case.
     PACKAGE_URL="https://downloads.example/codemux_9.9.9_amd64.deb?package_token=one#latest"
-    SIGNATURE_URL="https://downloads.example/signatures/codemux_9.9.9_amd64.deb.sig?signature_token=two"
+    SIGNATURE_URL="https://downloads.example/signatures/authenticated.sig?signature_token=two"
+    cp "$PKG.sig" "${RELEASE_DIR}/authenticated.sig"
     REQUIRED_SIGNATURE_URL="$SIGNATURE_URL" URL_ARTIFACT="$PACKAGE_URL" run_release_install
     is "query-protected signature rejects the public sibling URL" "$?" "1"
     is "missing signature authorization installs nothing" "$(test ! -e "${SIGROOT}/installed" && echo yes)" "yes"
@@ -683,7 +685,7 @@ CURL
     is "explicit authenticated signature URL verifies" "$?" "0"
     is "authenticated signature installs the verified file" "$(cat "${SIGROOT}/installed" 2>/dev/null)" "genuine package"
     contains "authenticated signature reports verification" "$(cat "${SIGROOT}/release.log")" "signed with the Codemux release key"
-    printf 'not a signature\n' > "${RELEASE_DIR}/codemux_9.9.9_amd64.deb.sig"
+    printf 'not a signature\n' > "${RELEASE_DIR}/authenticated.sig"
     REQUIRED_SIGNATURE_URL="$SIGNATURE_URL" URL_ARTIFACT="$PACKAGE_URL" URL_SIGNATURE="$SIGNATURE_URL" run_release_install
     is "bad authenticated signature fails" "$?" "1"
     is "bad authenticated signature installs nothing" "$(test ! -e "${SIGROOT}/installed" && echo yes)" "yes"
@@ -747,6 +749,7 @@ WGET
     CURL_BIN="$WGET_BIN"
     rm -f "$RELEASE_DIR"/*
     cp "$PKG" "$PKG.sig" "$RELEASE_DIR/"
+    cp "$PKG.sig" "${RELEASE_DIR}/authenticated.sig"
     run_release_install
     is "signed release installs via wget" "$?" "0"
     is "wget path installs the verified file" "$(cat "${SIGROOT}/installed" 2>/dev/null)" "genuine package"
