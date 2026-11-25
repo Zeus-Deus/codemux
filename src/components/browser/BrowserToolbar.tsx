@@ -21,7 +21,7 @@ import {
   DropdownMenuSeparator,
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
-import { agentBrowserRun } from "@/tauri/commands";
+import { agentBrowserRun, agentBrowserPendingConfirmation, type BrowserPendingConfirmation } from "@/tauri/commands";
 import { selectActiveWorkspaceId, useAppStore } from "@/stores/app-store";
 import { toast } from "@/lib/toast";
 import type { PortInfoSnapshot } from "@/tauri/types";
@@ -41,6 +41,7 @@ interface Props {
   sessionId?: string;
   currentUrl: string;
   onUrlChange: (url: string) => void;
+  onPendingConfirmation?: (sessionId: string, details: BrowserPendingConfirmation) => void;
   /** The stream itself is still coming up — there is no page to act on. */
   loading: boolean;
   inspectorActive: boolean;
@@ -69,6 +70,7 @@ export function BrowserToolbar({
   sessionId,
   currentUrl,
   onUrlChange,
+  onPendingConfirmation,
   loading,
   inspectorActive,
   onInspectorToggle,
@@ -114,6 +116,14 @@ export function BrowserToolbar({
     try {
       await agentBrowserRun(cmdId, "open", { url: normalized });
       if (token !== navTokenRef.current) return;
+      if (!isRemoteClient()) {
+        const pending = await agentBrowserPendingConfirmation(cmdId);
+        if (token !== navTokenRef.current) return;
+        if (pending) {
+          onPendingConfirmation?.(cmdId, pending);
+          return;
+        }
+      }
       onUrlChange(normalized);
       setUrlInput(normalized);
     } catch (err) {
@@ -133,9 +143,13 @@ export function BrowserToolbar({
 
   const runNav = (action: BrowserNavAction) => {
     setError(null);
-    runBrowserNav(cmdId, action).catch((err) => {
-      setError(`Couldn't ${NAV_VERB[action]}: ${String(err)}`);
-    });
+    runBrowserNav(cmdId, action)
+      .then(async () => {
+        if (isRemoteClient()) return;
+        const pending = await agentBrowserPendingConfirmation(cmdId);
+        if (pending) onPendingConfirmation?.(cmdId, pending);
+      })
+      .catch((err) => setError(`Couldn't ${NAV_VERB[action]}: ${String(err)}`));
   };
 
   const openInSystemBrowser = () => {

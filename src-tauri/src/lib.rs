@@ -2998,6 +2998,8 @@ fn build_core_app<R: tauri::Runtime>(
             commands::browser_set_loading_state,
             commands::agent_browser_spawn,
             commands::agent_browser_run,
+            commands::agent_browser_pending_confirmation,
+            commands::agent_browser_respond_confirmation,
             commands::agent_browser_close,
             commands::agent_browser_screenshot,
             commands::start_browser_stream,

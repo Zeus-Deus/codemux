@@ -10,6 +10,8 @@ const mocks = vi.hoisted(() => ({
   startBrowserStream: vi.fn(),
   browserStreamBridgeEndpoints: vi.fn(),
   agentBrowserRun: vi.fn(),
+  agentBrowserPendingConfirmation: vi.fn(),
+  agentBrowserRespondConfirmation: vi.fn(),
   copyToClipboard: vi.fn(),
   toastSuccess: vi.fn(),
   toastError: vi.fn(),
@@ -19,6 +21,8 @@ vi.mock("@/tauri/commands", () => ({
   startBrowserStream: (...a: unknown[]) => mocks.startBrowserStream(...a),
   browserStreamBridgeEndpoints: (...a: unknown[]) => mocks.browserStreamBridgeEndpoints(...a),
   agentBrowserRun: (...a: unknown[]) => mocks.agentBrowserRun(...a),
+  agentBrowserPendingConfirmation: (...a: unknown[]) => mocks.agentBrowserPendingConfirmation(...a),
+  agentBrowserRespondConfirmation: (...a: unknown[]) => mocks.agentBrowserRespondConfirmation(...a),
   activatePane: vi.fn(),
   writeToPty: vi.fn(),
 }));
@@ -78,6 +82,8 @@ beforeEach(() => {
     http_base: "http://127.0.0.1:9777/private/browser/9999",
   });
   mocks.agentBrowserRun.mockReset().mockResolvedValue(null);
+  mocks.agentBrowserPendingConfirmation.mockReset().mockResolvedValue(null);
+  mocks.agentBrowserRespondConfirmation.mockReset().mockResolvedValue(undefined);
   mocks.copyToClipboard.mockReset();
   mocks.toastSuccess.mockReset();
   mocks.toastError.mockReset();
@@ -98,6 +104,63 @@ afterEach(() => {
 });
 
 describe("BrowserPane start failures", () => {
+  it("keeps the bridge closed until a pending browser action is approved", async () => {
+    mocks.startBrowserStream
+      .mockRejectedValueOnce("Browser confirmation is pending for session browser-1")
+      .mockResolvedValue("ws://127.0.0.1:9223");
+    mocks.agentBrowserPendingConfirmation.mockResolvedValue({
+      id: "c_123",
+      description: "navigation: example.com",
+      expires_at_ms: Date.now() + 60_000,
+    });
+
+    renderPane();
+    await act(async () => {});
+    expect(screen.getByText("navigation: example.com")).toBeInTheDocument();
+    expect(FakeWebSocket.urls).toHaveLength(0);
+    expect(mocks.browserStreamBridgeEndpoints).not.toHaveBeenCalled();
+
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: "Approve browser action" }));
+    });
+    await vi.waitFor(() => expect(FakeWebSocket.urls).toHaveLength(1));
+    expect(mocks.agentBrowserRespondConfirmation).toHaveBeenCalledWith("browser-1", "c_123", true);
+    expect(mocks.browserStreamBridgeEndpoints).toHaveBeenCalledTimes(1);
+  });
+
+  it("denies a pending action without starting another browser", async () => {
+    mocks.startBrowserStream.mockRejectedValue("Browser confirmation is pending for session browser-1");
+    mocks.agentBrowserPendingConfirmation.mockResolvedValue({
+      id: "c_deny",
+      description: "navigation: blocked.example",
+      expires_at_ms: Date.now() + 60_000,
+    });
+    renderPane();
+    await act(async () => {});
+
+    fireEvent.click(screen.getByRole("button", { name: "Deny" }));
+    await act(async () => {});
+    expect(mocks.agentBrowserRespondConfirmation).toHaveBeenCalledWith("browser-1", "c_deny", false);
+    expect(mocks.startBrowserStream).toHaveBeenCalledTimes(1);
+    expect(screen.getByText("Browser action denied")).toBeInTheDocument();
+  });
+
+  it("expires an unanswered confirmation without silently retrying", async () => {
+    vi.useFakeTimers();
+    mocks.startBrowserStream.mockRejectedValue("Browser confirmation is pending for session browser-1");
+    mocks.agentBrowserPendingConfirmation.mockResolvedValue({
+      id: "c_expire",
+      description: "navigation: expired.example",
+      expires_at_ms: Date.now() + 1_000,
+    });
+    renderPane();
+    await act(async () => {});
+    await act(async () => { vi.advanceTimersByTime(1_200); });
+    expect(screen.getByText("Browser confirmation expired. Retry to request it again.")).toBeInTheDocument();
+    expect(mocks.startBrowserStream).toHaveBeenCalledTimes(1);
+    expect(mocks.agentBrowserRespondConfirmation).not.toHaveBeenCalled();
+  });
+
   it("connects through the fresh bridge when the session snapshot has an old URL", async () => {
     useAppStore.setState({
       appState: {
