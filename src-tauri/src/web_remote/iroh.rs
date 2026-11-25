@@ -3309,7 +3309,8 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let shared = temp.path().join("shared");
         std::fs::create_dir(&shared).unwrap();
-        windows_key_security::inherited_grant_fixture(&shared, "DC").unwrap();
+        // SDDL's DC alias is a directory-service right, not FILE_DELETE_CHILD.
+        windows_key_security::inherited_grant_fixture(&shared, "0x00000040").unwrap();
         let app_dir = shared.join("codemux");
         std::fs::create_dir(&app_dir).unwrap();
         windows_key_security::inherited_grant_fixture(&app_dir, "GR").unwrap();
@@ -3330,7 +3331,7 @@ mod tests {
         std::fs::create_dir_all(&app_dir).unwrap();
         // The immediate parent and app root are safe. A different user can
         // replace the earlier entry through DELETE_CHILD on its parent.
-        windows_key_security::inherited_grant_fixture(&outer, "DC").unwrap();
+        windows_key_security::inherited_grant_fixture(&outer, "0x00000040").unwrap();
         windows_key_security::inherited_grant_fixture(&inner, "GR").unwrap();
         windows_key_security::inherited_grant_fixture(&app_dir, "GR").unwrap();
         let path = app_dir.join(KEY_DIR).join(KEY_FILE);
