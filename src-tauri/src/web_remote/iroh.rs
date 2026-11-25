@@ -610,6 +610,69 @@ enum KeyAclScope {
     KeyFile,
 }
 
+#[cfg(target_os = "macos")]
+const ACL_FIRST_ENTRY: libc::c_int = 0;
+#[cfg(target_os = "macos")]
+const ACL_NEXT_ENTRY: libc::c_int = -1;
+#[cfg(target_os = "macos")]
+const ACL_EXTENDED_ALLOW: libc::c_int = 1;
+#[cfg(target_os = "macos")]
+const ACL_EXTENDED_DENY: libc::c_int = 2;
+
+#[cfg(target_os = "macos")]
+fn acl_lookup_has_entry(
+    found: libc::c_int,
+    entry_id: libc::c_int,
+    error: Option<i32>,
+    context: &str,
+) -> Result<bool, String> {
+    if found == 0 {
+        return Ok(true);
+    }
+    if found == -1 && entry_id == ACL_NEXT_ENTRY && error == Some(libc::EINVAL) {
+        return Ok(false);
+    }
+    Err(format!(
+        "inspect {context} ACL entry: {}",
+        error.map(std::io::Error::from_raw_os_error).map_or_else(
+            || format!("unexpected return code {found}"),
+            |e| e.to_string()
+        )
+    ))
+}
+
+#[cfg(target_os = "macos")]
+fn check_key_acl_entries(
+    context: &str,
+    scope: KeyAclScope,
+    mut next: impl FnMut() -> Result<Option<(libc::c_int, u64)>, String>,
+) -> Result<(), String> {
+    // From macOS <sys/acl.h>. Directory mutation includes deletion of the
+    // directory itself, not just creation or deletion of its children.
+    const MUTATE: u64 =
+        (1 << 2) | (1 << 4) | (1 << 5) | (1 << 6) | (1 << 8) | (1 << 10) | (1 << 12) | (1 << 13);
+    const READ_DATA: u64 = 1 << 1;
+    const SEARCH: u64 = 1 << 3;
+    let forbidden = match scope {
+        KeyAclScope::Ancestor => MUTATE,
+        KeyAclScope::PrivateDirectory => MUTATE | READ_DATA | SEARCH,
+        KeyAclScope::KeyFile => MUTATE | READ_DATA,
+    };
+
+    while let Some((tag, mask)) = next()? {
+        if tag == ACL_EXTENDED_DENY {
+            continue;
+        }
+        if tag != ACL_EXTENDED_ALLOW {
+            return Err(format!("{context} has an unsupported ACL entry"));
+        }
+        if mask & forbidden != 0 {
+            return Err(format!("{context} ACL grants unsafe access"));
+        }
+    }
+    Ok(())
+}
+
 /// macOS ACL allow entries can grant access despite private POSIX mode bits.
 /// Inspect the opened inode, never a pathname that can be replaced afterward.
 #[cfg(target_os = "macos")]
@@ -629,22 +692,7 @@ fn check_key_acl(file: &std::fs::File, context: &str, scope: KeyAclScope) -> Res
         fn acl_free(object: *mut c_void) -> libc::c_int;
     }
 
-    // From macOS <sys/acl.h>. Directory mutation includes deletion of the
-    // directory itself, not just creation or deletion of its children.
-    const MUTATE: u64 = (1 << 2) | (1 << 4) | (1 << 5) | (1 << 6)
-        | (1 << 8) | (1 << 10) | (1 << 12) | (1 << 13);
-    const READ_DATA: u64 = 1 << 1;
-    const SEARCH: u64 = 1 << 3;
     const ACL_TYPE_EXTENDED: libc::c_int = 0x100;
-    const ACL_FIRST_ENTRY: libc::c_int = 0;
-    const ACL_NEXT_ENTRY: libc::c_int = -1;
-    const ACL_EXTENDED_ALLOW: libc::c_int = 1;
-    const ACL_EXTENDED_DENY: libc::c_int = 2;
-    let forbidden = match scope {
-        KeyAclScope::Ancestor => MUTATE,
-        KeyAclScope::PrivateDirectory => MUTATE | READ_DATA | SEARCH,
-        KeyAclScope::KeyFile => MUTATE | READ_DATA,
-    };
 
     let acl = unsafe { acl_get_fd_np(file.as_raw_fd(), ACL_TYPE_EXTENDED) };
     if acl.is_null() {
@@ -658,36 +706,37 @@ fn check_key_acl(file: &std::fs::File, context: &str, scope: KeyAclScope) -> Res
     let result = (|| {
         let mut entry = std::ptr::null_mut();
         let mut entry_id = ACL_FIRST_ENTRY;
-        loop {
+        check_key_acl_entries(context, scope, || {
             let found = unsafe { acl_get_entry(acl, entry_id, &mut entry) };
-            if found == 0 {
-                return Ok(());
-            }
-            if found < 0 {
-                return Err(format!("inspect {context} ACL entry: {}", std::io::Error::last_os_error()));
+            let error = (found < 0)
+                .then(|| std::io::Error::last_os_error().raw_os_error())
+                .flatten();
+            if !acl_lookup_has_entry(found, entry_id, error, context)? {
+                return Ok(None);
             }
             entry_id = ACL_NEXT_ENTRY;
             let mut tag = 0;
             if unsafe { acl_get_tag_type(entry, &mut tag) } < 0 {
-                return Err(format!("inspect {context} ACL tag: {}", std::io::Error::last_os_error()));
-            }
-            if tag == ACL_EXTENDED_DENY {
-                continue;
-            }
-            if tag != ACL_EXTENDED_ALLOW {
-                return Err(format!("{context} has an unsupported ACL entry"));
+                return Err(format!(
+                    "inspect {context} ACL tag: {}",
+                    std::io::Error::last_os_error()
+                ));
             }
             let mut mask = 0u64;
             if unsafe { acl_get_permset_mask_np(entry, &mut mask) } < 0 {
-                return Err(format!("inspect {context} ACL rights: {}", std::io::Error::last_os_error()));
+                return Err(format!(
+                    "inspect {context} ACL rights: {}",
+                    std::io::Error::last_os_error()
+                ));
             }
-            if mask & forbidden != 0 {
-                return Err(format!("{context} ACL grants unsafe access"));
-            }
-        }
+            Ok(Some((tag, mask)))
+        })
     })();
     if unsafe { acl_free(acl) } != 0 {
-        return Err(format!("release {context} ACL: {}", std::io::Error::last_os_error()));
+        return Err(format!(
+            "release {context} ACL: {}",
+            std::io::Error::last_os_error()
+        ));
     }
     result
 }
@@ -1663,6 +1712,29 @@ mod tests {
         assert_eq!(loaded.public(), key.public(), "loading must keep the device identity");
         assert_eq!(std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777, 0o700);
         assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn iroh_identity_key_acl_scans_past_deny_entries() {
+        let mut entries = [(ACL_EXTENDED_DENY, 1 << 1), (ACL_EXTENDED_ALLOW, 1 << 1)].into_iter();
+        let error = check_key_acl_entries("iroh key", KeyAclScope::KeyFile, || Ok(entries.next()))
+            .unwrap_err();
+        assert!(error.contains("grants unsafe access"), "{error}");
+
+        let mut entries = [(ACL_EXTENDED_DENY, 1 << 1), (ACL_EXTENDED_ALLOW, 1 << 3)].into_iter();
+        check_key_acl_entries("iroh key", KeyAclScope::KeyFile, || Ok(entries.next())).unwrap();
+        assert!(entries.next().is_none());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn iroh_identity_key_acl_lookup_only_accepts_next_entry_end() {
+        assert!(acl_lookup_has_entry(0, ACL_FIRST_ENTRY, None, "iroh key").unwrap());
+        assert!(acl_lookup_has_entry(0, ACL_NEXT_ENTRY, None, "iroh key").unwrap());
+        assert!(!acl_lookup_has_entry(-1, ACL_NEXT_ENTRY, Some(libc::EINVAL), "iroh key").unwrap());
+        assert!(acl_lookup_has_entry(-1, ACL_FIRST_ENTRY, Some(libc::EINVAL), "iroh key").is_err());
+        assert!(acl_lookup_has_entry(-1, ACL_NEXT_ENTRY, Some(libc::EIO), "iroh key").is_err());
     }
 
     #[cfg(unix)]
