@@ -2,7 +2,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU16, Ordering};
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 use tokio::sync::Mutex;
 
@@ -931,6 +931,11 @@ fn track_current_browser_daemon(session: &str) -> Option<BrowserPidRecord> {
     Some(record)
 }
 
+fn live_owned_browser_pid(session: &str) -> Option<u32> {
+    let pid = read_agent_browser_daemon_pid(session)?;
+    owned_browser_pid(session, pid).map(|record| record.pid)
+}
+
 /// Remove our PID file once the daemon is gone. Best-effort.
 fn clear_session_pid(session_name: &str) {
     if let Some(path) = session_pid_path(session_name) {
@@ -1124,6 +1129,16 @@ fn session_name(browser_id: &str) -> &str {
     if browser_id.is_empty() { "default" } else { browser_id }
 }
 
+/// One lifecycle operation at a time for a daemon session, including its
+/// first command and any rollback. The gate is shared by manager instances
+/// so a second caller cannot use a daemon while its starter may stop it.
+fn browser_lifecycle_gate(session: &str) -> Arc<Mutex<()>> {
+    static GATES: OnceLock<std::sync::Mutex<HashMap<String, Arc<Mutex<()>>>>> = OnceLock::new();
+    let gates = GATES.get_or_init(|| std::sync::Mutex::new(HashMap::new()));
+    let mut gates = gates.lock().unwrap();
+    gates.entry(session.to_owned()).or_insert_with(|| Arc::new(Mutex::new(()))).clone()
+}
+
 fn validate_session_name(name: &str) -> Result<(), String> {
     // The name also becomes a PID/log filename. Keep it to one segment even
     // though Unix command arguments are quoted separately below.
@@ -1152,6 +1167,23 @@ fn shell_binary(binary: &str) -> String {
     } else {
         shell_quote(binary)
     }
+}
+
+#[cfg(not(target_os = "windows"))]
+fn browser_open_command(bin: &str, session: &str, port: u16) -> Result<std::process::Command, String> {
+    let mut cmd = if bin == "npx agent-browser" {
+        let mut cmd = std::process::Command::new("npx");
+        cmd.arg("agent-browser");
+        cmd
+    } else {
+        std::process::Command::new(bin)
+    };
+    set_browser_owner_env(&mut cmd, session)?;
+    cmd.args(["open", "about:blank", "--headless", "--session", session])
+        .env("AGENT_BROWSER_STREAM_PORT", port.to_string())
+        .env("AGENT_BROWSER_ARGS", STEALTH_CHROMIUM_ARGS)
+        .env("AGENT_BROWSER_USER_AGENT", stealth_user_agent());
+    Ok(cmd)
 }
 
 /// JavaScript that queries the DOM for all interactive elements.
@@ -2648,6 +2680,21 @@ impl AgentBrowserManager {
         }
     }
 
+    /// Reconcile a provisional `running` flag with the verified daemon after
+    /// a first or failed command. The lifecycle gate remains held by callers.
+    async fn refresh_running_session(&self, browser_id: &str, session: &str) -> bool {
+        let session = session.to_owned();
+        let pid = tokio::task::spawn_blocking(move || live_owned_browser_pid(&session))
+            .await
+            .ok()
+            .flatten();
+        if let Some(entry) = self.sessions.lock().await.get_mut(browser_id) {
+            entry.running = pid.is_some();
+            entry.pid = pid;
+        }
+        pid.is_some()
+    }
+
     /// **Deprecated.** No-op kept for binary/source compatibility with any
     /// external caller that linked against the old aliasing-based API.
     ///
@@ -2672,19 +2719,22 @@ impl AgentBrowserManager {
 
     pub async fn spawn(&self, browser_id: &str) -> Result<(), String> {
         let session = session_name(browser_id).to_string();
+        validate_session_name(&session)?;
+        let _lifecycle = browser_lifecycle_gate(&session).lock_owned().await;
         let port = self.allocate_port(browser_id).await?;
 
-        {
+        let was_running = {
             let sessions = self.sessions.lock().await;
-            if sessions.get(browser_id).map_or(false, |s| s.running) {
-                return Ok(());
-            }
+            sessions.get(browser_id).is_some_and(|s| s.running)
+        };
+        if was_running && self.refresh_running_session(browser_id, &session).await {
+            return Ok(());
         }
 
         // The launch shells out to agent-browser (which forks the daemon) and
         // can block on a real page load — run it on a blocking thread with a
         // hard timeout so it can never stall the async runtime (issue #96).
-        let pid = tokio::task::spawn_blocking(move || -> Result<Option<u32>, String> {
+        let pid = tokio::task::spawn_blocking(move || -> Result<u32, String> {
             require_owned_browser_session(&session)?;
             let bin = resolve_binary();
 
@@ -2705,15 +2755,7 @@ impl AgentBrowserManager {
             };
             #[cfg(not(target_os = "windows"))]
             let output = {
-                let mut cmd = std::process::Command::new("sh");
-                set_browser_owner_env(&mut cmd, &session)?;
-                cmd.args([
-                    "-c",
-                    &format!("{} open about:blank --headless --session {}", shell_binary(&bin), shell_quote(&session)),
-                ])
-                .env("AGENT_BROWSER_STREAM_PORT", port.to_string())
-                .env("AGENT_BROWSER_ARGS", STEALTH_CHROMIUM_ARGS)
-                .env("AGENT_BROWSER_USER_AGENT", stealth_user_agent());
+                let cmd = browser_open_command(&bin, &session, port)?;
                 output_capture_with_timeout(cmd, OPEN_TIMEOUT)
                     .map_err(|e| format!("Failed to start agent-browser: {}", e))?
             };
@@ -2722,14 +2764,16 @@ impl AgentBrowserManager {
                 let stderr = String::from_utf8_lossy(&output.stderr);
                 return Err(format!("Failed to start browser: {}", stderr));
             }
-            Ok(track_current_browser_daemon(&session).map(|record| record.pid))
+            track_current_browser_daemon(&session)
+                .map(|record| record.pid)
+                .ok_or_else(|| "Could not verify the started browser daemon".to_string())
         })
         .await
         .map_err(|e| format!("agent-browser spawn task failed: {e}"))??;
 
         self.sessions.lock().await.entry(browser_id.to_string()).and_modify(|s| {
             s.running = true;
-            s.pid = pid;
+            s.pid = Some(pid);
         });
         Ok(())
     }
@@ -2778,6 +2822,9 @@ impl AgentBrowserManager {
     }
 
     pub async fn run_command(&self, browser_id: &str, action: &str, params: serde_json::Value) -> Result<BrowserAutomationResult, String> {
+        let session = session_name(browser_id).to_string();
+        validate_session_name(&session)?;
+        let _lifecycle = browser_lifecycle_gate(&session).lock_owned().await;
         let port = self.allocate_port(browser_id).await?;
         let was_running = self.note_action_start(browser_id, action).await;
 
@@ -2811,13 +2858,16 @@ impl AgentBrowserManager {
             execute_agent_browser_action(&owned_browser_id, &owned_action, params, port)
         })
         .await
-        .map_err(|e| format!("agent-browser action task failed: {e}"))?;
+        .map_err(|e| format!("agent-browser action task failed: {e}"))
+        .and_then(|result| result);
 
         // The agent-facing "close" goes through this path (not close()), so
         // reset the state here — otherwise the entry keeps running = true and
         // a later open on the fresh daemon would skip the default viewport.
         if action == "close" {
             self.note_close_finished(browser_id).await;
+        } else if !was_running || result.is_err() {
+            self.refresh_running_session(browser_id, &session).await;
         }
 
         result
@@ -2825,6 +2875,8 @@ impl AgentBrowserManager {
 
     pub async fn get_screenshot(&self, browser_id: &str) -> Result<String, String> {
         let session = session_name(browser_id).to_string();
+        validate_session_name(&session)?;
+        let _lifecycle = browser_lifecycle_gate(&session).lock_owned().await;
         let port = self.allocate_port(browser_id).await?;
 
         // The CLI call + file read are blocking; run them off the executor
@@ -2909,6 +2961,7 @@ impl AgentBrowserManager {
     pub async fn close(&self, browser_id: &str) -> Result<(), String> {
         let session = session_name(browser_id).to_string();
         validate_session_name(&session)?;
+        let _lifecycle = browser_lifecycle_gate(&session).lock_owned().await;
 
         // Step 1: pop the session under the lock so nothing else races us.
         let removed = self.sessions.lock().await.remove(browser_id);
@@ -2978,6 +3031,7 @@ impl AgentBrowserManager {
     pub async fn start_stream(&self, browser_id: &str) -> Result<String, String> {
         let session = session_name(browser_id).to_string();
         validate_session_name(&session)?;
+        let _lifecycle = browser_lifecycle_gate(&session).lock_owned().await;
 
         // Serialize start_stream calls. The old code held a single Mutex<bool>
         // across the entire operation (including sleeps). Without this, concurrent
@@ -3104,16 +3158,7 @@ impl AgentBrowserManager {
             }
             #[cfg(not(target_os = "windows"))]
             {
-                let launch_cmd = format!(
-                    "{} open about:blank --headless --session {}",
-                    shell_binary(&bin), shell_quote(&session)
-                );
-                let mut cmd = std::process::Command::new("sh");
-                set_browser_owner_env(&mut cmd, &session)?;
-                cmd.args(["-c", &launch_cmd])
-                    .env("AGENT_BROWSER_STREAM_PORT", port.to_string())
-                    .env("AGENT_BROWSER_ARGS", STEALTH_CHROMIUM_ARGS)
-                    .env("AGENT_BROWSER_USER_AGENT", stealth_user_agent());
+                let mut cmd = browser_open_command(&bin, &session, port)?;
                 if let Some(log) = log_file {
                     cmd.stderr(log);
                 }
@@ -3240,6 +3285,70 @@ pub(crate) fn orphaned_ws_sessions(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn browser_open_passes_session_as_one_argument_for_native_and_npx() {
+        let session = "browser-'$(id);x";
+        let native = browser_open_command("/tmp/my browser/agent-browser", session, 9223).unwrap();
+        assert_eq!(native.get_program(), std::ffi::OsStr::new("/tmp/my browser/agent-browser"));
+        let args: Vec<_> = native.get_args().map(|arg| arg.to_string_lossy().into_owned()).collect();
+        assert_eq!(args, ["open", "about:blank", "--headless", "--session", session]);
+
+        let npx = browser_open_command("npx agent-browser", session, 9223).unwrap();
+        assert_eq!(npx.get_program(), std::ffi::OsStr::new("npx"));
+        let args: Vec<_> = npx.get_args().map(|arg| arg.to_string_lossy().into_owned()).collect();
+        assert_eq!(args, ["agent-browser", "open", "about:blank", "--headless", "--session", session]);
+    }
+
+    struct TestBrowserPidFile(PathBuf);
+
+    impl TestBrowserPidFile {
+        fn unowned(session: &str) -> Self {
+            let dir = run_dir_for_session(session).unwrap();
+            let path = dir.join(format!("{session}.pid"));
+            std::fs::write(&path, std::process::id().to_string()).unwrap();
+            Self(path)
+        }
+    }
+
+    impl Drop for TestBrowserPidFile {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.0);
+        }
+    }
+
+    #[tokio::test]
+    async fn failed_first_command_does_not_make_explicit_spawn_succeed() {
+        let session = format!("browser-failed-spawn-{}", uuid::Uuid::new_v4().simple());
+        let _pid_file = TestBrowserPidFile::unowned(&session);
+        let mgr = AgentBrowserManager::new();
+        assert!(mgr.run_command(&session, "viewport", serde_json::json!({})).await.is_err());
+        assert!(!mgr.sessions.lock().await.get(&session).unwrap().running);
+        let spawn = mgr.spawn(&session).await;
+        assert!(spawn.as_ref().is_err_and(|error| error.contains("already used by another process")), "{spawn:?}");
+    }
+
+    #[tokio::test]
+    async fn stream_start_and_command_wait_for_the_same_session_lifecycle() {
+        let session = format!("browser-overlap-{}", uuid::Uuid::new_v4().simple());
+        let _pid_file = TestBrowserPidFile::unowned(&session);
+        let mgr = Arc::new(AgentBrowserManager::new());
+        let held = browser_lifecycle_gate(&session).lock_owned().await;
+        let stream_mgr = mgr.clone();
+        let stream_session = session.clone();
+        let mut stream = tokio::spawn(async move { stream_mgr.start_stream(&stream_session).await });
+        let command_mgr = mgr.clone();
+        let command_session = session.clone();
+        let mut command = tokio::spawn(async move {
+            command_mgr.run_command(&command_session, "viewport", serde_json::json!({})).await
+        });
+        assert!(tokio::time::timeout(Duration::from_millis(50), &mut stream).await.is_err());
+        assert!(tokio::time::timeout(Duration::from_millis(50), &mut command).await.is_err());
+        drop(held);
+        assert!(tokio::time::timeout(Duration::from_secs(10), stream).await.unwrap().unwrap().is_err());
+        assert!(tokio::time::timeout(Duration::from_secs(10), command).await.unwrap().unwrap().is_err());
+    }
 
     #[test]
     fn stream_listener_must_belong_to_expected_pid() {
@@ -4512,12 +4621,22 @@ mod tests {
         std::fs::copy(which::which("bash").unwrap(), &binary).unwrap();
         let session = "browser-identity-test";
         let token = "a".repeat(32);
-        let mut child = std::process::Command::new(&binary)
-            .args(["-c", "while :; do sleep 1; done"])
+        let mut command = std::process::Command::new(&binary);
+        command.args(["-c", "while :; do sleep 1; done"])
             .env("CODEMUX_BROWSER_OWNER", &token)
-            .env("CODEMUX_BROWSER_SESSION", session)
-            .spawn()
-            .unwrap();
+            .env("CODEMUX_BROWSER_SESSION", session);
+        let spawn_started = Instant::now();
+        let mut child = loop {
+            match command.spawn() {
+                Ok(child) => break child,
+                Err(error) if error.raw_os_error() == Some(libc::ETXTBSY)
+                    && spawn_started.elapsed() < Duration::from_secs(3) =>
+                {
+                    std::thread::sleep(Duration::from_millis(25));
+                }
+                Err(error) => panic!("failed to start browser identity fixture: {error}"),
+            }
+        };
         let pid = child.id();
         let started_waiting = Instant::now();
         let start_time = loop {
