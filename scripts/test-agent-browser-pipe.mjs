@@ -13,12 +13,12 @@ import { execFile as execFileCallback } from 'node:child_process';
 const execFile = promisify(execFileCallback);
 assert(process.argv[2], 'Pass the patched sidecar binary path');
 const binary = resolve(process.argv[2]);
-const root = await mkdtemp(join(process.platform === 'linux' ? '/var/tmp' : tmpdir(), 'cmx-browser-pipe-'));
-const socketDir = join(root, 'sockets');
+const root = await mkdtemp(join(process.platform === 'linux' ? '/var/tmp' : process.platform === 'darwin' ? '/tmp' : tmpdir(), 'cmx-p-'));
+const socketDir = join(root, 's');
 const managedProfile = join(root, 'managed');
 const failedProfile = join(root, 'failed');
 const externalProfile = join(root, 'external');
-const sessionPrefix = `pipe-${randomUUID().slice(0, 12)}`;
+const sessionPrefix = `p${randomUUID().slice(0, 8)}`;
 const env = {
   ...process.env,
   AGENT_BROWSER_SOCKET_DIR: socketDir,

@@ -115,7 +115,7 @@ const OPEN_TIMEOUT: Duration = Duration::from_secs(60);
 /// Interactive DOM actions (click, fill, screenshot, snapshot, eval, …).
 /// Bounded well above their normal sub-second latency.
 const ACTION_TIMEOUT: Duration = Duration::from_secs(30);
-const PATCHED_BROWSER_VERSION: &str = "0.44.0+codemux.1";
+const PATCHED_BROWSER_VERSION: &str = "0.44.0+codemux.2";
 
 /// Per-action timeout for the agent-browser CLI. `open`/`wait` can block on a
 /// real page load, so they get [`OPEN_TIMEOUT`]; everything else is a fast,
@@ -4569,6 +4569,8 @@ mod tests {
         assert!(!browser_daemon_has_protected_stream("session", temp.path()));
         std::fs::write(&version_file, "0.44.0").unwrap();
         assert!(!browser_daemon_has_protected_stream("session", temp.path()));
+        std::fs::write(&version_file, "0.44.0+codemux.1").unwrap();
+        assert!(!browser_daemon_has_protected_stream("session", temp.path()));
         std::fs::write(&version_file, PATCHED_BROWSER_VERSION).unwrap();
         assert!(browser_daemon_has_protected_stream("session", temp.path()));
         std::fs::write(&version_file, "invalid").unwrap();
@@ -5113,7 +5115,7 @@ mod tests {
         let app_dir = temp.path().join("app");
         std::fs::create_dir(&app_dir).unwrap();
         let binary = app_dir.join("agent-browser");
-        std::fs::write(&binary, b"#!/bin/sh\necho 'agent-browser 0.44.0+codemux.1'\n").unwrap();
+        std::fs::write(&binary, b"#!/bin/sh\necho 'agent-browser 0.44.0+codemux.2'\n").unwrap();
         std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o700)).unwrap();
         assert_eq!(bundled_browser_binary_name(), "agent-browser");
         let candidates = native_binary_candidates(
@@ -5140,6 +5142,9 @@ mod tests {
         assert!(resolve_verified_candidate(&[binary.clone()]).is_err());
 
         std::fs::write(&binary, b"#!/bin/sh\necho 'agent-browser 0.44.0+codemux.1'\n").unwrap();
+        assert!(resolve_verified_candidate(&[binary.clone()]).is_err());
+
+        std::fs::write(&binary, b"#!/bin/sh\necho 'agent-browser 0.44.0+codemux.2'\n").unwrap();
         assert_eq!(resolve_verified_candidate(&[binary.clone()]).unwrap(), binary.to_string_lossy());
     }
 

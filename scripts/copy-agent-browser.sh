@@ -37,7 +37,7 @@ mkdir -p "$ROOT/src-tauri/binaries" "$BUILD_ROOT"
 # exact bytes recorded by this build. An npm binary never satisfies the stamp.
 if [ -s "$DEST" ] && [ -f "$STAMP" ] &&
    [ "$(cat "$STAMP")" = "$SOURCE_COMMIT $AUTH_PATCH_HASH $PIPE_PATCH_HASH $(hash_file "$DEST")" ] &&
-   [ "$("$DEST" --version)" = "agent-browser 0.44.0+codemux.1" ]; then
+   [ "$("$DEST" --version)" = "agent-browser 0.44.0+codemux.2" ]; then
   exit 0
 fi
 
@@ -61,8 +61,8 @@ TMPDIR="${CODEMUX_BROWSER_BUILD_TMPDIR:-${TMPDIR:-$BUILD_ROOT}}" \
   --manifest-path "$SOURCE_DIR/cli/Cargo.toml"
 
 BUILT="$BUILD_ROOT/target/$TARGET/ci/agent-browser$SUFFIX"
-if [ ! -s "$BUILT" ] || [ "$("$BUILT" --version)" != "agent-browser 0.44.0+codemux.1" ]; then
-  echo "Authenticated browser sidecar build is missing or has the wrong version" >&2
+if [ ! -s "$BUILT" ] || [ "$("$BUILT" --version)" != "agent-browser 0.44.0+codemux.2" ]; then
+  echo "Pipe-enabled browser sidecar build is missing or has the wrong version" >&2
   exit 1
 fi
 cp "$BUILT" "$DEST"

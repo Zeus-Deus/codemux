@@ -11,6 +11,19 @@ index f31f005..e6488c6 100644
  tokio-tungstenite = { version = "0.24", features = ["rustls-tls-webpki-roots"] }
  rustls = { version = "0.23", default-features = false }
  rustls-native-certs = "0.8"
+diff --git a/cli/src/codemux_auth.rs b/cli/src/codemux_auth.rs
+index 719543c..740c500 100644
+--- a/cli/src/codemux_auth.rs
++++ b/cli/src/codemux_auth.rs
+@@ -5,7 +5,7 @@ use std::sync::OnceLock;
+ 
+ pub const HEADER: &str = "x-codemux-browser-token";
+ pub const FIELD: &str = "codemuxToken";
+-pub const BUILD_VERSION: &str = concat!(env!("CARGO_PKG_VERSION"), "+codemux.1");
++pub const BUILD_VERSION: &str = concat!(env!("CARGO_PKG_VERSION"), "+codemux.2");
+ 
+ pub fn expected_token() -> Option<&'static str> {
+     static TOKEN: OnceLock<Option<String>> = OnceLock::new();
 diff --git a/cli/src/mcp.rs b/cli/src/mcp.rs
 index afb567c..30e5501 100644
 --- a/cli/src/mcp.rs
@@ -150,10 +163,58 @@ index aad976c..14643dc 100644
          state.active_provider_connection = true;
          let target = state
 diff --git a/cli/src/native/browser.rs b/cli/src/native/browser.rs
-index 27ef4d1..c1d5969 100644
+index 27ef4d1..c0e646c 100644
 --- a/cli/src/native/browser.rs
 +++ b/cli/src/native/browser.rs
-@@ -923,7 +923,7 @@ impl BrowserManager {
+@@ -1,7 +1,7 @@
+ use serde_json::{json, Value};
+ use std::collections::{HashMap, HashSet};
+ use std::future::Future;
+-use std::sync::Arc;
++use std::sync::{Arc, Mutex as StdMutex};
+ use std::time::{Duration, Instant};
+ use tokio::sync::{broadcast, Mutex};
+ 
+@@ -698,7 +698,7 @@ fn remaining_budget(deadline: Instant) -> Duration {
+ }
+ 
+ pub enum BrowserProcess {
+-    Chrome(ChromeProcess),
++    Chrome(Arc<StdMutex<ChromeProcess>>),
+     Lightpanda(LightpandaProcess),
+     Obscura(ObscuraProcess),
+ }
+@@ -706,7 +706,7 @@ pub enum BrowserProcess {
+ impl BrowserProcess {
+     pub fn kill(&mut self) {
+         match self {
+-            BrowserProcess::Chrome(p) => p.kill(),
++            BrowserProcess::Chrome(p) => p.lock().unwrap_or_else(|e| e.into_inner()).kill(),
+             BrowserProcess::Lightpanda(p) => p.kill(),
+             BrowserProcess::Obscura(p) => p.kill(),
+         }
+@@ -714,7 +714,10 @@ impl BrowserProcess {
+ 
+     pub fn wait_or_kill(&mut self, timeout: std::time::Duration) {
+         match self {
+-            BrowserProcess::Chrome(p) => p.wait_or_kill(timeout),
++            BrowserProcess::Chrome(p) => p
++                .lock()
++                .unwrap_or_else(|e| e.into_inner())
++                .wait_or_kill(timeout),
+             BrowserProcess::Lightpanda(p) => p.kill(),
+             BrowserProcess::Obscura(p) => p.kill(),
+         }
+@@ -723,7 +726,7 @@ impl BrowserProcess {
+     /// Non-blocking check whether the browser process has exited.
+     pub fn has_exited(&mut self) -> bool {
+         match self {
+-            BrowserProcess::Chrome(p) => p.has_exited(),
++            BrowserProcess::Chrome(p) => p.lock().unwrap_or_else(|e| e.into_inner()).has_exited(),
+             BrowserProcess::Lightpanda(_) => false,
+             BrowserProcess::Obscura(p) => p.has_exited(),
+         }
+@@ -923,7 +926,7 @@ impl BrowserManager {
          let download_path = options.download_path.clone();
          let headless = options.effectively_headless();
  
@@ -162,7 +223,7 @@ index 27ef4d1..c1d5969 100644
              "lightpanda" => {
                  let lp_options = LightpandaLaunchOptions {
                      executable_path: options.executable_path.clone(),
-@@ -932,7 +932,7 @@ impl BrowserManager {
+@@ -932,7 +935,7 @@ impl BrowserManager {
                  };
                  let lp = launch_lightpanda(&lp_options).await?;
                  let url = lp.ws_url.clone();
@@ -171,7 +232,7 @@ index 27ef4d1..c1d5969 100644
              }
              "obscura" => {
                  let obscura_options = ObscuraLaunchOptions {
-@@ -943,14 +943,14 @@ impl BrowserManager {
+@@ -943,14 +946,18 @@ impl BrowserManager {
                  };
                  let ob = launch_obscura(&obscura_options).await?;
                  let url = ob.ws_url.clone();
@@ -186,17 +247,28 @@ index 27ef4d1..c1d5969 100644
 -                let url = chrome.ws_url.clone();
 -                (url, BrowserProcess::Chrome(chrome))
 +                let pipe = chrome.take_pipe()?;
-+                (String::new(), BrowserProcess::Chrome(chrome), Some(pipe))
++                (
++                    String::new(),
++                    BrowserProcess::Chrome(Arc::new(StdMutex::new(chrome))),
++                    Some(pipe),
++                )
              }
          };
  
-@@ -959,7 +959,23 @@ impl BrowserManager {
+@@ -959,7 +966,54 @@ impl BrowserManager {
          } else if engine == "obscura" {
              initialize_obscura_manager(ws_url, process).await?
          } else {
 -            let client = Arc::new(CdpClient::connect(&ws_url).await?);
 +            let client = if let Some((reader, writer)) = chrome_pipe {
-+                let client = Arc::new(CdpClient::connect_pipe(reader, writer));
++                let chrome = match &process {
++                    BrowserProcess::Chrome(chrome) => chrome.clone(),
++                    _ => unreachable!("only managed Chrome uses a debugging pipe"),
++                };
++                let on_failure: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
++                    chrome.lock().unwrap_or_else(|e| e.into_inner()).kill();
++                });
++                let client = Arc::new(CdpClient::connect_pipe(reader, writer, Some(on_failure)));
 +                // A successful spawn does not prove Chromium accepted its
 +                // private transport. Never retry over a TCP debug port.
 +                let ready = tokio::time::timeout(
@@ -206,7 +278,31 @@ index 27ef4d1..c1d5969 100644
 +                .await;
 +                if !matches!(ready, Ok(Ok(_))) {
 +                    client.close().await;
-+                    return Err(format!("Chrome pipe did not become ready: {ready:?}"));
++                    let (exited, stderr) = if let BrowserProcess::Chrome(chrome) = &process {
++                        let exited = {
++                            let mut chrome_process =
++                                chrome.lock().unwrap_or_else(|e| e.into_inner());
++                            let exited = chrome_process.has_exited();
++                            chrome_process.kill();
++                            exited
++                        };
++                        tokio::time::sleep(Duration::from_millis(25)).await;
++                        let stderr = chrome
++                            .lock()
++                            .unwrap_or_else(|e| e.into_inner())
++                            .stderr_tail();
++                        (exited, stderr)
++                    } else {
++                        (false, String::new())
++                    };
++                    let diagnostic = if stderr.is_empty() {
++                        String::new()
++                    } else {
++                        format!("; Chrome stderr tail: {stderr}")
++                    };
++                    return Err(format!(
++                        "Chrome pipe did not become ready: {ready:?}; process exited: {exited}{diagnostic}"
++                    ));
 +                }
 +                client
 +            } else {
@@ -215,16 +311,16 @@ index 27ef4d1..c1d5969 100644
              let mut manager = Self {
                  client,
                  browser_process: Some(process),
-@@ -4531,7 +4547,7 @@ mod tests {
+@@ -4531,7 +4585,7 @@ mod tests {
          let executable = dir.path().join("chrome");
          let port = url::Url::parse(url).unwrap().port().unwrap();
          std::fs::write(&executable, format!(
 -            "#!/bin/sh\nfor arg in \"$@\"; do\ncase \"$arg\" in\n--user-data-dir=*) profile=${{arg#*=}} ;;\nesac\ndone\nprintf '%s\\n' {port} /devtools/browser/test > \"$profile/DevToolsActivePort\"\nprintf '%s\\n' \"$$\" > '{}/pid'\nexec sleep 60\n",
-+            "#!/bin/sh\nfor arg in \"$@\"; do\ncase \"$arg\" in\n--user-data-dir=*) profile=${{arg#*=}} ;;\nesac\ndone\nprintf '%s\\n' {port} /devtools/browser/test > \"$profile/DevToolsActivePort\"\nprintf '%s\\n' \"$$\" > '{}/pid'\nexec 3<&- 4>&-\nexec sleep 60\n",
++            "#!/bin/sh\nfor arg in \"$@\"; do\ncase \"$arg\" in\n--user-data-dir=*) profile=${{arg#*=}} ;;\nesac\ndone\nprintf '%s\\n' {port} /devtools/browser/test > \"$profile/DevToolsActivePort\"\nprintf '%s\\n' \"$$\" > '{}/pid'\nprintf 'deliberate pipe failure\\n' >&2\nexec 3<&- 4>&-\nexec sleep 60\n",
              dir.path().display()
          )).unwrap();
          std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
-@@ -4570,23 +4586,19 @@ mod tests {
+@@ -4570,23 +4624,24 @@ mod tests {
  
      #[cfg(unix)]
      #[tokio::test]
@@ -256,21 +352,38 @@ index 27ef4d1..c1d5969 100644
 +            error.contains("Chrome pipe did not become ready"),
 +            "{error}"
 +        );
++        assert!(error.contains("process exited:"), "{error}");
++        assert!(
++            error.contains("Chrome stderr tail: deliberate pipe failure"),
++            "{error}"
++        );
 +        server.abort();
 +        assert_initialization_process_reaped(dir.path());
      }
  
      #[cfg(unix)]
+@@ -4600,7 +4655,10 @@ mod tests {
+             .unwrap();
+         let mut manager = tokio::time::timeout(
+             Duration::from_secs(4),
+-            initialize_lightpanda_manager(url, BrowserProcess::Chrome(process)),
++            initialize_lightpanda_manager(
++                url,
++                BrowserProcess::Chrome(Arc::new(StdMutex::new(process))),
++            ),
+         )
+         .await
+         .expect("Lightpanda should release the failed connection and retry")
 diff --git a/cli/src/native/cdp/chrome.rs b/cli/src/native/cdp/chrome.rs
-index bf572f9..5be4864 100644
+index bf572f9..729e346 100644
 --- a/cli/src/native/cdp/chrome.rs
 +++ b/cli/src/native/cdp/chrome.rs
-@@ -1,8 +1,13 @@
+@@ -1,12 +1,17 @@
  #[cfg(windows)]
  use super::windows_process::Child;
 -use std::io::{BufRead, BufReader, Write};
 +use std::fs::File;
-+use std::io::Write;
++use std::io::{Read, Write};
 +#[cfg(unix)]
 +use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd};
  #[cfg(target_os = "linux")]
@@ -280,20 +393,51 @@ index bf572f9..5be4864 100644
  use std::path::{Path, PathBuf};
  #[cfg(not(windows))]
  use std::process::{Child, Command, Stdio};
-@@ -14,7 +19,8 @@ use crate::ca_bundle::CaBundle;
+-use std::sync::Arc;
++use std::sync::{Arc, Mutex};
+ use std::time::Duration;
+ 
+ use super::discovery::discover_cdp_url;
+@@ -14,7 +19,9 @@ use crate::ca_bundle::CaBundle;
  
  pub struct ChromeProcess {
      child: Child,
 -    pub ws_url: String,
 +    pipe_reader: Option<File>,
 +    pipe_writer: Option<File>,
++    stderr_tail: Arc<Mutex<Vec<u8>>>,
      temp_user_data_dir: Option<PathBuf>,
      temp_nss_home: Option<PreparedNssHome>,
      /// On Unix, the process group ID used to kill the entire Chrome process tree.
-@@ -61,6 +67,18 @@ impl PreparedNssHome {
+@@ -26,6 +33,8 @@ pub struct ChromeProcess {
+     xvfb: Option<XvfbServer>,
+ }
+ 
++const CHROME_STDERR_TAIL_BYTES: usize = 4096;
++
+ struct PreparedNssHomeInner {
+     path: PathBuf,
+ }
+@@ -61,6 +70,34 @@ impl PreparedNssHome {
  }
  
  impl ChromeProcess {
++    pub fn stderr_tail(&self) -> String {
++        let tail = self.stderr_tail.lock().unwrap_or_else(|e| e.into_inner());
++        String::from_utf8_lossy(&tail)
++            .chars()
++            .map(|ch| {
++                if ch == '\n' || ch == '\t' || !ch.is_control() {
++                    ch
++                } else {
++                    '�'
++                }
++            })
++            .collect::<String>()
++            .trim()
++            .to_string()
++    }
++
 +    pub fn take_pipe(&mut self) -> Result<(File, File), String> {
 +        let reader = self
 +            .pipe_reader
@@ -309,7 +453,16 @@ index bf572f9..5be4864 100644
      pub fn kill(&mut self) {
          let _ = self.child.kill();
          // On Unix, kill the entire process group to ensure Chrome helper
-@@ -426,7 +444,6 @@ impl Default for LaunchOptions {
+@@ -68,7 +105,7 @@ impl ChromeProcess {
+         // This prevents orphaned Chrome processes from blocking the user's
+         // normal Chrome (issue #1113).
+         #[cfg(unix)]
+-        if let Some(pgid) = self.pgid {
++        if let Some(pgid) = self.pgid.take() {
+             unsafe {
+                 libc::kill(-pgid, libc::SIGKILL);
+             }
+@@ -426,7 +463,6 @@ impl Default for LaunchOptions {
  
  struct ChromeArgs {
      args: Vec<String>,
@@ -317,11 +470,13 @@ index bf572f9..5be4864 100644
      temp_user_data_dir: Option<PathBuf>,
  }
  
-@@ -453,6 +470,12 @@ fn build_chrome_args(options: &LaunchOptions) -> Result<ChromeArgs, String> {
+@@ -453,6 +489,14 @@ fn build_chrome_args(options: &LaunchOptions) -> Result<ChromeArgs, String> {
      // resolves as disabled.
      let mut user_args: Vec<String> = Vec::new();
      for arg in &options.args {
-+        let switch = arg.trim_start_matches(|ch| ch == '-' || ch == '/');
++        let switch = arg
++            .trim_start()
++            .trim_start_matches(|ch| ch == '-' || ch == '/');
 +        if switch.to_ascii_lowercase().starts_with("remote-debugging-") {
 +            return Err(
 +                "Custom remote debugging arguments are unavailable for managed Chrome".into(),
@@ -330,7 +485,7 @@ index bf572f9..5be4864 100644
          if let Some(values) = arg.strip_prefix("--enable-features=") {
              for feature in values.split(',').map(str::trim).filter(|f| !f.is_empty()) {
                  if !enable_features.iter().any(|f| f == feature) {
-@@ -465,7 +488,7 @@ fn build_chrome_args(options: &LaunchOptions) -> Result<ChromeArgs, String> {
+@@ -465,7 +509,7 @@ fn build_chrome_args(options: &LaunchOptions) -> Result<ChromeArgs, String> {
      }
  
      let mut args = vec![
@@ -339,7 +494,7 @@ index bf572f9..5be4864 100644
          "--no-first-run".to_string(),
          "--no-default-browser-check".to_string(),
          "--disable-background-networking".to_string(),
-@@ -538,18 +561,17 @@ fn build_chrome_args(options: &LaunchOptions) -> Result<ChromeArgs, String> {
+@@ -538,18 +582,17 @@ fn build_chrome_args(options: &LaunchOptions) -> Result<ChromeArgs, String> {
          args.push(format!("--proxy-bypass-list={}", bypass));
      }
  
@@ -361,7 +516,7 @@ index bf572f9..5be4864 100644
      };
  
      if options.ignore_https_errors {
-@@ -600,7 +622,6 @@ fn build_chrome_args(options: &LaunchOptions) -> Result<ChromeArgs, String> {
+@@ -600,7 +643,6 @@ fn build_chrome_args(options: &LaunchOptions) -> Result<ChromeArgs, String> {
  
      Ok(ChromeArgs {
          args,
@@ -369,7 +524,7 @@ index bf572f9..5be4864 100644
          temp_user_data_dir,
      })
  }
-@@ -909,14 +930,9 @@ pub fn launch_chrome(options: &LaunchOptions) -> Result<ChromeProcess, String> {
+@@ -909,14 +951,9 @@ pub fn launch_chrome(options: &LaunchOptions) -> Result<ChromeProcess, String> {
  fn try_launch_chrome(chrome_path: &Path, options: &LaunchOptions) -> Result<ChromeProcess, String> {
      let ChromeArgs {
          args,
@@ -384,7 +539,7 @@ index bf572f9..5be4864 100644
      let cleanup_temp_dir = |dir: &Option<PathBuf>| {
          if let Some(ref d) = dir {
              let _ = std::fs::remove_dir_all(d);
-@@ -937,6 +953,32 @@ fn try_launch_chrome(chrome_path: &Path, options: &LaunchOptions) -> Result<Chro
+@@ -937,6 +974,32 @@ fn try_launch_chrome(chrome_path: &Path, options: &LaunchOptions) -> Result<Chro
      #[cfg(target_os = "linux")]
      let xvfb = maybe_start_xvfb(options);
  
@@ -417,7 +572,7 @@ index bf572f9..5be4864 100644
      #[cfg(not(windows))]
      let mut cmd = Command::new(chrome_path);
      #[cfg(not(windows))]
-@@ -969,11 +1011,21 @@ fn try_launch_chrome(chrome_path: &Path, options: &LaunchOptions) -> Result<Chro
+@@ -969,11 +1032,21 @@ fn try_launch_chrome(chrome_path: &Path, options: &LaunchOptions) -> Result<Chro
      #[cfg(unix)]
      {
          use std::os::unix::process::CommandExt;
@@ -442,7 +597,7 @@ index bf572f9..5be4864 100644
                  Ok(())
              });
          }
-@@ -988,38 +1040,15 @@ fn try_launch_chrome(chrome_path: &Path, options: &LaunchOptions) -> Result<Chro
+@@ -988,44 +1061,34 @@ fn try_launch_chrome(chrome_path: &Path, options: &LaunchOptions) -> Result<Chro
          format!("Failed to launch Chrome at {:?}: {}", chrome_path, e)
      })?;
  
@@ -485,21 +640,42 @@ index bf572f9..5be4864 100644
  
 -    // Chrome blocks on stderr writes once the pipe buffer fills, so keep draining it
 -    // after readiness. The fallback path has already taken stderr.
-+    // Chrome blocks on stderr writes once the pipe buffer fills, so keep draining it.
++    // Drain stderr continuously. Retain only a bounded tail for launch errors.
++    let stderr_tail = Arc::new(Mutex::new(Vec::new()));
      if let Some(stderr) = child.stderr.take() {
++        let tail = stderr_tail.clone();
          let _ = std::thread::Builder::new()
              .name("chrome-stderr-drain".into())
-@@ -1039,7 +1068,8 @@ fn try_launch_chrome(chrome_path: &Path, options: &LaunchOptions) -> Result<Chro
+             .spawn(move || {
+                 let mut stderr = stderr;
+-                let _ = std::io::copy(&mut stderr, &mut std::io::sink());
++                let mut buffer = [0u8; 8192];
++                while let Ok(count) = stderr.read(&mut buffer) {
++                    if count == 0 {
++                        break;
++                    }
++                    let mut tail = tail.lock().unwrap_or_else(|e| e.into_inner());
++                    tail.extend_from_slice(&buffer[..count]);
++                    if tail.len() > CHROME_STDERR_TAIL_BYTES {
++                        let excess = tail.len() - CHROME_STDERR_TAIL_BYTES;
++                        tail.drain(..excess);
++                    }
++                }
+             });
+     }
+ 
+@@ -1039,7 +1102,9 @@ fn try_launch_chrome(chrome_path: &Path, options: &LaunchOptions) -> Result<Chro
  
      Ok(ChromeProcess {
          child,
 -        ws_url,
 +        pipe_reader: Some(pipe_reader),
 +        pipe_writer: Some(pipe_writer),
++        stderr_tail,
          temp_user_data_dir,
          temp_nss_home,
          #[cfg(unix)]
-@@ -1049,123 +1079,6 @@ fn try_launch_chrome(chrome_path: &Path, options: &LaunchOptions) -> Result<Chro
+@@ -1049,123 +1114,6 @@ fn try_launch_chrome(chrome_path: &Path, options: &LaunchOptions) -> Result<Chro
      })
  }
  
@@ -623,7 +799,7 @@ index bf572f9..5be4864 100644
  /// Finds Chrome from the install cache, macOS Applications directories, or system paths.
  pub fn find_chrome() -> Option<PathBuf> {
      // 1. Check Chrome downloaded by `agent-browser install`
-@@ -1995,9 +1908,49 @@ mod tests {
+@@ -1995,9 +1943,52 @@ mod tests {
          ]));
      }
  
@@ -651,8 +827,11 @@ index bf572f9..5be4864 100644
 +    fn managed_chrome_rejects_debugging_overrides() {
 +        for flag in [
 +            "--remote-debugging-port=0",
++            " --remote-debugging-port=0",
 +            "-remote-debugging-port=0",
++            "\t-remote-debugging-port=0",
 +            "/remote-debugging-port=0",
++            " /remote-debugging-port=0",
 +            "--remote-debugging-pipe",
 +            "-REMOTE-DEBUGGING-PIPE",
 +            "--remote-debugging-io-pipes=1,2",
@@ -674,7 +853,7 @@ index bf572f9..5be4864 100644
          use std::os::unix::fs::PermissionsExt;
  
          let fixture = tempfile::tempdir().unwrap();
-@@ -2009,7 +1962,6 @@ set -eu
+@@ -2009,11 +2000,11 @@ set -eu
  for arg do
      case "$arg" in --user-data-dir=*) profile="${arg#*=}" ;; esac
  done
@@ -682,7 +861,12 @@ index bf572f9..5be4864 100644
  for round in 1 2; do
      while [ ! -f "$profile/request-$round" ]; do sleep 0.01; done
      printf '\377' >&2
-@@ -2027,10 +1979,7 @@ exec sleep 60
+     head -c 2097152 /dev/zero >&2
++    printf '\033[control\nlast stderr diagnostic %s\n' "$round" >&2
+     touch "$profile/drained-$round"
+ done
+ exec sleep 60
+@@ -2027,10 +2018,7 @@ exec sleep 60
          };
          let mut chrome = try_launch_chrome(&executable, &options).unwrap();
          let profile = chrome.temp_user_data_dir.clone().unwrap();
@@ -694,7 +878,24 @@ index bf572f9..5be4864 100644
          for round in 1..=2 {
              std::fs::write(profile.join(format!("request-{round}")), b"").unwrap();
              let drained = profile.join(format!("drained-{round}"));
-@@ -2182,33 +2131,6 @@ exec sleep 60
+@@ -2048,6 +2036,16 @@ exec sleep 60
+             );
+             assert!(!chrome.has_exited());
+         }
++        let deadline = std::time::Instant::now() + Duration::from_secs(2);
++        while !chrome.stderr_tail().contains("last stderr diagnostic 2")
++            && std::time::Instant::now() < deadline
++        {
++            std::thread::sleep(Duration::from_millis(10));
++        }
++        let tail = chrome.stderr_tail();
++        assert!(tail.ends_with("last stderr diagnostic 2"), "{tail}");
++        assert!(tail.chars().count() <= CHROME_STDERR_TAIL_BYTES);
++        assert!(!tail.contains('\u{1b}'));
+         drop(chrome);
+         assert!(!profile.exists());
+     }
+@@ -2182,33 +2180,6 @@ exec sleep 60
          assert!(!should_disable_sandbox(&args));
      }
  
@@ -728,18 +929,19 @@ index bf572f9..5be4864 100644
      #[test]
      fn test_find_playwright_chromium_nonexistent() {
          let guard = EnvGuard::new(&["PLAYWRIGHT_BROWSERS_PATH", "HOME", "USERPROFILE"]);
-@@ -2703,7 +2625,8 @@ exec sleep 60
+@@ -2703,7 +2674,9 @@ exec sleep 60
              let child = spawn_noop_child();
              let _process = ChromeProcess {
                  child,
 -                ws_url: String::new(),
 +                pipe_reader: None,
 +                pipe_writer: None,
++                stderr_tail: Arc::new(Mutex::new(Vec::new())),
                  temp_user_data_dir: Some(dir.clone()),
                  temp_nss_home: None,
                  #[cfg(unix)]
 diff --git a/cli/src/native/cdp/client.rs b/cli/src/native/cdp/client.rs
-index f06379b..b5f3b42 100644
+index f06379b..bc29603 100644
 --- a/cli/src/native/cdp/client.rs
 +++ b/cli/src/native/cdp/client.rs
 @@ -1,4 +1,5 @@
@@ -756,7 +958,7 @@ index f06379b..b5f3b42 100644
  use tokio::sync::{broadcast, mpsc, oneshot, watch, Mutex};
  use tokio::task::JoinHandle;
  use tokio_tungstenite::tungstenite::client::IntoClientRequest;
-@@ -117,16 +119,115 @@ pub fn is_session_detached_error(error: &str) -> bool {
+@@ -117,16 +119,171 @@ pub fn is_session_detached_error(error: &str) -> bool {
          .is_some_and(|rest| rest.is_empty() || rest == ".")
  }
  
@@ -775,7 +977,36 @@ index f06379b..b5f3b42 100644
 +
 +enum TransportWriter {
 +    WebSocket(futures_util::stream::SplitSink<CdpWebSocket, Message>),
-+    Pipe(tokio::fs::File),
++    Pipe {
++        file: tokio::fs::File,
++        incomplete: bool,
++        closed: Arc<AtomicBool>,
++        on_failure: Option<PipeFailureHandler>,
++    },
++}
++
++const PIPE_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
++type PipeFailureHandler = Arc<dyn Fn() + Send + Sync>;
++
++struct PipeWriteGuard {
++    closed: Arc<AtomicBool>,
++    on_failure: Option<PipeFailureHandler>,
++    complete: bool,
++}
++
++impl Drop for PipeWriteGuard {
++    fn drop(&mut self) {
++        if self.complete {
++            return;
++        }
++        // An outer command deadline may cancel a write before our own write
++        // deadline expires. The partial frame must still close the managed
++        // transport and stop Chrome without waiting for another command.
++        self.closed.store(true, Ordering::SeqCst);
++        if let Some(handler) = self.on_failure.take() {
++            std::thread::spawn(move || handler());
++        }
++    }
 +}
 +
 +impl TransportWriter {
@@ -785,12 +1016,39 @@ index f06379b..b5f3b42 100644
 +                .send(Message::Text(text))
 +                .await
 +                .map_err(|e| e.to_string()),
-+            Self::Pipe(pipe) => {
-+                pipe.write_all(text.as_bytes())
-+                    .await
-+                    .map_err(|e| e.to_string())?;
-+                pipe.write_all(&[0]).await.map_err(|e| e.to_string())?;
-+                pipe.flush().await.map_err(|e| e.to_string())
++            Self::Pipe {
++                file,
++                incomplete,
++                closed,
++                on_failure,
++            } => {
++                if *incomplete {
++                    return Err("CDP pipe has an incomplete frame".to_string());
++                }
++                // A cancelled or timed-out write may have sent only part of a
++                // frame. Keep the transport poisoned until the NUL terminator
++                // and flush have both completed.
++                *incomplete = true;
++                let mut guard = PipeWriteGuard {
++                    closed: closed.clone(),
++                    on_failure: on_failure.clone(),
++                    complete: false,
++                };
++                let write = async {
++                    file.write_all(text.as_bytes()).await?;
++                    file.write_all(&[0]).await?;
++                    file.flush().await
++                };
++                let result = tokio::time::timeout(PIPE_WRITE_TIMEOUT, write).await;
++                guard.complete = true;
++                match result {
++                    Ok(Ok(())) => {
++                        *incomplete = false;
++                        Ok(())
++                    }
++                    Ok(Err(error)) => Err(error.to_string()),
++                    Err(_) => Err("CDP pipe write timed out".to_string()),
++                }
 +            }
 +        }
 +    }
@@ -800,8 +1058,8 @@ index f06379b..b5f3b42 100644
 +            Self::WebSocket(socket) => {
 +                let _ = socket.close().await;
 +            }
-+            Self::Pipe(pipe) => {
-+                let _ = pipe.shutdown().await;
++            Self::Pipe { file, .. } => {
++                let _ = file.shutdown().await;
 +            }
 +        }
 +    }
@@ -812,7 +1070,7 @@ index f06379b..b5f3b42 100644
 +                .send(Message::Ping(Vec::new()))
 +                .await
 +                .map_err(|e| e.to_string()),
-+            Self::Pipe(_) => Ok(()),
++            Self::Pipe { .. } => Ok(()),
 +        }
 +    }
 +}
@@ -882,18 +1140,19 @@ index f06379b..b5f3b42 100644
  
  /// Sessions whose events go to one private receiver instead of the broadcast.
  type PrivateSessions = Arc<std::sync::Mutex<HashMap<String, mpsc::Sender<CdpEvent>>>>;
-@@ -336,8 +437,8 @@ async fn release_detached_session(
+@@ -336,8 +493,9 @@ async fn release_detached_session(
  }
  
  pub struct CdpClient {
 -    ws_tx: WsTx,
 -    socket: socket2::Socket,
 +    transport_tx: TransportTx,
++    pipe_failure_handler: Option<PipeFailureHandler>,
 +    socket: Option<socket2::Socket>,
      closed: Arc<AtomicBool>,
      close_complete: AtomicBool,
      close_lock: Mutex<()>,
-@@ -439,8 +540,29 @@ impl CdpClient {
+@@ -439,14 +597,50 @@ impl CdpClient {
              .try_clone()
              .map_err(|error| format!("Failed to duplicate CDP socket: {}", error))?;
  
@@ -904,14 +1163,28 @@ index f06379b..b5f3b42 100644
 +            TransportWriter::WebSocket(ws_tx),
 +            TransportReader::WebSocket(ws_rx),
 +            Some(socket),
++            None,
++            Arc::new(AtomicBool::new(false)),
 +        ))
 +    }
 +
-+    pub fn connect_pipe(reader: File, writer: File) -> Self {
++    pub fn connect_pipe(
++        reader: File,
++        writer: File,
++        on_failure: Option<PipeFailureHandler>,
++    ) -> Self {
++        let closed = Arc::new(AtomicBool::new(false));
 +        Self::from_transport(
-+            TransportWriter::Pipe(tokio::fs::File::from_std(writer)),
++            TransportWriter::Pipe {
++                file: tokio::fs::File::from_std(writer),
++                incomplete: false,
++                closed: closed.clone(),
++                on_failure: on_failure.clone(),
++            },
 +            TransportReader::Pipe(BufReader::new(tokio::fs::File::from_std(reader))),
 +            None,
++            on_failure,
++            closed,
 +        )
 +    }
 +
@@ -919,13 +1192,28 @@ index f06379b..b5f3b42 100644
 +        writer: TransportWriter,
 +        mut reader: TransportReader,
 +        socket: Option<socket2::Socket>,
++        pipe_failure_handler: Option<PipeFailureHandler>,
++        closed: Arc<AtomicBool>,
 +    ) -> Self {
 +        let is_websocket = matches!(writer, TransportWriter::WebSocket(_));
 +        let transport_tx = Arc::new(Mutex::new(writer));
  
          let pending: PendingMap = Arc::new(Mutex::new(HashMap::new()));
          let raw_pending: RawPendingMap = Arc::new(Mutex::new(HashMap::new()));
-@@ -466,36 +588,7 @@ impl CdpClient {
+         let (event_tx, _) = broadcast::channel(4096);
+         let (raw_tx, _) = broadcast::channel(4096);
+-        let closed = Arc::new(AtomicBool::new(false));
+ 
+         let private_sessions: PrivateSessions = Arc::new(std::sync::Mutex::new(HashMap::new()));
+         let method_taps: MethodTaps = Arc::new(std::sync::Mutex::new(Vec::new()));
+@@ -460,42 +654,14 @@ impl CdpClient {
+         let private_clone = private_sessions.clone();
+         let taps_clone = method_taps.clone();
+         let detached_clone = detached_sessions.clone();
++        let reader_pipe_failure_handler = pipe_failure_handler.clone();
+ 
+         // Notify used to stop the keepalive task when the reader loop exits.
+         let (cancel_tx, mut cancel_rx) = tokio::sync::watch::channel(false);
          let reader_cancel_tx = cancel_tx.clone();
  
          let reader_handle = tokio::spawn(async move {
@@ -963,7 +1251,25 @@ index f06379b..b5f3b42 100644
                  // Broadcast raw message for inspect proxy subscribers before typed parse,
                  // so messages with negative IDs (used by the inspect proxy) are still delivered.
                  if raw_tx_clone.receiver_count() > 0 {
-@@ -642,27 +735,29 @@ impl CdpClient {
+@@ -630,39 +796,47 @@ impl CdpClient {
+             // Reader loop exited (connection closed or error). Drop all pending
+             // command senders so callers get an immediate channel-closed error
+             // instead of waiting for the 30-second timeout.
+-            closed_reader.store(true, Ordering::SeqCst);
++            let already_closed = closed_reader.swap(true, Ordering::SeqCst);
+             pending_clone.lock().await.clear();
+             raw_pending_clone.lock().await.clear();
+ 
+             // Stop the keepalive task because the connection is gone.
+             let _ = reader_cancel_tx.send(true);
++            if !already_closed {
++                if let Some(handler) = reader_pipe_failure_handler {
++                    let _ = tokio::task::spawn_blocking(move || handler()).await;
++                }
++            }
+         });
+ 
+         // Spawn a keepalive task that sends WebSocket Ping frames at a regular
          // interval. This prevents intermediate proxies (Envoy, nginx, OpenResty,
          // cloud load balancers) from closing idle WebSocket connections. If the
          // send fails, the connection is dead and we stop pinging.
@@ -1007,10 +1313,11 @@ index f06379b..b5f3b42 100644
 -            ws_tx,
 +        Self {
 +            transport_tx,
++            pipe_failure_handler,
              socket,
              closed,
              close_complete: AtomicBool::new(false),
-@@ -674,11 +769,11 @@ impl CdpClient {
+@@ -674,11 +848,11 @@ impl CdpClient {
              event_tx,
              raw_tx,
              reader_handle: Mutex::new(Some(reader_handle)),
@@ -1024,21 +1331,27 @@ index f06379b..b5f3b42 100644
      }
  
      /// Refuse a command to a session Chrome already reported detached.
-@@ -716,6 +811,13 @@ impl CdpClient {
+@@ -716,6 +890,19 @@ impl CdpClient {
          }
      }
  
 +    async fn mark_transport_failed(&self) {
-+        self.closed.store(true, Ordering::SeqCst);
++        let already_closed = self.closed.swap(true, Ordering::SeqCst);
 +        self.pending.lock().await.clear();
 +        self.raw_pending.lock().await.clear();
 +        let _ = self.cancel_tx.send(true);
++        if !already_closed {
++            if let Some(handler) = &self.pipe_failure_handler {
++                let handler = handler.clone();
++                let _ = tokio::task::spawn_blocking(move || handler()).await;
++            }
++        }
 +    }
 +
      async fn abort_task(handle: &Mutex<Option<JoinHandle<()>>>) {
          let Some(task) = handle.lock().await.take() else {
              return;
-@@ -735,12 +837,14 @@ impl CdpClient {
+@@ -735,12 +922,14 @@ impl CdpClient {
          Self::abort_task(&self.keepalive_handle).await;
  
          let _ = tokio::time::timeout(TRANSPORT_CLOSE_TIMEOUT, async {
@@ -1056,7 +1369,7 @@ index f06379b..b5f3b42 100644
          Self::abort_task(&self.reader_handle).await;
          self.pending.lock().await.clear();
          self.raw_pending.lock().await.clear();
-@@ -776,7 +880,7 @@ impl CdpClient {
+@@ -776,7 +965,7 @@ impl CdpClient {
          };
  
          {
@@ -1065,7 +1378,7 @@ index f06379b..b5f3b42 100644
              self.ensure_open()?;
              let mut pending = self.pending.lock().await;
              if let Err(error) = self.ensure_session_attached(method, cmd.session_id.as_deref()) {
-@@ -791,8 +895,8 @@ impl CdpClient {
+@@ -791,8 +980,8 @@ impl CdpClient {
                  },
              );
              drop(pending);
@@ -1076,7 +1389,7 @@ index f06379b..b5f3b42 100644
                  guard.done = true;
                  return Err(format!("Failed to send CDP command: {}", error));
              }
-@@ -872,7 +976,7 @@ impl CdpClient {
+@@ -872,7 +1061,7 @@ impl CdpClient {
      /// Contains only what's needed to forward messages bidirectionally.
      pub fn inspect_handle(&self) -> InspectProxyHandle {
          InspectProxyHandle {
@@ -1085,7 +1398,7 @@ index f06379b..b5f3b42 100644
              raw_tx: self.raw_tx.clone(),
              closed: self.closed.clone(),
          }
-@@ -936,7 +1040,7 @@ impl CdpClient {
+@@ -936,7 +1125,7 @@ impl CdpClient {
          };
  
          {
@@ -1094,7 +1407,7 @@ index f06379b..b5f3b42 100644
              self.ensure_open()?;
              let mut raw_pending = self.raw_pending.lock().await;
              if let Err(error) = self.ensure_session_attached(method, cmd.session_id.as_deref()) {
-@@ -951,8 +1055,8 @@ impl CdpClient {
+@@ -951,8 +1140,8 @@ impl CdpClient {
                  },
              );
              drop(raw_pending);
@@ -1105,7 +1418,7 @@ index f06379b..b5f3b42 100644
                  guard.done = true;
                  return Err(format!("Failed to send CDP command: {}", error));
              }
-@@ -1018,23 +1122,25 @@ impl CdpClient {
+@@ -1018,23 +1207,25 @@ impl CdpClient {
          let json = serde_json::to_string(&cmd)
              .map_err(|e| format!("Failed to serialize CDP command: {}", e))?;
  
@@ -1141,7 +1454,7 @@ index f06379b..b5f3b42 100644
      }
  
      /// Test-only: count of in-flight commands still awaiting a response, so a
-@@ -1055,19 +1161,19 @@ impl CdpClient {
+@@ -1055,19 +1246,19 @@ impl CdpClient {
  /// Lightweight handle for the inspect WebSocket proxy, holding only
  /// the cloneable parts of CdpClient needed for bidirectional message forwarding.
  pub struct InspectProxyHandle {
@@ -1165,7 +1478,7 @@ index f06379b..b5f3b42 100644
              .await
              .map_err(|e| format!("Failed to send raw CDP message: {}", e))
      }
-@@ -1123,6 +1229,74 @@ mod tests {
+@@ -1123,6 +1314,165 @@ mod tests {
      const TEST_CERT_DER: &str = "MIIBPDCB46ADAgECAgkA9xwXmIhbzQIwCgYIKoZIzj0EAwIwFDESMBAGA1UEAwwJbG9jYWxob3N0MB4XDTI2MDgzMDA1NTU0NFoXDTM2MDgyNzA1NTU0NFowFDESMBAGA1UEAwwJbG9jYWxob3N0MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEQdmPO0sXXFRmVn7+8MViXGom2rYy8aV3Oc0pNZhUmFGaPl4MRFzc1G0yaV/WRBPF/BUh2LGsXCvUsn7NqaYkFaMeMBwwGgYDVR0RBBMwEYIJbG9jYWxob3N0hwR/AAABMAoGCCqGSM49BAMCA0gAMEUCIQC32oureGNAupABEmonQPAQBD7OdJjXmUxoVQNr0UB+6AIgb23GMwxTjwHyLG4tZcJST7r3cCW8K/Y+1h618j2f+Uw=";
      const TEST_KEY_DER: &str = "MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgIVZST8Vhc5f3OW+4kF78f8o1nQCRwjW/Yo8CXQ35Y9uhRANCAARB2Y87SxdcVGZWfv7wxWJcaibatjLxpXc5zSk1mFSYUZo+XgxEXNzUbTJpX9ZEE8X8FSHYsaxcK9Syfs2ppiQV";
  
@@ -1180,7 +1493,12 @@ index f06379b..b5f3b42 100644
 +        let (parent_reader, mut child_writer) = UnixStream::pair().unwrap();
 +        let reader = unsafe { File::from_raw_fd(parent_reader.into_raw_fd()) };
 +        let writer = unsafe { File::from_raw_fd(parent_writer.into_raw_fd()) };
-+        let client = CdpClient::connect_pipe(reader, writer);
++        let failed = Arc::new(AtomicBool::new(false));
++        let failed_callback = failed.clone();
++        let callback: PipeFailureHandler = Arc::new(move || {
++            failed_callback.store(true, Ordering::SeqCst);
++        });
++        let client = CdpClient::connect_pipe(reader, writer, Some(callback));
 +        let server = tokio::task::spawn_blocking(move || {
 +            let mut command = Vec::new();
 +            std::io::BufReader::new(child_reader)
@@ -1206,6 +1524,13 @@ index f06379b..b5f3b42 100644
 +        .await
 +        .expect("closed pipe must fail promptly");
 +        assert!(failure.is_err());
++        tokio::time::timeout(Duration::from_secs(2), async {
++            while !failed.load(Ordering::SeqCst) {
++                tokio::time::sleep(Duration::from_millis(10)).await;
++            }
++        })
++        .await
++        .expect("reader EOF must stop Chrome");
 +        client.close().await;
 +    }
 +
@@ -1220,7 +1545,7 @@ index f06379b..b5f3b42 100644
 +        drop(child_reader);
 +        let reader = unsafe { File::from_raw_fd(parent_reader.into_raw_fd()) };
 +        let writer = unsafe { File::from_raw_fd(parent_writer.into_raw_fd()) };
-+        let client = CdpClient::connect_pipe(reader, writer);
++        let client = CdpClient::connect_pipe(reader, writer, None);
 +
 +        let error = client
 +            .send_command_no_params("Browser.getVersion", None)
@@ -1237,10 +1562,89 @@ index f06379b..b5f3b42 100644
 +        client.close().await;
 +    }
 +
++    #[cfg(unix)]
++    #[tokio::test]
++    async fn stalled_pipe_write_hits_deadline_and_closes_transport() {
++        use std::os::fd::{FromRawFd, IntoRawFd};
++        use std::os::unix::net::UnixStream;
++
++        let (child_reader, parent_writer) = UnixStream::pair().unwrap();
++        let (parent_reader, _child_writer) = UnixStream::pair().unwrap();
++        // Keep both child ends open, but never read the command pipe.
++        let reader = unsafe { File::from_raw_fd(parent_reader.into_raw_fd()) };
++        let writer = unsafe { File::from_raw_fd(parent_writer.into_raw_fd()) };
++        let failed = Arc::new(AtomicBool::new(false));
++        let failed_callback = failed.clone();
++        let callback: PipeFailureHandler = Arc::new(move || {
++            failed_callback.store(true, Ordering::SeqCst);
++        });
++        let client = CdpClient::connect_pipe(reader, writer, Some(callback));
++
++        let error = tokio::time::timeout(
++            PIPE_WRITE_TIMEOUT + Duration::from_secs(3),
++            client.send_raw("x".repeat(2 * 1024 * 1024)),
++        )
++        .await
++        .expect("stalled write must reach its deadline")
++        .unwrap_err();
++        assert!(error.contains("CDP pipe write timed out"), "{error}");
++        assert!(failed.load(Ordering::SeqCst));
++        assert_eq!(
++            client
++                .send_command_no_params("Browser.getVersion", None)
++                .await
++                .unwrap_err(),
++            CONNECTION_CLOSED_ERROR
++        );
++        drop(child_reader);
++        client.close().await;
++    }
++
++    #[cfg(unix)]
++    #[tokio::test]
++    async fn cancelled_pipe_write_stops_managed_browser() {
++        use std::os::fd::{FromRawFd, IntoRawFd};
++        use std::os::unix::net::UnixStream;
++
++        let (child_reader, parent_writer) = UnixStream::pair().unwrap();
++        let (parent_reader, _child_writer) = UnixStream::pair().unwrap();
++        let reader = unsafe { File::from_raw_fd(parent_reader.into_raw_fd()) };
++        let writer = unsafe { File::from_raw_fd(parent_writer.into_raw_fd()) };
++        let failed = Arc::new(AtomicBool::new(false));
++        let failed_callback = failed.clone();
++        let callback: PipeFailureHandler = Arc::new(move || {
++            failed_callback.store(true, Ordering::SeqCst);
++        });
++        let client = CdpClient::connect_pipe(reader, writer, Some(callback));
++
++        assert!(tokio::time::timeout(
++            Duration::from_millis(100),
++            client.send_raw("x".repeat(2 * 1024 * 1024)),
++        )
++        .await
++        .is_err());
++        tokio::time::timeout(Duration::from_secs(2), async {
++            while !failed.load(Ordering::SeqCst) {
++                tokio::time::sleep(Duration::from_millis(10)).await;
++            }
++        })
++        .await
++        .expect("cancelled write must stop Chrome");
++        assert_eq!(
++            client
++                .send_command_no_params("Browser.getVersion", None)
++                .await
++                .unwrap_err(),
++            CONNECTION_CLOSED_ERROR
++        );
++        drop(child_reader);
++        client.close().await;
++    }
++
      #[test]
      fn repairs_only_unpaired_surrogate_escapes() {
          let msg = r#"{"id":1,"result":{"high":"\ud800","low":"\udfff","pair":"\ud83d\ude00","escaped":"\\ud800","text":"café 中文"}}"#;
-@@ -1888,7 +2062,7 @@ mod tests {
+@@ -1888,7 +2238,7 @@ mod tests {
  
          let client = Arc::new(CdpClient::connect(&url).await.unwrap());
          accepted_rx.await.unwrap();
