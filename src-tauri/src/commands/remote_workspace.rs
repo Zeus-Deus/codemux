@@ -189,6 +189,7 @@ mod on_device {
             cwd,
             adopted: false,
             base_branch: None,
+            initial_tab_id: None,
         })
     }
 

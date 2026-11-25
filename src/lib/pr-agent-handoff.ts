@@ -25,7 +25,7 @@ import { useAppStore } from "@/stores/app-store";
 import { useUIStore } from "@/stores/ui-store";
 import { usePrAgentRunsStore } from "@/stores/pr-agent-runs-store";
 import { saveWorkspacePrompt } from "@/lib/workspace-prompt-handoff";
-import { firstTerminalTabId } from "@/lib/terminal-preset-target";
+import { initialTerminalTabId } from "@/lib/terminal-preset-target";
 import { useChatDraftStore } from "@/stores/chat-draft-store";
 
 // ── Task shapes ───────────────────────────────────────────────────────
@@ -454,7 +454,7 @@ export async function handOffToAgent(req: HandoffRequest): Promise<HandoffOutcom
   // Creating a worktree starts its terminal but no agent command. Confirm
   // delivery to that terminal before recording a successful handoff.
   try {
-    const tabId = await firstTerminalTabId(result.workspaceId);
+    const tabId = initialTerminalTabId(result);
     await applyPreset(result.workspaceId, presetId, "current_terminal", null, modelSelection, true, tabId);
     return finish("worktree", result.workspaceId, tabId);
   } catch (error) {

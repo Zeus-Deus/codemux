@@ -68,7 +68,7 @@ import { autoNameWorkspace } from "@/lib/agent-chat/materialize";
 import { utilitySelectionFromStores } from "@/lib/utility-agent";
 import { toast, errorMessage } from "@/lib/toast";
 import { saveWorkspacePrompt } from "@/lib/workspace-prompt-handoff";
-import { firstTerminalTabId } from "@/lib/terminal-preset-target";
+import { initialTerminalTabId } from "@/lib/terminal-preset-target";
 import { Eyebrow } from "@/components/ui/eyebrow";
 import { PresetIcon } from "@/components/icons/preset-icon";
 
@@ -362,7 +362,7 @@ export function ProjectOnboarding({ projectDir, tempWorkspaceId, onComplete, onC
         let launchError: string | null = null;
         if (!created.adopted && selectedAgentId) {
           try {
-            const tabId = await firstTerminalTabId(created.workspaceId);
+            const tabId = initialTerminalTabId(created);
             await applyPreset(created.workspaceId, selectedAgentId, "current_terminal", null, null, true, tabId);
           } catch (error) {
             launchError = errorMessage(error);

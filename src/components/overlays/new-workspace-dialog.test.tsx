@@ -42,12 +42,11 @@ vi.mock("@/tauri/commands", () => ({
   }),
   pickFolderDialog: vi.fn().mockResolvedValue(null),
   createWorkspace: vi.fn().mockResolvedValue("ws-new"),
-  getAppState: vi.fn().mockResolvedValue({
-    workspaces: [{ workspace_id: "ws-new", tabs: [{ tab_id: "tab-default", kind: "terminal" }] }],
-  }),
+  createEmptyWorkspace: vi.fn().mockResolvedValue("ws-new"),
+  createTab: vi.fn().mockResolvedValue("tab-created"),
   createWorktreeWorkspaceResult: vi
     .fn()
-    .mockResolvedValue({ workspaceId: "ws-new", cwd: null, adopted: false }),
+    .mockResolvedValue({ workspaceId: "ws-new", cwd: null, adopted: false, initialTabId: "tab-default" }),
   importWorktreeWorkspace: vi.fn().mockResolvedValue("ws-new"),
   activateWorkspace: vi.fn().mockResolvedValue(undefined),
   renameWorkspace: vi.fn().mockResolvedValue(undefined),
@@ -136,7 +135,8 @@ import {
   getPresets,
   listChatProviderCapabilities,
   createWorkspace,
-  getAppState,
+  createEmptyWorkspace,
+  createTab,
   applyPreset,
   listBranchesDetailed,
   listWorktrees,
@@ -295,9 +295,7 @@ beforeEach(() => {
     workspaceId: "ws-new",
     cwd: null,
     adopted: false,
-  });
-  (getAppState as Mock).mockResolvedValue({
-    workspaces: [{ workspace_id: "ws-new", tabs: [{ tab_id: "tab-default", kind: "terminal" }] }],
+    initialTabId: "tab-default",
   });
   // useDefaultBranch keeps a module-level cache so the same project_root
   // only fetches once per session. Clear it between tests so a previous
@@ -1750,11 +1748,12 @@ describe("Non-git project", () => {
         null,
         { model: null, reasoning: null, context: null },
         true,
-        "tab-default",
+        "tab-created",
       );
     });
     expect(Object.values(useChatDraftStore.getState().draftsById)[0].inputDraft).toBe("Tidy the notes");
-    expect(createWorkspace).toHaveBeenCalledWith("/path/to/project");
+    expect(createEmptyWorkspace).toHaveBeenCalledWith("/path/to/project");
+    expect(createTab).toHaveBeenCalledWith("ws-new", "terminal");
     expect(createWorktreeWorkspaceResult).not.toHaveBeenCalled();
     expect(generateBranchName).not.toHaveBeenCalled();
   });
@@ -1807,7 +1806,8 @@ describe("Detected default branch routing", () => {
   it("attaches the repo's detected default to the repo root", async () => {
     await submitBranch("trunk");
     await waitFor(() => {
-      expect(createWorkspace).toHaveBeenCalledWith("/path/to/project");
+      expect(createEmptyWorkspace).toHaveBeenCalledWith("/path/to/project");
+      expect(createTab).toHaveBeenCalledWith("ws-new", "terminal");
     });
     expect(createWorktreeWorkspaceResult).not.toHaveBeenCalled();
   });

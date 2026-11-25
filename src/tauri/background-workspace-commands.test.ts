@@ -29,6 +29,19 @@ describe("background workspace creation IPC", () => {
       expect.objectContaining({ select: false, repoPath: "/project", branch: "task" }));
   });
 
+  it("returns the original terminal tab supplied by workspace creation", async () => {
+    invoke.mockResolvedValue({
+      workspace_id: "ws-new",
+      cwd: "/worktrees/task",
+      adopted: false,
+      initial_tab_id: "tab-original",
+    });
+
+    const created = await createWorktreeWorkspaceResult("/project", "task", true, "single");
+
+    expect(created.initialTabId).toBe("tab-original");
+  });
+
   it.each([false, true])("creates a background pane without selecting or refreshing the view (remote: %s)", async (remote) => {
     (window as { __CODEMUX_REMOTE__?: boolean }).__CODEMUX_REMOTE__ = remote;
     invoke.mockResolvedValue("pane-new");

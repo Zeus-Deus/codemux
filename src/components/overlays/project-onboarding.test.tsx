@@ -19,10 +19,7 @@ vi.mock("@/tauri/commands", () => ({
   generateRandomBranchName: vi.fn().mockResolvedValue("random-branch"),
   createWorktreeWorkspaceResult: vi
     .fn()
-    .mockResolvedValue({ workspaceId: "ws-new", adopted: false }),
-  getAppState: vi.fn().mockResolvedValue({
-    workspaces: [{ workspace_id: "ws-new", tabs: [{ tab_id: "tab-default", kind: "terminal" }] }],
-  }),
+    .mockResolvedValue({ workspaceId: "ws-new", adopted: false, initialTabId: "tab-default" }),
   applyPreset: vi.fn().mockResolvedValue(undefined),
   importWorktreeWorkspace: vi.fn().mockResolvedValue("ws-new"),
   activateWorkspace: vi.fn().mockResolvedValue(undefined),
@@ -46,7 +43,6 @@ import {
   applyPreset,
   closeWorkspace,
   createWorktreeWorkspaceResult,
-  getAppState,
   getPresets,
   importWorktreeWorkspace,
   listWorktrees,
@@ -60,7 +56,6 @@ import type { TerminalPreset, WorktreeInfo } from "@/tauri/types";
 const mockCloseWorkspace = vi.mocked(closeWorkspace);
 const mockCreate = vi.mocked(createWorktreeWorkspaceResult);
 const mockApplyPreset = vi.mocked(applyPreset);
-const mockGetAppState = vi.mocked(getAppState);
 const mockGetPresets = vi.mocked(getPresets);
 const mockImport = vi.mocked(importWorktreeWorkspace);
 const mockListWorktrees = vi.mocked(listWorktrees);
@@ -116,9 +111,6 @@ beforeEach(() => {
   vi.clearAllMocks();
   useUIStore.setState({ lastSelectedAgentId: null });
   useChatDraftStore.setState({ draftsById: {}, activeDraftId: null });
-  mockGetAppState.mockResolvedValue({
-    workspaces: [{ workspace_id: "ws-new", tabs: [{ tab_id: "tab-default", kind: "terminal" }] }],
-  } as Awaited<ReturnType<typeof getAppState>>);
 });
 
 async function goToSetupStep(task = "Add dark mode") {

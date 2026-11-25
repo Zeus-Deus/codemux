@@ -373,6 +373,7 @@ export interface WorkspaceCreateResult {
   workspaceId: string;
   cwd: string | null;
   adopted: boolean;
+  initialTabId?: string | null;
 }
 
 /** Coerce the create_* response, which is either the legacy bare
@@ -381,17 +382,20 @@ export interface WorkspaceCreateResult {
  *  shape so the frontend never breaks on the sibling backend's rollout
  *  order. */
 function normalizeWorkspaceCreate(raw: unknown): WorkspaceCreateResult {
-  if (typeof raw === "string") return { workspaceId: raw, cwd: null, adopted: false };
+  if (typeof raw === "string") return { workspaceId: raw, cwd: null, adopted: false, initialTabId: null };
   const obj = (raw ?? {}) as {
     workspace_id?: string;
     workspaceId?: string;
     cwd?: string | null;
     adopted?: boolean;
+    initial_tab_id?: string | null;
+    initialTabId?: string | null;
   };
   return {
     workspaceId: obj.workspace_id ?? obj.workspaceId ?? "",
     cwd: obj.cwd ?? null,
     adopted: obj.adopted === true,
+    initialTabId: obj.initial_tab_id ?? obj.initialTabId ?? null,
   };
 }
 

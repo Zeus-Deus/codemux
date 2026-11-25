@@ -441,6 +441,8 @@ pub async fn create_workspace<R: tauri::Runtime>(
 /// `base_branch` is what a freshly created worktree branch forked from, as
 /// recorded on the workspace; absent when nothing was recorded (adopted or
 /// reused checkouts, plain folders), so older readers see the old shape.
+/// `initial_tab_id` is captured before creation emits state, so a later tab
+/// reorder cannot redirect a preset intended for the first terminal.
 #[derive(Debug, Clone, Serialize)]
 pub struct WorkspaceCreated {
     pub workspace_id: String,
@@ -448,6 +450,8 @@ pub struct WorkspaceCreated {
     pub adopted: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub base_branch: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub initial_tab_id: Option<String>,
 }
 
 // `async fn` so the git-info subprocesses run on the blocking pool instead
@@ -542,6 +546,7 @@ async fn create_empty_workspace_impl<R: tauri::Runtime>(
         cwd,
         adopted: false,
         base_branch: None,
+        initial_tab_id: None,
     })
 }
 
@@ -915,7 +920,7 @@ pub(crate) async fn create_worktree_checked<R: tauri::Runtime>(
     // Archived workspaces do not participate — see
     // `find_live_workspace_for_worktree_path` for why they are neither a
     // blocker nor auto-unarchived here.
-    let claim = state.adopt_or_create_worktree_workspace_with_selection(
+    let (claim, initial_tab_id) = state.adopt_or_create_worktree_workspace_with_selection(
         wt_path_buf.clone(),
         layout,
         worktree_path.clone(),
@@ -945,6 +950,7 @@ pub(crate) async fn create_worktree_checked<R: tauri::Runtime>(
                 workspace_id: existing_id,
                 adopted: true,
                 base_branch: None,
+                initial_tab_id: None,
             });
         }
         WorktreeWorkspaceClaim::Created(id) => id,
@@ -1088,6 +1094,7 @@ pub(crate) async fn create_worktree_checked<R: tauri::Runtime>(
         cwd: worktree_path,
         adopted: false,
         base_branch,
+        initial_tab_id,
     })
 }
 
@@ -1148,6 +1155,7 @@ async fn import_worktree_workspace_checked<R: tauri::Runtime>(
     checkpoint.check()?;
     let layout = match layout.as_str() {
         "single" => WorkspacePresetLayout::Single,
+        "empty" => WorkspacePresetLayout::Empty,
         "pair" => WorkspacePresetLayout::Pair,
         "quad" => WorkspacePresetLayout::Quad,
         "six" => WorkspacePresetLayout::Six,

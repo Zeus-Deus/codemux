@@ -3191,6 +3191,7 @@ impl AppStateStore {
             None,
             None,
         )
+        .0
     }
 
     /// [`Self::adopt_or_create_worktree_workspace`] with explicit focus, an
@@ -3198,6 +3199,8 @@ impl AppStateStore {
     /// workspace. A checkout `probe` finds is adopted and the reservation
     /// goes unused. A reservation that already names a live workspace is
     /// returned as adopted, so retrying under the same id never duplicates.
+    /// Returns the first terminal tab ID from the new workspace while the
+    /// creation lock is held; later tab changes cannot substitute a target.
     #[allow(clippy::too_many_arguments)]
     pub fn adopt_or_create_worktree_workspace_with_selection<F>(
         &self,
@@ -3209,20 +3212,20 @@ impl AppStateStore {
         select: bool,
         initial_chat: Option<InitialChatPane>,
         reserved: Option<WorkspaceId>,
-    ) -> WorktreeWorkspaceClaim
+    ) -> (WorktreeWorkspaceClaim, Option<String>)
     where
         F: FnOnce(&AppStateSnapshot) -> Option<String>,
     {
         let mut snapshot = self.inner.lock().unwrap();
         Self::with_workspace_selection(&mut snapshot, select, |snapshot| {
             if let Some(existing_id) = probe(&snapshot) {
-                return WorktreeWorkspaceClaim::Adopted(existing_id);
+                return (WorktreeWorkspaceClaim::Adopted(existing_id), None);
             }
             if let Some(existing) = reserved
                 .as_ref()
                 .filter(|id| snapshot.workspaces.iter().any(|w| &w.workspace_id == *id))
             {
-                return WorktreeWorkspaceClaim::Adopted(existing.0.clone());
+                return (WorktreeWorkspaceClaim::Adopted(existing.0.clone()), None);
             }
             let workspace_id = Self::create_workspace_with_layout_locked_with_id(
                 snapshot,
@@ -3254,7 +3257,18 @@ impl AppStateStore {
                 )
                 .expect("new workspace accepts its initial chat pane");
             }
-            WorktreeWorkspaceClaim::Created(workspace_id)
+            let initial_tab_id = snapshot
+                .workspaces
+                .iter()
+                .find(|workspace| workspace.workspace_id == workspace_id)
+                .and_then(|workspace| {
+                    workspace
+                        .tabs
+                        .iter()
+                        .find(|tab| matches!(&tab.kind, TabKind::Terminal))
+                })
+                .map(|tab| tab.tab_id.clone());
+            (WorktreeWorkspaceClaim::Created(workspace_id), initial_tab_id)
         })
     }
 
@@ -15374,7 +15388,7 @@ mod reserved_workspace_id_tests {
         let reserved = AppStateStore::reserve_workspace_id();
         assert_eq!(
             claim(Some(reserved.clone()), None),
-            WorktreeWorkspaceClaim::Created(reserved.clone())
+            (WorktreeWorkspaceClaim::Created(reserved.clone()), None)
         );
         let workspace = store.find_workspace(&reserved.0).unwrap();
         assert_eq!(workspace.worktree_path.as_deref(), Some("/tmp/codemux-reserved-worktree"));
@@ -15384,17 +15398,43 @@ mod reserved_workspace_id_tests {
         let count = store.snapshot().workspaces.len();
         assert_eq!(
             claim(Some(reserved.clone()), None),
-            WorktreeWorkspaceClaim::Adopted(reserved.0.clone()),
+            (WorktreeWorkspaceClaim::Adopted(reserved.0.clone()), None),
             "a retry under the same reservation adopts it"
         );
         let unused = AppStateStore::reserve_workspace_id();
         assert_eq!(
             claim(Some(unused.clone()), Some(reserved.0.clone())),
-            WorktreeWorkspaceClaim::Adopted(reserved.0.clone()),
+            (WorktreeWorkspaceClaim::Adopted(reserved.0.clone()), None),
             "a live checkout wins over the reservation"
         );
         assert_eq!(store.snapshot().workspaces.len(), count);
         assert!(store.find_workspace(&unused.0).is_none());
+    }
+
+    #[test]
+    fn worktree_claim_returns_the_original_terminal_tab() {
+        let store = AppStateStore::default();
+        let (claim, initial_tab_id) = store.adopt_or_create_worktree_workspace_with_selection(
+            PathBuf::from("/tmp/codemux-original-tab"),
+            WorkspacePresetLayout::Single,
+            "/tmp/codemux-original-tab".into(),
+            "original-tab".into(),
+            |_| None,
+            true,
+            None,
+            None,
+        );
+        let WorktreeWorkspaceClaim::Created(workspace_id) = claim else {
+            panic!("expected a newly created workspace");
+        };
+        let original = initial_tab_id
+            .as_ref()
+            .expect("created worktree has a terminal tab")
+            .clone();
+        let (second, _) = store.create_tab(&workspace_id.0, TabKind::Terminal).unwrap();
+        assert!(store.reorder_tabs(&workspace_id.0, vec![second, original.clone()]));
+        store.close_tab(&workspace_id.0, &original).unwrap();
+        assert_eq!(initial_tab_id, Some(original));
     }
 }
 

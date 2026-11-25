@@ -7,11 +7,8 @@ const mockApplyPreset = vi.fn().mockResolvedValue(undefined);
 const mockCreateTab = vi.fn().mockResolvedValue("tab-1");
 const mockCreateWorktree = vi
   .fn()
-  .mockResolvedValue({ workspaceId: "ws-new", adopted: false });
+  .mockResolvedValue({ workspaceId: "ws-new", adopted: false, initialTabId: "tab-default" });
 const mockGetCheckLogExcerpt = vi.fn().mockResolvedValue("");
-const mockGetAppState = vi.fn().mockResolvedValue({
-  workspaces: [{ workspace_id: "ws-new", tabs: [{ tab_id: "tab-default", kind: "terminal" }] }],
-});
 const mockGetPresets = vi.fn().mockResolvedValue({
   presets: [
     {
@@ -39,7 +36,6 @@ vi.mock("@/tauri/commands", () => ({
   createTab: (...a: unknown[]) => mockCreateTab(...a),
   createWorktreeWorkspaceResult: (...a: unknown[]) => mockCreateWorktree(...a),
   getCheckLogExcerpt: (...a: unknown[]) => mockGetCheckLogExcerpt(...a),
-  getAppState: (...a: unknown[]) => mockGetAppState(...a),
   getPresets: (...a: unknown[]) => mockGetPresets(...a),
 }));
 
@@ -116,11 +112,8 @@ function ws(over: Partial<WorkspaceSnapshot>): WorkspaceSnapshot {
 
 beforeEach(() => {
   vi.clearAllMocks();
-  mockCreateWorktree.mockResolvedValue({ workspaceId: "ws-new", adopted: false });
+  mockCreateWorktree.mockResolvedValue({ workspaceId: "ws-new", adopted: false, initialTabId: "tab-default" });
   mockGetCheckLogExcerpt.mockResolvedValue("");
-  mockGetAppState.mockResolvedValue({
-    workspaces: [{ workspace_id: "ws-new", tabs: [{ tab_id: "tab-default", kind: "terminal" }] }],
-  });
   workspaces = [];
   lastSelectedAgentId = null;
   useChatDraftStore.setState({ draftsById: {}, activeDraftId: null });
@@ -363,6 +356,31 @@ describe("handOffToAgent — routes", () => {
       "ws-new", "builtin-claude", "current_terminal", null, null, true, "tab-default",
     );
     expect(mockCreateTab).not.toHaveBeenCalled();
+  });
+
+  it("uses the tab returned at worktree creation even if tab order later changes", async () => {
+    mockCreateWorktree.mockResolvedValueOnce({
+      workspaceId: "ws-new",
+      adopted: false,
+      initialTabId: "tab-original",
+    });
+
+    await handOffToAgent(req(CHECK_TASK));
+
+    expect(mockApplyPreset.mock.calls[0][6]).toBe("tab-original");
+  });
+
+  it("does not substitute another terminal if the original tab ID is missing", async () => {
+    mockCreateWorktree.mockResolvedValueOnce({
+      workspaceId: "ws-new",
+      adopted: false,
+      initialTabId: null,
+    });
+
+    await expect(handOffToAgent(req(CHECK_TASK))).rejects.toThrow(/no initial terminal tab/);
+    expect(mockApplyPreset).not.toHaveBeenCalled();
+    expect(mockToastSuccess).not.toHaveBeenCalled();
+    expect(Object.values(useChatDraftStore.getState().draftsById)[0].manualPromptRequired).toBe(false);
   });
 
   it("keeps the PR task without claiming a new-worktree agent opened when its write fails", async () => {
