@@ -19,6 +19,7 @@ const {
   mockCheckoutDefault,
   mockCloseWorkspace,
   mockCloseWorkspaceWithWorktree,
+  mockCopyMissingNestedWorktreeIncludes,
   mockGetDefaultBranch,
   mockDetectEditors,
   mockSetWorkspacePinned,
@@ -30,6 +31,7 @@ const {
   mockCheckoutDefault: vi.fn(),
   mockCloseWorkspace: vi.fn(),
   mockCloseWorkspaceWithWorktree: vi.fn(),
+  mockCopyMissingNestedWorktreeIncludes: vi.fn(),
   mockGetDefaultBranch: vi.fn().mockResolvedValue("main"),
   mockDetectEditors: vi.fn().mockResolvedValue([]),
   mockSetWorkspacePinned: vi.fn().mockResolvedValue(undefined),
@@ -53,6 +55,8 @@ vi.mock("@/tauri/commands", () => ({
   closeWorkspace: (...args: unknown[]) => mockCloseWorkspace(...args),
   closeWorkspaceWithWorktree: (...args: unknown[]) =>
     mockCloseWorkspaceWithWorktree(...args),
+  copyMissingNestedWorktreeIncludes: (...args: unknown[]) =>
+    mockCopyMissingNestedWorktreeIncludes(...args),
   renameWorkspace: vi.fn().mockResolvedValue(undefined),
   setWorkspacePinned: (...args: unknown[]) => mockSetWorkspacePinned(...args),
   setWorkspaceMuted: (...args: unknown[]) => mockSetWorkspaceMuted(...args),
@@ -264,6 +268,8 @@ beforeEach(() => {
   mockCloseWorkspace.mockResolvedValue(undefined);
   mockCloseWorkspaceWithWorktree.mockReset();
   mockCloseWorkspaceWithWorktree.mockResolvedValue(undefined);
+  mockCopyMissingNestedWorktreeIncludes.mockReset();
+  mockCopyMissingNestedWorktreeIncludes.mockResolvedValue({ copied: [], errors: [], skipped_nested: [], source: "file" });
   mockGetDefaultBranch.mockReset();
   mockGetDefaultBranch.mockResolvedValue("main");
   mockDetectEditors.mockReset();
@@ -315,6 +321,35 @@ describe("Repository-only menu items", () => {
     for (const name of [/Copy branch name/i, /Checkout default branch/i, /Re-run setup/i]) {
       expect(screen.getByRole("menuitem", { name })).toBeInTheDocument();
     }
+  });
+});
+
+describe("Copy missing nested files", () => {
+  it("lets the desktop recover nested files from a linked worktree menu", async () => {
+    render(
+      <WorkspaceContextMenuItems
+        workspace={makeWorkspace({ worktree_path: "/fixture/worktree" })}
+        onArchiveRequest={() => {}}
+        onDeleteRequest={() => {}}
+      />,
+    );
+
+    await userEvent.click(screen.getByRole("menuitem", { name: "Copy missing nested files" }));
+    expect(mockCopyMissingNestedWorktreeIncludes).toHaveBeenCalledExactlyOnceWith("ws-1");
+  });
+
+  it("keeps the recovery action out of the browser", async () => {
+    remote.value = true;
+    render(
+      <WorkspaceContextMenuItems
+        workspace={makeWorkspace({ worktree_path: "/fixture/worktree" })}
+        onArchiveRequest={() => {}}
+        onDeleteRequest={() => {}}
+      />,
+    );
+
+    await flushDefaultBranchFetch();
+    expect(screen.queryByRole("menuitem", { name: "Copy missing nested files" })).not.toBeInTheDocument();
   });
 });
 

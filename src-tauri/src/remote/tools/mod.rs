@@ -387,20 +387,11 @@ fn provision_worktree_workspace(ws: &Workspace, runner: &SetupRunner) -> Value {
         .as_ref()
         .map(|c| c.worktree_includes.clone())
         .unwrap_or_default();
-    let (includes_copied, includes_skipped_nested) = match crate::scripts::process_worktree_includes(
+    let includes = crate::scripts::IncludeResult::reported(crate::scripts::process_worktree_includes(
         &root_path,
         &workspace_path,
         &setting_patterns,
-    ) {
-        Ok(result) => (result.copied, result.skipped_nested),
-        Err(e) => {
-            eprintln!(
-                "[codemux-remote] worktree includes failed for workspace {}: {e}",
-                ws.id
-            );
-            (Vec::new(), Vec::new())
-        }
-    };
+    ));
     // Step 2: setup commands, in the background. The port is derived
     // from the workspace id exactly like the desktop, so a project's
     // setup script sees a stable CODEMUX_PORT for this workspace.
@@ -447,8 +438,9 @@ fn provision_worktree_workspace(ws: &Workspace, runner: &SetupRunner) -> Value {
 
     json!({
         "port": port,
-        "includes_copied": includes_copied,
-        "includes_skipped_nested": includes_skipped_nested,
+        "includes_copied": includes.copied,
+        "includes_skipped_nested": includes.skipped_nested,
+        "includes_errors": includes.errors,
         "setup_commands": setup_commands,
         "setup_running": setup_running,
         "log": log,
@@ -825,9 +817,19 @@ mod tests {
         let repo = TempDir::new().unwrap();
         init_repo(repo.path());
         // The root include is copied and the nested match is reported.
-        std::fs::write(repo.path().join(".gitignore"), ".env\nconfig/local.env\nsetup-ran.txt\n").unwrap();
-        std::fs::write(repo.path().join(".codemuxinclude"), ".env\nconfig/local.env\n").unwrap();
+        std::fs::write(repo.path().join(".gitignore"), ".env\nblocked.env\nconfig/local.env\nsetup-ran.txt\n").unwrap();
+        std::fs::write(repo.path().join(".codemuxinclude"), ".env\nblocked.env\nconfig/local.env\n").unwrap();
         std::fs::write(repo.path().join(".env"), "SECRET=from-root").unwrap();
+        #[cfg(unix)]
+        let blocked_source = if unsafe { libc::geteuid() } != 0 {
+            use std::os::unix::fs::PermissionsExt;
+            let path = repo.path().join("blocked.env");
+            std::fs::write(&path, "unreadable fixture").unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).unwrap();
+            true
+        } else {
+            false
+        };
         std::fs::create_dir(repo.path().join("config")).unwrap();
         std::fs::write(repo.path().join("config/local.env"), "NESTED=fixture").unwrap();
         // Committed setup config: the script records its env into a
@@ -859,6 +861,14 @@ mod tests {
         assert!((3100..6500).contains(&port), "port {port} out of range");
         assert_eq!(setup["includes_copied"], json!([".env"]));
         assert_eq!(setup["includes_skipped_nested"], json!(["config/local.env"]));
+        #[cfg(unix)]
+        if blocked_source {
+            let errors = setup["includes_errors"].as_array().unwrap();
+            assert_eq!(errors.len(), 1);
+            assert!(errors[0].as_str().unwrap().contains("blocked.env"), "{errors:?}");
+        } else {
+            assert_eq!(setup["includes_errors"], json!([]));
+        }
 
         // Includes are copied synchronously: present as soon as the
         // tool returns.
@@ -924,6 +934,7 @@ mod tests {
         assert_eq!(out["setup"]["setup_commands"], 0);
         assert_eq!(out["setup"]["setup_running"], false);
         assert_eq!(out["setup"]["includes_skipped_nested"], json!([]));
+        assert_eq!(out["setup"]["includes_errors"], json!([]));
         assert!(out["setup"]["port"].as_u64().is_some());
 
         match prev_home {

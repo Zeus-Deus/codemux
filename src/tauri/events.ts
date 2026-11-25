@@ -15,6 +15,7 @@ import type {
   TerminalStatusPayload,
   ThemeColors,
   SettingsPersistence,
+  WorktreeIncludeResult,
 } from "./types";
 import type { AutomationRunView } from "./commands";
 
@@ -120,9 +121,10 @@ export const onWorkspaceSetupFailed = (
 
 export interface WorktreeIncludesApplied {
   workspace_id: string;
-  source: "file" | "setting" | "defaults";
+  source: WorktreeIncludeResult["source"];
   copied: string[];
   skipped_nested?: string[];
+  errors?: string[];
 }
 
 export const onWorktreeIncludesApplied = (

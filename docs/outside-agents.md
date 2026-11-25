@@ -578,7 +578,9 @@ To control Codemux from another machine, use SSH or **Over the network**, not `c
 
 On a headless host, `worktree_create` and `codemux-remote worktree create` copy matching top-level files from the main checkout into a new worktree before returning. Project setup commands start in the background after the include step.
 
-The tool lists skipped nested paths in `setup.includes_skipped_nested`, and the CLI prints them to stderr. Have the setup commands provision required nested files, or copy them into the worktree yourself and rerun the commands with `codemux-remote worktree setup --path <path> --workspace-id <id> --name <name> --branch <branch>`. Get those values from `worktree_create` or `codemux-remote workspace list`.
+The tool lists skipped nested paths in `setup.includes_skipped_nested` and copy failures in `setup.includes_errors`. The CLI prints both to stderr. Have the setup commands provision required nested files, or copy them into the worktree yourself and rerun the commands with `codemux-remote worktree setup --path <path> --workspace-id <id> --name <name> --branch <branch>`. Get those values from `worktree_create` or `codemux-remote workspace list`.
+
+On the desktop, **Copy missing nested files** in the worktree menu copies matching nested includes while preserving existing files. It runs separately from the setup commands.
 
 ### Phones and browsers
 

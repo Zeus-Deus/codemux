@@ -1125,6 +1125,10 @@ fn run_worktree_create(
         if skipped.as_array().is_some_and(|paths| !paths.is_empty()) {
             eprintln!("[codemux-remote] Automatic setup skipped nested worktree includes: {skipped}");
         }
+        let errors = &data["setup"]["includes_errors"];
+        if errors.as_array().is_some_and(|errors| !errors.is_empty()) {
+            eprintln!("[codemux-remote] Worktree include errors: {errors}");
+        }
         Ok(output)
     }) {
         Ok(output) => {

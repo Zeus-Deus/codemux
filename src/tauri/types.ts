@@ -1601,6 +1601,13 @@ export interface WorkspaceConfig {
   worktree_includes: string[];
 }
 
+export interface WorktreeIncludeResult {
+  source: "file" | "setting" | "defaults";
+  copied: string[];
+  skipped_nested: string[];
+  errors: string[];
+}
+
 export interface ProjectScripts {
   setup: string[];
   teardown: string[];

@@ -122,6 +122,7 @@ import { StatusIndicator } from "@/components/ui/status-indicator";
 import { ProjectAvatar } from "@/components/ui/project-avatar";
 import { IssueDetailPopover } from "@/components/github/issue-detail-popover";
 import { toast } from "@/lib/toast";
+import { copyMissingNestedFilesWithFeedback } from "@/lib/worktree-includes";
 import { useForceDelete } from "@/hooks/use-force-delete";
 import { useDefaultBranch } from "./default-branch-cache";
 import { useDetectedEditors } from "@/stores/editor-discovery-store";
@@ -953,6 +954,15 @@ export function WorkspaceContextMenuItems({
         >
           <RotateCcw />
           <span className="flex-1">Re-run setup</span>
+        </ContextMenuItem>
+      )}
+      {isWorktree && !isChat && !isAttachOrRemote && !isRemoteClient() && (
+        <ContextMenuItem
+          className={MENU_ROW}
+          onClick={() => void copyMissingNestedFilesWithFeedback(workspace.workspace_id)}
+        >
+          <Copy />
+          <span className="flex-1">Copy missing nested files</span>
         </ContextMenuItem>
       )}
       <ContextMenuItem className={MENU_ROW} onClick={handleToggleMute}>

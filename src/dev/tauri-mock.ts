@@ -4572,6 +4572,7 @@ type Handler = (args: Args) => unknown;
 
 /** Per-project scripts saved through `set_project_scripts`, keyed by path. */
 const mockProjectScripts = new Map<string, ProjectScripts>();
+const mockRecoveredWorktreeIncludes = new Set<string>();
 
 /** The seeded preview PNG as an image-read response. */
 function mockPreviewImageBytes() {
@@ -7746,6 +7747,15 @@ const handlers: Record<string, Handler> = {
   // No mock project has a `.codemux/config.json`; like the backend, that
   // reads as null, so the DB scripts below are the effective config.
   get_workspace_config: () => null,
+  copy_missing_nested_worktree_includes: (a) => {
+    const workspace = appState.workspaces.find((item) => item.workspace_id === a.workspaceId);
+    if (!workspace?.worktree_path || workspace.attach_only || workspace.host_id != null) {
+      throw new Error("Select a local linked worktree.");
+    }
+    const copied = mockRecoveredWorktreeIncludes.has(workspace.workspace_id) ? [] : ["config/local.env"];
+    mockRecoveredWorktreeIncludes.add(workspace.workspace_id);
+    return { copied, errors: [], skipped_nested: [], source: "file" };
+  },
   get_project_scripts: (a) =>
     mockProjectScripts.get(a.path as string) ?? {
       setup: [],

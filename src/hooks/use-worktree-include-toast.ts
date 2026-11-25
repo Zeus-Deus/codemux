@@ -1,12 +1,18 @@
 import { useEffect } from "react";
+import { isRemoteClient } from "@/components/remote/is-remote-client";
 import { onWorktreeIncludesApplied } from "@/tauri/events";
 import { dbGetUiState, dbSetUiState } from "@/tauri/commands";
 import { useAppStore } from "@/stores/app-store";
 import { basename } from "@/lib/path";
 import { toast } from "@/lib/toast";
+import {
+  copyMissingNestedFilesWithFeedback,
+  formatIncludeDetails,
+  reportWorktreeIncludeErrors,
+} from "@/lib/worktree-includes";
 
 /**
- * Reports skipped nested files and shows a one-time hint for default copies.
+ * Reports include errors and skipped nested files, and shows a one-time hint for defaults.
  *
  * Implementation note: do NOT subscribe to `appState` via `useAppStore`
  * here, and do NOT put `appState` in the effect's dependency array.
@@ -30,12 +36,16 @@ import { toast } from "@/lib/toast";
 export function useWorktreeIncludeToast() {
   useEffect(() => {
     const unlisten = onWorktreeIncludesApplied(async (payload) => {
+      reportWorktreeIncludeErrors(payload.errors ?? []);
       const skipped = payload.skipped_nested ?? [];
       if (skipped.length > 0) {
-        const paths = skipped.slice(0, 3).join(", ");
-        const remaining = skipped.length > 3 ? ` and ${skipped.length - 3} more` : "";
+        const remote = isRemoteClient();
         toast.warning("Nested worktree files skipped", {
-          description: `Skipped ${paths}${remaining}. Use Re-run setup to copy nested files.`,
+          description: `Skipped ${formatIncludeDetails(skipped)}.${remote ? " Copy missing nested files from the desktop." : ""}`,
+          action: remote ? undefined : {
+            label: "Copy missing nested files",
+            onClick: () => copyMissingNestedFilesWithFeedback(payload.workspace_id),
+          },
           classNames: { description: "line-clamp-3 break-words" },
           duration: 8000,
         });
