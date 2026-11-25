@@ -1823,9 +1823,14 @@ fn output_capture_and_track_browser_daemon_with_status(
 }
 
 #[cfg(not(windows))]
-fn track_late_browser_daemon(session: &str) {
+fn browser_daemon_trackers() -> &'static std::sync::Mutex<HashSet<String>> {
     static TRACKERS: OnceLock<std::sync::Mutex<HashSet<String>>> = OnceLock::new();
-    let trackers = TRACKERS.get_or_init(|| std::sync::Mutex::new(HashSet::new()));
+    TRACKERS.get_or_init(|| std::sync::Mutex::new(HashSet::new()))
+}
+
+#[cfg(not(windows))]
+fn track_late_browser_daemon(session: &str) {
+    let trackers = browser_daemon_trackers();
     let Ok(mut pending) = trackers.lock() else { return };
     if !pending.insert(session.to_owned()) {
         return;
@@ -1853,6 +1858,22 @@ fn track_late_browser_daemon(session: &str) {
             pending.remove(session.as_str());
         }
     }
+}
+
+#[cfg(not(windows))]
+async fn wait_for_late_browser_daemon_tracking(session: &str) -> bool {
+    let deadline = Instant::now() + Duration::from_secs(6);
+    while Instant::now() < deadline {
+        let pending = browser_daemon_trackers()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .contains(session);
+        if !pending {
+            return true;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    false
 }
 
 fn previous_app_has_exited(record: &BrowserPidRecord) -> bool {
@@ -4319,6 +4340,43 @@ impl AgentBrowserManager {
         }
     }
 
+    #[cfg(not(windows))]
+    async fn settle_provisional_action(
+        &self,
+        browser_id: &str,
+        session: &str,
+        action: &str,
+        result: &Result<(BrowserAutomationResult, BrowserActionOutcome), BrowserActionFailure>,
+    ) {
+        // A CLI can exit before its detached daemon publishes a PID. Hold
+        // the per-session lifecycle gate through the late tracker, then
+        // retire only a first action with no verified process or endpoint.
+        let provisional = self.sessions.lock().await.get(browser_id).is_some_and(|entry| {
+            entry.running && entry.pid.is_none() && !entry.browser_ready && !entry.confirmation_pending
+        });
+        if !provisional || !wait_for_late_browser_daemon_tracking(session).await {
+            return;
+        }
+        self.reconcile_action_result(browser_id, session, action, result).await;
+        let lookup_session = session.to_owned();
+        let confirmed_absent = tokio::task::spawn_blocking(move || {
+            live_owned_browser_record(&lookup_session).is_none()
+                && read_agent_browser_daemon_pid(&lookup_session).is_none()
+                && run_dir_for_session(&lookup_session).is_some_and(|dir| {
+                    probe_browser_control_endpoint(&lookup_session, &dir)
+                        == BrowserControlEndpointProbe::Absent
+                })
+        }).await.unwrap_or(false);
+        if confirmed_absent {
+            let mut sessions = self.sessions.lock().await;
+            if sessions.get(browser_id).is_some_and(|entry| {
+                entry.pid.is_none() && !entry.browser_ready && !entry.confirmation_pending
+            }) {
+                sessions.remove(browser_id);
+            }
+        }
+    }
+
     pub async fn run_command(&self, browser_id: &str, action: &str, params: serde_json::Value) -> Result<BrowserAutomationResult, String> {
         let session = session_name(browser_id).to_string();
         validate_session_name(&session)?;
@@ -4424,6 +4482,10 @@ impl AgentBrowserManager {
             }
         } else {
             self.reconcile_action_result(browser_id, session, action, result).await;
+            #[cfg(not(windows))]
+            if !was_running && action != "close" {
+                self.settle_provisional_action(browser_id, session, action, result).await;
+            }
         }
     }
 
@@ -5950,6 +6012,78 @@ mod tests {
             command, Duration::from_secs(2), &session,
         ).unwrap();
         assert!(output.status.success());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn exited_unix_launcher_without_daemon_allows_same_session_retry() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        let launcher = temp.path().join("agent-browser");
+        std::fs::write(&launcher, "#!/bin/sh\nexit 1\n").unwrap();
+        std::fs::set_permissions(&launcher, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let binary = launcher.to_str().unwrap();
+        let session = format!("browser-exited-retry-{}", uuid::Uuid::new_v4().simple());
+        let params = serde_json::json!({"url": "about:blank"});
+        let manager = AgentBrowserManager::new();
+        let port = manager.allocate_port(&session).await.unwrap();
+        let was_running = manager.prepare_unix_action(&session, &session, "open", &params, binary).await.unwrap();
+        assert!(!was_running);
+
+        let argv = build_agent_browser_argv_groups(&session, "open", &params).unwrap().remove(0);
+        let command = browser_action_command(binary, &argv, &session, port).unwrap();
+        let output = output_capture_and_track_browser_daemon_with_status(
+            command, Duration::from_secs(2), &session,
+        ).unwrap();
+        assert!(!output.status.success());
+        let result = Err(BrowserActionFailure::after_launch("launcher exited without a daemon".into()));
+        manager.reconcile_action_attempt(&session, &session, "open", was_running, false, &result).await;
+        assert!(manager.sessions.lock().await.get(&session).is_none(), "failed first action must release its provisional port");
+
+        std::fs::write(&launcher, "#!/bin/sh\nexit 0\n").unwrap();
+        let retry_port = manager.allocate_port(&session).await.unwrap();
+        assert!(!manager.prepare_unix_action(&session, &session, "open", &params, binary).await.unwrap());
+        let command = browser_action_command(binary, &argv, &session, retry_port).unwrap();
+        let output = output_capture_and_track_browser_daemon_with_status(
+            command, Duration::from_secs(2), &session,
+        ).unwrap();
+        assert!(output.status.success());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn failed_unix_action_preserves_a_daemon_that_publishes_its_pid_late() {
+        let session = format!("browser-action-late-pid-{}", uuid::Uuid::new_v4().simple());
+        let (_temp, mut daemon, record) = browser_identity_fixture(&session, browser_owner_token());
+        let pid_path = run_dir_for_session(&session).unwrap().join(format!("{session}.pid"));
+        let manager = AgentBrowserManager::new();
+        manager.allocate_port(&session).await.unwrap();
+        let was_running = manager.note_action_start(&session, "open").await;
+        assert!(!was_running);
+        let daemon_pid = daemon.id();
+        let pid_path_for_writer = pid_path.clone();
+        let writer = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(300));
+            std::fs::write(pid_path_for_writer, daemon_pid.to_string()).unwrap();
+        });
+
+        let mut command = std::process::Command::new("sh");
+        command.args(["-c", "exit 1"]);
+        let output = output_capture_and_track_browser_daemon_with_status(
+            command, Duration::from_secs(2), &session,
+        ).unwrap();
+        assert!(!output.status.success());
+        let result = Err(BrowserActionFailure::after_launch("launcher exited before PID publication".into()));
+        manager.reconcile_action_attempt(&session, &session, "open", was_running, false, &result).await;
+        writer.join().unwrap();
+        let current = manager.sessions.lock().await.get(&session).map(|entry| (entry.running, entry.pid));
+        assert_eq!(current, Some((true, Some(record.pid))));
+
+        kill_verified_browser_pid(&record, &session);
+        let _ = daemon.wait();
+        let _ = std::fs::remove_file(pid_path);
+        clear_session_pid(&session);
     }
 
     #[cfg(not(target_os = "windows"))]
