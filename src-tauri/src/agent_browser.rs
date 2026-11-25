@@ -931,6 +931,28 @@ fn track_current_browser_daemon(session: &str) -> Option<BrowserPidRecord> {
     Some(record)
 }
 
+#[cfg(not(windows))]
+fn failed_open_daemon_started_here(
+    current: &BrowserPidRecord,
+    before_open: Option<&BrowserPidRecord>,
+) -> bool {
+    current.token == browser_owner_token()
+        && before_open.is_none_or(|previous| {
+            previous.pid != current.pid || previous.start_time != current.start_time
+        })
+}
+
+#[cfg(not(windows))]
+fn rollback_failed_unix_open(session: &str, before_open: Option<&BrowserPidRecord>) {
+    if let Some(record) = track_current_browser_daemon(session)
+        .filter(|record| failed_open_daemon_started_here(record, before_open))
+    {
+        // Signal this exact process. A session-wide CLI `close` could race a
+        // second app that starts a replacement at the same control socket.
+        kill_verified_browser_pid(&record, session);
+    }
+}
+
 fn live_owned_browser_pid(session: &str) -> Option<u32> {
     let pid = read_agent_browser_daemon_pid(session)?;
     owned_browser_pid(session, pid).map(|record| record.pid)
@@ -1115,14 +1137,15 @@ struct StreamSession {
     last_seen_at: Option<Instant>,
 }
 
+#[derive(Clone)]
 pub struct AgentBrowserManager {
     /// Atomic counter for the next port to try allocating.
-    next_port: AtomicU16,
+    next_port: Arc<AtomicU16>,
     /// Per-session state keyed by session identifier (workspace_id or cli_session_name).
-    sessions: Mutex<HashMap<String, StreamSession>>,
+    sessions: Arc<Mutex<HashMap<String, StreamSession>>>,
     /// Serializes start_stream calls to prevent concurrent daemon launches
     /// from racing (e.g., React StrictMode double-mount, pane remount + agent action).
-    start_lock: Mutex<()>,
+    start_lock: Arc<Mutex<()>>,
 }
 
 fn session_name(browser_id: &str) -> &str {
@@ -1137,6 +1160,23 @@ fn browser_lifecycle_gate(session: &str) -> Arc<Mutex<()>> {
     let gates = GATES.get_or_init(|| std::sync::Mutex::new(HashMap::new()));
     let mut gates = gates.lock().unwrap();
     gates.entry(session.to_owned()).or_insert_with(|| Arc::new(Mutex::new(()))).clone()
+}
+
+/// Keep the session gate in a worker that survives cancellation of its
+/// caller. A blocking CLI job cannot be cancelled once started, so releasing
+/// the gate with the waiting caller would let a second operation race its
+/// rollback and state reconciliation.
+async fn run_detached_browser_lifecycle<T, F>(session: String, work: F) -> Result<T, String>
+where
+    T: Send + 'static,
+    F: std::future::Future<Output = Result<T, String>> + Send + 'static,
+{
+    tokio::spawn(async move {
+        let _lifecycle = browser_lifecycle_gate(&session).lock_owned().await;
+        work.await
+    })
+    .await
+    .map_err(|error| format!("Browser lifecycle task failed: {error}"))?
 }
 
 fn validate_session_name(name: &str) -> Result<(), String> {
@@ -2559,9 +2599,9 @@ impl Default for AgentBrowserManager {
 impl AgentBrowserManager {
     pub fn new() -> Self {
         Self {
-            next_port: AtomicU16::new(DEFAULT_STREAM_PORT),
-            sessions: Mutex::new(HashMap::new()),
-            start_lock: Mutex::new(()),
+            next_port: Arc::new(AtomicU16::new(DEFAULT_STREAM_PORT)),
+            sessions: Arc::new(Mutex::new(HashMap::new())),
+            start_lock: Arc::new(Mutex::new(())),
         }
     }
 
@@ -2720,7 +2760,15 @@ impl AgentBrowserManager {
     pub async fn spawn(&self, browser_id: &str) -> Result<(), String> {
         let session = session_name(browser_id).to_string();
         validate_session_name(&session)?;
-        let _lifecycle = browser_lifecycle_gate(&session).lock_owned().await;
+        let manager = self.clone();
+        let browser_id = browser_id.to_owned();
+        run_detached_browser_lifecycle(session, async move {
+            manager.spawn_locked(&browser_id).await
+        }).await
+    }
+
+    async fn spawn_locked(&self, browser_id: &str) -> Result<(), String> {
+        let session = session_name(browser_id).to_string();
         let port = self.allocate_port(browser_id).await?;
 
         let was_running = {
@@ -2824,7 +2872,16 @@ impl AgentBrowserManager {
     pub async fn run_command(&self, browser_id: &str, action: &str, params: serde_json::Value) -> Result<BrowserAutomationResult, String> {
         let session = session_name(browser_id).to_string();
         validate_session_name(&session)?;
-        let _lifecycle = browser_lifecycle_gate(&session).lock_owned().await;
+        let manager = self.clone();
+        let browser_id = browser_id.to_owned();
+        let action = action.to_owned();
+        run_detached_browser_lifecycle(session, async move {
+            manager.run_command_locked(&browser_id, &action, params).await
+        }).await
+    }
+
+    async fn run_command_locked(&self, browser_id: &str, action: &str, params: serde_json::Value) -> Result<BrowserAutomationResult, String> {
+        let session = session_name(browser_id).to_string();
         let port = self.allocate_port(browser_id).await?;
         let was_running = self.note_action_start(browser_id, action).await;
 
@@ -2876,7 +2933,15 @@ impl AgentBrowserManager {
     pub async fn get_screenshot(&self, browser_id: &str) -> Result<String, String> {
         let session = session_name(browser_id).to_string();
         validate_session_name(&session)?;
-        let _lifecycle = browser_lifecycle_gate(&session).lock_owned().await;
+        let manager = self.clone();
+        let browser_id = browser_id.to_owned();
+        run_detached_browser_lifecycle(session, async move {
+            manager.get_screenshot_locked(&browser_id).await
+        }).await
+    }
+
+    async fn get_screenshot_locked(&self, browser_id: &str) -> Result<String, String> {
+        let session = session_name(browser_id).to_string();
         let port = self.allocate_port(browser_id).await?;
 
         // The CLI call + file read are blocking; run them off the executor
@@ -2961,7 +3026,15 @@ impl AgentBrowserManager {
     pub async fn close(&self, browser_id: &str) -> Result<(), String> {
         let session = session_name(browser_id).to_string();
         validate_session_name(&session)?;
-        let _lifecycle = browser_lifecycle_gate(&session).lock_owned().await;
+        let manager = self.clone();
+        let browser_id = browser_id.to_owned();
+        run_detached_browser_lifecycle(session, async move {
+            manager.close_locked(&browser_id).await
+        }).await
+    }
+
+    async fn close_locked(&self, browser_id: &str) -> Result<(), String> {
+        let session = session_name(browser_id).to_string();
 
         // Step 1: pop the session under the lock so nothing else races us.
         let removed = self.sessions.lock().await.remove(browser_id);
@@ -3031,7 +3104,15 @@ impl AgentBrowserManager {
     pub async fn start_stream(&self, browser_id: &str) -> Result<String, String> {
         let session = session_name(browser_id).to_string();
         validate_session_name(&session)?;
-        let _lifecycle = browser_lifecycle_gate(&session).lock_owned().await;
+        let manager = self.clone();
+        let browser_id = browser_id.to_owned();
+        run_detached_browser_lifecycle(session, async move {
+            manager.start_stream_locked(&browser_id).await
+        }).await
+    }
+
+    async fn start_stream_locked(&self, browser_id: &str) -> Result<String, String> {
+        let session = session_name(browser_id).to_string();
 
         // Serialize start_stream calls. The old code held a single Mutex<bool>
         // across the entire operation (including sleeps). Without this, concurrent
@@ -3158,6 +3239,7 @@ impl AgentBrowserManager {
             }
             #[cfg(not(target_os = "windows"))]
             {
+                let before_open = track_current_browser_daemon(&session);
                 let mut cmd = browser_open_command(&bin, &session, port)?;
                 if let Some(log) = log_file {
                     cmd.stderr(log);
@@ -3166,9 +3248,7 @@ impl AgentBrowserManager {
                     launch_status_with_timeout(cmd, OPEN_TIMEOUT),
                 );
                 if let Err(error) = opened {
-                    if let Some(record) = track_current_browser_daemon(&session) {
-                        stop_owned_browser_daemon(&session, &record, &bin);
-                    }
+                    rollback_failed_unix_open(&session, before_open.as_ref());
                     return Err(error);
                 }
             }
@@ -3348,6 +3428,50 @@ mod tests {
         drop(held);
         assert!(tokio::time::timeout(Duration::from_secs(10), stream).await.unwrap().unwrap().is_err());
         assert!(tokio::time::timeout(Duration::from_secs(10), command).await.unwrap().unwrap().is_err());
+    }
+
+    #[tokio::test]
+    async fn cancelled_caller_does_not_release_a_running_lifecycle_worker() {
+        let session = format!("browser-cancel-{}", uuid::Uuid::new_v4().simple());
+        let (started, started_rx) = std::sync::mpsc::channel();
+        let (release, release_rx) = std::sync::mpsc::channel();
+        let caller = tokio::spawn(run_detached_browser_lifecycle(session.clone(), async move {
+            tokio::task::spawn_blocking(move || {
+                started.send(()).unwrap();
+                release_rx.recv().unwrap();
+            })
+            .await
+            .unwrap();
+            Ok(())
+        }));
+        tokio::task::spawn_blocking(move || started_rx.recv_timeout(Duration::from_secs(5)))
+            .await
+            .unwrap()
+            .unwrap();
+        caller.abort();
+        let gate = browser_lifecycle_gate(&session);
+        assert!(tokio::time::timeout(Duration::from_millis(50), gate.clone().lock_owned()).await.is_err());
+        release.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(5), gate.lock_owned()).await.unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn failed_open_never_rolls_back_a_foreign_or_preexisting_daemon() {
+        let own = BrowserPidRecord {
+            pid: 10,
+            start_time: 100,
+            token: browser_owner_token().to_owned(),
+        };
+        let foreign = BrowserPidRecord {
+            token: uuid::Uuid::new_v4().simple().to_string(),
+            ..own.clone()
+        };
+        assert!(!failed_open_daemon_started_here(&foreign, None));
+        assert!(!failed_open_daemon_started_here(&own, Some(&own)));
+        assert!(failed_open_daemon_started_here(&own, None));
+        let new_own = BrowserPidRecord { pid: 11, ..own.clone() };
+        assert!(failed_open_daemon_started_here(&new_own, Some(&own)));
     }
 
     #[test]
@@ -4659,6 +4783,58 @@ mod tests {
         assert!(browser_process_start(std::process::id(), session, &token).is_none());
         child.kill().unwrap();
         child.wait().unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn failed_open_after_another_process_starts_does_not_stop_its_daemon() {
+        let temp = tempfile::tempdir().unwrap();
+        let binary = temp.path().join("agent-browser");
+        std::fs::copy(which::which("bash").unwrap(), &binary).unwrap();
+        let session = format!("browser-foreign-open-{}", uuid::Uuid::new_v4().simple());
+        let token = uuid::Uuid::new_v4().simple().to_string();
+        let mut command = std::process::Command::new(&binary);
+        command.args(["-c", "while :; do sleep 1; done"])
+            .env("CODEMUX_BROWSER_OWNER", &token)
+            .env("CODEMUX_BROWSER_SESSION", &session);
+        let spawn_started = Instant::now();
+        let mut child = loop {
+            match command.spawn() {
+                Ok(child) => break child,
+                Err(error) if error.raw_os_error() == Some(libc::ETXTBSY)
+                    && spawn_started.elapsed() < Duration::from_secs(3) =>
+                {
+                    std::thread::sleep(Duration::from_millis(25));
+                }
+                Err(error) => panic!("failed to start foreign browser fixture: {error}"),
+            }
+        };
+        let start = Instant::now();
+        let start_time = loop {
+            if let Some(start_time) = browser_process_start(child.id(), &session, &token) {
+                break start_time;
+            }
+            assert!(start.elapsed() < Duration::from_secs(3));
+            std::thread::sleep(Duration::from_millis(25));
+        };
+        let daemon_pid_path = run_dir_for_session(&session)
+            .unwrap()
+            .join(format!("{session}.pid"));
+        std::fs::write(&daemon_pid_path, child.id().to_string()).unwrap();
+        write_session_pid(&session, &BrowserPidRecord {
+            pid: child.id(),
+            start_time,
+            token,
+        }).unwrap();
+
+        rollback_failed_unix_open(&session, None);
+        let still_running = child.try_wait().unwrap().is_none();
+
+        let _ = child.kill();
+        let _ = child.wait();
+        let _ = std::fs::remove_file(daemon_pid_path);
+        clear_session_pid(&session);
+        assert!(still_running, "failed open stopped another process's daemon");
     }
 
     #[cfg(unix)]
