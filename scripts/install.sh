@@ -12,13 +12,19 @@
 #
 # No telemetry. Nothing is executed that is not printed first under --dry-run.
 #
+# A downloaded release package is installed only after its signature checks
+# out against the Codemux release signing key (see CODEMUX_SIGNING_KEY). The
+# check needs the OpenSSL 3 command-line tool.
+#
 # Environment overrides
 #   CODEMUX_INSTALL_VERSION    version or tag to install (default: latest release)
 #   CODEMUX_VERSION            same, but ignored inside a Codemux terminal pane,
 #                              where the app already exports it (see
 #                              codemux_pinned_version below)
 #   CODEMUX_ARTIFACT           path or URL to a .deb / .rpm / .AppImage; skips
-#                              version resolution and download-by-name entirely
+#                              version resolution and download-by-name entirely,
+#                              and is installed as given, without a signature
+#                              check
 #   CODEMUX_INSTALL_DIR        bin directory for the AppImage fallback
 #                              (default: /usr/local/bin, or ~/.local/bin non-root)
 #   CODEMUX_NO_DEPS=1          never touch the package manager for dependencies
@@ -47,6 +53,13 @@ CODEMUX_REPO_SLUG="${CODEMUX_REPO_SLUG:-Zeus-Deus/codemux}"
 CODEMUX_API_BASE="https://api.github.com/repos/${CODEMUX_REPO_SLUG}"
 CODEMUX_DOWNLOAD_BASE="https://github.com/${CODEMUX_REPO_SLUG}/releases/download"
 CODEMUX_RELEASES_URL="https://github.com/${CODEMUX_REPO_SLUG}/releases"
+
+# The release signing key: the minisign public key the auto-updater trusts
+# (src-tauri/tauri.conf.json plugins.updater.pubkey, base64-decoded, key line).
+# Every release asset ships a `<asset>.sig` made with its secret half, which
+# lives only in the protected release environment, so a package swapped on the
+# release page after the fact fails this check just as it fails the updater's.
+CODEMUX_SIGNING_KEY="RWQojvM96tHVIz/Dg68uFnUaG41lwxWJ1FtKErbIA9aSYfSs0ZXICm2t"
 
 # ── Output helpers ───────────────────────────────────────────────────────────
 
@@ -204,6 +217,75 @@ codemux_optional_packages() {
     esac
 }
 
+# Release signatures are Tauri updater signatures: base64 of a minisign
+# signature file whose lines are
+#   untrusted comment: ...
+#   base64("ED" + 8-byte key id + Ed25519 signature of BLAKE2b-512(file))
+#   trusted comment: timestamp:<n><TAB>file:<asset name>
+#   base64(Ed25519 signature of (the 64 signature bytes + trusted comment))
+# and the key is base64("Ed" + 8-byte key id + 32-byte Ed25519 public key).
+# OpenSSL 3 can check all of that; older OpenSSL cannot verify raw Ed25519.
+codemux_can_verify_signatures() {
+    have openssl || return 1
+    # Captured rather than piped into `grep -q`, which can SIGPIPE openssl and
+    # fail the pipeline under pipefail.
+    _cv_help=$(openssl pkeyutl -help 2>&1 || true)
+    case "$_cv_help" in *-rawin*) ;; *) return 1 ;; esac
+    printf '' | openssl dgst -blake2b512 >/dev/null 2>&1
+}
+
+# Hex of <count> bytes of <file> starting at <offset>.
+codemux_hex() {
+    dd if="$1" bs=1 skip="$2" count="$3" 2>/dev/null | od -An -tx1 -v | tr -d ' \n'
+}
+
+codemux_size() {
+    wc -c < "$1" | tr -d ' '
+}
+
+# Succeeds only when <sig> is a valid signature of <file> by
+# CODEMUX_SIGNING_KEY and names <asset name>, so a correctly signed package
+# from another release or of another kind is refused too. <scratch dir> must be
+# private to this run.
+codemux_verify_signature() { # <file> <sig> <asset name> <scratch dir>
+    _vs_file="$1"
+    _vs_name="$3"
+    _vs_dir="$4"
+    _vs_tab=$(printf '\t')
+
+    printf '%s' "$CODEMUX_SIGNING_KEY" | openssl base64 -d -A > "${_vs_dir}/key.bin" 2>/dev/null || return 1
+    [ "$(codemux_size "${_vs_dir}/key.bin")" = "42" ] || return 1
+    [ "$(codemux_hex "${_vs_dir}/key.bin" 0 2)" = "4564" ] || return 1
+    # SubjectPublicKeyInfo DER header for an Ed25519 key, then the raw key.
+    { printf 'MCowBQYDK2VwAyEA' | openssl base64 -d -A \
+        && dd if="${_vs_dir}/key.bin" bs=1 skip=10 count=32 2>/dev/null; } > "${_vs_dir}/key.der" || return 1
+
+    openssl base64 -d -A < "$2" > "${_vs_dir}/sig.txt" 2>/dev/null || return 1
+    _vs_trusted=$(sed -n '3s/^trusted comment: //p' "${_vs_dir}/sig.txt")
+    [ -n "$_vs_trusted" ] || return 1
+    sed -n 2p "${_vs_dir}/sig.txt" | openssl base64 -d -A > "${_vs_dir}/sig.bin" 2>/dev/null || return 1
+    sed -n 4p "${_vs_dir}/sig.txt" | openssl base64 -d -A > "${_vs_dir}/global.sig" 2>/dev/null || return 1
+    [ "$(codemux_size "${_vs_dir}/sig.bin")" = "74" ] || return 1
+    [ "$(codemux_size "${_vs_dir}/global.sig")" = "64" ] || return 1
+    # "ED" (prehashed) and the same key id as the trusted key.
+    [ "$(codemux_hex "${_vs_dir}/sig.bin" 0 2)" = "4544" ] || return 1
+    [ "$(codemux_hex "${_vs_dir}/sig.bin" 2 8)" = "$(codemux_hex "${_vs_dir}/key.bin" 2 8)" ] || return 1
+    dd if="${_vs_dir}/sig.bin" of="${_vs_dir}/sig.raw" bs=1 skip=10 count=64 2>/dev/null || return 1
+
+    openssl dgst -blake2b512 -binary "$_vs_file" > "${_vs_dir}/file.hash" || return 1
+    openssl pkeyutl -verify -pubin -keyform DER -inkey "${_vs_dir}/key.der" -rawin \
+        -in "${_vs_dir}/file.hash" -sigfile "${_vs_dir}/sig.raw" >/dev/null 2>&1 || return 1
+
+    # The trusted comment is only trustworthy once its own signature holds.
+    { cat "${_vs_dir}/sig.raw" && printf '%s' "$_vs_trusted"; } > "${_vs_dir}/global.msg" || return 1
+    openssl pkeyutl -verify -pubin -keyform DER -inkey "${_vs_dir}/key.der" -rawin \
+        -in "${_vs_dir}/global.msg" -sigfile "${_vs_dir}/global.sig" >/dev/null 2>&1 || return 1
+    case "$_vs_trusted" in
+        "file:${_vs_name}"|*"${_vs_tab}file:${_vs_name}") return 0 ;;
+    esac
+    return 1
+}
+
 # ── Runtime state ────────────────────────────────────────────────────────────
 
 DRY_RUN=0
@@ -290,6 +372,8 @@ Environment
   CODEMUX_INSTALL_VERSION  version or tag to install (CODEMUX_VERSION also
                          works outside a Codemux terminal)
   CODEMUX_ARTIFACT       path or URL to a .deb / .rpm / .AppImage to install
+                         as given (release downloads are signature-checked;
+                         this one is not)
   CODEMUX_INSTALL_DIR    bin directory for the AppImage fallback
   CODEMUX_NO_DEPS=1      never touch the package manager for dependencies
   CODEMUX_METHOD         force deb | rpm | appimage
@@ -474,6 +558,48 @@ download_to() {
     fi
 }
 
+require_signature_tools() {
+    [ "$DRY_RUN" = "1" ] && return 0
+    codemux_can_verify_signatures && return 0
+    # Minimal container images often lack the openssl CLI; it is one small
+    # package everywhere, so fetch it the same way the runtime libraries are.
+    if [ "$PRIV" != "none" ] && [ "${CODEMUX_NO_DEPS:-0}" != "1" ] && ! have openssl; then
+        note "installing openssl to check the release signature"
+        case "$FAMILY" in
+            debian)
+                if have apt-get; then
+                    as_root env DEBIAN_FRONTEND=noninteractive apt-get update -qq >/dev/null 2>&1 || true
+                    as_root env DEBIAN_FRONTEND=noninteractive apt-get install -y openssl >/dev/null 2>&1
+                fi ;;
+            fedora) { have dnf && as_root dnf install -y openssl >/dev/null 2>&1; } || { have yum && as_root yum install -y openssl >/dev/null 2>&1; } ;;
+            suse)   have zypper && as_root zypper --non-interactive install openssl >/dev/null 2>&1 ;;
+            arch)   have pacman && as_root pacman -S --needed --noconfirm openssl >/dev/null 2>&1 ;;
+        esac || true
+        codemux_can_verify_signatures && return 0
+    fi
+    bad "the installer checks each release package's signature before installing it,"
+    bad "and that needs the OpenSSL 3 command-line tool, which was not found."
+    note "Install it (the package is called openssl on every major distro), then re-run:"
+    note "  sudo apt-get install openssl    # or: sudo dnf install openssl"
+    exit 1
+}
+
+# Fetch <url>.sig and refuse to continue unless it signs <file> as <name>.
+verify_release_artifact() { # <file> <url> <name>
+    step "Checking the release signature"
+    if [ "$DRY_RUN" = "1" ]; then
+        printf '%b\n' "  ${C_DIM}would verify:${C_RESET} ${3} against ${2}.sig"
+        return 0
+    fi
+    _va_dir="${WORKDIR}/verify"
+    mkdir -p "$_va_dir"
+    fetch_text "${2}.sig" > "${_va_dir}/artifact.sig" 2>/dev/null \
+        || die "could not download ${2}.sig, so ${3} cannot be verified. Nothing was installed."
+    codemux_verify_signature "$1" "${_va_dir}/artifact.sig" "$3" "$_va_dir" \
+        || die "${3} does not match its release signature. It may have been tampered with. Nothing was installed. Please report this at ${CODEMUX_RELEASES_URL%/releases}/issues"
+    ok "signed with the Codemux release key"
+}
+
 resolve_version() {
     _pinned=$(codemux_pinned_version)
     if [ -n "$_pinned" ]; then
@@ -627,6 +753,10 @@ install_rpm() {
     if have dnf; then
         as_root dnf install -y "$_file"
     elif have zypper; then
+        # The RPM carries no GPG header signature (releases sign with the
+        # minisign updater key instead), so zypper would refuse the local file.
+        # A downloaded release RPM has already passed the signature check in
+        # verify_release_artifact by the time it gets here.
         as_root zypper --non-interactive install --allow-unsigned-rpm "$_file"
     elif have yum; then
         as_root yum install -y "$_file"
@@ -884,6 +1014,7 @@ main() {
 
     _artifact=""
     if [ -n "${CODEMUX_ARTIFACT:-}" ]; then
+        warn "CODEMUX_ARTIFACT is installed as given; its signature is not checked"
         case "$CODEMUX_ARTIFACT" in
             http://*|https://*)
                 step "Downloading the artifact you pointed at"
@@ -898,6 +1029,8 @@ main() {
                 ;;
         esac
     else
+        # Before anything is downloaded, so a missing tool costs no bandwidth.
+        require_signature_tools
         step "Resolving the release"
         _version=$(resolve_version)
         if [ -n "$(codemux_pinned_version)" ]; then
@@ -915,6 +1048,8 @@ main() {
         [ "$DRY_RUN" = "1" ] || note "$_url"
         download_to "$_url" "$_artifact"
         [ "$DRY_RUN" = "1" ] || ok "downloaded ($(du -h "$_artifact" 2>/dev/null | cut -f1))"
+        say ""
+        verify_release_artifact "$_artifact" "$_url" "$(codemux_artifact_name "$METHOD" "$_version")"
     fi
 
     say ""

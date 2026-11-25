@@ -491,6 +491,145 @@ is "overlapping package upgrade succeeds" "$?" "0"
 is "overlapping install keeps the packaged binary" "$("$launcher" --help 2>/dev/null)" "native package"
 is "overlapping install keeps package resources" "$(test -d "$LIB_DIR" && echo yes)" "yes"
 
+# ── release signatures ───────────────────────────────────────────────────────
+#
+# Signatures are made here with a throwaway key in the release format (Tauri
+# updater = base64 of a minisign signature file), so these run offline.
+
+echo "release signatures"
+REAL_KEY=$(sed -n 's/.*"pubkey"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "${SCRIPT_DIR}/../src-tauri/tauri.conf.json" \
+    | openssl base64 -d -A 2>/dev/null | sed -n 2p)
+is "embedded key is the updater key" "$CODEMUX_SIGNING_KEY" "$REAL_KEY"
+
+if ! codemux_can_verify_signatures; then
+    echo "  skip (needs OpenSSL 3)"
+else
+    SIGROOT="${TMPROOT}/sig"
+    mkdir -p "$SIGROOT"
+    openssl genpkey -algorithm ed25519 -out "${SIGROOT}/test.pem" 2>/dev/null
+    TEST_KEY=$({ printf 'Ed\001\002\003\004\005\006\007\010'
+                 openssl pkey -in "${SIGROOT}/test.pem" -pubout -outform DER | tail -c 32; } | openssl base64 -A)
+    OTHER_KEY=$({ printf 'Ed\001\002\003\004\005\006\007\010'
+                  openssl genpkey -algorithm ed25519 2>/dev/null | openssl pkey -pubout -outform DER | tail -c 32; } | openssl base64 -A)
+
+    # Writes <file>.sig signed by the test key, naming <name> in the trusted comment.
+    sign_fixture() { # <file> <name>
+        local s="${SIGROOT}/work"
+        mkdir -p "$s"
+        openssl dgst -blake2b512 -binary "$1" > "${s}/hash"
+        openssl pkeyutl -sign -inkey "${SIGROOT}/test.pem" -rawin -in "${s}/hash" -out "${s}/sig"
+        local trusted
+        trusted=$(printf 'timestamp:1700000000\tfile:%s' "$2")
+        { cat "${s}/sig"; printf '%s' "$trusted"; } > "${s}/global.msg"
+        openssl pkeyutl -sign -inkey "${SIGROOT}/test.pem" -rawin -in "${s}/global.msg" -out "${s}/global"
+        {
+            printf 'untrusted comment: signature from tauri secret key\n'
+            { printf 'ED\001\002\003\004\005\006\007\010'; cat "${s}/sig"; } | openssl base64 -A
+            printf '\ntrusted comment: %s\n' "$trusted"
+            openssl base64 -A < "${s}/global"
+            printf '\n'
+        } | openssl base64 -A > "$1.sig"
+    }
+
+    verify_with() { # <key> <file> <sig> <name>
+        local d
+        d=$(mktemp -d "${SIGROOT}/v.XXXXXX")
+        ( CODEMUX_SIGNING_KEY="$1"; codemux_verify_signature "$2" "$3" "$4" "$d" )
+        printf '%s' "$?"
+    }
+
+    PKG="${SIGROOT}/codemux_9.9.9_amd64.deb"
+    printf 'genuine package\n' > "$PKG"
+    sign_fixture "$PKG" codemux_9.9.9_amd64.deb
+    is "genuine package verifies"          "$(verify_with "$TEST_KEY" "$PKG" "$PKG.sig" codemux_9.9.9_amd64.deb)" "0"
+    is "another key is refused"            "$(verify_with "$OTHER_KEY" "$PKG" "$PKG.sig" codemux_9.9.9_amd64.deb)" "1"
+    is "the real release key refuses it"   "$(verify_with "$CODEMUX_SIGNING_KEY" "$PKG" "$PKG.sig" codemux_9.9.9_amd64.deb)" "1"
+    is "a signature naming another asset is refused" \
+       "$(verify_with "$TEST_KEY" "$PKG" "$PKG.sig" codemux_9.9.8_amd64.deb)" "1"
+    TAMPERED="${SIGROOT}/tampered.deb"
+    printf 'genuine packagf\n' > "$TAMPERED"
+    is "tampered package is refused"       "$(verify_with "$TEST_KEY" "$TAMPERED" "$PKG.sig" codemux_9.9.9_amd64.deb)" "1"
+    printf 'not a signature' > "${SIGROOT}/junk.sig"
+    is "garbage signature is refused"      "$(verify_with "$TEST_KEY" "$PKG" "${SIGROOT}/junk.sig" codemux_9.9.9_amd64.deb)" "1"
+    # Re-signing the trusted comment needs the key, so editing it breaks the check.
+    openssl base64 -d -A < "$PKG.sig" | sed 's/file:codemux_9.9.9/file:codemux_9.9.8/' | openssl base64 -A > "${SIGROOT}/edited.sig"
+    is "edited trusted comment is refused" \
+       "$(verify_with "$TEST_KEY" "$PKG" "${SIGROOT}/edited.sig" codemux_9.9.8_amd64.deb)" "1"
+
+    # The whole release path with downloads served from a fixture directory:
+    # nothing may reach the package manager unless the signature holds.
+    RELEASE_DIR="${SIGROOT}/release"
+    CURL_BIN="${SIGROOT}/curl-bin"
+    mkdir -p "$RELEASE_DIR" "$CURL_BIN"
+    cat > "${CURL_BIN}/curl" <<'CURL'
+#!/bin/sh
+# Serve <url> from $FIXTURE_DIR by its last path segment.
+out=""
+while [ $# -gt 1 ]; do
+    case "$1" in -o) out="$2"; shift ;; esac
+    shift
+done
+src="${FIXTURE_DIR}/${1##*/}"
+[ -f "$src" ] || exit 22
+if [ -n "$out" ]; then cp "$src" "$out"; else cat "$src"; fi
+CURL
+    chmod +x "${CURL_BIN}/curl"
+
+    run_release_install() ( # -> exit status; marker file when the manager ran
+        set -e
+        rm -f "${SIGROOT}/installed"
+        CODEMUX_SIGNING_KEY="$TEST_KEY"
+        FIXTURE_DIR="$RELEASE_DIR"
+        export FIXTURE_DIR
+        PATH="${CURL_BIN}:${STUB_BIN}:${PATH}"
+        CODEMUX_OS_RELEASE_PATH="$UBUNTU"
+        CODEMUX_INSTALL_VERSION=9.9.9
+        CODEMUX_INSTALL_DIR="${TMPROOT}/opt/bin"
+        # The installer's WORKDIR lands here, cleaned up with TMPROOT.
+        TMPDIR="$SIGROOT"
+        unset CODEMUX_ARTIFACT CODEMUX_METHOD
+        install_native_package() { cp "$2" "${SIGROOT}/installed"; }
+        print_next_steps() { :; }
+        main > "${SIGROOT}/release.log" 2>&1
+    )
+
+    cp "$PKG" "$PKG.sig" "$RELEASE_DIR/"
+    run_release_install
+    is "signed release installs" "$?" "0"
+    is "the verified file is what gets installed" "$(cat "${SIGROOT}/installed" 2>/dev/null)" "genuine package"
+    contains "reports the signature check" "$(cat "${SIGROOT}/release.log")" "signed with the Codemux release key"
+
+    printf 'trojaned package\n' > "${RELEASE_DIR}/codemux_9.9.9_amd64.deb"
+    run_release_install
+    is "replaced release asset fails" "$?" "1"
+    is "replaced release asset is never installed" "$(test ! -e "${SIGROOT}/installed" && echo yes)" "yes"
+    contains "explains the mismatch" "$(cat "${SIGROOT}/release.log")" "does not match its release signature"
+
+    cp "$PKG" "$RELEASE_DIR/"
+    rm -f "${RELEASE_DIR}/codemux_9.9.9_amd64.deb.sig"
+    run_release_install
+    is "missing signature fails" "$?" "1"
+    is "missing signature installs nothing" "$(test ! -e "${SIGROOT}/installed" && echo yes)" "yes"
+    contains "explains the missing signature" "$(cat "${SIGROOT}/release.log")" "cannot be verified"
+fi
+
+OUT=$( (
+    DRY_RUN=0 PRIV=none
+    codemux_can_verify_signatures() { return 1; }
+    fetch_text() { echo "network used" >&2; }
+    require_signature_tools
+) 2>&1)
+contains "no OpenSSL 3 stops before downloading" "$OUT" "needs the OpenSSL 3 command-line tool"
+not_contains "no OpenSSL 3 downloads nothing" "$OUT" "network used"
+
+OUT=$(env -u CODEMUX_INSTALL_SH_NO_MAIN NO_COLOR=1 PATH="${STUB_BIN}:${PATH}" \
+      CODEMUX_OS_RELEASE_PATH="$UBUNTU" CODEMUX_INSTALL_VERSION=9.9.9 \
+      CODEMUX_INSTALL_DIR="${TMPROOT}/opt/bin" \
+      bash "$INSTALL_SH" --dry-run 2>&1)
+contains "dry run plans the signature check" "$OUT" "would verify: codemux_9.9.9_amd64.deb against https://github.com/Zeus-Deus/codemux/releases/download/v9.9.9/codemux_9.9.9_amd64.deb.sig"
+OUT=$(run_dry "$UBUNTU" "$FAKE_DEB")
+contains "a local CODEMUX_ARTIFACT warns it is unverified" "$OUT" "signature is not checked"
+
 # ── syntax ───────────────────────────────────────────────────────────────────
 
 echo "syntax"
