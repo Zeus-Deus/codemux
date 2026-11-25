@@ -1,6 +1,10 @@
 use crate::database::DatabaseStore;
+use crate::workspace_service::Checkpoint;
+use cap_std::{ambient_authority, fs::Dir};
 use serde::{Deserialize, Serialize};
+use std::fs::File;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct WorkspaceConfig {
@@ -83,18 +87,114 @@ pub fn read_effective_config(
     read_saved_config(workspace_path, db)
 }
 
-/// Lifecycle events may be triggered by opening an untrusted checkout.
-/// Only commands explicitly saved in Settings can run automatically.
-/// The file still supplies include patterns when present.
-pub fn read_automatic_lifecycle_config(
-    workspace_path: &Path,
-    db: &DatabaseStore,
-) -> WorkspaceConfig {
-    let mut config = read_saved_config(workspace_path, db).unwrap_or_default();
-    if let Some(file) = read_workspace_config(workspace_path) {
-        config.worktree_includes = file.worktree_includes;
+/// The working directory and project root used to select local lifecycle
+/// commands. Keep the directory handles alive until the runner finishes so
+/// replacements cannot be mistaken for the directories we inspected.
+pub(crate) struct LifecyclePaths {
+    cwd: PathBuf,
+    root: PathBuf,
+    checkout: PathBuf,
+    cwd_dir: File,
+    root_dir: File,
+}
+
+impl LifecyclePaths {
+    pub(crate) fn resolve(workspace_path: &Path) -> Result<Self, String> {
+        let cwd = dunce::canonicalize(workspace_path)
+            .map_err(|error| format!("Could not resolve workspace directory: {error}"))?;
+        let cwd_dir = open_directory(&cwd)
+            .map_err(|error| format!("Could not open workspace directory: {error}"))?;
+        let (checkout, root) = resolve_project_paths(&cwd)
+            .map_err(|error| format!("Could not resolve project directory: {error}"))?;
+        let root_dir = open_directory(&root)
+            .map_err(|error| format!("Could not open project directory: {error}"))?;
+        let paths = Self { cwd, root, checkout, cwd_dir, root_dir };
+        paths.check()?;
+        Ok(paths)
     }
-    config
+
+    pub(crate) fn workspace(&self) -> &Path {
+        &self.cwd
+    }
+
+    pub(crate) fn root(&self) -> &Path {
+        &self.root
+    }
+
+    fn check(&self) -> Result<(), String> {
+        if !directory_unchanged(&self.cwd, &self.cwd_dir) {
+            return Err("Workspace directory changed after lifecycle commands were selected".into());
+        }
+        if !directory_unchanged(&self.root, &self.root_dir)
+            || !resolve_project_paths(&self.cwd).is_ok_and(|(checkout, root)| {
+                checkout == self.checkout && root == self.root
+            })
+        {
+            return Err("Project directory changed after lifecycle commands were selected".into());
+        }
+        Ok(())
+    }
+
+    pub(crate) fn guard(self: &Arc<Self>, checkpoint: Checkpoint) -> Checkpoint {
+        let paths = Arc::clone(self);
+        Checkpoint::new(move || {
+            checkpoint.check()?;
+            paths.check()
+        })
+    }
+
+    pub(crate) fn saved_config(&self, db: &DatabaseStore) -> Option<WorkspaceConfig> {
+        read_saved_config_at(&self.checkout, &self.root, db)
+    }
+
+    /// Repository configuration still supplies include patterns. Only
+    /// commands explicitly saved in Settings can run automatically.
+    pub(crate) fn automatic_config(&self, db: &DatabaseStore) -> WorkspaceConfig {
+        let mut config = self.saved_config(db).unwrap_or_default();
+        if let Some(file) = read_workspace_config(&self.cwd) {
+            config.worktree_includes = file.worktree_includes;
+        }
+        config
+    }
+}
+
+fn open_directory(path: &Path) -> std::io::Result<File> {
+    Dir::open_ambient_dir(path, ambient_authority()).map(Dir::into_std_file)
+}
+
+fn directory_unchanged(path: &Path, held: &File) -> bool {
+    let current = (|| {
+        if dunce::canonicalize(path)? != path {
+            return Ok(false);
+        }
+        same_directory(held, &open_directory(path)?)
+    })();
+    current.unwrap_or(false)
+}
+
+#[cfg(unix)]
+fn same_directory(left: &File, right: &File) -> std::io::Result<bool> {
+    use std::os::unix::fs::MetadataExt;
+
+    let left = left.metadata()?;
+    let right = right.metadata()?;
+    Ok((left.dev(), left.ino()) == (right.dev(), right.ino()))
+}
+
+#[cfg(windows)]
+fn same_directory(left: &File, right: &File) -> std::io::Result<bool> {
+    use crate::windows_file_id::file_id;
+
+    Ok(file_id(left)? == file_id(right)?)
+}
+
+fn resolve_project_paths(cwd: &Path) -> std::io::Result<(PathBuf, PathBuf)> {
+    let checkout = find_git_checkout(cwd).unwrap_or(cwd);
+    let root = match resolve_worktree_git_file(&checkout.join(".git")) {
+        Some(root) => dunce::canonicalize(root)?,
+        None => checkout.to_path_buf(),
+    };
+    Ok((checkout.to_path_buf(), root))
 }
 
 pub(crate) fn read_saved_config(workspace_path: &Path, db: &DatabaseStore) -> Option<WorkspaceConfig> {
@@ -102,16 +202,20 @@ pub(crate) fn read_saved_config(workspace_path: &Path, db: &DatabaseStore) -> Op
     if !cwd.is_dir() {
         return None;
     }
-    let checkout = find_git_checkout(&cwd).unwrap_or(&cwd);
-    let Some(root) = resolve_worktree_git_file(&checkout.join(".git")) else {
-        return db.get_project_scripts_at(checkout).map(saved_workspace_config);
-    };
-    let root = dunce::canonicalize(root).ok()?;
-    let scripts = db.get_project_scripts_at(&root)?;
+    let (checkout, root) = resolve_project_paths(&cwd).ok()?;
+    read_saved_config_at(&checkout, &root, db)
+}
+
+fn read_saved_config_at(
+    checkout: &Path,
+    root: &Path,
+    db: &DatabaseStore,
+) -> Option<WorkspaceConfig> {
+    let scripts = db.get_project_scripts_at(root)?;
     // A .git file is untrusted. Even a linked directory inside the main
     // tree must be registered as this project's worktree to inherit consent.
     if checkout != root
-        && !crate::git::git_list_worktrees(&root)
+        && !crate::git::git_list_worktrees(root)
             .ok()?
             .into_iter()
             .filter(|worktree| !worktree.is_bare)
@@ -228,16 +332,16 @@ mod tests {
     #[test]
     fn test_find_git_root_missing_target() {
         let dir = tempfile::tempdir().unwrap();
-        // .git file points to a path that doesn't exist on disk
+        let missing = dir.path().join("missing");
         fs::write(
             dir.path().join(".git"),
-            "gitdir: /nonexistent/path/.git/worktrees/feat",
+            format!("gitdir: {}", missing.join(".git/worktrees/feat").display()),
         )
         .unwrap();
 
         // Should parse the path even if the target doesn't exist
         let result = find_git_root(dir.path());
-        assert_eq!(result, Some(PathBuf::from("/nonexistent/path")));
+        assert_eq!(result, Some(missing));
     }
 
     #[test]
@@ -323,7 +427,7 @@ mod tests {
         )
         .unwrap();
 
-        let automatic = read_automatic_lifecycle_config(dir.path(), &db);
+        let automatic = LifecyclePaths::resolve(dir.path()).unwrap().automatic_config(&db);
         assert!(automatic.setup.is_empty());
         assert!(automatic.teardown.is_empty());
         assert_eq!(automatic.worktree_includes, ["file-pattern"]);
@@ -333,13 +437,71 @@ mod tests {
             teardown: vec!["local-teardown".into()],
             ..Default::default()
         }).unwrap();
-        let automatic = read_automatic_lifecycle_config(dir.path(), &db);
+        let automatic = LifecyclePaths::resolve(dir.path()).unwrap().automatic_config(&db);
         assert_eq!(automatic.setup, ["local-setup"]);
         assert_eq!(automatic.teardown, ["local-teardown"]);
         assert_eq!(automatic.worktree_includes, ["file-pattern"]);
 
         let explicit = read_effective_config(dir.path(), &db).unwrap();
         assert_eq!(explicit.setup, ["repo-setup"]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn legacy_project_script_paths_require_review_before_running() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path().join("project");
+        let alias = dir.path().join("old-project");
+        fs::create_dir(&project).unwrap();
+        std::os::unix::fs::symlink(&project, &alias).unwrap();
+        let project = dunce::canonicalize(&project).unwrap();
+
+        let db = crate::database::init_test_database();
+        let scripts = crate::database::ProjectScripts {
+            setup: vec!["setup fixture".into()],
+            teardown: vec!["teardown fixture".into()],
+            run: Some("run fixture".into()),
+            ..Default::default()
+        };
+        db.set_setting(
+            &format!("project.scripts:{}", alias.display()),
+            &serde_json::to_string(&scripts).unwrap(),
+        )
+        .unwrap();
+
+        let (draft, reviewed_root) = db
+            .legacy_project_scripts_for_review(project.to_str().unwrap())
+            .unwrap();
+        assert_eq!(&draft, &scripts);
+        assert_eq!(reviewed_root, project);
+        assert!(read_saved_config(&project, &db).is_none());
+        assert!(read_saved_config(&alias, &db).is_none());
+
+        db.save_reviewed_project_scripts(reviewed_root.to_str().unwrap(), &draft)
+            .unwrap();
+        let automatic = LifecyclePaths::resolve(&project).unwrap().automatic_config(&db);
+        assert_eq!(automatic.setup, scripts.setup);
+        assert_eq!(automatic.teardown, scripts.teardown);
+        assert_eq!(automatic.run, scripts.run);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn reviewed_scripts_cannot_follow_a_replaced_canonical_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path().join("project");
+        let other = dir.path().join("other");
+        fs::create_dir(&project).unwrap();
+        fs::create_dir(&other).unwrap();
+        let reviewed = dunce::canonicalize(&project).unwrap();
+        fs::remove_dir(&project).unwrap();
+        std::os::unix::fs::symlink(&other, &project).unwrap();
+
+        let db = crate::database::init_test_database();
+        assert!(db
+            .save_reviewed_project_scripts(reviewed.to_str().unwrap(), &Default::default())
+            .is_err());
+        assert!(read_saved_config(&other, &db).is_none());
     }
 
     #[test]

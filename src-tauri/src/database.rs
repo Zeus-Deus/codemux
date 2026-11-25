@@ -1697,6 +1697,55 @@ impl DatabaseStore {
         None
     }
 
+    /// Find older Unix settings for review. Resolving a former alias can
+    /// surface its contents, but it cannot grant automatic execution.
+    #[cfg(unix)]
+    pub(crate) fn legacy_project_scripts_for_review(
+        &self,
+        project_root: &str,
+    ) -> Option<(ProjectScripts, PathBuf)> {
+        let canonical = dunce::canonicalize(project_root).ok()?;
+        if !canonical.is_dir() {
+            return None;
+        }
+        let legacy_rows = {
+            let conn = self.conn.lock().unwrap();
+            let mut statement = conn
+                .prepare(
+                    "SELECT key, value FROM settings
+                     WHERE user_id = 'local' AND key GLOB 'project.scripts:*'",
+                )
+                .ok()?;
+            let rows = statement
+                .query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))
+                .ok()?;
+            rows.collect::<Result<Vec<_>, _>>().ok()?
+        };
+        let mut candidate: Option<ProjectScripts> = None;
+        let mut ambiguous = false;
+        for (key, value) in legacy_rows {
+            let old_path = key.strip_prefix("project.scripts:")?;
+            if canonical.to_str() == Some(old_path)
+                || !dunce::canonicalize(old_path).is_ok_and(|path| path == canonical)
+            {
+                continue;
+            }
+            let Ok(scripts) = serde_json::from_str(&value) else {
+                continue;
+            };
+            if old_path == project_root {
+                // The user selected this particular legacy spelling.
+                return Some((scripts, canonical));
+            }
+            ambiguous |= candidate.as_ref().is_some_and(|previous| previous != &scripts);
+            candidate = Some(scripts);
+        }
+        if ambiguous {
+            return None;
+        }
+        candidate.map(|scripts| (scripts, canonical))
+    }
+
     pub fn set_project_scripts(
         &self,
         project_root: &str,
@@ -1707,6 +1756,24 @@ impl DatabaseStore {
             Some(path) => path.to_str().ok_or("Project root is not valid Unicode")?,
             None => project_root,
         };
+        self.write_project_scripts(project_root, scripts)
+    }
+
+    /// An explicit review saves to the directory that Settings displayed.
+    pub(crate) fn save_reviewed_project_scripts(
+        &self,
+        path: &str,
+        scripts: &ProjectScripts,
+    ) -> Result<(), String> {
+        let canonical = dunce::canonicalize(path)
+            .map_err(|error| format!("Could not resolve the reviewed project: {error}"))?;
+        if canonical.to_str() != Some(path) || !canonical.is_dir() {
+            return Err("The reviewed project path changed. Reopen Settings and review the scripts again.".into());
+        }
+        self.write_project_scripts(path, scripts)
+    }
+
+    fn write_project_scripts(&self, project_root: &str, scripts: &ProjectScripts) -> Result<(), String> {
         let key = format!("project.scripts:{project_root}");
         let value = serde_json::to_string(scripts).map_err(|e| e.to_string())?;
         self.set_setting(&key, &value)

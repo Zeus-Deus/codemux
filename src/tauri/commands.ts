@@ -769,8 +769,11 @@ export const runWorkspaceSetup = (workspaceId: string) =>
 export const getProjectScripts = (path: string) =>
   invoke<ProjectScripts | null>("get_project_scripts", { path });
 
-export const setProjectScripts = (path: string, scripts: ProjectScripts) =>
-  invoke<void>("set_project_scripts", { path, scripts });
+export const getProjectScriptsForReview = (path: string) =>
+  invoke<(ProjectScripts & { review_root?: string }) | null>("get_project_scripts_for_review", { path });
+
+export const setProjectScripts = (path: string, scripts: ProjectScripts, reviewed?: true) =>
+  invoke<void>("set_project_scripts", { path, scripts, reviewed });
 
 export const runProjectDevCommand = (workspaceId: string, forceNew?: boolean) =>
   invoke<void>("run_project_dev_command", { workspaceId, forceNew: forceNew ?? false });

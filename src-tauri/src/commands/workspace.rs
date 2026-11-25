@@ -30,7 +30,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
-use tauri::{Emitter, Manager, State};
+use tauri::{Manager, State};
 
 /// Snapshot of the git fields written to a workspace by `populate_git_info`.
 /// Carrying these out of the I/O step as a value lets async callers gather
@@ -1934,14 +1934,22 @@ async fn close_workspace_tracked<R: tauri::Runtime>(
     // the control socket to answer it. Each asks the checkpoint first.
     let mut torn_down = Ok(());
     if !force && !hermes_pending {
-        if let Some(folder) = teardown {
-            let commands = crate::scripts::teardown_commands(Path::new(&folder), db);
-            let teardown = CompletedTeardown { folder, commands };
+        if let Some(paths) = teardown.and_then(|folder| {
+            crate::config::workspace_config::LifecyclePaths::resolve(Path::new(&folder)).ok()
+        }) {
+            let commands = paths.saved_config(db).map(|config| config.teardown).unwrap_or_default();
+            let teardown = CompletedTeardown {
+                folder: paths.workspace().to_string_lossy().into_owned(),
+                commands,
+            };
             if !teardown.commands.is_empty() && !attempt.already_ran(&teardown) {
-                let (title, id, checkpoint) = (ws_title.clone(), workspace_id.clone(), checkpoint.clone());
+                let paths = Arc::new(paths);
+                let (title, id, checkpoint) = (ws_title.clone(), workspace_id.clone(), paths.guard(checkpoint.clone()));
                 let running = attempt.clone();
                 torn_down = tokio::task::spawn_blocking(move || {
-                    crate::scripts::run_teardown_scripts(Path::new(&teardown.folder), &title, &id, &teardown.commands, &checkpoint)?;
+                    crate::scripts::run_teardown_scripts(
+                        paths.workspace(), paths.root(), &title, &id, &teardown.commands, &checkpoint,
+                    )?;
                     running.set_teardown(Some(teardown));
                     Ok(())
                 })
@@ -3604,12 +3612,14 @@ fn spawn_setup_scripts<R: tauri::Runtime>(
     workspace_path: &Path,
     checkpoint: &Checkpoint,
 ) {
-    // Pre-resolve root path on the calling thread to avoid race conditions.
-    let root_path = crate::scripts::resolve_root_path(workspace_path);
-
-    let config =
-        crate::config::workspace_config::read_automatic_lifecycle_config(workspace_path, db);
-    let setting_patterns = config.worktree_includes.clone();
+    let paths = match crate::config::workspace_config::LifecyclePaths::resolve(workspace_path) {
+        Ok(paths) => Arc::new(paths),
+        Err(error) => {
+            eprintln!("[codemux::scripts] Setup failed for workspace {workspace_id}: {error}");
+            return;
+        }
+    };
+    let config = paths.automatic_config(db);
 
     let (ws_title, ws_branch) = {
         let snapshot = state.snapshot();
@@ -3623,49 +3633,18 @@ fn spawn_setup_scripts<R: tauri::Runtime>(
     };
     let port = crate::scripts::allocate_workspace_port(workspace_id);
 
-    let ws_path = workspace_path.to_path_buf();
     let ws_id = workspace_id.to_string();
     let app2 = app.clone();
-    let checkpoint = checkpoint.background();
+    let checkpoint = paths.guard(checkpoint.background());
 
     std::thread::spawn(move || {
-        // Wait for frontend to mount the overlay and register event listeners
+        // Wait for frontend to mount the overlay and register event listeners.
         std::thread::sleep(std::time::Duration::from_millis(500));
-
-        // A requester whose grant was withdrawn since the create returned
-        // copies nothing and starts no command. The copy and each command can
-        // take long, so the runner asks again before every command.
-        if let Err(refusal) = checkpoint.check() {
-            let error = crate::scripts::report_setup_stopped(&app2, &ws_id, Some(&config), &refusal);
+        if let Err(error) = crate::scripts::run_setup_pipeline(
+            paths.workspace(), paths.root(), &ws_title, &ws_id, &app2, Some(&config),
+            ws_branch.as_deref(), Some(port), &checkpoint,
+        ) {
             eprintln!("[codemux::scripts] Setup failed for workspace {ws_id}: {error}");
-            return;
-        }
-
-        // Step 1: Process worktree includes (file → setting → defaults)
-        match crate::scripts::process_worktree_includes(&root_path, &ws_path, &setting_patterns) {
-            Ok(result) => {
-                let _ = app2.emit(
-                    "worktree-includes-applied",
-                    serde_json::json!({
-                        "workspace_id": ws_id,
-                        "source": result.source,
-                        "copied": result.copied,
-                    }),
-                );
-            }
-            Err(e) => {
-                eprintln!("[codemux::scripts] worktree includes error for workspace {ws_id}: {e}");
-            }
-        }
-
-        // Step 2: Run setup commands
-        if !config.setup.is_empty() {
-            if let Err(e) = crate::scripts::run_setup_scripts_with_config(
-                &ws_path, &ws_title, &ws_id, &app2, &config, &root_path,
-                ws_branch.as_deref(), Some(port), &checkpoint,
-            ) {
-                eprintln!("[codemux::scripts] Setup failed for workspace {ws_id}: {e}");
-            }
         }
     });
 }

@@ -58,11 +58,39 @@ pub fn get_project_scripts(db: State<'_, DatabaseStore>, path: String) -> Option
     db.get_project_scripts(&path)
 }
 
+#[derive(serde::Serialize)]
+pub struct ProjectScriptsReview {
+    #[serde(flatten)]
+    scripts: ProjectScripts,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    review_root: Option<std::path::PathBuf>,
+}
+
+#[tauri::command]
+pub fn get_project_scripts_for_review(
+    db: State<'_, DatabaseStore>,
+    path: String,
+) -> Option<ProjectScriptsReview> {
+    if let Some(scripts) = db.get_project_scripts(&path) {
+        return Some(ProjectScriptsReview { scripts, review_root: None });
+    }
+    #[cfg(unix)]
+    if let Some((scripts, root)) = db.legacy_project_scripts_for_review(&path) {
+        return Some(ProjectScriptsReview { scripts, review_root: Some(root) });
+    }
+    None
+}
+
 #[tauri::command]
 pub fn set_project_scripts(
     db: State<'_, DatabaseStore>,
     path: String,
     scripts: ProjectScripts,
+    reviewed: Option<bool>,
 ) -> Result<(), String> {
-    db.set_project_scripts(&path, &scripts)
+    if reviewed == Some(true) {
+        db.save_reviewed_project_scripts(&path, &scripts)
+    } else {
+        db.set_project_scripts(&path, &scripts)
+    }
 }

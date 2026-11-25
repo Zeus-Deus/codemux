@@ -581,7 +581,7 @@ On a headless host, the `worktree_create` tool reports `setup.setup_requires_exp
 
 If you used `codemux-remote worktree create` from a shell, run `codemux-remote workspace list` and match the returned checkout path to an entry's `path` under `workspaces`. Take the `id`, `name` and `branch` from that entry. If you passed `--state-dir` to create the worktree, use the same directory when listing. For a worktree created through the daemon, use the daemon's state directory.
 
-On the host, review the setup commands in `.codemux/config.json`. Set the shell variables from the matching workspace entry and run the setup command.
+On the host, review the setup commands in the worktree's `.codemux/config.json`. If it is missing or invalid, setup reads `.codemux/config.json` from the main checkout. Set the shell variables from the matching workspace entry and run the setup command.
 
 ```sh
 codemux-remote worktree setup --path "$WORKTREE_PATH" --workspace-id "$WORKSPACE_ID" \

@@ -7746,13 +7746,13 @@ const handlers: Record<string, Handler> = {
   // No mock project has a `.codemux/config.json`; like the backend, that
   // reads as null, so the DB scripts below are the effective config.
   get_workspace_config: () => null,
-  get_project_scripts: (a) =>
-    mockProjectScripts.get(a.path as string) ?? {
-      setup: [],
-      teardown: [],
-      run: null,
-      worktree_includes: [],
-    },
+  get_project_scripts: (a) => mockProjectScripts.get(a.path as string) ?? {
+    setup: [],
+    teardown: [],
+    run: null,
+    worktree_includes: [],
+  },
+  get_project_scripts_for_review: (a) => handlers.get_project_scripts(a),
   // Kept in memory so the titlebar Run button flips from "Set Run" to
   // "Run" after a command is picked in its popover.
   set_project_scripts: (a) => {

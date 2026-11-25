@@ -3160,6 +3160,7 @@ fn build_core_app<R: tauri::Runtime>(
             commands::db_add_recent_project,
             commands::db_get_recent_projects,
             commands::get_project_scripts,
+            commands::get_project_scripts_for_review,
             commands::set_project_scripts,
             commands::check_is_git_repo,
             commands::init_git_repo,

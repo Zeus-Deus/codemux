@@ -1,5 +1,4 @@
-use crate::config::workspace_config::{find_git_root, read_saved_config, WorkspaceConfig};
-use crate::database::DatabaseStore;
+use crate::config::workspace_config::{find_git_root, WorkspaceConfig};
 use crate::workspace_service::Checkpoint;
 use serde::Serialize;
 use std::io::Write;
@@ -279,15 +278,40 @@ pub fn run_setup_scripts<R: Runtime>(
         workspace_path.display()
     );
 
-    let root_path = resolve_root_path(workspace_path);
+    run_setup_pipeline(
+        workspace_path,
+        &resolve_root_path(workspace_path),
+        workspace_name,
+        workspace_id,
+        app_handle,
+        config.as_ref(),
+        branch,
+        port,
+        &Checkpoint::default(),
+    )
+}
 
-    let setting_patterns = config
-        .as_ref()
-        .map(|c| c.worktree_includes.clone())
-        .unwrap_or_default();
+/// Apply includes and run the selected commands. The guard is checked before
+/// the include copy and again before starting each command.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn run_setup_pipeline<R: Runtime>(
+    workspace_path: &Path,
+    root_path: &Path,
+    workspace_name: &str,
+    workspace_id: &str,
+    app_handle: &AppHandle<R>,
+    config: Option<&WorkspaceConfig>,
+    branch: Option<&str>,
+    port: Option<u16>,
+    checkpoint: &Checkpoint,
+) -> Result<(), String> {
+    checkpoint.check().map_err(|refusal| {
+        report_setup_stopped(app_handle, workspace_id, config, &refusal)
+    })?;
+    let setting_patterns = config.map_or(&[][..], |config| config.worktree_includes.as_slice());
 
     // Step 1: Process worktree includes (copy gitignored files from main worktree)
-    match process_worktree_includes(&root_path, workspace_path, &setting_patterns) {
+    match process_worktree_includes(root_path, workspace_path, setting_patterns) {
         Ok(result) => {
             let _ = app_handle.emit(
                 "worktree-includes-applied",
@@ -313,22 +337,22 @@ pub fn run_setup_scripts<R: Runtime>(
         }
     };
 
-    run_setup_scripts_with_config(
+    run_checked_setup_commands(
         workspace_path,
         workspace_name,
         workspace_id,
-        app_handle,
-        &config,
-        &root_path,
+        config,
+        root_path,
         branch,
         port,
-        &Checkpoint::default(),
+        checkpoint,
+        &mut frontend_events(app_handle, workspace_id),
     )
 }
 
 /// Progress notifications from the shared setup-command runner core.
 ///
-/// The desktop (`run_setup_scripts_with_config`) maps these to the Tauri
+/// The desktop (`run_setup_pipeline`) maps these to the Tauri
 /// events the frontend listens for (`workspace-setup-progress` /
 /// `workspace-setup-failed` / `workspace-setup-complete`); the headless
 /// daemon (`remote::tools::worktree_create`) logs them to stderr because
@@ -467,43 +491,8 @@ fn stop_setup(command: &str, refusal: &str, notify: &mut dyn FnMut(SetupEvent<'_
     format!("Setup stopped before `{command}`: {refusal}")
 }
 
-/// Run setup scripts with a pre-resolved config and root path.
-/// The `root_path` should be resolved on the calling thread (not inside a spawned thread)
-/// to avoid race conditions with worktree `.git` file resolution.
-///
-/// Thin Tauri wrapper over [`run_setup_commands`]: forwards each
-/// [`SetupEvent`] to the frontend as the events it has always listened
-/// for, with unchanged payload shapes. `checkpoint` is asked before each
-/// command starts.
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn run_setup_scripts_with_config<R: Runtime>(
-    workspace_path: &Path,
-    workspace_name: &str,
-    workspace_id: &str,
-    app_handle: &AppHandle<R>,
-    config: &WorkspaceConfig,
-    root_path: &Path,
-    branch: Option<&str>,
-    port: Option<u16>,
-    checkpoint: &Checkpoint,
-) -> Result<(), String> {
-    run_checked_setup_commands(
-        workspace_path,
-        workspace_name,
-        workspace_id,
-        config,
-        root_path,
-        branch,
-        port,
-        checkpoint,
-        &mut frontend_events(app_handle, workspace_id),
-    )
-}
-
-/// Setup that stopped before it began, as [`run_setup_scripts_with_config`]
-/// reports one that stopped before a command: whoever asked for it lost
-/// their authority while it waited to start. Returns the error.
-pub fn report_setup_stopped<R: Runtime>(
+/// Report why the setup guard stopped the pipeline before it began.
+fn report_setup_stopped<R: Runtime>(
     app_handle: &AppHandle<R>,
     workspace_id: &str,
     config: Option<&WorkspaceConfig>,
@@ -564,20 +553,14 @@ fn frontend_events<'a, R: Runtime>(
     }
 }
 
-/// Automatic teardown uses the commands explicitly saved in Settings.
-pub fn teardown_commands(workspace_path: &Path, db: &DatabaseStore) -> Vec<String> {
-    read_saved_config(workspace_path, db)
-        .map(|config| config.teardown)
-        .unwrap_or_default()
-}
-
-/// Runs `commands` (see [`teardown_commands`]) in order, stopping at the
+/// Runs locally saved `commands` in order, stopping at the
 /// first failure. It blocks until they finish, so an async caller runs it on
 /// the blocking pool. A command can take long while the close waits: once
 /// whoever asked for the close lost their authority (`checkpoint`), no
 /// further command starts.
 pub(crate) fn run_teardown_scripts(
     workspace_path: &Path,
+    root_path: &Path,
     workspace_name: &str,
     workspace_id: &str,
     commands: &[String],
@@ -587,8 +570,7 @@ pub(crate) fn run_teardown_scripts(
         return Ok(());
     }
 
-    let root_path = resolve_root_path(workspace_path);
-    let mut env_vars = script_env(workspace_path, &root_path, None, None);
+    let mut env_vars = script_env(workspace_path, root_path, None, None);
     env_vars.push(("CODEMUX_WORKSPACE_NAME", workspace_name.to_string()));
     env_vars.push(("CODEMUX_WORKSPACE_ID", workspace_id.to_string()));
 
@@ -721,7 +703,7 @@ mod tests {
             let (folder, config) = (dir.path().to_path_buf(), config.clone());
             let run = std::thread::spawn(move || match name {
                 "setup" => run_setup_commands(&folder, "ws", "ws-1", &config, &folder, None, None, &mut |_| {}),
-                _ => run_teardown_scripts(&folder, "ws", "ws-1", &config.teardown, &Checkpoint::default()),
+                _ => run_teardown_scripts(&folder, &folder, "ws", "ws-1", &config.teardown, &Checkpoint::default()),
             });
             let out = dir.path().join(format!("{name}.out"));
             let deadline = Instant::now() + Duration::from_secs(20);
@@ -776,10 +758,62 @@ mod tests {
         assert!(!dir.path().join("two").exists());
 
         fs::remove_file(dir.path().join("one")).unwrap();
-        let error = run_teardown_scripts(dir.path(), "ws", "ws-1", &commands, &once()).unwrap_err();
+        let error = run_teardown_scripts(dir.path(), dir.path(), "ws", "ws-1", &commands, &once()).unwrap_err();
         assert_eq!(error, "grant_revoked: withdrawn; teardown stopped before `touch two`");
         assert!(dir.path().join("one").exists());
         assert!(!dir.path().join("two").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn lifecycle_commands_stop_after_workspace_or_project_directory_changes() {
+        use crate::config::workspace_config::LifecyclePaths;
+        use std::sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc,
+        };
+
+        for check_workspace in [true, false] {
+            let fixture = tempfile::tempdir().unwrap();
+            let project = fixture.path().join("project");
+            let workspace = fixture.path().join("workspace");
+            fs::create_dir_all(project.join(".git/worktrees/fixture")).unwrap();
+            fs::create_dir(&workspace).unwrap();
+            fs::write(
+                workspace.join(".git"),
+                format!("gitdir: {}", project.join(".git/worktrees/fixture").display()),
+            )
+            .unwrap();
+            let paths = Arc::new(LifecyclePaths::resolve(&workspace).unwrap());
+            let replace = if check_workspace { workspace.clone() } else { project };
+            let backup = fixture.path().join("previous");
+            let checks = AtomicUsize::new(0);
+            let checkpoint = paths.guard(Checkpoint::new(move || {
+                if checks.fetch_add(1, Ordering::SeqCst) == 1 {
+                    fs::rename(&replace, &backup).unwrap();
+                    fs::create_dir(&replace).unwrap();
+                }
+                Ok(())
+            }));
+            let commands = vec!["touch first".to_string(), "touch second".to_string()];
+
+            let error = if check_workspace {
+                let config = WorkspaceConfig { setup: commands, ..Default::default() };
+                run_checked_setup_commands(
+                    paths.workspace(), "ws", "ws-1", &config, paths.root(),
+                    None, None, &checkpoint, &mut |_| {},
+                ).unwrap_err()
+            } else {
+                run_teardown_scripts(
+                    paths.workspace(), paths.root(), "ws", "ws-1", &commands, &checkpoint,
+                ).unwrap_err()
+            };
+
+            let changed = if check_workspace { "Workspace" } else { "Project" };
+            assert!(error.contains(&format!("{changed} directory changed")), "{error}");
+            assert!(workspace.join("first").exists() || fixture.path().join("previous/first").exists());
+            assert!(!workspace.join("second").exists());
+        }
     }
 
     #[test]
