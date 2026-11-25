@@ -74,7 +74,7 @@ async function waitForFile(path, child) {
   throw new Error(`Sidecar did not publish ${path}`);
 }
 
-const directory = await mkdtemp(join(process.platform === 'win32' ? tmpdir() : '/tmp', 'cmx-ab-auth-'));
+const directory = await mkdtemp(join(process.platform === 'win32' ? tmpdir() : '/var/tmp', 'cmx-ab-auth-'));
 if (process.platform !== 'win32') await chmod(directory, 0o700);
 const children = [];
 
