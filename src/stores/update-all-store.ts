@@ -41,6 +41,8 @@ export interface MachineState {
   loading: boolean;
   checkedAt?: number;
   providers: ProviderUpdateReport[];
+  /** The latest device check, separate from versions and agent rows kept for display. */
+  latestCheck?: { helperVersion: string | null; providerInventoryFresh: boolean };
   /** Devices only: the helper's version and this desktop's. */
   helperVersion?: string | null;
   runningVersion?: string | null;
@@ -120,12 +122,19 @@ export function buildPlan(machines: Record<string, MachineState>, names: Record<
   const skipped: SkippedItem[] = [];
   for (const [key, state] of Object.entries(machines) as [MachineKey, MachineState][]) {
     const name = names[key] ?? key;
-    if (key !== LOCAL && state.error) {
-      skipped.push({ machine: key, label: name, reason: state.error });
-      continue;
-    }
-    if (key !== LOCAL && helperIsOutdated(state)) {
-      items.push({ machine: key, item: "helper", label: "Codemux" });
+    if (key !== LOCAL) {
+      const checkedVersion = state.latestCheck ? state.latestCheck.helperVersion : state.error ? null : state.helperVersion;
+      const helperOutdated = !!checkedVersion && !!state.appVersion && isOlderVersion(checkedVersion, state.appVersion);
+      if (helperOutdated) items.push({ machine: key, item: "helper", label: "Codemux" });
+      const inventoryFresh = state.latestCheck
+        ? !!state.latestCheck.helperVersion && state.latestCheck.providerInventoryFresh
+        : !state.error;
+      if (!inventoryFresh) {
+        // An older helper can be reached but cannot list agents. Upgrade it
+        // first; the post-install check will discover them for this run.
+        if (!helperOutdated) skipped.push({ machine: key, label: name, reason: state.error ?? "Couldn't check device agents" });
+        continue;
+      }
     }
     for (const report of state.providers) {
       if (!report.available) continue;
@@ -216,6 +225,7 @@ export const useUpdateAll = create<Store>((set, get) => {
           patchMachine(key, {
             // A failed or partial check must not erase the last usable rows.
             providers: report.providers ?? previous?.providers ?? [],
+            latestCheck: { helperVersion: report.helper_version, providerInventoryFresh: report.providers !== null && !report.error },
             helperVersion: report.helper_version ?? previous?.helperVersion ?? null,
             runningVersion: report.helper_version ? report.running_version : previous?.runningVersion ?? null,
             serveAlive: report.helper_version ? report.serve_alive : previous?.serveAlive ?? null,
@@ -225,7 +235,10 @@ export const useUpdateAll = create<Store>((set, get) => {
           });
         }
       } catch (error) {
-        if (isLatest()) patchMachine(key, { error: String(error) });
+        if (isLatest()) patchMachine(key, {
+          latestCheck: { helperVersion: null, providerInventoryFresh: false },
+          error: String(error),
+        });
       } finally {
         if (isLatest()) patchMachine(key, { loading: false });
       }
@@ -292,6 +305,17 @@ export const useUpdateAll = create<Store>((set, get) => {
             if (ordered[0]?.item === "helper" && (await get().updateOne(machine, "helper"))) {
               updated++;
               ordered.shift();
+              const refreshed = get().machines[machine];
+              if (refreshed?.latestCheck?.providerInventoryFresh === false) {
+                // The display may still hold agent rows from an earlier check.
+                // Do not run those installers after an unsuccessful re-check.
+                const reason = refreshed.error ?? "Couldn't check device agents after the helper update";
+                for (const rest of ordered) {
+                  patchItem(itemKey(machine, rest.item), { phase: "failed", message: reason });
+                  failed.push({ machine, label: rest.label, reason });
+                }
+                return;
+              }
               // The helper refresh in updateOne can discover providers an
               // older helper could not list, so include them in this run.
               const planned = new Set(ordered.map((p) => p.item));

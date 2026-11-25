@@ -99,10 +99,59 @@ describe("refreshDevice", () => {
     expect(machines[key].providers).toEqual(previous.providers);
     expect(machines[key].helperVersion).toBe(previous.helperVersion);
     expect(machines[key].checkedAt).toBe(previous.checkedAt);
+    expect(machines[key].latestCheck).toEqual({ helperVersion: null, providerInventoryFresh: false });
     expect(buildPlan(machines, { [key]: "workstation" })).toEqual({
       items: [],
       skipped: [{ machine: key, label: "workstation", reason: failure === "rejected check" ? "Error: SSH timed out" : "SSH timed out" }],
     });
+  });
+
+  it("upgrades a reachable old helper before discovering its agents", async () => {
+    const key = hostKey(2);
+    const previous = {
+      loading: false,
+      checkedAt: 123,
+      providers: [report("codex")],
+      helperVersion: "0.22.0",
+      appVersion: "0.24.0",
+    };
+    useUpdateAll.setState({ machines: { [key]: previous } });
+    invoke.mockResolvedValueOnce({
+      host_id: 2,
+      helper_version: "0.23.0",
+      running_version: null,
+      serve_alive: null,
+      app_version: "0.24.0",
+      providers: null,
+      error: "Update Codemux on this device to manage its agents",
+    });
+
+    await useUpdateAll.getState().refreshDevice(2, true);
+
+    const state = useUpdateAll.getState().machines[key]!;
+    expect(state.providers).toEqual(previous.providers);
+    expect(state.helperVersion).toBe("0.23.0");
+    expect(state.checkedAt).toBe(previous.checkedAt);
+    expect(state.latestCheck).toEqual({ helperVersion: "0.23.0", providerInventoryFresh: false });
+    const plan = buildPlan(useUpdateAll.getState().machines as Record<string, MachineState>, { [key]: "workstation" });
+    expect(plan).toEqual({ items: [{ machine: key, item: "helper", label: "Codemux" }], skipped: [] });
+
+    invoke.mockReset();
+    invoke.mockImplementation(async (cmd: string) => {
+      if (cmd === "device_helper_update") {
+        return { host_id: 2, status: "upgraded", from: "0.23.0", to: "0.24.0", message: null };
+      }
+      if (cmd === "provider_updates_device") {
+        return { host_id: 2, helper_version: "0.24.0", running_version: null, serve_alive: null, app_version: "0.24.0", providers: [report("grok")], error: null };
+      }
+      if (cmd === "provider_update_device") return report("grok", { installed_version: "1.1.0", available: false });
+      throw new Error(`unexpected ${cmd}`);
+    });
+
+    expect(await useUpdateAll.getState().runPlan(plan)).toMatchObject({ updated: 2, failed: [] });
+    expect(invoke.mock.calls.map(([cmd]) => cmd)).toEqual([
+      "device_helper_update", "provider_updates_device", "provider_update_device", "provider_updates_device",
+    ]);
   });
 
   it("ignores a pre-install check that finishes after a helper update", async () => {
@@ -191,6 +240,30 @@ describe("updateOne", () => {
 });
 
 describe("runPlan", () => {
+  it("does not use cached agents when the check after a helper upgrade fails", async () => {
+    const key = hostKey(2);
+    useUpdateAll.setState({
+      machines: { [key]: { loading: false, providers: [report("codex")], helperVersion: "0.23.0", appVersion: "0.24.0" } },
+    });
+    invoke.mockImplementation(async (cmd: string) => {
+      if (cmd === "device_helper_update") {
+        return { host_id: 2, status: "upgraded", from: "0.23.0", to: "0.24.0", message: null };
+      }
+      if (cmd === "provider_updates_device") throw new Error("SSH timed out");
+      throw new Error(`unexpected ${cmd}`);
+    });
+
+    const plan = buildPlan(useUpdateAll.getState().machines as Record<string, MachineState>, {});
+    const summary = await useUpdateAll.getState().runPlan(plan);
+
+    expect(invoke.mock.calls.map(([cmd]) => cmd)).toEqual(["device_helper_update", "provider_updates_device"]);
+    expect(summary).toMatchObject({
+      updated: 1,
+      failed: [{ machine: key, label: "Codex", reason: "Error: SSH timed out" }],
+    });
+    expect(useUpdateAll.getState().machines[key]?.providers).toEqual([report("codex")]);
+  });
+
   it("updates a device's helper before its providers and reports partial failure", async () => {
     useUpdateAll.setState({
       machines: {
