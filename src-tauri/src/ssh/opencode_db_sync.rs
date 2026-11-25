@@ -130,10 +130,10 @@ const REMOTE_TRANSFER_TIMEOUT_SECS: u64 = 60;
 const REMOTE_TRANSFER: &str = r#"run_transfer() {
     seconds=$1
     shift
-    if command timeout --version >/dev/null 2>&1; then
+    # Other timeout implementations can leave descendants running after a deadline.
+    if [[ $(LC_ALL=C command timeout --version 2>/dev/null) == 'timeout (GNU coreutils)'* ]]; then
         command timeout -s KILL "$seconds" "$@"
     else
-        # macOS provides Perl but may not have the GNU timeout executable.
         command perl -MIO::Select -e '
             getpgrp() == $$ || setpgrp(0, 0) or die "setpgrp: $!";
             my $seconds = shift @ARGV;
@@ -450,9 +450,10 @@ mod tests {
 
     fn transfer_fixture(script: &str, opencode: &str) -> Command {
         let mut command = Command::new("bash");
+        // Keep the fixture's scratch files in the test runner's temporary directory.
         let fixture = format!(
             r#"mktemp() {{
-    directory=$(command mktemp "$@") || return 1
+    directory=$(command mktemp "$1" "${{TMPDIR:-/tmp}}/${{2##*/}}") || return 1
     printf '%s\n' "$directory" >&2
     ls -ld "$directory" >&2
     printf '%s\n' "$directory"
@@ -472,12 +473,19 @@ export -f opencode
         output(&mut command, input).await.unwrap()
     }
 
-    fn force_perl_with_blocked_alarm(script: &str) -> String {
-        // A program started over SSH can inherit a signal mask. Exercise
-        // the fallback with SIGALRM unavailable as a timer mechanism.
+    fn non_gnu_timeout_with_blocked_perl_alarm(script: &str) -> String {
+        // A compatible version flag doesn't establish group-kill behavior.
+        // Programs started over SSH can also inherit a blocked SIGALRM.
         let prefix = r#"command() {
     case "$1" in
-        timeout) return 1 ;;
+        timeout)
+            if [[ "$2" == --version ]]; then
+                printf 'timeout (uutils coreutils) 0.5.0\n'
+                return 0
+            fi
+            printf 'unexpected non-GNU timeout invocation\n' >&2
+            return 99
+            ;;
         perl)
             shift
             builtin command perl -MPOSIX -e '
@@ -537,7 +545,7 @@ case "$1" in
     *) return 3 ;;
 esac
 "#;
-        let fallback = force_perl_with_blocked_alarm(&script);
+        let fallback = non_gnu_timeout_with_blocked_perl_alarm(&script);
         for script in [&script, &fallback] {
             let result = run_transfer_fixture(script, fake_opencode, None).await;
             assert!(result.status.success(), "{result:?}");
@@ -562,7 +570,7 @@ esac
     async fn perl_export_deadline_works_with_a_blocked_alarm_signal() {
         let script = remote_extract_script("/home/me/ws", 2);
         assert_remote_export_cleanup(
-            &force_perl_with_blocked_alarm(&script),
+            &non_gnu_timeout_with_blocked_perl_alarm(&script),
             &[128 + libc::SIGKILL],
         )
         .await;
