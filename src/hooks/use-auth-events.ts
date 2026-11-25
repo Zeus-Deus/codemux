@@ -41,6 +41,10 @@ export function useAuthEvents() {
         useSyncedSettingsStore
           .getState()
           .replaceSessionSettings(DEFAULT_SETTINGS);
+        // A definitive 401 signs out locally even if its SQLite revocation
+        // needs a retry. The refresh response can be discarded by the event's
+        // identity transition, so carry the storage warning on this event.
+        useAuthStore.setState({ error: payload.storageError ?? null });
         // A callback can persist a valid OAuth token while its immediate user
         // lookup times out. Re-read local state so it becomes
         // `pending-verification`; App will retry verification only after the

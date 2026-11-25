@@ -1,4 +1,4 @@
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use tauri::{Emitter, Manager, State};
 
 use crate::auth::{
@@ -85,50 +85,65 @@ async fn verify_token(token: &str) -> VerifyOutcome {
     }
 }
 
-/// A new backend process must not trust old account browser sessions until
-/// the account API has validated this host's exact stored token. This also
-/// keeps a rejected token suspended after a previous process could not write
-/// its revocation to SQLite. Offline verification leaves browsers suspended.
+/// A backend process must not trust account browser sessions until the account
+/// API has validated this host's exact stored token. Keep watching the file
+/// database: a CLI login can write a new record after this process starts,
+/// but its verification state belongs to the CLI's separate DatabaseStore.
 pub(crate) async fn verify_stored_account_for_remote(db: &DatabaseStore) {
-    let Some(record) = load_auth_record(db) else {
-        return;
-    };
-    if record.stored.user.is_none() {
-        return;
-    }
+    verify_stored_account_for_remote_with_poll(db, Duration::from_secs(5)).await;
+}
+
+async fn verify_stored_account_for_remote_with_poll(db: &DatabaseStore, poll: Duration) {
+    let mut verified_record: Option<Vec<u8>> = None;
+    let mut attempted_record: Option<Vec<u8>> = None;
+    let mut retry_after = Instant::now();
+    let mut retry_delay = poll;
     loop {
-        if !record.is_current(db) {
-            return;
-        }
-        let outcome = if is_token_expired(&record.stored.expires_at) {
-            VerifyOutcome::Unauthorized
+        if let Some(record) = load_auth_record(db).filter(|record| record.stored.user.is_some()) {
+            if attempted_record.as_deref() != Some(record.encrypted()) {
+                attempted_record = Some(record.encrypted().to_vec());
+                retry_after = Instant::now();
+                retry_delay = poll;
+            }
+            if verified_record.as_deref() != Some(record.encrypted()) && Instant::now() >= retry_after {
+                if !record.is_current(db) {
+                    attempted_record = None;
+                    tokio::time::sleep(poll).await;
+                    continue;
+                }
+                let outcome = if is_token_expired(&record.stored.expires_at) {
+                    VerifyOutcome::Unauthorized
+                } else {
+                    verify_token(&record.stored.token).await
+                };
+                match outcome {
+                    VerifyOutcome::Verified(user) if record.stored.user.as_ref().is_some_and(|cached| cached.id == user.id) => {
+                        if db.mark_account_auth_verified_if_current(record.encrypted()) {
+                            verified_record = Some(record.encrypted().to_vec());
+                        } else {
+                            attempted_record = None;
+                        }
+                    }
+                    VerifyOutcome::Verified(_) | VerifyOutcome::Unauthorized => {
+                        if let Err(error) = db.clear_auth_token_if_current(record.encrypted()) {
+                            log::warn!("[auth] Could not persist rejected account revocation: {error}");
+                            retry_rejected_auth_revocation(db, record.encrypted()).await;
+                        }
+                        verified_record = None;
+                        attempted_record = None;
+                    }
+                    VerifyOutcome::Offline => {
+                        retry_after = Instant::now() + retry_delay;
+                        retry_delay = (retry_delay * 2).min(Duration::from_secs(60));
+                    }
+                }
+            }
         } else {
-            verify_token(&record.stored.token).await
-        };
-        match outcome {
-            VerifyOutcome::Verified(user) => {
-                if record.stored.user.as_ref().is_some_and(|cached| cached.id == user.id) {
-                    db.mark_account_auth_verified_if_current(record.encrypted());
-                    return;
-                }
-                // A different server-side owner invalidates this host's old
-                // browser rows. Require a new sign-in for the new identity.
-                if let Err(error) = db.clear_auth_token_if_current(record.encrypted()) {
-                    log::warn!("[auth] Could not persist changed account revocation: {error}");
-                    retry_rejected_auth_revocation(db, record.encrypted()).await;
-                }
-                return;
-            }
-            VerifyOutcome::Unauthorized => {
-                if let Err(error) = db.clear_auth_token_if_current(record.encrypted()) {
-                    log::warn!("[auth] Could not persist rejected account revocation: {error}");
-                    retry_rejected_auth_revocation(db, record.encrypted()).await;
-                }
-                return;
-            }
-            VerifyOutcome::Offline => {}
+            verified_record = None;
+            attempted_record = None;
+            retry_delay = poll;
         }
-        tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+        tokio::time::sleep(poll).await;
     }
 }
 
@@ -136,6 +151,13 @@ async fn retry_rejected_auth_revocation(db: &DatabaseStore, expected: &[u8]) {
     let mut delay = std::time::Duration::from_secs(5);
     loop {
         tokio::time::sleep(delay).await;
+        // A new CLI or GUI sign-in owns the row now. The old rejection must
+        // never clear it, even if this process still cannot start a write.
+        match db.load_raw_auth_token() {
+            Ok(None) => return,
+            Ok(Some(current)) if current != expected => return,
+            _ => {}
+        }
         match db.clear_auth_token_if_current(expected) {
             Ok(_) => return,
             Err(error) => {
@@ -151,11 +173,19 @@ async fn retry_rejected_auth_revocation(db: &DatabaseStore, expected: &[u8]) {
 }
 
 fn emit_signed_out<R: tauri::Runtime>(app: &tauri::AppHandle<R>) {
+    emit_signed_out_with_storage_error(app, None);
+}
+
+fn emit_signed_out_with_storage_error<R: tauri::Runtime>(
+    app: &tauri::AppHandle<R>,
+    storage_error: Option<String>,
+) {
     let _ = app.emit(
         "auth-state-changed",
         &AuthStatePayload {
             authenticated: false,
             user: None,
+            storage_error,
         },
     );
     let _ = app.emit(
@@ -165,6 +195,46 @@ fn emit_signed_out<R: tauri::Runtime>(app: &tauri::AppHandle<R>) {
             auth_method: None,
         },
     );
+}
+
+const AUTH_CLEANUP_PENDING: &str =
+    "Account access is disabled, but local sign-out cleanup could not be saved. Codemux will retry.";
+
+/// A definitive rejection ends this local session even if SQLite could not
+/// commit its revocation. Inspect the raw row because the rejection set hides
+/// the old record; a different row belongs to a newer CLI sign-in.
+fn finish_rejected_local_session<R: tauri::Runtime>(
+    app: &tauri::AppHandle<R>,
+    db: &DatabaseStore,
+    auth_state: &AuthState,
+    generation: u64,
+    expected: &[u8],
+    cleanup_pending: bool,
+) -> Result<Option<u64>, String> {
+    auth_state
+        .replace_session_if_current(generation, || {
+            // A read error cannot prove that another account replaced this
+            // one. Fail closed for the rejected local session and keep the
+            // cleanup warning until storage can be inspected again.
+            let (persisted, inspection_failed) = match db.load_raw_auth_token() {
+                Ok(persisted) => (persisted, false),
+                Err(error) => {
+                    log::warn!("[auth] Could not inspect rejected auth record: {error}");
+                    (Some(expected.to_vec()), true)
+                }
+            };
+            if persisted.as_deref().is_some_and(|current| current != expected) {
+                return Ok(None);
+            }
+            auth_state.clear_local_session();
+            emit_signed_out_with_storage_error(
+                app,
+                ((cleanup_pending || inspection_failed) && persisted.is_some())
+                    .then(|| AUTH_CLEANUP_PENDING.to_string()),
+            );
+            Ok(Some(()))
+        })
+        .map(|replaced| replaced.map(|(assigned, ())| assigned))
 }
 
 fn signed_out_refresh() -> SessionRefresh {
@@ -382,13 +452,53 @@ pub async fn refresh_session<R: tauri::Runtime>(
                 Ok(true) => Ok(signed_out_refresh()),
                 Ok(false) => Ok(current_local_refresh(&db, &auth_state)),
                 Err(error) => {
-                    let app = app.clone();
                     let expected = record.encrypted().to_vec();
+                    let local_transition = finish_rejected_local_session(
+                        &app,
+                        &db,
+                        &auth_state,
+                        session_generation,
+                        &expected,
+                        true,
+                    );
+                    let retry_transition = local_transition.clone();
+                    let retry_app = app.clone();
                     tauri::async_runtime::spawn(async move {
-                        let db = app.state::<DatabaseStore>();
+                        let db = retry_app.state::<DatabaseStore>();
                         retry_rejected_auth_revocation(&db, &expected).await;
+                        let auth_state = retry_app.state::<AuthState>();
+                        match db.load_raw_auth_token() {
+                            Ok(None) => {
+                                if let Ok(Some(assigned)) = retry_transition {
+                                    auth_state.commit_if_session_current(assigned, || {
+                                        emit_signed_out(&retry_app);
+                                    });
+                                } else if let Err(error) = finish_rejected_local_session(
+                                    &retry_app, &db, &auth_state, session_generation, &expected, false,
+                                ) {
+                                    log::warn!("[auth] Could not finish rejected local sign-out: {error}");
+                                }
+                            }
+                            Ok(Some(current)) if current == expected => {
+                                // The retry stopped without durable cleanup. Keep the
+                                // warning until the row is actually gone.
+                                if !matches!(retry_transition, Ok(Some(_))) {
+                                    if let Err(error) = finish_rejected_local_session(
+                                        &retry_app, &db, &auth_state, session_generation, &expected, true,
+                                    ) {
+                                        log::warn!("[auth] Could not finish rejected local sign-out: {error}");
+                                    }
+                                }
+                            }
+                            Ok(Some(_)) => {} // A newer CLI sign-in owns the row.
+                            Err(error) => log::warn!("[auth] Could not inspect auth cleanup: {error}"),
+                        }
                     });
-                    Err(error)
+                    match local_transition {
+                        Ok(Some(_)) => Ok(signed_out_refresh()),
+                        Ok(None) => Ok(current_local_refresh(&db, &auth_state)),
+                        Err(inspect_error) => Err(format!("{error}; {inspect_error}")),
+                    }
                 }
             }
         }
@@ -491,6 +601,7 @@ pub async fn signin_email<R: tauri::Runtime>(
         let payload = AuthStatePayload {
             authenticated: true,
             user: Some(user.clone()),
+            storage_error: None,
         };
         let _ = app.emit("auth-state-changed", &payload);
         let _ = app.emit(
@@ -719,6 +830,19 @@ mod tests {
         }
     }
 
+    async fn wait_for_account_browser(db: &DatabaseStore, browser_token: &str) {
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                if crate::web_remote::auth::authenticate(db, browser_token).is_some() {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("host should verify the account browser");
+    }
+
     #[tokio::test]
     #[serial_test::serial(mockserver)]
     async fn fresh_host_verification_restores_account_browser_after_reopen() {
@@ -735,7 +859,7 @@ mod tests {
         ).unwrap();
         drop(db);
 
-        let reopened = DatabaseStore::test_file(&path);
+        let reopened = std::sync::Arc::new(DatabaseStore::test_file(&path));
         assert!(crate::web_remote::auth::authenticate(&reopened, browser_token).is_none());
         let mut server = mockito::Server::new_async().await;
         let mock = server.mock("GET", "/api/auth/desktop/verify")
@@ -747,9 +871,143 @@ mod tests {
             }).to_string())
             .create_async().await;
         let _api = ApiUrlGuard::set(&server.url());
-        verify_stored_account_for_remote(&reopened).await;
+        let verifier_db = reopened.clone();
+        let verifier = tokio::spawn(async move {
+            verify_stored_account_for_remote_with_poll(&verifier_db, Duration::from_millis(20)).await;
+        });
+        wait_for_account_browser(&reopened, browser_token).await;
+        verifier.abort();
+        let _ = verifier.await;
         mock.assert_async().await;
         assert!(crate::web_remote::auth::authenticate(&reopened, browser_token).is_some());
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(mockserver)]
+    async fn running_host_verifies_cli_login_without_reopening_its_database() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("auth.sqlite");
+        let host = std::sync::Arc::new(DatabaseStore::test_file(&path));
+        let cli = DatabaseStore::test_file(&path);
+        let browser_token = "new-cli-browser";
+        assert!(load_auth_record(&host).is_none());
+
+        let mut server = mockito::Server::new_async().await;
+        let mock = server.mock("GET", "/api/auth/desktop/verify")
+            .match_header("authorization", "Bearer cli-host-token")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(serde_json::json!({
+                "user": { "id": "u1", "email": "u1@example.com", "name": null, "image": null }
+            }).to_string())
+            .create_async().await;
+        let _api = ApiUrlGuard::set(&server.url());
+        let verifier_db = host.clone();
+        let verifier = tokio::spawn(async move {
+            verify_stored_account_for_remote_with_poll(&verifier_db, Duration::from_millis(20)).await;
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        crate::auth::save_auth(
+            &cli, "cli-host-token", "2099-01-01T00:00:00Z", Some(&cached_user()),
+        ).unwrap();
+        cli.web_remote_insert_account_session(
+            "cli-account-browser", None, None,
+            &crate::web_remote::auth::sha256_hex(browser_token), true, "u1",
+        ).unwrap();
+        assert!(crate::web_remote::auth::authenticate(&host, browser_token).is_none());
+
+        wait_for_account_browser(&host, browser_token).await;
+        verifier.abort();
+        let _ = verifier.await;
+        mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(mockserver)]
+    async fn rejected_session_signs_out_locally_while_sqlite_cleanup_retries() {
+        use tauri::Listener;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("auth.sqlite");
+        let app = tauri::test::mock_app();
+        assert!(app.manage(DatabaseStore::test_file(&path)));
+        assert!(app.manage(AuthState::default()));
+        let db = app.state::<DatabaseStore>();
+        let auth_state = app.state::<AuthState>();
+        let record = crate::auth::save_auth_with_method(
+            &db, "rejected-token", "2099-01-01T00:00:00Z", Some(&cached_user()), Some("email"),
+        ).unwrap();
+        auth_state.set_local_session(Some(&record.stored));
+
+        let received = std::sync::Arc::new(std::sync::Mutex::new(Vec::<AuthStatePayload>::new()));
+        let captured = received.clone();
+        app.listen("auth-state-changed", move |event| {
+            captured.lock().unwrap().push(serde_json::from_str(event.payload()).unwrap());
+        });
+        let mut server = mockito::Server::new_async().await;
+        let mock = server.mock("GET", "/api/auth/desktop/verify")
+            .match_header("authorization", "Bearer rejected-token")
+            .with_status(401)
+            .create_async().await;
+        let _api = ApiUrlGuard::set(&server.url());
+        db.test_set_query_only(true);
+
+        let result = refresh_session(
+            app.handle().clone(), app.state::<DatabaseStore>(), app.state::<AuthState>(),
+        ).await.unwrap();
+        mock.assert_async().await;
+        assert_eq!(result.status, "signed-out");
+        assert!(!result.authenticated);
+        assert_eq!(auth_state.auth_method(), None);
+        assert!(db.load_auth_token().is_none());
+        assert_eq!(db.load_raw_auth_token().unwrap().as_deref(), Some(record.encrypted()));
+        assert_eq!(received.lock().unwrap().last().unwrap().storage_error.as_deref(), Some(AUTH_CLEANUP_PENDING));
+
+        db.test_set_query_only(false);
+        tokio::time::timeout(Duration::from_secs(8), async {
+            loop {
+                if db.load_raw_auth_token().unwrap().is_none()
+                    && received.lock().unwrap().last().is_some_and(|event| event.storage_error.is_none())
+                {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        }).await.expect("background revocation should persist after write recovery");
+        assert_eq!(received.lock().unwrap().last().unwrap().storage_error, None);
+    }
+
+    #[test]
+    #[serial_test::serial(mockserver)]
+    fn rejected_record_does_not_sign_out_a_replacement_cli_account() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("auth.sqlite");
+        let app = tauri::test::mock_app();
+        assert!(app.manage(DatabaseStore::test_file(&path)));
+        assert!(app.manage(AuthState::default()));
+        let db = app.state::<DatabaseStore>();
+        let auth_state = app.state::<AuthState>();
+        let old = crate::auth::save_auth_with_method(
+            &db, "old-token", "2099-01-01T00:00:00Z", Some(&cached_user()), Some("email"),
+        ).unwrap();
+        auth_state.set_local_session(Some(&old.stored));
+        let (generation, ()) = auth_state.session_snapshot(|| ());
+        db.test_set_query_only(true);
+        assert!(db.clear_auth_token_if_current(old.encrypted()).is_err());
+
+        let cli = DatabaseStore::test_file(&path);
+        let replacement = crate::auth::save_auth_with_method(
+            &cli, "new-token", "2099-01-01T00:00:00Z", Some(&cached_user()), Some("email"),
+        ).unwrap();
+        assert_eq!(finish_rejected_local_session(
+            app.handle(), &db, &auth_state, generation, old.encrypted(), true,
+        ).unwrap(), None);
+        assert_eq!(auth_state.auth_method().as_deref(), Some("email"));
+        assert_eq!(db.load_raw_auth_token().unwrap().as_deref(), Some(replacement.encrypted()));
+        db.test_set_query_only(false);
+        assert!(!db.clear_auth_token_if_current(old.encrypted()).unwrap());
+        assert_eq!(db.load_raw_auth_token().unwrap().as_deref(), Some(replacement.encrypted()));
     }
 
     #[test]

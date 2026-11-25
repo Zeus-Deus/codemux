@@ -456,6 +456,8 @@ export type SessionRefresh = SessionBootstrap;
 export interface AuthStatePayload {
   authenticated: boolean;
   user: AuthUser | null;
+  /** A rejected account is inactive while durable local cleanup retries. */
+  storageError?: string | null;
 }
 
 // ── Terminal ──

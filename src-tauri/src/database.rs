@@ -1599,6 +1599,15 @@ impl DatabaseStore {
         Self::from_connection(conn)
     }
 
+    #[cfg(test)]
+    pub(crate) fn test_set_query_only(&self, enabled: bool) {
+        self.conn
+            .lock()
+            .unwrap()
+            .execute_batch(if enabled { "PRAGMA query_only=ON" } else { "PRAGMA query_only=OFF" })
+            .unwrap();
+    }
+
     #[cfg(all(test, unix))]
     pub(crate) fn test_busy_handler(&self, handler: fn(i32) -> bool) {
         self.conn.lock().unwrap().busy_handler(Some(handler)).unwrap();
@@ -6329,6 +6338,21 @@ impl DatabaseStore {
         )
         .ok()?;
         (!self.rejected_auth_records.lock().unwrap().contains(&record)).then_some(record)
+    }
+
+    /// Inspect the persisted row even when this process has rejected it in
+    /// memory. A failed 401 cleanup must not sign out a newer CLI account.
+    pub(crate) fn load_raw_auth_token(&self) -> Result<Option<Vec<u8>>, String> {
+        self.conn
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT encrypted_data FROM auth_tokens WHERE id = 1",
+                [],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|error| format!("Failed to inspect current auth record: {error}"))
     }
 
     pub fn clear_auth_token(&self) -> Result<(), String> {

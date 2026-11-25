@@ -34,6 +34,7 @@ import {
   useAuthStore,
 } from "@/stores/auth-store";
 import { startOauthFlow } from "@/tauri/commands";
+import { DEFAULT_SETTINGS, useSyncedSettingsStore } from "@/stores/synced-settings-store";
 
 const bootstrapSession = vi.fn();
 
@@ -112,5 +113,30 @@ describe("useAuthEvents GitHub callback", () => {
     emitAuthState(unverifiedCallback);
 
     expect(bootstrapSession).not.toHaveBeenCalled();
+  });
+
+  it("signs out and reports delayed local cleanup after a rejected session", () => {
+    const warning = "Account access is disabled, but local sign-out cleanup could not be saved. Codemux will retry.";
+    useAuthStore.setState({
+      user: { id: "u1", email: "u1@example.com", name: null, image: null },
+      isAuthenticated: true,
+      sessionStatus: "offline",
+    });
+    useSyncedSettingsStore.getState().replaceSessionSettings({
+      ...DEFAULT_SETTINGS,
+      appearance: { ...DEFAULT_SETTINGS.appearance, theme: "dark" },
+    });
+
+    emitAuthState({ authenticated: false, user: null, storageError: warning });
+
+    expect(useAuthStore.getState()).toMatchObject({
+      user: null,
+      isAuthenticated: false,
+      sessionStatus: "signed-out",
+      error: warning,
+    });
+    expect(useSyncedSettingsStore.getState().settings).toEqual(DEFAULT_SETTINGS);
+    emitAuthState({ authenticated: false, user: null });
+    expect(useAuthStore.getState().error).toBeNull();
   });
 });

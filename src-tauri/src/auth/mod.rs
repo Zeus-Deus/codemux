@@ -57,6 +57,8 @@ pub struct AuthResponse {
 pub struct AuthStatePayload {
     pub authenticated: bool,
     pub user: Option<AuthUser>,
+    #[serde(rename = "storageError", skip_serializing_if = "Option::is_none")]
+    pub storage_error: Option<String>,
 }
 
 /// What the API returns from /desktop/verify
@@ -808,6 +810,7 @@ fn emit_callback_auth_state<R: tauri::Runtime>(
         &AuthStatePayload {
             authenticated,
             user,
+            storage_error: None,
         },
     );
     let _ = app.emit(
