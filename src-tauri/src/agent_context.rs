@@ -157,13 +157,14 @@ const DROID_AUTONOMY_JSON: &str = r#"{"sessionDefaultSettings":{"autonomyLevel":
 /// Folder for the Gemini and Droid launch files on Unix. `$HOME` is expanded
 /// by the shell running the command, so this is right on whichever host the
 /// terminal lives. It must never be the shared temp dir: the files decide
-/// what a full-autonomy agent is told and allowed, and a fixed name there can
-/// be created or symlinked first by another local user.
+/// what a full-autonomy agent is told and allowed. A shared temp directory
+/// lets another local user plant an entry before the file is created.
 #[cfg(unix)]
-const LAUNCH_DIR: &str = "$HOME/.codemux/agent-launch";
+const LAUNCH_DIR: &str = "$HOME/.codemux-agent-launch";
 
-/// Where the `kind` launch file for `workspace_id` goes. On Unix the result
-/// contains `$HOME` and must be used inside double quotes.
+/// Where one launch's `kind` file for `workspace_id` goes. On Unix the result
+/// contains `$HOME` and must be used inside double quotes. The random suffix
+/// keeps concurrent launches from deleting or overwriting each other's file.
 fn launch_file_path(workspace_id: &str, kind: &str) -> String {
     // Workspace ids are generated, but the path is spliced into a shell
     // command, so keep only characters that need no quoting.
@@ -171,7 +172,7 @@ fn launch_file_path(workspace_id: &str, kind: &str) -> String {
         .chars()
         .filter(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
         .collect();
-    let name = format!("codemux-{id}-{kind}");
+    let name = format!("codemux-{id}-{}-{kind}", uuid::Uuid::new_v4().simple());
     #[cfg(unix)]
     return format!("{LAUNCH_DIR}/{name}");
     // %TEMP% is already private to the user on Windows.
@@ -183,18 +184,17 @@ fn launch_file_path(workspace_id: &str, kind: &str) -> String {
 }
 
 /// Create a fresh launch file only after checking every ancestor on the host
-/// running the terminal. `set -C` makes the final redirect exclusive, so a
-/// symlink planted at the fixed file name cannot be followed. The shell
-/// wrapper keeps the checks and write together across supported outer shells.
+/// running the terminal. `set -C` makes the final redirect exclusive, so an
+/// existing file or symlink is never overwritten. The shell wrapper keeps
+/// the checks and write together across supported outer shells.
 #[cfg(unix)]
 fn write_launch_file(path: &str, contents: &str) -> String {
     let name = path.rsplit('/').next().expect("launch file has a name");
     let script = format!(
         "{}cmx_file=\"$cmx_dir/{name}\"\n\
-         rm -f \"$cmx_file\" || exit 1\n\
          set -C\n\
-         {contents} > \"$cmx_file\" || {{ rm -f \"$cmx_file\"; exit 1; }}\n",
-        crate::private_dir::shell_private_dir_guard(&[".codemux", "agent-launch"], true),
+         {contents} > \"$cmx_file\" || exit 1\n",
+        crate::private_dir::shell_private_dir_guard(&[".codemux-agent-launch"], true),
     );
     format!("sh -c {}", shell_sq(&script))
 }
@@ -202,6 +202,11 @@ fn write_launch_file(path: &str, contents: &str) -> String {
 #[cfg(unix)]
 fn shell_sq(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\\''"))
+}
+
+#[cfg(windows)]
+fn powershell_literal(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "''"))
 }
 
 /// Returns the shell-level expansion of the `CODEMUX_AGENT_CONTEXT` env var for
@@ -245,8 +250,9 @@ fn gemini_injection_command(path: &str, command: &str) -> String {
     // Note: on PS 5.1 `Set-Content` defaults to UTF-8-with-BOM; on PS 7+ it
     // defaults to UTF-8 without BOM. Gemini CLI accepts both, so we don't
     // force `-Encoding` and instead let each host pick its default.
+    let path = powershell_literal(path);
     format!(
-        "$env:CODEMUX_AGENT_CONTEXT | Set-Content -Path '{path}' -NoNewline; $env:GEMINI_SYSTEM_MD = '{path}'; {command}"
+        "$env:CODEMUX_AGENT_CONTEXT | Set-Content -LiteralPath {path} -NoNewline; $env:GEMINI_SYSTEM_MD = {path}; {command}"
     )
 }
 
@@ -272,8 +278,9 @@ fn droid_injection_command(path: &str, command: &str) -> String {
     // single quotes) written with `Set-Content -NoNewline`, then droid
     // launched with `--settings`. Uses `;` rather than `&&` because
     // `&&` is PowerShell 7+ only — Windows PowerShell 5.1 rejects it.
+    let path = powershell_literal(path);
     format!(
-        "'{DROID_AUTONOMY_JSON}' | Set-Content -Path '{path}' -NoNewline; {command} --settings '{path}'"
+        "'{DROID_AUTONOMY_JSON}' | Set-Content -LiteralPath {path} -NoNewline; {command} --settings {path}"
     )
 }
 
@@ -490,7 +497,8 @@ mod tests {
         let result = inject_agent_context("gemini --yolo", "test-ws-gemini");
         assert!(result.contains("printf"));
         assert!(result.contains("GEMINI_SYSTEM_MD="));
-        assert!(result.contains("codemux-test-ws-gemini-gemini-system.md"));
+        assert!(result.contains("codemux-test-ws-gemini-"));
+        assert!(result.contains("-gemini-system.md"));
         assert!(result.ends_with("gemini --yolo"));
         assert!(result.contains("$CODEMUX_AGENT_CONTEXT"));
     }
@@ -498,7 +506,7 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn inject_gemini_writes_file_and_sets_env_windows() {
-        // Windows pipeline uses PowerShell `Set-Content -NoNewline` +
+        // Windows pipeline uses PowerShell `Set-Content -LiteralPath -NoNewline` +
         // `$env:GEMINI_SYSTEM_MD = 'path'` (inline env-var syntax is
         // Unix-only; PS needs an explicit assignment statement). The
         // statements are chained with `;` because `&&` is PowerShell 7+
@@ -508,7 +516,8 @@ mod tests {
         assert!(result.contains("-NoNewline"));
         assert!(result.contains("$env:GEMINI_SYSTEM_MD"));
         assert!(result.contains("$env:CODEMUX_AGENT_CONTEXT"));
-        assert!(result.contains("codemux-test-ws-gemini-gemini-system.md"));
+        assert!(result.contains("codemux-test-ws-gemini-"));
+        assert!(result.contains("-gemini-system.md"));
         assert!(result.ends_with("gemini --yolo"));
         // Must NOT contain the Unix `printf` form — that would be a
         // regression to a broken-on-Windows shell command.
@@ -528,7 +537,8 @@ mod tests {
         let result = inject_agent_context("droid", "test-ws-droid");
         assert!(result.contains("printf"));
         assert!(result.contains(r#"{"sessionDefaultSettings":{"autonomyLevel":"high"}}"#));
-        assert!(result.contains("codemux-test-ws-droid-droid-settings.json"));
+        assert!(result.contains("codemux-test-ws-droid-"));
+        assert!(result.contains("-droid-settings.json"));
         assert!(result.contains("droid --settings "));
         assert!(result.ends_with("droid-settings.json\""));
     }
@@ -542,9 +552,21 @@ mod tests {
         assert!(result.contains("Set-Content"));
         assert!(result.contains("-NoNewline"));
         assert!(result.contains(r#"{"sessionDefaultSettings":{"autonomyLevel":"high"}}"#));
-        assert!(result.contains("codemux-test-ws-droid-droid-settings.json"));
+        assert!(result.contains("codemux-test-ws-droid-"));
+        assert!(result.contains("-droid-settings.json"));
         assert!(result.contains("droid --settings "));
         assert!(!result.contains("printf"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_launch_paths_are_powershell_literals() {
+        let path = "C:\\Users\\O'Brien\\[data]\\settings.json";
+        let quoted = "'C:\\Users\\O''Brien\\[data]\\settings.json'";
+        for command in [gemini_injection_command(path, "gemini"), droid_injection_command(path, "droid")] {
+            assert!(command.contains(&format!("Set-Content -LiteralPath {quoted}")), "{command}");
+            assert!(!command.contains("Set-Content -Path"), "{command}");
+        }
     }
 
     #[test]
@@ -562,9 +584,9 @@ mod tests {
         // hardcoded unix path.
         let result = inject_agent_context("droid", "test-ws-dx");
         let expected_temp = std::env::temp_dir()
-            .join("codemux-test-ws-dx-droid-settings.json")
+            .join("codemux-test-ws-dx-")
             .to_string_lossy()
-            .into_owned();
+            .replace('\'', "''");
         assert!(
             result.contains(&expected_temp),
             "droid injection must reference {expected_temp:?}, got {result:?}",
@@ -578,16 +600,16 @@ mod tests {
     #[test]
     fn unix_launch_files_stay_out_of_shared_temp() {
         let temp = std::env::temp_dir().to_string_lossy().into_owned();
-        for (command, name) in [
-            ("gemini --yolo", "codemux-ws-1-gemini-system.md"),
-            ("droid", "codemux-ws-1-droid-settings.json"),
+        for (command, kind) in [
+            ("gemini --yolo", "gemini-system.md"),
+            ("droid", "droid-settings.json"),
         ] {
             let result = inject_agent_context(command, "ws-1");
-            let path = format!("\"$HOME/.codemux/agent-launch/{name}\"");
             assert!(result.starts_with("sh -c 'umask 077"), "{result}");
             assert!(result.contains("cmx_check_ancestor"), "{result}");
             assert!(result.contains("set -C"), "{result}");
-            assert!(result.contains(&path), "{result}");
+            assert!(result.contains("\"$HOME/.codemux-agent-launch/codemux-ws-1-"), "{result}");
+            assert!(result.contains(&format!("-{kind}\"")), "{result}");
             assert!(!result.contains(&temp), "{result}");
         }
     }
@@ -613,17 +635,59 @@ mod tests {
             "{}",
             String::from_utf8_lossy(&out.stderr)
         );
-        let dir = home_path.join(".codemux/agent-launch");
-        let file = dir.join("codemux-ws-run-droid-settings.json");
-        assert_eq!(
-            String::from_utf8_lossy(&out.stdout).trim(),
-            format!("--settings {}", file.display()),
-        );
+        let dir = home_path.join(".codemux-agent-launch");
+        let output = String::from_utf8_lossy(&out.stdout);
+        let file = std::path::PathBuf::from(output.trim().strip_prefix("--settings ").unwrap());
+        assert_eq!(file.parent(), Some(dir.as_path()));
+        let file_name = file.file_name().unwrap().to_string_lossy();
+        assert!(file_name.starts_with("codemux-ws-run-") && file_name.ends_with("-droid-settings.json"));
         assert_eq!(std::fs::read_to_string(&file).unwrap(), DROID_AUTONOMY_JSON);
         let mode = std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o700);
         let file_mode = std::fs::metadata(&file).unwrap().permissions().mode() & 0o777;
         assert_eq!(file_mode, 0o600);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn concurrent_unix_launches_keep_separate_settings_files() {
+        let home = tempfile::tempdir().unwrap();
+        let home_path = home.path().canonicalize().unwrap();
+        let commands: Vec<_> = (0..2)
+            .map(|_| inject_agent_context("droid", "same-workspace").replace("&& droid ", "&& echo "))
+            .collect();
+        assert_ne!(commands[0], commands[1], "each launch needs a new file name");
+        let start = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let handles: Vec<_> = commands
+            .into_iter()
+            .map(|command| {
+                let home_path = home_path.clone();
+                let start = start.clone();
+                std::thread::spawn(move || {
+                    start.wait();
+                    std::process::Command::new("sh")
+                        .arg("-c")
+                        .arg(command)
+                        .env("HOME", home_path)
+                        .output()
+                        .unwrap()
+                })
+            })
+            .collect();
+        let files: Vec<_> = handles
+            .into_iter()
+            .map(|handle| {
+                let out = handle.join().unwrap();
+                assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+                let output = String::from_utf8_lossy(&out.stdout);
+                let path = output.trim().strip_prefix("--settings ").unwrap();
+                let file = std::path::PathBuf::from(path);
+                assert_eq!(file.parent(), Some(home_path.join(".codemux-agent-launch").as_path()));
+                assert_eq!(std::fs::read_to_string(&file).unwrap(), DROID_AUTONOMY_JSON);
+                file
+            })
+            .collect();
+        assert_ne!(files[0], files[1]);
     }
 
     #[cfg(unix)]
@@ -643,7 +707,7 @@ mod tests {
             .status()
             .unwrap();
         assert!(!status.success());
-        assert!(!home.join(".codemux").exists());
+        assert!(!home.join(".codemux-agent-launch").exists());
 
         std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
         let elsewhere = tempfile::tempdir().unwrap();
@@ -654,13 +718,32 @@ mod tests {
             .env("HOME", &home)
             .status()
             .unwrap();
+        assert!(status.success(), "a linked data directory does not affect launch files");
+        let gemini = inject_agent_context("gemini --yolo", "ws-gemini").replace("gemini --yolo", "true");
+        let status = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(gemini)
+            .env("HOME", &home)
+            .status()
+            .unwrap();
+        assert!(status.success(), "Gemini also works with linked app data");
+        assert_eq!(std::fs::read_dir(elsewhere.path()).unwrap().count(), 0);
+
+        std::fs::remove_dir_all(home.join(".codemux-agent-launch")).unwrap();
+        std::os::unix::fs::symlink(elsewhere.path(), home.join(".codemux-agent-launch")).unwrap();
+        let status = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(&launch)
+            .env("HOME", &home)
+            .status()
+            .unwrap();
         assert!(!status.success());
         assert_eq!(std::fs::read_dir(elsewhere.path()).unwrap().count(), 0);
 
-        std::fs::remove_file(home.join(".codemux")).unwrap();
-        std::fs::create_dir(home.join(".codemux")).unwrap();
+        std::fs::remove_file(home.join(".codemux-agent-launch")).unwrap();
+        std::fs::create_dir(home.join(".codemux-agent-launch")).unwrap();
         std::fs::set_permissions(
-            home.join(".codemux"),
+            home.join(".codemux-agent-launch"),
             std::fs::Permissions::from_mode(0o777),
         )
         .unwrap();
@@ -671,31 +754,33 @@ mod tests {
             .status()
             .unwrap();
         assert!(!status.success());
-        assert!(!home.join(".codemux/agent-launch").exists());
+        assert!(std::fs::read_dir(home.join(".codemux-agent-launch")).unwrap().next().is_none());
     }
 
     #[cfg(unix)]
     #[test]
-    fn unix_launch_replaces_a_planted_file_link_without_following_it() {
+    fn unix_launch_refuses_a_planted_file_link_without_following_it() {
+        use std::os::unix::fs::PermissionsExt;
         let home = tempfile::tempdir().unwrap();
-        let dir = home.path().join(".codemux/agent-launch");
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = home.path().join(".codemux-agent-launch");
+        std::fs::create_dir(&dir).unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
         let target = home.path().join("target");
         std::fs::write(&target, "keep").unwrap();
         let file = dir.join("codemux-ws-run-droid-settings.json");
         std::os::unix::fs::symlink(&target, &file).unwrap();
 
-        let launch = inject_agent_context("droid", "ws-run").replace("&& droid ", "&& echo ");
+        let path = format!("{LAUNCH_DIR}/codemux-ws-run-droid-settings.json");
+        let launch = droid_injection_command(&path, "droid").replace("&& droid ", "&& echo ");
         let status = std::process::Command::new("sh")
             .arg("-c")
             .arg(&launch)
             .env("HOME", home.path().canonicalize().unwrap())
             .status()
             .unwrap();
-        assert!(status.success());
+        assert!(!status.success());
         assert_eq!(std::fs::read_to_string(&target).unwrap(), "keep");
-        assert_eq!(std::fs::read_to_string(&file).unwrap(), DROID_AUTONOMY_JSON);
-        assert!(!std::fs::symlink_metadata(&file)
+        assert!(std::fs::symlink_metadata(&file)
             .unwrap()
             .file_type()
             .is_symlink());
@@ -704,7 +789,9 @@ mod tests {
     #[test]
     fn launch_file_path_drops_shell_metacharacters_from_the_id() {
         let path = launch_file_path("ws\"$(x)`;' 1", "droid-settings.json");
-        assert!(path.ends_with("codemux-wsx1-droid-settings.json"), "{path}");
+        assert!(path.contains("codemux-wsx1-"), "{path}");
+        assert!(path.ends_with("-droid-settings.json"), "{path}");
+        assert!(!path.contains("$("), "{path}");
     }
 
     /// Regression guard: the Gemini injection path MUST resolve its temp
@@ -722,9 +809,9 @@ mod tests {
 
         // Build what the expected temp path SHOULD look like on this OS.
         let expected_temp = std::env::temp_dir()
-            .join("codemux-test-ws-xplat-gemini-system.md")
+            .join("codemux-test-ws-xplat-")
             .to_string_lossy()
-            .into_owned();
+            .replace('\'', "''");
 
         assert!(
             result.contains(&expected_temp),
@@ -748,7 +835,8 @@ mod tests {
         }
 
         // The file name component is the same on every platform.
-        assert!(result.contains("codemux-test-ws-xplat-gemini-system.md"));
+        assert!(result.contains("codemux-test-ws-xplat-"));
+        assert!(result.contains("-gemini-system.md"));
     }
 
     /// Meta-test: grep the source files we modified for Windows support
