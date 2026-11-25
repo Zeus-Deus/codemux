@@ -19,8 +19,8 @@ case "$TARGET" in
   aarch64-apple-darwin)      AB_PACKAGE="cli-darwin-arm64" ;;
   x86_64-pc-windows-msvc)    AB_PACKAGE="cli-win32-x64-msvc" ;;
   *)
-    echo "[copy-agent-browser] Unknown target: $TARGET — skipping"
-    exit 0
+    echo "[copy-agent-browser] Unsupported target: $TARGET" >&2
+    exit 1
     ;;
 esac
 
@@ -41,6 +41,7 @@ if [ -f "$SRC" ]; then
   chmod +x "$DST"
   echo "[copy-agent-browser] Copied $SRC → $DST"
 else
-  echo "[copy-agent-browser] WARNING: $SRC not found — agent-browser won't be bundled"
-  echo "[copy-agent-browser] Run 'npm install' first to download the binary"
+  echo "[copy-agent-browser] ERROR: $SRC not found — refusing to reuse a staged sidecar" >&2
+  echo "[copy-agent-browser] Run 'npm install' first to download the binary" >&2
+  exit 1
 fi

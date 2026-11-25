@@ -1,4 +1,5 @@
 use crate::agent_browser::{AgentBrowserManager, BrowserAutomationResult};
+use crate::browser_stream_bridge::{BrowserStreamBridge, BrowserStreamBridgeEndpoints};
 use crate::state::AppStateStore;
 use std::path::PathBuf;
 use tauri::State;
@@ -222,6 +223,16 @@ pub async fn start_browser_stream(
     browser_id: String,
 ) -> Result<String, String> {
     manager.start_stream(&browser_id).await
+}
+
+#[tauri::command]
+pub async fn browser_stream_bridge_endpoints<R: tauri::Runtime>(
+    app: tauri::AppHandle<R>,
+    manager: State<'_, AgentBrowserManager>,
+    bridge: State<'_, BrowserStreamBridge>,
+    browser_id: String,
+) -> Result<BrowserStreamBridgeEndpoints, String> {
+    bridge.endpoints(app, &manager, browser_id).await
 }
 
 #[tauri::command]

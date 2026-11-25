@@ -282,7 +282,11 @@ fn kill_owned_browser_daemons_in(dir: &std::path::Path) {
         if record.token != browser_owner_token() || !browser_process_matches(&record, session) {
             continue;
         }
-        stop_owned_browser_daemon(session, &record, &bin);
+        if let Ok(bin) = &bin {
+            stop_owned_browser_daemon(session, &record, bin);
+        } else {
+            kill_verified_browser_pid(&record, session);
+        }
         if !pid_alive(record.pid) {
             let _ = std::fs::remove_file(path);
         }
@@ -497,7 +501,8 @@ fn set_browser_owner_env(command: &mut std::process::Command, session: &str) -> 
     command
         .env("CODEMUX_BROWSER_OWNER", browser_owner_token())
         .env("CODEMUX_BROWSER_SESSION", session)
-        .env("AGENT_BROWSER_SOCKET_DIR", socket_dir);
+        .env("AGENT_BROWSER_SOCKET_DIR", socket_dir)
+        .env_remove("AGENT_BROWSER_NAMESPACE");
     Ok(())
 }
 
@@ -586,7 +591,10 @@ fn browser_control_endpoint_ready(session: &str, dir: &std::path::Path) -> bool 
     }
     #[cfg(windows)]
     {
-        let port = browser_control_port(session, dir);
+        // v0.44 only connects to the published .port entry. A missing file
+        // leaves no reachable control endpoint, even if the old session hash
+        // happens to collide with an unrelated listener.
+        let Some(port) = browser_control_port(session, dir) else { return false };
         std::net::TcpStream::connect_timeout(
             &std::net::SocketAddr::from(([127, 0, 0, 1], port)),
             Duration::from_millis(50),
@@ -595,24 +603,16 @@ fn browser_control_endpoint_ready(session: &str, dir: &std::path::Path) -> bool 
 }
 
 #[cfg(windows)]
-fn browser_control_port(session: &str, dir: &std::path::Path) -> u16 {
+fn browser_control_port(session: &str, dir: &std::path::Path) -> Option<u16> {
     let path = dir.join(format!("{session}.port"));
     std::fs::read_to_string(path)
         .ok()
         .and_then(|value| value.trim().parse::<u16>().ok())
-        .unwrap_or_else(|| {
-            // agent-browser v0.24.0 uses the session hash if its .port file
-            // is absent, unreadable, or invalid.
-            let hash = session.chars().fold(0i32, |hash, ch| {
-                hash.wrapping_shl(5).wrapping_sub(hash).wrapping_add(ch as i32)
-            });
-            49152 + (hash.unsigned_abs() % 16383) as u16
-        })
 }
 
 #[cfg(windows)]
 fn browser_control_listener_owned_by_pid(session: &str, dir: &std::path::Path, pid: u32) -> bool {
-    listener_owned_by_pid(browser_control_port(session, dir), pid)
+    browser_control_port(session, dir).is_some_and(|port| listener_owned_by_pid(port, pid))
 }
 
 fn require_owned_browser_session(session: &str) -> Result<(), String> {
@@ -932,6 +932,9 @@ struct StreamSession {
     /// the session was adopted from a stale PID file or when the
     /// agent-browser CLI didn't write its lock file in time.
     pid: Option<u32>,
+    /// Rotates after every successful daemon launch, even if the OS reuses
+    /// the same PID and stream port immediately.
+    stream_generation: u128,
     /// Last time we saw signs of life on this session (TCP probe success
     /// or first-frame timestamp passed in by the frontend). Used by the
     /// optional reaper background task.
@@ -947,6 +950,16 @@ pub struct AgentBrowserManager {
     /// Serializes start_stream calls to prevent concurrent daemon launches
     /// from racing (e.g., React StrictMode double-mount, pane remount + agent action).
     start_lock: Mutex<()>,
+    #[cfg(test)]
+    test_stream_ports: Mutex<std::collections::HashSet<u16>>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) struct BrowserStreamIdentity {
+    pub port: u16,
+    pub pid: u32,
+    pub start_time: u64,
+    pub generation: u128,
 }
 
 fn session_name(browser_id: &str) -> &str {
@@ -954,14 +967,10 @@ fn session_name(browser_id: &str) -> &str {
 }
 
 fn validate_session_name(name: &str) -> Result<(), String> {
-    // The name also becomes a PID/log filename. Keep it to one segment even
-    // though Unix command arguments are quoted separately below.
+    // Match the v0.44 CLI grammar and keep PID/socket paths to one segment.
     if name.is_empty()
         || name.len() > 64
-        || name == "."
-        || name == ".."
-        || name.contains(['/', '\\', '\0'])
-        || name.chars().any(char::is_control)
+        || !name.chars().all(|ch| ch.is_alphanumeric() || matches!(ch, '-' | '_'))
     {
         return Err("Invalid browser session name".into());
     }
@@ -975,12 +984,7 @@ fn shell_quote(value: &str) -> String {
 
 #[cfg(not(target_os = "windows"))]
 fn shell_binary(binary: &str) -> String {
-    // The fallback is two fixed argv words; every resolved path is one word.
-    if binary == "npx agent-browser" {
-        binary.to_string()
-    } else {
-        shell_quote(binary)
-    }
+    shell_quote(binary)
 }
 
 /// JavaScript that queries the DOM for all interactive elements.
@@ -1054,170 +1058,74 @@ fn extract_eval_result(stdout: &str) -> String {
     trimmed.to_string()
 }
 
-/// Resolve the path to the agent-browser native binary.
-///
-/// Search order (first match wins):
-/// 1. System PATH — covers AUR `agent-browser` package and manual installs
-/// 2. Tauri sidecar — bundled next to the executable in AppImage/deb/rpm
-/// 3. node_modules — dev mode (`npm run tauri dev`)
-/// 4. npx fallback — always works if Node.js + npm are present
-#[cfg_attr(target_os = "windows", allow(unreachable_code))]
-fn resolve_binary() -> String {
-    // 1. System PATH (AUR/system package, cargo install, manual install).
-    //
-    // Resolve PATH in-process instead of spawning the `which` command.
-    // Windows prefers its bundled sidecar before trying PATH below.
-    #[cfg(unix)]
-    {
-        if let Ok(path) = which::which("agent-browser") {
-            let path = path.to_string_lossy();
-            // Skip the node_modules/.bin shim — we want the native binary directly.
-            if !path.contains("node_modules/.bin") {
-                return path.into_owned();
-            }
-        }
-    }
-
-    // Windows takes a different discovery path because the rest of this
-    // function is shaped around the Linux/macOS sidecar naming convention
-    // (`agent-browser-{triple}` next to the main exe) and the bash `which`
-    // probe at the top. Specifically:
-    //   1. Tauri's Windows bundler copies the staged sidecar
-    //      `src-tauri/binaries/agent-browser-x86_64-pc-windows-msvc.exe` to
-    //      `target/{debug,release}/agent-browser.exe` (drops the triple,
-    //      keeps `.exe`) — so the runtime lookup must match THAT name.
-    //   2. The original target_triple match below has no Windows branch and
-    //      hard-returns `"npx agent-browser"`, which `Command::new("npx")`
-    //      can't actually spawn because Windows only auto-appends `.exe` and
-    //      `npx` ships as `npx.cmd` (per microsoft/CreateProcessW docs).
-    //   3. The `which` crate (already a dep) honors PATHEXT and is the
-    //      canonical Windows-safe way to probe for an executable on PATH.
-    #[cfg(target_os = "windows")]
-    {
-        // (a) Tauri runtime convention — sidecar copied next to main exe.
-        if let Ok(exe) = std::env::current_exe() {
-            if let Some(dir) = exe.parent() {
-                let candidate = dir.join("agent-browser.exe");
-                if candidate.exists() {
-                    return candidate.to_string_lossy().to_string();
-                }
-            }
-        }
-        // (b) Dev mode — npm-installed binary in node_modules.
-        let npm_binary = "agent-browser-win32-x64.exe";
-        let mut search_dirs: Vec<std::path::PathBuf> = Vec::new();
-        if let Ok(cwd) = std::env::current_dir() {
-            search_dirs.push(cwd.clone());
-            if let Some(parent) = cwd.parent() {
-                search_dirs.push(parent.to_path_buf());
-            }
-        }
-        if let Ok(exe) = std::env::current_exe() {
-            if let Some(dir) = exe.parent() {
-                search_dirs.push(dir.to_path_buf());
-            }
-        }
-        for base in &search_dirs {
-            let candidate = base.join("node_modules/agent-browser/bin").join(npm_binary);
-            if candidate.exists() {
-                return candidate.to_string_lossy().to_string();
-            }
-        }
-        // (c) Native install on PATH — `which` honors PATHEXT so this finds
-        //     `agent-browser.exe`/`.cmd` without explicit suffix probing.
-        if let Ok(path) = which::which("agent-browser") {
-            return path.to_string_lossy().to_string();
-        }
-        // (d) Last-resort npx fallback. Use `npx.cmd` (not `npx`) because
-        //     CreateProcessW won't auto-append `.cmd`. `which::which("npx")`
-        //     resolves to the right shim with PATHEXT, so prefer it.
-        if let Ok(npx_path) = which::which("npx") {
-            return format!("{} agent-browser", npx_path.to_string_lossy());
-        }
-        return "npx.cmd agent-browser".to_string();
-    }
-
-    // Determine the platform-specific sidecar name
-    let target_triple = if cfg!(target_os = "linux") && cfg!(target_arch = "x86_64") {
-        "x86_64-unknown-linux-gnu"
-    } else if cfg!(target_os = "linux") && cfg!(target_arch = "aarch64") {
-        "aarch64-unknown-linux-gnu"
-    } else if cfg!(target_os = "macos") && cfg!(target_arch = "aarch64") {
-        "aarch64-apple-darwin"
-    } else if cfg!(target_os = "macos") && cfg!(target_arch = "x86_64") {
-        "x86_64-apple-darwin"
-    } else {
-        return "npx agent-browser".to_string();
-    };
-
-    let npm_binary = if cfg!(target_os = "linux") && cfg!(target_arch = "x86_64") {
-        "agent-browser-linux-x64"
-    } else if cfg!(target_os = "linux") && cfg!(target_arch = "aarch64") {
-        "agent-browser-linux-arm64"
-    } else if cfg!(target_os = "macos") && cfg!(target_arch = "aarch64") {
-        "agent-browser-darwin-arm64"
-    } else if cfg!(target_os = "macos") && cfg!(target_arch = "x86_64") {
-        "agent-browser-darwin-x64"
-    } else {
-        return "npx agent-browser".to_string();
-    };
-
-    let sidecar_name = format!("agent-browser-{target_triple}");
-
-    // 2. Tauri sidecar — next to the executable (AppImage/deb/rpm installs)
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(dir) = exe.parent() {
-            let candidate = dir.join(&sidecar_name);
-            if candidate.exists() {
-                return candidate.to_string_lossy().to_string();
-            }
-        }
-    }
-
-    // 3. node_modules — dev mode (npm run tauri dev)
-    // Tauri runs from src-tauri/ but node_modules is at the project root.
-    // Check cwd, parent of cwd, and parent of exe for the npm binary.
-    let mut search_dirs = vec![
-        std::env::current_dir().unwrap_or_default(),
-    ];
-    // Parent of cwd (project root when cwd is src-tauri/)
-    if let Ok(cwd) = std::env::current_dir() {
-        if let Some(parent) = cwd.parent() {
-            search_dirs.push(parent.to_path_buf());
-        }
-    }
-    // Directory containing the executable
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(dir) = exe.parent() {
-            search_dirs.push(dir.to_path_buf());
-        }
-    }
-    for base in &search_dirs {
-        let candidate = base.join("node_modules/agent-browser/bin").join(npm_binary);
-        if candidate.exists() {
-            return candidate.to_string_lossy().to_string();
-        }
-    }
-
-    // 4. npx fallback — spawns Node.js shim, requires npm + Node.js
-    "npx agent-browser".to_string()
+/// Resolve only a native binary with the origin-protected stream API.
+/// Bundled sidecars take precedence over the npm development package; PATH
+/// and npx are deliberately excluded so an older installation cannot reopen
+/// the unauthenticated v0.24 stream endpoint.
+fn resolve_binary() -> Result<String, String> {
+    static BINARY: OnceLock<Result<String, String>> = OnceLock::new();
+    BINARY.get_or_init(resolve_binary_uncached).clone()
 }
 
-/// Split `resolve_binary()`'s return value into `(program, prefix_args)` so it
-/// can drive `Command::new(...).args(...)` directly on Windows. The function
-/// either returns a single binary path (most installs / dev) or a path to npx
-/// followed by the fixed `agent-browser` argument.
-/// In the npx case we want the spawn to be `npx -> agent-browser <action> ...`,
-/// not `Command::new("npx agent-browser")` which Windows treats as a single
-/// (nonexistent) executable name.
-#[cfg(target_os = "windows")]
-fn split_resolved_binary(bin: &str) -> (String, Vec<String>) {
-    let trimmed = bin.trim();
-    if let Some(program) = trimmed.strip_suffix(" agent-browser") {
-        (program.to_string(), vec!["agent-browser".to_string()])
+fn resolve_binary_uncached() -> Result<String, String> {
+    let (sidecar_name, npm_relative) = if cfg!(all(target_os = "linux", target_arch = "x86_64")) {
+        ("agent-browser-x86_64-unknown-linux-gnu", "node_modules/@agent-browser/cli-linux-x64-gnu/bin/agent-browser")
+    } else if cfg!(all(target_os = "linux", target_arch = "aarch64")) {
+        ("agent-browser-aarch64-unknown-linux-gnu", "node_modules/@agent-browser/cli-linux-arm64-gnu/bin/agent-browser")
+    } else if cfg!(all(target_os = "macos", target_arch = "x86_64")) {
+        ("agent-browser-x86_64-apple-darwin", "node_modules/@agent-browser/cli-darwin-x64/bin/agent-browser")
+    } else if cfg!(all(target_os = "macos", target_arch = "aarch64")) {
+        ("agent-browser-aarch64-apple-darwin", "node_modules/@agent-browser/cli-darwin-arm64/bin/agent-browser")
+    } else if cfg!(all(target_os = "windows", target_arch = "x86_64")) {
+        ("agent-browser.exe", "node_modules/@agent-browser/cli-win32-x64-msvc/bin/agent-browser.exe")
     } else {
-        (trimmed.to_string(), Vec::new())
+        return Err("No secure agent-browser sidecar is available for this platform".into());
+    };
+
+    let exe = std::env::current_exe().ok();
+    #[cfg(debug_assertions)]
+    let dev_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).parent();
+    #[cfg(not(debug_assertions))]
+    let dev_root: Option<&std::path::Path> = None;
+    let candidates = native_binary_candidates(exe.as_deref().and_then(std::path::Path::parent), dev_root, sidecar_name, npm_relative);
+    resolve_verified_candidate(&candidates)
+}
+
+fn native_binary_candidates(
+    exe_dir: Option<&std::path::Path>,
+    dev_root: Option<&std::path::Path>,
+    sidecar_name: &str,
+    npm_relative: &str,
+) -> Vec<PathBuf> {
+    let mut candidates = Vec::new();
+    if let Some(dir) = exe_dir {
+        candidates.push(dir.join(sidecar_name));
     }
+    if let Some(root) = dev_root {
+        candidates.push(root.join(npm_relative));
+    }
+    candidates
+}
+
+fn resolve_verified_candidate(candidates: &[PathBuf]) -> Result<String, String> {
+    for candidate in candidates {
+        let Ok(meta) = std::fs::symlink_metadata(candidate) else { continue };
+        if !meta.is_file() || meta.file_type().is_symlink() {
+            continue;
+        }
+        let mut command = std::process::Command::new(candidate);
+        command.arg("--version");
+        let Ok(output) = output_capture_with_timeout(command, PROC_CONTROL_TIMEOUT) else { continue };
+        if !output.status.success() {
+            continue;
+        }
+        let output = String::from_utf8_lossy(&output.stdout);
+        let version = output.split_whitespace().find_map(|word| semver::Version::parse(word.trim_start_matches('v')).ok());
+        if version.is_some_and(|version| version >= semver::Version::new(0, 44, 0)) {
+            return Ok(candidate.to_string_lossy().into_owned());
+        }
+    }
+    Err("Secure agent-browser v0.44 or newer is unavailable; reinstall Codemux's browser sidecar".into())
 }
 
 /// Locate a Chromium-based browser executable on Windows. agent-browser
@@ -1528,11 +1436,7 @@ fn run_agent_browser_native(
     discard_stderr: bool,
     timeout: Duration,
 ) -> std::io::Result<std::process::Output> {
-    let (program, prefix_args) = split_resolved_binary(bin);
-    let mut cmd = std::process::Command::new(&program);
-    for a in &prefix_args {
-        cmd.arg(a);
-    }
+    let mut cmd = std::process::Command::new(bin);
     for a in argv {
         cmd.arg(a);
     }
@@ -1552,8 +1456,8 @@ fn run_agent_browser_native(
 }
 
 #[cfg(not(target_os = "windows"))]
-fn build_agent_browser_command(session: &str, action: &str, params: &serde_json::Value) -> Result<String, String> {
-    let bin = shell_binary(&resolve_binary());
+fn build_agent_browser_command(binary: &str, session: &str, action: &str, params: &serde_json::Value) -> Result<String, String> {
+    let bin = shell_binary(binary);
     let session = shell_quote(session);
     let command = match action {
         "open_url" | "open" => {
@@ -1659,10 +1563,10 @@ fn execute_agent_browser_action(browser_id: &str, action: &str, params: serde_js
     let session = session_name(browser_id);
     validate_session_name(session)?;
     require_owned_browser_session(session)?;
+    let bin = resolve_binary()?;
 
     #[cfg(target_os = "windows")]
     let (stdout, stderr, status_success) = {
-        let bin = resolve_binary();
         let groups = build_agent_browser_argv_groups(session, action, &params)?;
         let mut combined_stdout = String::new();
         let mut combined_stderr = String::new();
@@ -1682,7 +1586,7 @@ fn execute_agent_browser_action(browser_id: &str, action: &str, params: serde_js
 
     #[cfg(not(target_os = "windows"))]
     let (stdout, stderr, status_success) = {
-        let shell_cmd = build_agent_browser_command(session, action, &params)?;
+        let shell_cmd = build_agent_browser_command(&bin, session, action, &params)?;
         let mut cmd = std::process::Command::new("sh");
         set_browser_owner_env(&mut cmd, session)?;
         cmd.args(["-c", &shell_cmd])
@@ -1714,7 +1618,6 @@ fn execute_agent_browser_action(browser_id: &str, action: &str, params: serde_js
 
         #[cfg(target_os = "windows")]
         let dom_output_opt = {
-            let bin = resolve_binary();
             match build_agent_browser_argv_groups(session, "eval", &dom_params) {
                 Ok(groups) if !groups.is_empty() => {
                     run_agent_browser_native(&bin, &groups[0], session, stream_port, false, ACTION_TIMEOUT).ok()
@@ -1723,7 +1626,7 @@ fn execute_agent_browser_action(browser_id: &str, action: &str, params: serde_js
             }
         };
         #[cfg(not(target_os = "windows"))]
-        let dom_output_opt = match build_agent_browser_command(session, "eval", &dom_params) {
+        let dom_output_opt = match build_agent_browser_command(&bin, session, "eval", &dom_params) {
             Ok(dom_cmd) => {
                 let mut cmd = std::process::Command::new("sh");
                 if set_browser_owner_env(&mut cmd, session).is_err() {
@@ -1799,6 +1702,8 @@ impl AgentBrowserManager {
             next_port: AtomicU16::new(DEFAULT_STREAM_PORT),
             sessions: Mutex::new(HashMap::new()),
             start_lock: Mutex::new(()),
+            #[cfg(test)]
+            test_stream_ports: Mutex::new(std::collections::HashSet::new()),
         }
     }
 
@@ -1893,6 +1798,7 @@ impl AgentBrowserManager {
                     port,
                     running: false,
                     pid: None,
+                    stream_generation: 0,
                     last_seen_at: None,
                 },
             );
@@ -1911,6 +1817,57 @@ impl AgentBrowserManager {
         if sessions.get(session_key).is_some_and(|s| s.port == port && !s.running) {
             sessions.remove(session_key);
         }
+    }
+
+    /// Authorize a stream bridge only for a live session tracked by this
+    /// manager. The identity is rechecked for every bridged request so a
+    /// closed browser cannot leave access to a later port occupant.
+    pub(crate) async fn verified_stream_identity(&self, browser_id: &str) -> Result<BrowserStreamIdentity, String> {
+        let session = session_name(browser_id).to_owned();
+        validate_session_name(&session)?;
+        let (port, tracked_pid, generation) = {
+            let sessions = self.sessions.lock().await;
+            let stream = sessions.get(browser_id)
+                .ok_or_else(|| format!("Browser session {session} is not streaming"))?;
+            if !stream.running {
+                return Err(format!("Browser session {session} is not streaming"));
+            }
+            (stream.port, stream.pid, stream.stream_generation)
+        };
+        tokio::task::spawn_blocking(move || {
+            require_owned_browser_session(&session)?;
+            let pid = tracked_pid.or_else(|| read_agent_browser_daemon_pid(&session))
+                .ok_or_else(|| format!("Cannot verify browser session {session} PID"))?;
+            let record = owned_browser_pid(&session, pid)
+                .ok_or_else(|| format!("Cannot verify browser session {session} owner"))?;
+            if !listener_owned_by_pid(port, pid) {
+                return Err(format!("Browser session {session} does not own stream port {port}"));
+            }
+            Ok(BrowserStreamIdentity { port, pid, start_time: record.start_time, generation })
+        })
+        .await
+        .map_err(|error| format!("Browser ownership check failed: {error}"))?
+    }
+
+    pub(crate) async fn owns_stream_port(&self, port: u16) -> bool {
+        #[cfg(test)]
+        if self.test_stream_ports.lock().await.contains(&port) {
+            return true;
+        }
+        let browser_id = {
+            let sessions = self.sessions.lock().await;
+            sessions.iter()
+                .find(|(_, session)| session.port == port && session.running)
+                .map(|(browser_id, _)| browser_id.clone())
+        };
+        let Some(browser_id) = browser_id else { return false };
+        self.verified_stream_identity(&browser_id).await
+            .is_ok_and(|identity| identity.port == port)
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn allow_test_stream_port(&self, port: u16) {
+        self.test_stream_ports.lock().await.insert(port);
     }
 
     /// **Deprecated.** No-op kept for binary/source compatibility with any
@@ -1951,7 +1908,7 @@ impl AgentBrowserManager {
         // hard timeout so it can never stall the async runtime (issue #96).
         let pid = tokio::task::spawn_blocking(move || -> Result<Option<u32>, String> {
             require_owned_browser_session(&session)?;
-            let bin = resolve_binary();
+            let bin = resolve_binary()?;
 
             #[cfg(target_os = "windows")]
             let output = {
@@ -1961,7 +1918,6 @@ impl AgentBrowserManager {
                 argv.extend([
                     "open".into(),
                     "about:blank".into(),
-                    "--headless".into(),
                     "--session".into(),
                     session.clone(),
                 ]);
@@ -1974,7 +1930,7 @@ impl AgentBrowserManager {
                 set_browser_owner_env(&mut cmd, &session)?;
                 cmd.args([
                     "-c",
-                    &format!("{} open about:blank --headless --session {}", shell_binary(&bin), shell_quote(&session)),
+                    &format!("{} open about:blank --session {}", shell_binary(&bin), shell_quote(&session)),
                 ])
                 .env("AGENT_BROWSER_STREAM_PORT", port.to_string())
                 .env("AGENT_BROWSER_ARGS", STEALTH_CHROMIUM_ARGS)
@@ -1995,6 +1951,7 @@ impl AgentBrowserManager {
         self.sessions.lock().await.entry(browser_id.to_string()).and_modify(|s| {
             s.running = true;
             s.pid = pid;
+            s.stream_generation = uuid::Uuid::new_v4().as_u128();
         });
         Ok(())
     }
@@ -2020,7 +1977,11 @@ impl AgentBrowserManager {
                 if action == "close" {
                     s.running
                 } else {
-                    std::mem::replace(&mut s.running, true)
+                    let was_running = std::mem::replace(&mut s.running, true);
+                    if !was_running {
+                        s.stream_generation = uuid::Uuid::new_v4().as_u128();
+                    }
+                    was_running
                 }
             }
             None => false,
@@ -2039,6 +2000,7 @@ impl AgentBrowserManager {
         if let Some(s) = sessions.get_mut(browser_id) {
             s.running = false;
             s.pid = None;
+            s.stream_generation = 0;
         }
     }
 
@@ -2096,7 +2058,7 @@ impl AgentBrowserManager {
         // under a hard timeout so a wedged screenshot can't hang the runtime.
         tokio::task::spawn_blocking(move || -> Result<String, String> {
             require_owned_browser_session(&session)?;
-            let bin = resolve_binary();
+            let bin = resolve_binary()?;
 
             #[cfg(target_os = "windows")]
             let output = run_agent_browser_native(
@@ -2216,7 +2178,11 @@ impl AgentBrowserManager {
         let Some(removed) = removed else { return };
         let Some(pid) = removed.pid.or_else(|| read_agent_browser_daemon_pid(session)) else { return };
         let Some(record) = owned_browser_pid(session, pid) else { return };
-        stop_owned_browser_daemon(session, &record, &resolve_binary());
+        if let Ok(bin) = resolve_binary() {
+            stop_owned_browser_daemon(session, &record, &bin);
+        } else {
+            kill_verified_browser_pid(&record, session);
+        }
     }
 
     /// Start the browser session and return the WebSocket stream URL.
@@ -2274,6 +2240,7 @@ impl AgentBrowserManager {
                 .and_modify(|s| {
                     s.running = false;
                     s.pid = None;
+                    s.stream_generation = 0;
                 });
         }
 
@@ -2282,7 +2249,7 @@ impl AgentBrowserManager {
         let bin = {
             let session_for_close = session.clone();
             tokio::task::spawn_blocking(move || -> Result<String, String> {
-                let bin = resolve_binary();
+                let bin = resolve_binary()?;
                 require_owned_browser_session(&session_for_close)?;
                 if let Some(pid) = read_agent_browser_daemon_pid(&session_for_close) {
                     if pid_alive(pid) {
@@ -2332,16 +2299,11 @@ impl AgentBrowserManager {
                 if let Some(log) = log_file {
                     use std::os::windows::process::CommandExt;
                     const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-                    let (program, prefix_args) = split_resolved_binary(&bin);
-                    let mut cmd = std::process::Command::new(&program);
-                    for a in &prefix_args {
-                        cmd.arg(a);
-                    }
+                    let mut cmd = std::process::Command::new(&bin);
                     let mut argv: Vec<String> = windows_executable_path_args();
                     argv.extend([
                         "open".into(),
                         "about:blank".into(),
-                        "--headless".into(),
                         "--session".into(),
                         session.clone(),
                     ]);
@@ -2360,7 +2322,6 @@ impl AgentBrowserManager {
                     argv.extend([
                         "open".into(),
                         "about:blank".into(),
-                        "--headless".into(),
                         "--session".into(),
                         session.clone(),
                     ]);
@@ -2370,7 +2331,7 @@ impl AgentBrowserManager {
             #[cfg(not(target_os = "windows"))]
             {
                 let launch_cmd = format!(
-                    "{} open about:blank --headless --session {}",
+                    "{} open about:blank --session {}",
                     shell_binary(&bin), shell_quote(&session)
                 );
                 let mut cmd = std::process::Command::new("sh");
@@ -2430,6 +2391,7 @@ impl AgentBrowserManager {
             .and_modify(|s| {
                 s.running = port_alive;
                 s.pid = pid;
+                s.stream_generation = uuid::Uuid::new_v4().as_u128();
                 s.last_seen_at = now;
             });
 
@@ -2503,9 +2465,17 @@ mod tests {
 
         std::fs::write(temp.path().join("owned.port"), "invalid").unwrap();
         assert!(!browser_control_listener_owned_by_pid("owned", temp.path(), std::process::id()));
-        assert_eq!(browser_control_port("default", temp.path()), 50838);
+        assert_eq!(browser_control_port("default", temp.path()), None);
         std::fs::write(temp.path().join("default.port"), "invalid").unwrap();
-        assert_eq!(browser_control_port("default", temp.path()), 50838);
+        assert_eq!(browser_control_port("default", temp.path()), None);
+    }
+
+    #[tokio::test]
+    async fn unrelated_listener_in_browser_range_is_not_proxy_authorized() {
+        let manager = AgentBrowserManager::new();
+        let port = manager.allocate_port("unowned-listener-test").await.unwrap();
+        let _listener = std::net::TcpListener::bind(("127.0.0.1", port)).unwrap();
+        assert!(!manager.owns_stream_port(port).await);
     }
 
     #[cfg(unix)]
@@ -2656,67 +2626,62 @@ mod tests {
     }
 
     #[test]
-    fn resolve_binary_returns_existing_path_or_npx_fallback() {
-        let result = resolve_binary();
-        if result.starts_with("npx ") {
-            // Fallback is acceptable (e.g., binary not in cwd/node_modules)
-            assert_eq!(result, "npx agent-browser");
-        } else {
-            // Must be a real path that exists and is a file
-            let path = std::path::Path::new(&result);
-            assert!(path.exists(), "resolve_binary returned non-existent path: {}", result);
-            assert!(path.is_file(), "resolve_binary returned non-file: {}", result);
+    fn resolver_fails_closed_without_a_secure_native_binary() {
+        assert!(resolve_verified_candidate(&[]).is_err());
+        if let Ok(path) = resolve_binary() {
+            assert!(std::path::Path::new(&path).is_file());
         }
     }
 
-    // Structurally Linux/macOS only: the assertion hardcodes
-    // `agent-browser-linux-x64` / `agent-browser-darwin` binary names.
-    // Windows needs its own version once `resolve_binary()` grows a
-    // Windows target-triple branch.
+    #[test]
+    fn resolver_candidates_ignore_an_untrusted_working_directory() {
+        let temp = tempfile::tempdir().unwrap();
+        let untrusted = temp.path().join("workspace");
+        let trusted = temp.path().join("app");
+        let dev_root = temp.path().join("source");
+        std::fs::create_dir_all(&untrusted).unwrap();
+        let candidates = native_binary_candidates(
+            Some(&trusted),
+            Some(&dev_root),
+            "agent-browser",
+            "node_modules/@agent-browser/cli-linux-x64-gnu/bin/agent-browser",
+        );
+        assert!(candidates.iter().all(|path| !path.starts_with(&untrusted)));
+        assert_eq!(candidates[0], trusted.join("agent-browser"));
+        assert!(candidates[1].starts_with(&dev_root));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let planted = untrusted.join("node_modules/@agent-browser/cli-linux-x64-gnu/bin/agent-browser");
+            std::fs::create_dir_all(planted.parent().unwrap()).unwrap();
+            let marker = temp.path().join("executed");
+            std::fs::write(&planted, format!("#!/bin/sh\ntouch '{}'\necho 'agent-browser 0.44.0'\n", marker.display())).unwrap();
+            std::fs::set_permissions(&planted, std::fs::Permissions::from_mode(0o700)).unwrap();
+            assert!(resolve_verified_candidate(&candidates).is_err());
+            assert!(!marker.exists(), "untrusted cwd binary must never execute");
+        }
+    }
+
     #[cfg(unix)]
     #[test]
-    fn resolve_binary_finds_native_binary_from_project_root() {
-        // Run from the project root where node_modules exists
-        let result = resolve_binary();
-        // Step 1 of resolve_binary() prefers a system-wide install on
-        // PATH (e.g. /usr/bin/agent-browser from a packaged install).
-        // On dev machines that also run a packaged Codemux, that branch
-        // legitimately wins over the node_modules lookup this test was
-        // written for — accept it instead of failing on those hosts.
-        if let Ok(system) = which::which("agent-browser") {
-            if result == system.to_string_lossy() {
-                assert!(system.is_file(), "system agent-browser vanished: {result}");
-                return;
-            }
-        }
-        // On this machine, the native binary should be found in node_modules
-        if !result.starts_with("npx ") {
-            assert!(
-                result.contains("agent-browser-linux-x64") || result.contains("agent-browser-darwin"),
-                "Expected platform-specific binary name, got: {}",
-                result
-            );
-            // Verify it's executable
-            let output = std::process::Command::new(&result)
-                .arg("--version")
-                .output();
-            assert!(output.is_ok(), "Binary at {} is not executable", result);
-            let out = output.unwrap();
-            let version = String::from_utf8_lossy(&out.stdout);
-            assert!(
-                version.contains("agent-browser") || out.status.success(),
-                "Binary didn't respond to --version: {}",
-                version
-            );
-        }
+    fn resolver_rejects_old_native_binary_and_accepts_secure_version() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        let binary = temp.path().join("agent-browser");
+        std::fs::write(&binary, b"#!/bin/sh\necho 'agent-browser 0.24.0'\n").unwrap();
+        std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(resolve_verified_candidate(&[binary.clone()]).is_err());
+
+        std::fs::write(&binary, b"#!/bin/sh\necho 'agent-browser 0.44.0'\n").unwrap();
+        assert_eq!(resolve_verified_candidate(&[binary.clone()]).unwrap(), binary.to_string_lossy());
     }
 
     #[cfg(not(target_os = "windows"))]
     #[test]
     fn build_command_open_uses_navigation_load_wait_only() {
-        let cmd = build_agent_browser_command("test-session", "open", &serde_json::json!({"url": "https://example.com"})).unwrap();
-        let bin = resolve_binary();
-        assert!(cmd.starts_with(&shell_binary(&bin)), "Command should start with resolved binary: {}", cmd);
+        let cmd = build_agent_browser_command("agent-browser", "test-session", "open", &serde_json::json!({"url": "https://example.com"})).unwrap();
+        assert!(cmd.starts_with("'agent-browser'"), "Command should start with the selected binary: {}", cmd);
         assert!(cmd.contains("--session 'test-session'"));
         assert!(cmd.contains("https://example.com"));
         assert!(!cmd.contains("wait --load"), "open already waits for load: {}", cmd);
@@ -2729,7 +2694,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let marker = dir.path().join("injected");
         let session = format!("browser; touch {} #", marker.display());
-        let cmd = build_agent_browser_command(&session, "screenshot", &serde_json::json!({})).unwrap();
+        let cmd = build_agent_browser_command("agent-browser", &session, "screenshot", &serde_json::json!({})).unwrap();
         let session_arg = cmd.split_once("--session ").unwrap().1;
         let output = std::process::Command::new("sh")
             .arg("-c")
@@ -2753,7 +2718,7 @@ mod tests {
     #[cfg(not(target_os = "windows"))]
     #[test]
     fn build_command_viewport_uses_set_viewport() {
-        let cmd = build_agent_browser_command("s", "viewport", &serde_json::json!({"width": 800, "height": 600})).unwrap();
+        let cmd = build_agent_browser_command("agent-browser", "s", "viewport", &serde_json::json!({"width": 800, "height": 600})).unwrap();
         assert!(cmd.contains("set viewport 800 600"), "v0.24.0 uses 'set viewport', got: {}", cmd);
     }
 
@@ -2765,6 +2730,7 @@ mod tests {
         // payload must produce the same exact `set viewport W H` shell
         // string with no trailing scale arg.
         let cmd = build_agent_browser_command(
+            "agent-browser",
             "s",
             "viewport",
             &serde_json::json!({"width": 800, "height": 600, "scale": 1.0}),
@@ -2785,6 +2751,7 @@ mod tests {
         // surface as a 3rd positional arg so agent-browser actually
         // applies the retina factor (not just resizes the box).
         let cmd = build_agent_browser_command(
+            "agent-browser",
             "s",
             "viewport",
             &serde_json::json!({"width": 390, "height": 844, "scale": 3.0}),
@@ -2805,6 +2772,7 @@ mod tests {
         // catches a regression where someone forgets to wire preset
         // resolution into the legacy width/height path.
         let cmd = build_agent_browser_command(
+            "agent-browser",
             "s",
             "viewport",
             &serde_json::json!({"preset": "mobile"}),
@@ -2825,6 +2793,7 @@ mod tests {
         // (1280×720) rather than fail mid-stream. The CLI / MCP layer is
         // expected to validate up front; this is the last-line defence.
         let cmd = build_agent_browser_command(
+            "agent-browser",
             "s",
             "viewport",
             &serde_json::json!({"preset": "iphone-99-pro-max-ultra"}),
@@ -2843,6 +2812,7 @@ mod tests {
         // "reset" preset = RESET_SPEC = 1280x800 @ DPR 1.0; DPR 1.0 must
         // be omitted from argv (same backwards-compat rule).
         let cmd = build_agent_browser_command(
+            "agent-browser",
             "s",
             "viewport",
             &serde_json::json!({"preset": "reset"}),
@@ -2880,7 +2850,7 @@ mod tests {
     #[cfg(not(target_os = "windows"))]
     #[test]
     fn build_command_unknown_action_returns_error() {
-        let result = build_agent_browser_command("s", "nonexistent_action", &serde_json::json!({}));
+        let result = build_agent_browser_command("agent-browser", "s", "nonexistent_action", &serde_json::json!({}));
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("Unknown action"));
     }
@@ -2951,27 +2921,6 @@ mod tests {
             build_agent_browser_argv_groups("s", "nonexistent_action", &serde_json::json!({}));
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("Unknown action"));
-    }
-
-    #[cfg(target_os = "windows")]
-    #[test]
-    fn split_resolved_binary_handles_npx_fallback() {
-        let (program, prefix) = split_resolved_binary("npx agent-browser");
-        assert_eq!(program, "npx");
-        assert_eq!(prefix, vec!["agent-browser".to_string()]);
-    }
-
-    #[cfg(target_os = "windows")]
-    #[test]
-    fn split_resolved_binary_handles_plain_path() {
-        let (program, prefix) =
-            split_resolved_binary(r"C:\Users\Some User\node_modules\agent-browser\bin\agent-browser-win32-x64.exe");
-        assert_eq!(program, r"C:\Users\Some User\node_modules\agent-browser\bin\agent-browser-win32-x64.exe");
-        assert!(prefix.is_empty());
-
-        let (program, prefix) = split_resolved_binary(r"C:\Program Files\nodejs\npx.cmd agent-browser");
-        assert_eq!(program, r"C:\Program Files\nodejs\npx.cmd");
-        assert_eq!(prefix, vec!["agent-browser".to_string()]);
     }
 
     #[tokio::test]

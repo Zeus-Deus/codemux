@@ -2,17 +2,17 @@
 //!
 //! The embedded browser pane is a screenshot-driven Chromium session served by
 //! a per-workspace `agent-browser` daemon bound to `127.0.0.1:<port>` (ports
-//! 9223–9299; see `src-tauri/src/agent_browser.rs`). The desktop pane talks to
-//! that daemon directly: a WebSocket for the screencast + input events, and HTTP
-//! `/api/status` / `/api/command` for liveness probes and evals
-//! (`src/components/browser/{BrowserPane,stream-protocol}.ts`).
+//! 9223–9299; see `src-tauri/src/agent_browser.rs`). The desktop pane uses the
+//! app-local capability bridge for screencast and input WebSockets, status
+//! probes, and commands (`src-tauri/src/browser_stream_bridge.rs`).
 //!
 //! A remote browser can't reach those loopback daemons, so this module bridges
 //! them through the authenticated web-remote origin:
 //!
 //! - `GET /proxy/browser/:port/ws` upgrades the client socket and pipes it,
 //!   frame-for-frame (binary-safe, backpressure-aware), to `ws://127.0.0.1:<port>`.
-//! - `ANY /proxy/browser/:port/api/*rest` forwards the daemon's HTTP endpoints.
+//! - `GET /proxy/browser/:port/api/status` and
+//!   `POST /proxy/browser/:port/api/command` forward the pane's HTTP requests.
 //!
 //! ## The single-segment HTTP constraint
 //!
@@ -29,10 +29,9 @@
 //!
 //! ## Port validation
 //!
-//! `:port` is validated strictly against the agent-browser range before any
-//! connection is attempted; anything else is rejected. That keeps the proxy
-//! from being turned into a general-purpose request forwarder against
-//! arbitrary loopback ports.
+//! `:port` must be inside the agent-browser range and currently owned by a
+//! live browser daemon tracked by this app. That prevents a paired client
+//! from using the proxy to reach unrelated loopback services.
 
 use std::time::Duration;
 
@@ -61,6 +60,7 @@ const BROWSER_PORT_MIN: u16 = crate::agent_browser::DEFAULT_STREAM_PORT; // 9223
 /// `agent_browser::MAX_STREAM_PORT`; kept in sync by this constant + the
 /// `port_range_low_bound_tracks_agent_browser` test's floor assertion.
 const BROWSER_PORT_MAX: u16 = 9299;
+const MAX_BROWSER_RESPONSE_BYTES: usize = 16 << 20;
 
 /// Whether `port` is inside the agent-browser stream-port range.
 fn port_in_range(port: u16) -> bool {
@@ -76,6 +76,11 @@ fn port_in_range(port: u16) -> bool {
 /// no false positives.
 fn has_control_char(s: &str) -> bool {
     s.bytes().any(|b| b < 0x20 || b == 0x7f)
+}
+
+fn allowed_browser_api(method: &Method, rest: &str) -> bool {
+    (method == Method::GET && rest == "status")
+        || (method == Method::POST && rest == "command")
 }
 
 // ── WebSocket proxy ─────────────────────────────────────────────────
@@ -98,13 +103,18 @@ pub(super) async fn ws_proxy<R: Runtime>(
     if !port_in_range(port) {
         return (StatusCode::BAD_REQUEST, "port out of range").into_response();
     }
+    if !app.state::<crate::agent_browser::AgentBrowserManager>().owns_stream_port(port).await {
+        return StatusCode::FORBIDDEN.into_response();
+    }
     ws.on_upgrade(move |socket| async move {
         let shared = app.state::<WebRemoteState>().shared();
         let (close, mut closed) = watch::channel(false);
         let connection = shared.connections.register_browser_proxy(&session.id, close);
         // Register before checking again so a revocation during the upgrade
         // is either visible here or can signal this bridge to close.
-        if super::server::session_active(&app, &session.id) {
+        if super::server::session_active(&app, &session.id)
+            && app.state::<crate::agent_browser::AgentBrowserManager>().owns_stream_port(port).await
+        {
             tokio::select! {
                 biased;
                 _ = closed.changed() => {}
@@ -202,8 +212,8 @@ fn tungstenite_to_axum(msg: TungMessage) -> Option<AxumMessage> {
 
 // ── HTTP forward ────────────────────────────────────────────────────
 
-/// `ANY /proxy/browser/:port/api/*rest` — forward the daemon's HTTP endpoints
-/// (`/api/status`, `/api/command`) with a minimal, credential-free request.
+/// Forward only the browser pane's status GET and command POST with a
+/// minimal, credential-free request.
 pub async fn http_forward<R: Runtime>(
     State(app): State<AppHandle<R>>,
     Path((port, rest)): Path<(u16, String)>,
@@ -218,11 +228,17 @@ pub async fn http_forward<R: Runtime>(
     if !port_in_range(port) {
         return (StatusCode::BAD_REQUEST, "port out of range").into_response();
     }
+    if !app.state::<crate::agent_browser::AgentBrowserManager>().owns_stream_port(port).await {
+        return StatusCode::FORBIDDEN.into_response();
+    }
     // Reject a percent-decoded CR/LF (or other control char) in the path before
     // it reaches the raw request line — no header/request smuggling to the
     // daemon. (`uri.query()` stays percent-encoded, so it needs no such guard.)
     if has_control_char(&rest) {
         return (StatusCode::BAD_REQUEST, "invalid path").into_response();
+    }
+    if !allowed_browser_api(&method, &rest) {
+        return StatusCode::NOT_FOUND.into_response();
     }
     match forward(port, &method, &rest, uri.query(), &headers, &body).await {
         Ok(resp) => resp,
@@ -357,6 +373,9 @@ async fn read_response<R: AsyncRead + Unpin>(stream: &mut R, method: &Method) ->
 
     match content_length {
         Some(len) => {
+            if len > MAX_BROWSER_RESPONSE_BYTES {
+                return Err(());
+            }
             let end = body_start.checked_add(len).ok_or(())?;
             while buf.len() < end {
                 let n = stream.read(&mut chunk).await.map_err(|_| ())?;
@@ -373,7 +392,7 @@ async fn read_response<R: AsyncRead + Unpin>(stream: &mut R, method: &Method) ->
                 break;
             }
             buf.extend_from_slice(&chunk[..n]);
-            if buf.len() > (16 << 20) {
+            if buf.len() > MAX_BROWSER_RESPONSE_BYTES {
                 return Err(()); // never return a silently truncated response
             }
         },
@@ -479,6 +498,16 @@ mod tests {
     use tokio::net::{TcpListener, TcpStream};
     use tokio_tungstenite::{tungstenite, WebSocketStream};
 
+    #[test]
+    fn remote_proxy_exposes_only_the_browser_pane_api() {
+        assert!(allowed_browser_api(&Method::GET, "status"));
+        assert!(allowed_browser_api(&Method::POST, "command"));
+        assert!(!allowed_browser_api(&Method::GET, "command"));
+        assert!(!allowed_browser_api(&Method::POST, "status"));
+        assert!(!allowed_browser_api(&Method::POST, "shutdown"));
+        assert!(!allowed_browser_api(&Method::GET, "../status"));
+    }
+
     async fn bind_test_daemon() -> TcpListener {
         // Keep the successful bind for the whole test. Only connect the proxy
         // to this listener, even if a real daemon already owns another port.
@@ -528,6 +557,30 @@ mod tests {
         assert!(request.contains(&format!("Origin: http://127.0.0.1:{port}\r\n")));
         assert!(!request.contains("session=private"));
         assert!(!request.contains("Bearer private"));
+    }
+
+    #[tokio::test]
+    async fn paired_client_cannot_proxy_to_an_unowned_browser_range_port() {
+        let app = tauri::test::mock_app();
+        let db = crate::database::DatabaseStore::new_in_memory();
+        db.web_remote_insert_session("phone", None, None, &auth::sha256_hex("phone"), true)
+            .unwrap();
+        app.manage(db);
+        app.manage(crate::agent_browser::AgentBrowserManager::new());
+
+        let unrelated = bind_test_daemon().await;
+        let port = unrelated.local_addr().unwrap().port();
+        let mut headers = HeaderMap::new();
+        headers.insert(header::AUTHORIZATION, "Bearer phone".parse().unwrap());
+        let response = http_forward(
+            State(app.handle().clone()),
+            Path((port, "status".to_owned())),
+            Method::GET,
+            "/api/status".parse().unwrap(),
+            headers,
+            Bytes::new(),
+        ).await;
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
     }
 
     type TestSocket = WebSocketStream<TcpStream>;
@@ -594,9 +647,12 @@ mod tests {
             }
             app.manage(db);
             app.manage(WebRemoteState::default());
+            app.manage(crate::agent_browser::AgentBrowserManager::new());
             let shared = app.state::<WebRemoteState>().shared();
 
             let daemon = bind_test_daemon().await;
+            app.state::<crate::agent_browser::AgentBrowserManager>()
+                .allow_test_stream_port(daemon.local_addr().unwrap().port()).await;
             let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
             let proxy = listener.local_addr().unwrap();
             let (shutdown, rx) = watch::channel(false);
@@ -831,6 +887,12 @@ mod tests {
     #[tokio::test]
     async fn read_response_rejects_overflowing_content_length() {
         let raw = b"HTTP/1.1 200 OK\r\nContent-Length: 18446744073709551615\r\n\r\n";
+        assert!(read_via_pipe(raw).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn read_response_rejects_declared_body_above_safety_cap() {
+        let raw = b"HTTP/1.1 200 OK\r\nContent-Length: 16777217\r\n\r\n";
         assert!(read_via_pipe(raw).await.is_err());
     }
 

@@ -5454,13 +5454,6 @@ impl AppStateStore {
         stream_port: u16,
     ) -> AgentBrowserSession {
         let mut snapshot = self.inner.lock().unwrap();
-        if let Some(session) = snapshot
-            .agent_browser_sessions
-            .iter()
-            .find(|s| s.workspace_id.0 == workspace_id)
-        {
-            return session.clone();
-        }
         // Derive a stable session name from the workspace cwd so the
         // agent-browser Chromium storage state (cookies, localStorage)
         // persists across app restarts. Workspace IDs are regenerated
@@ -5470,6 +5463,21 @@ impl AppStateStore {
             .iter()
             .find(|w| w.workspace_id.0 == workspace_id)
             .map(|w| w.cwd.clone());
+        if let Some(session) = snapshot
+            .agent_browser_sessions
+            .iter_mut()
+            .find(|s| s.workspace_id.0 == workspace_id)
+        {
+            // v0.44 accepts only letters, numbers, '-' and '_'. Existing
+            // sessions created from a directory with punctuation must be
+            // renamed before the CLI can reuse them.
+            if !valid_browser_session_name(&session.cli_session_name) {
+                if let Some(cwd) = &workspace_cwd {
+                    session.cli_session_name = stable_browser_session_name(cwd);
+                }
+            }
+            return session.clone();
+        }
         let workspace_exists = workspace_cwd.is_some();
         let cli_session_name = workspace_cwd
             .map(|cwd| stable_browser_session_name(&cwd))
@@ -9330,8 +9338,24 @@ fn stable_browser_session_name(cwd: &str) -> String {
     let hash = hasher.finish();
     // Truncate on a UTF-8 char boundary so multi-byte branch names stay
     // valid; the hash below still disambiguates shared prefixes.
-    let short_name: String = dir_name.chars().take(MAX_DIR_NAME).collect();
+    let mut short_name = String::new();
+    for ch in dir_name.chars() {
+        let ch = if ch.is_alphanumeric() || matches!(ch, '-' | '_') { ch } else { '-' };
+        if short_name.len() + ch.len_utf8() > MAX_DIR_NAME {
+            break;
+        }
+        short_name.push(ch);
+    }
+    if short_name.is_empty() {
+        short_name.push_str("default");
+    }
     format!("ws-{}-{:06x}", short_name, hash & 0xFFFFFF)
+}
+
+fn valid_browser_session_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 64
+        && name.chars().all(|ch| ch.is_alphanumeric() || matches!(ch, '-' | '_'))
 }
 
 fn next_id(prefix: &str) -> String {
@@ -11302,6 +11326,28 @@ mod tests {
         );
 
         assert!(name.starts_with("ws-"), "expected ws- prefix, got: {name}");
+    }
+
+    #[test]
+    fn browser_session_names_sanitize_paths_and_migrate_legacy_records() {
+        let cwd = PathBuf::from("/tmp/My Project.v2 🔒");
+        let name = stable_browser_session_name(cwd.to_str().unwrap());
+        assert!(valid_browser_session_name(&name));
+        assert!(name.len() <= 42);
+
+        let store = AppStateStore::default();
+        let workspace = store.create_workspace_at_path(cwd);
+        let first = store.resolve_agent_browser_session(&workspace.0, 9223);
+        assert_eq!(first.cli_session_name, name);
+        {
+            let mut snapshot = store.inner.lock().unwrap();
+            let session = snapshot.agent_browser_sessions.iter_mut()
+                .find(|session| session.workspace_id == workspace)
+                .unwrap();
+            session.cli_session_name = "ws-My Project.v2-abcdef".into();
+        }
+        let migrated = store.resolve_agent_browser_session(&workspace.0, 9223);
+        assert_eq!(migrated.cli_session_name, name);
     }
 
     #[test]
