@@ -2283,10 +2283,9 @@ fn extract_eval_result(stdout: &str) -> String {
     trimmed.to_string()
 }
 
-/// Resolve only a native binary with the origin-protected stream API.
-/// Bundled sidecars take precedence over the npm development package; PATH
-/// and npx are deliberately excluded so an older installation cannot reopen
-/// the unauthenticated v0.24 stream endpoint.
+/// Resolve only Codemux's authenticated native sidecar. The packaged sibling
+/// binary and the staged development binary must report the patched version;
+/// PATH and package-runner installations are never used for managed sessions.
 fn resolve_binary() -> Result<String, String> {
     static BINARY: OnceLock<Result<String, String>> = OnceLock::new();
     BINARY.get_or_init(resolve_binary_uncached).clone()
