@@ -253,7 +253,13 @@ export const useUpdateAll = create<Store>((set, get) => {
           patchItem(key, { phase: "updated" });
         } else {
           const hostId = Number(machine.slice(5));
-          replaceReport(machine, await invoke<ProviderUpdateReport>("provider_update_device", { hostId, provider: item }));
+          try {
+            replaceReport(machine, await invoke<ProviderUpdateReport>("provider_update_device", { hostId, provider: item }));
+          } finally {
+            // The provider command may upgrade the helper before the agent
+            // installer fails, so refresh its installed and running versions.
+            await get().refreshDevice(hostId, true);
+          }
           patchItem(key, { phase: "updated" });
         }
         return true;

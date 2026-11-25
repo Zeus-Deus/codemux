@@ -96,6 +96,14 @@ export function UpdatesSection() {
   const appPending = app.available;
   const total = plan.items.length + (appPending ? 1 : 0);
   const restartRequired = Object.values(known).some(helperNeedsRestart);
+  const restartNotice = (current: Partial<Record<MachineKey, MachineState>>) => {
+    const devices = hosts.filter((host) => helperNeedsRestart(current[hostKey(host.id)]));
+    if (devices.length === 0) return "Running chats weren't interrupted.";
+    if (devices.length === 1) {
+      return `Running chats weren't interrupted. After sessions on ${devices[0].name} finish, restart its Codemux headless service to use the new helper.`;
+    }
+    return `Running chats weren't interrupted. After sessions on ${devices.map((host) => host.name).join(", ")} finish, restart each device's Codemux headless service to use the new helper.`;
+  };
 
   const start = async (approved: UpdatePlan) => {
     setConfirming(null);
@@ -107,7 +115,7 @@ export function UpdatesSection() {
       });
     } else if (result.updated) {
       toast.success(`${label(result.updated)} installed`, {
-        description: "Running chats weren't interrupted. Restart Codemux when it suits you so every agent uses its new version.",
+        description: restartNotice(useUpdateAll.getState().machines),
       });
     }
     // Last, because it restarts the app.
@@ -148,7 +156,7 @@ export function UpdatesSection() {
         <p role="status" className="-mt-3 mb-6 text-body-sm text-muted-foreground">
           {summary.failed.length
             ? `${summary.updated} updated, ${summary.failed.length} failed. Failed items show why below.`
-            : `${summary.updated} updated. Running chats weren't interrupted; restart Codemux when it suits you to use the new versions.`}
+            : `${summary.updated} updated. ${restartNotice(machines)}`}
         </p>
       )}
 

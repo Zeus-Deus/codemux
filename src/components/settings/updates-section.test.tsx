@@ -143,4 +143,70 @@ describe("UpdatesSection", () => {
     expect(await screen.findByText("v0.24.0 installed · service stopped")).toBeInTheDocument();
     expect(screen.queryByText(/already running headless service keeps its previous version/)).not.toBeInTheDocument();
   });
+
+  it("shows a restart requirement after a direct agent update fails following a helper upgrade", async () => {
+    invoke.mockImplementation(async (cmd: string) => {
+      if (cmd === "provider_updates_local") return [];
+      if (cmd === "provider_updates_device") {
+        return {
+          host_id: 2,
+          helper_version: installedVersion,
+          running_version: statusAvailable ? runningVersion : null,
+          serve_alive: statusAvailable ? true : null,
+          app_version: "0.24.0",
+          providers: [report("codex")],
+          error: null,
+        };
+      }
+      if (cmd === "provider_update_device") {
+        installedVersion = "0.24.0";
+        statusAvailable = true;
+        throw new Error("npm failed (exit 1)");
+      }
+      throw new Error(`unexpected ${cmd}`);
+    });
+    statusAvailable = false;
+    render(<UpdatesSection />);
+    const row = (await screen.findByText("1.0.0 → 1.1.0 · npm")).closest("[data-settings-row]");
+    if (!(row instanceof HTMLElement)) throw new Error("agent row missing");
+
+    fireEvent.click(within(row).getByRole("button", { name: "Update" }));
+    expect(await screen.findByText("v0.24.0 installed · v0.23.0 running · Restart required")).toBeInTheDocument();
+    expect(within(row).getByText("npm failed (exit 1)")).toBeInTheDocument();
+    expect(invoke).toHaveBeenCalledWith("provider_updates_device", { hostId: 2, force: true });
+  });
+
+  it("names the device service in the update toast and completion summary", async () => {
+    vi.mocked(toast.success).mockClear();
+    invoke.mockImplementation(async (cmd: string) => {
+      if (cmd === "provider_updates_local") return [];
+      if (cmd === "provider_updates_device") {
+        return {
+          host_id: 2,
+          helper_version: installedVersion,
+          running_version: statusAvailable ? runningVersion : null,
+          serve_alive: statusAvailable ? true : null,
+          app_version: "0.24.0",
+          providers: [],
+          error: null,
+        };
+      }
+      if (cmd === "device_helper_update") {
+        installedVersion = "0.24.0";
+        statusAvailable = true;
+        return { host_id: 2, status: "upgraded", from: "0.23.0", to: "0.24.0", message: null };
+      }
+      throw new Error(`unexpected ${cmd}`);
+    });
+    statusAvailable = false;
+    render(<UpdatesSection />);
+    fireEvent.click(await screen.findByRole("button", { name: "Update all (1)" }));
+    const dialog = await screen.findByRole("alertdialog");
+    fireEvent.click(within(dialog).getByRole("button", { name: "Update all" }));
+
+    await waitFor(() => expect(toast.success).toHaveBeenCalled());
+    const notice = "Running chats weren't interrupted. After sessions on buildbox finish, restart its Codemux headless service to use the new helper.";
+    expect(vi.mocked(toast.success).mock.calls[0][1]).toEqual({ description: notice });
+    expect(screen.getByRole("status")).toHaveTextContent(`1 updated. ${notice}`);
+  });
 });
