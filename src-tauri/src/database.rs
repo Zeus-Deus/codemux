@@ -4164,8 +4164,9 @@ impl DatabaseStore {
                      (SELECT sdk_session_id FROM agent_chat_sessions WHERE thread_id = ?1),
                      sdk_session_id
                  ),
-                 codex_tool_catalog_key = CASE WHEN sdk_session_id IS NULL THEN
-                     (SELECT codex_tool_catalog_key FROM agent_chat_sessions WHERE thread_id = ?1)
+                 codex_tool_catalog_key = CASE
+                     WHEN (SELECT sdk_session_id FROM agent_chat_sessions WHERE thread_id = ?1) IS NOT NULL THEN
+                         (SELECT codex_tool_catalog_key FROM agent_chat_sessions WHERE thread_id = ?1)
                      ELSE codex_tool_catalog_key END,
                  created_at = COALESCE(
                      (SELECT created_at FROM agent_chat_sessions WHERE thread_id = ?1),
@@ -8198,6 +8199,26 @@ mod tests {
         let record = db.get_agent_chat_session("new").unwrap();
         assert!(record.sdk_session_id.is_none());
         assert!(record.codex_tool_catalog_key.is_none());
+    }
+
+    #[test]
+    fn migrated_codex_catalog_key_follows_the_selected_native_id() {
+        let db = init_test_database();
+        let old_key = "a".repeat(64);
+        let new_key = "b".repeat(64);
+        db.upsert_agent_chat_session("old", "ws-1", Some("/repo"), "codex")
+            .unwrap();
+        db.set_agent_chat_native_cursor("old", "old-native", Some(&old_key))
+            .unwrap();
+        db.upsert_agent_chat_session("new", "ws-1", Some("/repo"), "codex")
+            .unwrap();
+        db.set_agent_chat_native_cursor("new", "new-native", Some(&new_key))
+            .unwrap();
+
+        db.migrate_agent_chat_session("old", "new").unwrap();
+        let record = db.get_agent_chat_session("new").unwrap();
+        assert_eq!(record.sdk_session_id.as_deref(), Some("old-native"));
+        assert_eq!(record.codex_tool_catalog_key.as_deref(), Some(old_key.as_str()));
     }
 
     #[test]
