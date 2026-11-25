@@ -89,7 +89,7 @@ async function unixChromePid(profile) {
     }
     return null;
   }
-  const { stdout } = await execFile('ps', ['-axo', 'pid=,command=']);
+  const { stdout } = await execFile('ps', ['-axww', '-o', 'pid=,command=']);
   for (const line of stdout.split('\n')) {
     if (!line.includes(`--user-data-dir=${profile}`) ||
         !line.includes('--remote-debugging-pipe') || line.includes(' --type=')) continue;
