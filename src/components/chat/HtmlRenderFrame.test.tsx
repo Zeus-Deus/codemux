@@ -1,12 +1,20 @@
 /// <reference types="@testing-library/jest-dom/vitest" />
-import { act, cleanup, render, screen } from "@testing-library/react";
-import { afterEach, describe, expect, it } from "vitest";
+import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
+import { afterEach, describe, expect, it, vi } from "vitest";
 
 import type { ToolCallItem } from "@/lib/agent-chat/types";
 
+const mocks = vi.hoisted(() => ({ openExternalUrl: vi.fn().mockResolvedValue("browser") }));
+
+vi.mock("@/lib/open-url", () => ({ openExternalUrl: mocks.openExternalUrl }));
+
 import { HtmlRenderFrame } from "./HtmlRenderFrame";
 
-afterEach(() => cleanup());
+afterEach(() => {
+  cleanup();
+  mocks.openExternalUrl.mockClear();
+});
 
 function renderCall(overrides: Partial<ToolCallItem> = {}): ToolCallItem {
   return {
@@ -21,6 +29,17 @@ function renderCall(overrides: Partial<ToolCallItem> = {}): ToolCallItem {
     approval_request_id: null,
     ...overrides,
   };
+}
+
+function postLink(frame: HTMLIFrameElement, url: string, source: Window | null = frame.contentWindow) {
+  act(() => {
+    window.dispatchEvent(
+      new MessageEvent("message", {
+        source,
+        data: { jsonrpc: "2.0", method: "ui/open-link", params: { url } },
+      }),
+    );
+  });
 }
 
 describe("HtmlRenderFrame", () => {
@@ -63,6 +82,102 @@ describe("HtmlRenderFrame", () => {
       );
     });
     expect(frame.style.height).toBe(before);
+  });
+
+  it("requires a parent-owned confirmation before opening a link requested by the page", async () => {
+    render(<HtmlRenderFrame item={renderCall()} />);
+    const frame = screen.getByTitle<HTMLIFrameElement>("Weekly turns");
+    frame.focus();
+    postLink(frame, "https://example.com/one");
+
+    expect(screen.getByRole("alertdialog")).toHaveTextContent("https://example.com/one");
+    expect(mocks.openExternalUrl).not.toHaveBeenCalled();
+
+    // A frame script can send more requests while the dialog is open. It
+    // cannot silently replace the address the reader is checking.
+    postLink(frame, "https://example.com/two");
+    expect(screen.getByRole("alertdialog")).not.toHaveTextContent("https://example.com/two");
+
+    fireEvent.click(screen.getByRole("button", { name: "Open link" }));
+    await waitFor(() => expect(mocks.openExternalUrl).toHaveBeenCalledWith("https://example.com/one"));
+    expect(mocks.openExternalUrl).toHaveBeenCalledTimes(1);
+  });
+
+  it("does not open a link when the reader cancels or the message came from another window", () => {
+    render(<HtmlRenderFrame item={renderCall()} />);
+    const frame = screen.getByTitle<HTMLIFrameElement>("Weekly turns");
+    frame.focus();
+    postLink(frame, "https://example.com/foreign", window);
+    expect(screen.queryByRole("alertdialog")).toBeNull();
+
+    postLink(frame, "https://example.com/real");
+    fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
+    expect(screen.queryByRole("alertdialog")).toBeNull();
+    expect(mocks.openExternalUrl).not.toHaveBeenCalled();
+  });
+
+  it("returns focus to the rendered page after Cancel or Escape", async () => {
+    const user = userEvent.setup();
+    render(<HtmlRenderFrame item={renderCall()} />);
+    const frame = screen.getByTitle<HTMLIFrameElement>("Weekly turns");
+    frame.focus();
+    postLink(frame, "https://example.com/cancel");
+
+    await user.click(screen.getByRole("button", { name: "Cancel" }));
+    await waitFor(() => expect(frame).toHaveFocus());
+
+    postLink(frame, "https://example.com/escape");
+    expect(screen.getByRole("alertdialog")).toBeInTheDocument();
+    await user.keyboard("{Escape}");
+    await waitFor(() => expect(frame).toHaveFocus());
+    expect(screen.queryByRole("alertdialog")).toBeNull();
+    expect(mocks.openExternalUrl).not.toHaveBeenCalled();
+  });
+
+  it("shows and opens the canonical destination, rejecting credentials and malformed URLs", async () => {
+    render(<HtmlRenderFrame item={renderCall()} />);
+    const frame = screen.getByTitle<HTMLIFrameElement>("Weekly turns");
+    frame.focus();
+    postLink(frame, "https://trusted.example@evil.example/private");
+    postLink(frame, "https://[invalid");
+    expect(screen.queryByRole("alertdialog")).toBeNull();
+
+    postLink(frame, "https://example.com/a/../review");
+    const dialog = screen.getByRole("alertdialog");
+    expect(dialog).toHaveTextContent("Destination");
+    expect(dialog).toHaveTextContent("https://example.com/review");
+    expect(dialog.querySelectorAll('bdi[dir="ltr"]')).toHaveLength(2);
+    fireEvent.click(screen.getByRole("button", { name: "Open link" }));
+    await waitFor(() => expect(mocks.openExternalUrl).toHaveBeenCalledWith("https://example.com/review"));
+  });
+
+  it("keeps the origin and actions visible while keyboard users inspect a long address", async () => {
+    const previousHeight = window.innerHeight;
+    Object.defineProperty(window, "innerHeight", { configurable: true, value: 240 });
+    try {
+      render(<HtmlRenderFrame item={renderCall()} />);
+      const frame = screen.getByTitle<HTMLIFrameElement>("Weekly turns");
+      frame.focus();
+      postLink(frame, `https://example.com/${"x".repeat(7000)}`);
+      const dialog = screen.getByRole("alertdialog");
+      expect(dialog.className).toContain("max-h-[calc(100dvh-2rem)]");
+      const origin = screen.getByRole("region", { name: "Destination origin" });
+      const address = screen.getByRole("region", { name: "Full destination address" });
+      expect(origin).toHaveTextContent("https://example.com");
+      expect(address).toHaveAttribute("tabindex", "0");
+      expect(address.className).toContain("overflow-y-auto");
+      expect(address.className).toContain("focus-visible:ring-2");
+      origin.focus();
+      await userEvent.tab();
+      expect(address).toHaveFocus();
+      expect(screen.getByRole("button", { name: "Cancel" })).toBeVisible();
+      expect(screen.getByRole("button", { name: "Open link" })).toBeVisible();
+      fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
+      postLink(frame, `https://example.com/${"x".repeat(8200)}`);
+      expect(screen.queryByRole("alertdialog")).toBeNull();
+    } finally {
+      Object.defineProperty(window, "innerHeight", { configurable: true, value: previousHeight });
+    }
   });
 
   it("posts new font stacks to an open page without reloading it", async () => {
