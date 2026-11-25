@@ -1,5 +1,18 @@
 import type { AgentChatSessionRecord } from "@/tauri/commands";
 
+export function resumeCursorForSession(
+  record: AgentChatSessionRecord,
+): { resume: string; toolCatalogKey?: string } | null {
+  if (!record.sdk_session_id) return null;
+  if (record.provider === "codex" && record.codex_tool_catalog_key) {
+    return {
+      resume: record.sdk_session_id,
+      toolCatalogKey: record.codex_tool_catalog_key,
+    };
+  }
+  return { resume: record.sdk_session_id };
+}
+
 export type SessionBucketKey =
   | "today"
   | "yesterday"

@@ -2117,6 +2117,8 @@ export interface AgentChatSessionRecord {
   imported_from?: string | null;
   thread_id: string;
   sdk_session_id: string | null;
+  /** Persisted catalog binding for a Codex native thread. */
+  codex_tool_catalog_key?: string | null;
   workspace_id: string;
   cwd: string | null;
   provider: AgentChatProviderKind;

@@ -15,8 +15,9 @@ use serde_json::Value;
 // * **App-shutdown kill.** `shutdown_all` is called from the Tauri
 //   `RunEvent::Exit` handler in `lib.rs`. Each child gets a graceful
 //   2-second budget via `JsonRpcChild::shutdown` before SIGKILL.
-// * **No auto-restart.** A crashed server stays in `Errored`; the user
-//   restarts manually via `restart_mcp_server`.
+// * **Bounded startup recovery.** A failed initial spawn or handshake may
+//   retry in the background with backoff. A server that failed after it was
+//   running still needs a manual restart.
 // * **Codemux exception.** The hardcoded `Codemux` source row is
 //   always-on; toggling it is suppressed at the command layer.
 
@@ -29,6 +30,7 @@ pub use plugin::{
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter, Runtime};
@@ -40,9 +42,9 @@ use super::parser::{
     parse_claude_wrapped_config, parse_codex_config_file, parse_mcp_config_file,
     parse_opencode_config_file,
 };
-use super::paths::{enumerate_mcp_paths, is_claude_wrapped_path};
+use super::paths::{enumerate_mcp_paths_with_home, is_claude_wrapped_path};
 use super::runtime::{McpServerHandle, McpServerStatus, McpTool};
-use super::{McpConfigSource, McpServerConfig};
+use super::{McpConfigSource, McpProjectScope, McpServerConfig};
 
 // Pause an approved first start immediately before its reservation in the
 // revocation race test. Scoped to that test's task and absent in production.
@@ -84,6 +86,54 @@ impl McpServerRuntime {
             started_at_ms: h.started_at_ms,
         }
     }
+}
+
+/// Runtime bookkeeping is not part of a discovered server definition. A
+/// settled failure is reusable only while the executable, credentials, scope,
+/// and every other effective setting still match discovery.
+fn same_prime_definition(existing: &McpServerConfig, discovered: &McpServerConfig) -> bool {
+    fn effective_raw(raw: &Value) -> Option<serde_json::Map<String, Value>> {
+        let Value::Object(fields) = raw else { return None };
+        let mut fields = fields.clone();
+        fields.remove("runtimeGeneration");
+        fields.remove("pluginRegistrationToken");
+        (!fields.is_empty()).then_some(fields)
+    }
+
+    existing.id == discovered.id
+        && existing.name == discovered.name
+        && existing.sources == discovered.sources
+        && existing.command == discovered.command
+        && existing.args == discovered.args
+        && existing.env == discovered.env
+        && existing.disabled == discovered.disabled
+        && existing.transport == discovered.transport
+        && existing.project_root == discovered.project_root
+        && existing.checkout_root == discovered.checkout_root
+        && effective_raw(&existing.raw) == effective_raw(&discovered.raw)
+}
+
+const STARTUP_RETRY_DELAYS: [Duration; 3] = [
+    Duration::from_secs(2),
+    Duration::from_secs(5),
+    Duration::from_secs(15),
+];
+const STARTUP_RETRY_CYCLE_COOLDOWN: Duration = Duration::from_secs(60);
+
+fn retryable_startup_failure(handle: &McpServerHandle) -> bool {
+    matches!(handle.status, McpServerStatus::Errored { .. })
+        && handle.started_at_ms.is_none()
+        && handle.child.is_none()
+        && handle.remote.is_none()
+}
+
+struct StartupRetryState {
+    definition: McpServerConfig,
+    discovery_root: Option<PathBuf>,
+    task_id: String,
+    generation: String,
+    active: bool,
+    next_cycle: Instant,
 }
 
 /// Process-wide registry of MCP children. Stored as Tauri managed state
@@ -195,6 +245,53 @@ impl std::fmt::Debug for McpRegistry {
 }
 
 impl McpRegistry {
+    async fn prime_discovery(&self, project_root: Option<&std::path::Path>) -> Vec<McpServerConfig> {
+        #[cfg(test)]
+        if let Some(configs) = self.inner.lock().await.prime_configs_for_test.clone() {
+            return configs;
+        }
+        discover_configs(project_root)
+    }
+
+    /// A retry may use its captured definition only while that definition is
+    /// still enabled in the same discovery scope. Read the files again after
+    /// the backoff, while the server lifecycle lock is held.
+    async fn retry_definition_is_current(
+        &self,
+        config: &McpServerConfig,
+        task_id: &str,
+    ) -> bool {
+        let root = {
+            let inner = self.inner.lock().await;
+            inner.startup_retries.get(&config.id)
+                .filter(|retry| retry.active && retry.task_id == task_id
+                    && same_prime_definition(&retry.definition, config))
+                .map(|retry| retry.discovery_root.clone())
+        };
+        let Some(root) = root else { return false };
+        let current = self.prime_discovery(root.as_deref()).await.into_iter().any(|discovered| {
+            discovered.id == config.id && !discovered.disabled
+                && same_prime_definition(&discovered, config)
+        });
+        if !current {
+            let mut inner = self.inner.lock().await;
+            if inner.startup_retries.get(&config.id).is_some_and(|retry| retry.task_id == task_id) {
+                inner.startup_retries.remove(&config.id);
+            }
+        }
+        current
+    }
+
+    /// A saved Codex catalog may be compared against the live tools while a
+    /// failed server is recovering. A mismatch must wait for that server's
+    /// next settled catalog instead of starting a replacement thread.
+    pub async fn has_visible_startup_retry(&self, project: Option<&McpProjectScope>) -> bool {
+        let inner = self.inner.lock().await;
+        inner.startup_retries.values().any(|retry| {
+            retry.active && visible_in_project(&retry.definition, project)
+        })
+    }
+
     /// Cheap clone of the registry handle. Exit-handler shorthand.
     pub fn clone_handle(&self) -> Self {
         self.clone()
@@ -218,11 +315,18 @@ struct RegistryInner {
     /// Keyed by `McpServerConfig.id`. Codemux's hardcoded row is also
     /// in here under `"codemux-self"` once spawned.
     handles: HashMap<String, McpServerHandle>,
+    startup_retries: HashMap<String, StartupRetryState>,
     /// Mirror of the frontend zustand `disabledIds` — written by
     /// `set_disabled_ids` whenever the store changes. Disabled servers
     /// are skipped during `prime_for_chat` and stopped if currently
     /// running.
     disabled_ids: HashSet<String>,
+    /// Native config sources discovered in each checkout. A merged global
+    /// handle may also appear in a checkout's Claude-local or project file;
+    /// that native source must hide the handle only in that checkout.
+    native_scoped_sources: HashMap<PathBuf, HashSet<(String, McpConfigSource)>>,
+    #[cfg(test)]
+    prime_configs_for_test: Option<Vec<McpServerConfig>>,
 }
 
 impl Default for McpRegistry {
@@ -235,11 +339,15 @@ impl Default for McpRegistry {
         Self {
             inner: Arc::new(Mutex::new(RegistryInner {
                 handles: HashMap::new(),
+                startup_retries: HashMap::new(),
                 plugins: HashMap::new(),
                 watchers: HashMap::new(),
                 cancel_calls: HashMap::new(),
                 calls_in_flight: HashMap::new(),
                 disabled_ids: HashSet::new(),
+                native_scoped_sources: HashMap::new(),
+                #[cfg(test)]
+                prime_configs_for_test: None,
             })),
             status_tx,
             prime_lock: Arc::new(Mutex::new(())),
@@ -298,6 +406,7 @@ impl McpRegistry {
     pub(crate) fn set_native_delegation_handler(&self, handler: NativeDelegationHandler) {
         *self.native_delegation.lock().unwrap() = Some(handler);
     }
+    #[cfg(test)]
     pub(crate) async fn dispatch_native_tool_call(
         &self,
         name: &str,
@@ -306,9 +415,25 @@ impl McpRegistry {
     ) -> Result<serde_json::Value, String> {
         self.dispatch_native_tool_call_with_id(name, arguments, actor, None).await
     }
+    pub(crate) async fn dispatch_native_tool_call_scoped(
+        &self,
+        name: &str,
+        arguments: serde_json::Value,
+        actor: crate::delegation::app::NativeActor,
+        project: Option<&McpProjectScope>,
+    ) -> Result<serde_json::Value, String> {
+        self.dispatch_native_tool_call_with_id_scoped(name, arguments, actor, None, project).await
+    }
     pub(crate) async fn dispatch_native_tool_call_with_id(
         &self, name: &str, arguments: serde_json::Value,
         actor: crate::delegation::app::NativeActor, call_id: Option<String>,
+    ) -> Result<serde_json::Value, String> {
+        self.dispatch_native_tool_call_with_id_scoped(name, arguments, actor, call_id, None).await
+    }
+    pub(crate) async fn dispatch_native_tool_call_with_id_scoped(
+        &self, name: &str, arguments: serde_json::Value,
+        actor: crate::delegation::app::NativeActor, call_id: Option<String>,
+        project: Option<&McpProjectScope>,
     ) -> Result<serde_json::Value, String> {
         if let Some(raw) = crate::agent_control::native::tool_name(name) {
             let handler = self.native_delegation.lock().unwrap().clone()
@@ -355,7 +480,7 @@ impl McpRegistry {
             let handler = self.native_delegation.lock().unwrap().clone().ok_or("Native caller policy is unavailable")?;
             return handler(actor, raw.into(), arguments, call_id).await;
         }
-        self.dispatch_tool_call(name, arguments, actor.workspace_id.as_deref()).await
+        self.dispatch_tool_call_scoped(name, arguments, actor.workspace_id.as_deref(), project).await
     }
     pub fn set_activity_emitter(&self, emit: Arc<dyn Fn(PluginMcpActivity) + Send + Sync>) {
         let _ = self.activity.set(emit);
@@ -511,6 +636,7 @@ impl McpRegistry {
                 .filter(|id| inner.disabled_ids.contains(*id) && !next.contains(*id))
                 .filter_map(|id| inner.handles.get(id).map(|handle| handle.config.clone()))
                 .collect::<Vec<_>>();
+            inner.startup_retries.retain(|id, _| !next.contains(id));
             inner.disabled_ids = next;
             // Codemux self can't be disabled.
             inner.disabled_ids.remove("codemux-self");
@@ -571,6 +697,15 @@ impl McpRegistry {
         app: Option<&AppHandle<R>>,
         config: McpServerConfig,
     ) -> McpServerRuntime {
+        self.ensure_started_with_retry_guard(app, config, None).await
+    }
+
+    async fn ensure_started_with_retry_guard<R: Runtime>(
+        &self,
+        app: Option<&AppHandle<R>>,
+        config: McpServerConfig,
+        retry_guard: Option<(&str, &str)>,
+    ) -> McpServerRuntime {
         let (config, token) = if config.sources.contains(&McpConfigSource::Plugin) {
             let inner = self.inner.lock().await;
             match (inner.plugins.get(&config.id), inner.handles.get(&config.id)) {
@@ -580,7 +715,7 @@ impl McpRegistry {
         } else {
             (config, None)
         };
-        self.ensure_started_owned(app, config, token.as_deref())
+        self.ensure_started_owned(app, config, token.as_deref(), retry_guard)
             .await
     }
 
@@ -589,10 +724,37 @@ impl McpRegistry {
         app: Option<&AppHandle<R>>,
         mut config: McpServerConfig,
         token: Option<&str>,
+        retry_guard: Option<(&str, &str)>,
     ) -> McpServerRuntime {
         let id = config.id.clone();
         let server_lock = self.server_lock(&id);
         let lifecycle = server_lock.lock().await;
+
+        if let Some((task_id, generation)) = retry_guard {
+            if !self.retry_definition_is_current(&config, task_id).await {
+                let inner = self.inner.lock().await;
+                return inner.handles.get(&id)
+                    .map(McpServerRuntime::from_handle)
+                    .unwrap_or_else(|| McpServerRuntime::from_handle(&McpServerHandle::discovered(config)));
+            }
+            let inner = self.inner.lock().await;
+            let Some(handle) = inner.handles.get(&id) else {
+                return McpServerRuntime::from_handle(&McpServerHandle::discovered(config));
+            };
+            let current = inner.startup_retries.get(&id).is_some_and(|retry| {
+                retry.active
+                    && retry.task_id == task_id
+                    && retry.generation == generation
+                    && same_prime_definition(&retry.definition, &config)
+            });
+            if !current
+                || !retryable_startup_failure(handle)
+                || !same_prime_definition(&handle.config, &config)
+                || handle.config.raw.get("runtimeGeneration").and_then(Value::as_str) != Some(generation)
+            {
+                return McpServerRuntime::from_handle(handle);
+            }
+        }
 
         // Codemux self is always-on regardless of disabled set; everyone
         // else respects the user's toggle.
@@ -662,6 +824,24 @@ impl McpRegistry {
         let _start_guard;
         {
             let mut inner = self.inner.lock().await;
+            if let Some((task_id, expected_generation)) = retry_guard {
+                let current = inner.startup_retries.get(&id).is_some_and(|retry| {
+                    retry.active
+                        && retry.task_id == task_id
+                        && retry.generation == expected_generation
+                        && same_prime_definition(&retry.definition, &config)
+                }) && inner.handles.get(&id).is_some_and(|handle| {
+                    retryable_startup_failure(handle)
+                        && same_prime_definition(&handle.config, &config)
+                        && handle.config.raw.get("runtimeGeneration").and_then(Value::as_str)
+                            == Some(expected_generation)
+                });
+                if !current || inner.disabled_ids.contains(&id) {
+                    return inner.handles.get(&id)
+                        .map(McpServerRuntime::from_handle)
+                        .unwrap_or_else(|| McpServerRuntime::from_handle(&McpServerHandle::discovered(config)));
+                }
+            }
             if let Some(existing) = inner.handles.get(&id) {
                 if matches!(
                     existing.status,
@@ -689,6 +869,11 @@ impl McpRegistry {
             _start_guard = plugin::CallGuard::new(tracker.clone(), None);
             inner.calls_in_flight.insert(id.clone(), tracker);
             inner.handles.insert(id.clone(), placeholder);
+            if retry_guard.is_some() {
+                inner.startup_retries.get_mut(&id)
+                    .expect("retry task exists")
+                    .generation = generation.clone();
+            }
         }
         drop(approval_guard);
         emit_status_with_bus(
@@ -970,6 +1155,7 @@ impl McpRegistry {
             if let Some(task) = inner.watchers.remove(id) {
                 task.abort();
             }
+            inner.startup_retries.remove(id);
             inner.cancel_calls.remove(id);
             let tracker = inner.calls_in_flight.remove(id);
             let handle = inner
@@ -1120,6 +1306,99 @@ impl McpRegistry {
         Ok(revoked)
     }
 
+    /// Retry only failures from initial startup, after the current chat has
+    /// made its catalog decision. One worker owns each definition; repeated
+    /// resume attempts cannot start another handshake or reset its backoff.
+    async fn schedule_startup_retry<R: Runtime>(
+        &self,
+        app: Option<&AppHandle<R>>,
+        config: &McpServerConfig,
+        project_root: Option<&std::path::Path>,
+    ) {
+        let id = config.id.clone();
+        let task_id = uuid::Uuid::new_v4().to_string();
+        let generation = {
+            let mut inner = self.inner.lock().await;
+            if inner.disabled_ids.contains(&id) {
+                return;
+            }
+            let Some(handle) = inner.handles.get(&id) else { return };
+            if !retryable_startup_failure(handle)
+                || !same_prime_definition(&handle.config, config)
+            {
+                return;
+            }
+            let Some(generation) = handle.config.raw.get("runtimeGeneration")
+                .and_then(Value::as_str).map(str::to_owned) else { return };
+            let now = Instant::now();
+            if inner.startup_retries.get(&id).is_some_and(|retry| {
+                same_prime_definition(&retry.definition, config)
+                    && (retry.active || now < retry.next_cycle)
+            }) {
+                return;
+            }
+            inner.startup_retries.insert(id.clone(), StartupRetryState {
+                definition: config.clone(),
+                discovery_root: project_root.map(std::path::Path::to_path_buf),
+                task_id: task_id.clone(),
+                generation: generation.clone(),
+                active: true,
+                next_cycle: now,
+            });
+            generation
+        };
+
+        let registry = self.clone();
+        let app = app.cloned();
+        let config = config.clone();
+        tokio::spawn(async move {
+            let mut expected_generation = generation;
+            for delay in STARTUP_RETRY_DELAYS {
+                tokio::time::sleep(delay).await;
+                let row = registry.ensure_started_with_retry_guard(
+                    app.as_ref(), config.clone(), Some((&task_id, &expected_generation)),
+                ).await;
+                if !matches!(row.status, McpServerStatus::Errored { .. }) {
+                    break;
+                }
+                let next_generation = {
+                    let inner = registry.inner.lock().await;
+                    inner.startup_retries.get(&id)
+                        .filter(|retry| retry.active && retry.task_id == task_id)
+                        .and_then(|retry| inner.handles.get(&id).filter(|handle| {
+                            retryable_startup_failure(handle)
+                                && same_prime_definition(&handle.config, &config)
+                                && handle.config.raw.get("runtimeGeneration").and_then(Value::as_str)
+                                    == Some(retry.generation.as_str())
+                        }).map(|_| retry.generation.clone()))
+                };
+                match next_generation {
+                    Some(next) if next != expected_generation => expected_generation = next,
+                    _ => break,
+                }
+            }
+
+            let mut inner = registry.inner.lock().await;
+            if inner.startup_retries.get(&id).is_some_and(|retry| retry.task_id == task_id) {
+                let still_failed = inner.handles.get(&id).is_some_and(|handle| {
+                    retryable_startup_failure(handle)
+                        && same_prime_definition(&handle.config, &config)
+                        && inner.startup_retries.get(&id).is_some_and(|retry| {
+                            handle.config.raw.get("runtimeGeneration").and_then(Value::as_str)
+                                == Some(retry.generation.as_str())
+                        })
+                });
+                if still_failed {
+                    let retry = inner.startup_retries.get_mut(&id).expect("retry task exists");
+                    retry.active = false;
+                    retry.next_cycle = Instant::now() + STARTUP_RETRY_CYCLE_COOLDOWN;
+                } else {
+                    inner.startup_retries.remove(&id);
+                }
+            }
+        });
+    }
+
     /// Spawn every enabled (non-disabled) MCP server discovered for the
     /// given project root, plus Codemux's own hardcoded entry. Errors
     /// per server are surfaced as `Errored` rows rather than failing
@@ -1129,22 +1408,150 @@ impl McpRegistry {
     /// Used by:
     ///   1. `agent_chat_start_session` — first chat session triggers spawn.
     ///   2. Settings → MCP Servers mount — so users can inspect status.
+    /// Returns false only while a discovered server has not reached a
+    /// terminal state; a failed server has a settled, empty tool surface.
     pub async fn prime_for_chat<R: Runtime>(
         &self,
         app: Option<&AppHandle<R>>,
         project_root: Option<&std::path::Path>,
-    ) {
+    ) -> bool {
         // Serialize concurrent primes so a warm-up prime and the
         // start-session backstop prime can't double-spawn the same child
         // (see `prime_lock`). The second waiter finds every server already
         // `Starting`/`Running` and no-ops through `ensure_started`.
         let _prime_guard = self.prime_lock.lock().await;
-        let configs = discover_configs(project_root);
+        let configs = self.prime_discovery(project_root).await;
+        let stale_retries = {
+            let inner = self.inner.lock().await;
+            inner.startup_retries.iter()
+                .filter(|(_, retry)| retry.discovery_root.as_deref() == project_root)
+                .filter(|(id, retry)| !configs.iter().any(|config| {
+                    &config.id == *id && !config.disabled
+                        && same_prime_definition(&retry.definition, config)
+                }))
+                .map(|(id, _)| id.clone())
+                .collect::<Vec<_>>()
+        };
+        for id in stale_retries {
+            let _ = self.stop_server(app, &id).await;
+        }
+        self.remember_native_scoped_sources(project_root, &configs).await;
+        let mut settled = true;
         for cfg in configs {
             if cfg.disabled {
                 continue;
             }
-            let _ = self.ensure_started(app, cfg).await;
+            let disabled = self.is_disabled(&cfg.id).await;
+            let approved = super::project_trust::fingerprint(&cfg)
+                .is_none_or(|fingerprint| super::project_trust::is_approved(app, &fingerprint));
+            let settled_failure = if !disabled && approved {
+                let inner = self.inner.lock().await;
+                inner.handles.get(&cfg.id)
+                    .filter(|handle| matches!(handle.status, McpServerStatus::Errored { .. })
+                        && same_prime_definition(&handle.config, &cfg))
+                    .map(McpServerRuntime::from_handle)
+            } else {
+                None
+            };
+            // A failed handshake leaves no tools. Do not start the same
+            // definition again on every chat retry; explicit Restart and a
+            // changed definition still take the normal start path.
+            let row = match settled_failure {
+                Some(row) => row,
+                None => self.ensure_started(app, cfg.clone()).await,
+            };
+            if !disabled && approved && matches!(row.status, McpServerStatus::Errored { .. }) {
+                self.schedule_startup_retry(app, &cfg, project_root).await;
+            }
+            // A previous prime may still be discovering this server. Terminal
+            // failures are settled: the adapter's catalog hash decides
+            // whether their absent tools change a saved Codex thread.
+            let recovering = if matches!(row.status, McpServerStatus::Starting) {
+                let inner = self.inner.lock().await;
+                inner.startup_retries.get(&cfg.id).is_some_and(|retry| {
+                    retry.active && same_prime_definition(&retry.definition, &cfg)
+                })
+            } else {
+                false
+            };
+            if !disabled && !recovering && matches!(row.status, McpServerStatus::Discovered | McpServerStatus::Starting | McpServerStatus::Stopping) {
+                settled = false;
+            }
+        }
+        settled
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn set_prime_configs_for_test(&self, configs: Vec<McpServerConfig>) {
+        self.inner.lock().await.prime_configs_for_test = Some(configs);
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn has_native_scope_for_test(&self, checkout: &std::path::Path) -> bool {
+        self.inner.lock().await.native_scoped_sources.contains_key(checkout)
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn insert_starting_server_for_test(&self, config: McpServerConfig) {
+        let mut handle = McpServerHandle::discovered(config);
+        handle.status = McpServerStatus::Starting;
+        self.inner.lock().await.handles.insert(handle.config.id.clone(), handle);
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn insert_recovering_starting_server_for_test(&self, mut config: McpServerConfig) {
+        if !config.raw.is_object() {
+            config.raw = serde_json::json!({});
+        }
+        config.raw["runtimeGeneration"] = serde_json::json!("retry-start");
+        let mut handle = McpServerHandle::discovered(config.clone());
+        handle.status = McpServerStatus::Starting;
+        let mut inner = self.inner.lock().await;
+        inner.startup_retries.insert(config.id.clone(), StartupRetryState {
+            definition: config.clone(),
+            discovery_root: None,
+            task_id: "test-recovery".into(),
+            generation: "retry-start".into(),
+            active: true,
+            next_cycle: Instant::now(),
+        });
+        inner.handles.insert(config.id.clone(), handle);
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn settle_starting_server_as_errored_for_test(&self, id: &str) {
+        let mut inner = self.inner.lock().await;
+        let handle = inner.handles.get_mut(id).expect("starting server");
+        assert!(matches!(handle.status, McpServerStatus::Starting));
+        handle.status = McpServerStatus::Errored { message: "MCP initialize timed out".into() };
+        if !handle.config.raw.is_object() {
+            handle.config.raw = serde_json::json!({});
+        }
+        handle.config.raw["runtimeGeneration"] = serde_json::json!("timed-out-start");
+    }
+
+    async fn remember_native_scoped_sources(
+        &self,
+        project_root: Option<&std::path::Path>,
+        configs: &[McpServerConfig],
+    ) {
+        if let Some(root) = project_root {
+            let checkout = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
+            let native_sources = configs
+                .iter()
+                .flat_map(|config| {
+                    config.sources.iter().copied().filter_map(|source| {
+                        (super::is_project_source(source)
+                            || source == McpConfigSource::ClaudeLocal)
+                            .then(|| (config.id.clone(), source))
+                    })
+                })
+                .collect();
+            self.inner
+                .lock()
+                .await
+                .native_scoped_sources
+                .insert(checkout, native_sources);
         }
     }
 
@@ -1164,8 +1571,8 @@ impl McpRegistry {
         out
     }
 
-    /// Provider-facing tools across running servers, without a count cap.
-    /// Trusted native-controller tools are never injected into a provider.
+    /// Global running tools, without a count cap. Sessions use
+    /// `list_tools_for_workspace` with their fixed project scope.
     pub async fn list_all_tools(&self) -> Vec<McpTool> {
         self.list_all_tools_excluding_sources(&[]).await
     }
@@ -1185,17 +1592,21 @@ impl McpRegistry {
         &self,
         sources: &[McpConfigSource],
     ) -> Vec<McpTool> {
-        self.list_tools_for_workspace(sources, None).await
+        self.list_tools_for_workspace(sources, None, None).await
     }
 
     pub async fn list_tools_for_workspace(
         &self,
         sources: &[McpConfigSource],
         workspace_id: Option<&str>,
+        project: Option<&McpProjectScope>,
     ) -> Vec<McpTool> {
         let inner = self.inner.lock().await;
         let mut tools = Vec::new();
         for handle in inner.handles.values() {
+            if !visible_in_project(&handle.config, project) {
+                continue;
+            }
             if inner
                 .plugins
                 .get(&handle.config.id)
@@ -1203,11 +1614,22 @@ impl McpRegistry {
             {
                 continue;
             }
-            let provider_native = handle
-                .config
-                .sources
-                .iter()
-                .any(|source| sources.contains(source));
+            let native_here = project
+                .and_then(|project| inner.native_scoped_sources.get(&project.checkout))
+                .is_some_and(|native| {
+                    sources.iter().any(|source| {
+                        native.contains(&(handle.config.id.clone(), *source))
+                    })
+                });
+            // The primary scoped handle is already restricted by
+            // visible_in_project. A secondary scoped source on a global
+            // handle is native only where that source was discovered.
+            let provider_native = native_here || handle.config.sources.iter().any(|source| {
+                sources.contains(source)
+                    && ((!super::is_project_source(*source)
+                        && *source != McpConfigSource::ClaudeLocal)
+                        || handle.config.primary_source() == *source)
+            });
             if handle.status.is_running() && !provider_native {
                 let is_self = handle.config.sources.contains(&McpConfigSource::Codemux);
                 tools.extend(
@@ -1247,6 +1669,23 @@ impl McpRegistry {
         id: &str,
         sources: Vec<McpConfigSource>,
     ) {
+        self.insert_running_server_for_test_at(id, sources, None).await;
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn insert_running_server_for_test_at(
+        &self,
+        id: &str,
+        sources: Vec<McpConfigSource>,
+        scope: Option<&McpProjectScope>,
+    ) {
+        let project_root = scope.map(|scope| {
+            if sources.first() == Some(&McpConfigSource::ClaudeLocal) {
+                scope.checkout.clone()
+            } else {
+                scope.approval_root.clone()
+            }
+        });
         let config = McpServerConfig {
             id: id.into(),
             name: id.into(),
@@ -1257,7 +1696,8 @@ impl McpRegistry {
             disabled: false,
             transport: super::McpTransport::Stdio,
             raw: serde_json::Value::Null,
-            project_root: None,
+            checkout_root: scope.map(|scope| scope.checkout.clone()),
+            project_root,
         };
         let mut handle = McpServerHandle::discovered(config);
         handle.status = McpServerStatus::Running { tool_count: 1 };
@@ -1312,15 +1752,26 @@ impl McpRegistry {
     /// workspace-scoped tools (browser routing, git cwd) bind to the
     /// session's own workspace rather than whichever one the app
     /// process happens to sit in. `None` keeps the child's env/cwd
-    /// fallback behavior.
+    /// fallback behavior. This unscoped entry point cannot call a
+    /// project-bound server.
     pub async fn dispatch_tool_call(
         &self,
         prefixed_name: &str,
         arguments: serde_json::Value,
         workspace_id: Option<&str>,
     ) -> Result<serde_json::Value, String> {
-        self.dispatch_tool_call_inner(prefixed_name, arguments, workspace_id, None)
+        self.dispatch_tool_call_scoped(prefixed_name, arguments, workspace_id, None)
             .await
+    }
+
+    pub async fn dispatch_tool_call_scoped(
+        &self,
+        prefixed_name: &str,
+        arguments: serde_json::Value,
+        workspace_id: Option<&str>,
+        project: Option<&McpProjectScope>,
+    ) -> Result<serde_json::Value, String> {
+        self.dispatch_tool_call_inner(prefixed_name, arguments, workspace_id, project, None).await
     }
 
     async fn dispatch_tool_call_inner(
@@ -1328,12 +1779,16 @@ impl McpRegistry {
         prefixed_name: &str,
         arguments: serde_json::Value,
         workspace_id: Option<&str>,
+        project: Option<&McpProjectScope>,
         owned_server: Option<&str>,
     ) -> Result<serde_json::Value, String> {
         let (raw_name, is_codemux_self, child, remote, mut cancelled, mut call_guard) = {
             let inner = self.inner.lock().await;
             let mut found = None;
             for handle in inner.handles.values() {
+                if !visible_in_project(&handle.config, project) {
+                    continue;
+                }
                 if owned_server.is_some_and(|id| id != handle.config.id) {
                     continue;
                 }
@@ -1464,6 +1919,7 @@ impl McpRegistry {
             let mut inner = self.inner.lock().await;
             let mut out = Vec::new();
             inner.cancel_calls.clear();
+            inner.startup_retries.clear();
             for (_, task) in inner.watchers.drain() {
                 task.abort();
             }
@@ -1543,6 +1999,22 @@ fn now_ms() -> i64 {
         .unwrap_or(0)
 }
 
+/// A server bound to one checkout must have a matching caller scope. A
+/// missing scope fails closed for project and Claude-local definitions.
+fn visible_in_project(config: &McpServerConfig, project: Option<&McpProjectScope>) -> bool {
+    let Some(project) = project else {
+        return !super::is_project_source(config.primary_source())
+            && config.primary_source() != McpConfigSource::ClaudeLocal;
+    };
+    let approval_root = match config.primary_source() {
+        source if super::is_project_source(source) => Some(&project.approval_root),
+        McpConfigSource::ClaudeLocal => Some(&project.checkout),
+        _ => return true,
+    };
+    config.project_root.as_ref() == approval_root
+        && config.checkout_root.as_ref() == Some(&project.checkout)
+}
+
 /// Walk the configured MCP files for a project root and produce a flat
 /// `Vec<McpServerConfig>` suitable for spawning. Identical definitions from
 /// multiple providers are deduplicated before launch so Codemux owns one
@@ -1550,12 +2022,19 @@ fn now_ms() -> i64 {
 /// Project-sourced entries carry the project root their approval is keyed
 /// by (see [`super::project_trust::approval_root`]).
 pub(crate) fn discover_configs(project_root: Option<&std::path::Path>) -> Vec<McpServerConfig> {
+    discover_configs_with_home(project_root, dirs::home_dir().as_deref())
+}
+
+fn discover_configs_with_home(
+    project_root: Option<&std::path::Path>,
+    home: Option<&std::path::Path>,
+) -> Vec<McpServerConfig> {
     let mut out: Vec<McpServerConfig> = vec![codemux_self_config()];
 
     let project_path: Option<PathBuf> = project_root.map(|p| p.to_path_buf());
     // Resolved only when the project defines a server: it can ask Git.
     let approval_root = std::cell::OnceCell::new();
-    let scan = enumerate_mcp_paths(project_path.as_deref());
+    let scan = enumerate_mcp_paths_with_home(project_path.as_deref(), home);
     let own = PathBuf::from(crate::mcp_server::codemux_mcp_command());
 
     for (path, source) in scan.paths {
@@ -1584,6 +2063,9 @@ pub(crate) fn discover_configs(project_root: Option<&std::path::Path>) -> Vec<Mc
                         srv.project_root = approval_root
                             .get_or_init(|| project_path.as_deref().map(super::project_trust::approval_root))
                             .clone();
+                        srv.checkout_root = project_path.as_deref().map(|path| {
+                            std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+                        });
                     }
                     out.push(srv);
                 }
@@ -1727,6 +2209,7 @@ pub(crate) mod test_support {
             transport: McpTransport::Http,
             raw: serde_json::json!({}),
             project_root: None,
+            checkout_root: None,
         };
         let row = registry
             .ensure_started(None::<&tauri::AppHandle<tauri::Wry>>, config)
@@ -1745,6 +2228,56 @@ mod tests {
     use crate::mcp::{McpConfigSource, McpServerConfig, McpTransport, WORKSPACE_META_KEY};
     use std::collections::HashMap;
 
+    #[tokio::test]
+    async fn discovery_excludes_a_global_copy_only_where_claude_local_is_native() {
+        let home = tempfile::tempdir().unwrap();
+        let first = tempfile::tempdir().unwrap();
+        let second = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(home.path().join(".cursor")).unwrap();
+        std::fs::write(
+            home.path().join(".cursor/mcp.json"),
+            serde_json::json!({"mcpServers":{"shared":{"command":"fixture-server"}}}).to_string(),
+        ).unwrap();
+        let mut projects = serde_json::Map::new();
+        projects.insert(
+            first.path().display().to_string(),
+            serde_json::json!({"mcpServers":{"shared":{"command":"fixture-server"}}}),
+        );
+        std::fs::write(home.path().join(".claude.json"), serde_json::json!({"projects":projects}).to_string()).unwrap();
+
+        let first_configs = discover_configs_with_home(Some(first.path()), Some(home.path()));
+        let second_configs = discover_configs_with_home(Some(second.path()), Some(home.path()));
+        let global = first_configs.iter().find(|config| config.name == "shared").unwrap().clone();
+        assert_eq!(global.primary_source(), McpConfigSource::CursorUser);
+        assert!(global.sources.contains(&McpConfigSource::ClaudeLocal));
+        assert_eq!(second_configs.iter().find(|config| config.name == "shared").unwrap().sources,
+            vec![McpConfigSource::CursorUser]);
+
+        let registry = McpRegistry::new();
+        registry.remember_native_scoped_sources(Some(first.path()), &first_configs).await;
+        registry.remember_native_scoped_sources(Some(second.path()), &second_configs).await;
+        // The global handle may have started from the other checkout first,
+        // before this checkout's Claude-local source was discovered.
+        let running_global = second_configs.iter().find(|config| config.name == "shared").unwrap().clone();
+        let mut handle = McpServerHandle::discovered(running_global);
+        handle.status = McpServerStatus::Running { tool_count: 1 };
+        handle.tools.push(McpTool {
+            name: "tool".into(), prefixed_name: "mcp__shared__tool".into(),
+            description: None, input_schema: serde_json::json!({}), server_id: global.id.clone(),
+        });
+        registry.inner.lock().await.handles.insert(global.id, handle);
+        let native = &[McpConfigSource::ClaudeLocal, McpConfigSource::ClaudeUser, McpConfigSource::ClaudeProject];
+        let first_scope = McpProjectScope::new(first.path());
+        let second_scope = McpProjectScope::new(second.path());
+        assert!(registry.list_tools_for_workspace(native, None, Some(&first_scope)).await.is_empty());
+        assert_eq!(registry.list_tools_for_workspace(native, None, Some(&second_scope)).await.len(), 1);
+
+        std::fs::write(home.path().join(".claude.json"), "{}").unwrap();
+        let refreshed = discover_configs_with_home(Some(first.path()), Some(home.path()));
+        registry.remember_native_scoped_sources(Some(first.path()), &refreshed).await;
+        assert_eq!(registry.list_tools_for_workspace(native, None, Some(&first_scope)).await.len(), 1);
+    }
+
     fn make_config(id: &str, name: &str, command: &str) -> McpServerConfig {
         McpServerConfig {
             id: id.into(),
@@ -1757,6 +2290,7 @@ mod tests {
             transport: McpTransport::Stdio,
             raw: serde_json::Value::Null,
             project_root: None,
+            checkout_root: None,
         }
     }
 
@@ -2046,6 +2580,185 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn chat_prime_reuses_a_timed_out_definition_but_starts_a_changed_one() {
+        let reg = McpRegistry::new();
+        let cfg = make_config("slow", "slow", "/no/such/binary/at/all");
+        reg.set_prime_configs_for_test(vec![cfg.clone()]).await;
+        reg.insert_starting_server_for_test(cfg.clone()).await;
+        reg.settle_starting_server_as_errored_for_test(&cfg.id).await;
+
+        assert!(reg.prime_for_chat(None::<&tauri::AppHandle<tauri::Wry>>, None).await);
+        let generation = reg.inner.lock().await.handles[&cfg.id].config.raw["runtimeGeneration"].clone();
+        assert_eq!(generation, "timed-out-start");
+
+        let mut changed = cfg;
+        changed.command = "/no/such/different/binary".into();
+        reg.set_prime_configs_for_test(vec![changed.clone()]).await;
+        assert!(reg.prime_for_chat(None::<&tauri::AppHandle<tauri::Wry>>, None).await);
+        let inner = reg.inner.lock().await;
+        let handle = &inner.handles[&changed.id];
+        assert!(matches!(handle.status, McpServerStatus::Errored { .. }));
+        assert_ne!(handle.config.raw["runtimeGeneration"], generation);
+        assert_eq!(handle.config.command, changed.command);
+    }
+
+    #[tokio::test]
+    async fn sleeping_retry_does_not_launch_a_removed_definition() {
+        let reg = McpRegistry::new();
+        let cfg = make_config("removed", "removed", "/no/such/binary/at/all");
+        reg.set_prime_configs_for_test(vec![cfg.clone()]).await;
+        assert!(reg.prime_for_chat(None::<&tauri::AppHandle<tauri::Wry>>, None).await);
+        let generation = reg.inner.lock().await.handles[&cfg.id].config.raw["runtimeGeneration"].clone();
+
+        // No prime runs after the edit: the sleeping worker must re-read
+        // discovery itself before reserving another process.
+        reg.set_prime_configs_for_test(Vec::new()).await;
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        let inner = reg.inner.lock().await;
+        assert_eq!(inner.handles[&cfg.id].config.raw["runtimeGeneration"], generation);
+        assert!(matches!(inner.handles[&cfg.id].status, McpServerStatus::Errored { .. }));
+        assert!(!inner.startup_retries.contains_key(&cfg.id));
+    }
+
+    #[tokio::test]
+    async fn prime_cancels_retry_when_source_disables_the_definition() {
+        let reg = McpRegistry::new();
+        let cfg = make_config("disabled-by-file", "disabled-by-file", "/no/such/binary/at/all");
+        reg.set_prime_configs_for_test(vec![cfg.clone()]).await;
+        assert!(reg.prime_for_chat(None::<&tauri::AppHandle<tauri::Wry>>, None).await);
+
+        let mut disabled = cfg.clone();
+        disabled.disabled = true;
+        reg.set_prime_configs_for_test(vec![disabled]).await;
+        assert!(reg.prime_for_chat(None::<&tauri::AppHandle<tauri::Wry>>, None).await);
+        assert!(matches!(reg.inner.lock().await.handles[&cfg.id].status, McpServerStatus::Stopped));
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        let inner = reg.inner.lock().await;
+        assert!(matches!(inner.handles[&cfg.id].status, McpServerStatus::Stopped));
+        assert!(!inner.startup_retries.contains_key(&cfg.id));
+    }
+
+    #[tokio::test]
+    async fn chat_prime_treats_background_retry_start_as_settled() {
+        let reg = McpRegistry::new();
+        let cfg = make_config("recovering", "recovering", "/no/such/binary/at/all");
+        reg.set_prime_configs_for_test(vec![cfg.clone()]).await;
+        reg.insert_recovering_starting_server_for_test(cfg).await;
+        assert!(reg.prime_for_chat(None::<&tauri::AppHandle<tauri::Wry>>, None).await);
+    }
+
+    #[tokio::test]
+    async fn chat_prime_recovers_an_unchanged_http_server_after_startup_failure() {
+        use mockito::Matcher;
+
+        let mut server = mockito::Server::new_async().await;
+        let mut cfg = make_config("recovering", "recovering", &format!("{}/mcp", server.url()));
+        cfg.transport = McpTransport::Http;
+        let reg = McpRegistry::new();
+        reg.set_prime_configs_for_test(vec![cfg]).await;
+
+        // The first initialize has no matching endpoint. The same config
+        // becomes available before the delayed retry, without a manual
+        // restart or a definition change.
+        assert!(reg.prime_for_chat(None::<&tauri::AppHandle<tauri::Wry>>, None).await);
+        assert!(matches!(reg.list_runtime().await[0].status, McpServerStatus::Errored { .. }));
+        let initialize = server.mock("POST", "/mcp")
+            .match_body(Matcher::PartialJson(serde_json::json!({"method": "initialize"})))
+            .with_header("content-type", "application/json")
+            .with_body(serde_json::json!({
+                "jsonrpc": "2.0", "id": 1,
+                "result": {
+                    "protocolVersion": "2025-06-18", "capabilities": {},
+                    "serverInfo": {"name": "recovering", "version": "1"}
+                }
+            }).to_string())
+            .expect(1)
+            .create_async().await;
+        let initialized = server.mock("POST", "/mcp")
+            .match_body(Matcher::PartialJson(serde_json::json!({"method": "notifications/initialized"})))
+            .with_status(202)
+            .expect(1)
+            .create_async().await;
+        let list = server.mock("POST", "/mcp")
+            .match_body(Matcher::PartialJson(serde_json::json!({"method": "tools/list"})))
+            .with_header("content-type", "application/json")
+            .with_body(serde_json::json!({
+                "jsonrpc": "2.0", "id": 2,
+                "result": {"tools": [{"name": "echo", "inputSchema": {"type": "object"}}]}
+            }).to_string())
+            .expect(1)
+            .create_async().await;
+        let _no_events = server.mock("GET", "/mcp").with_status(405).create_async().await;
+
+        tokio::time::timeout(Duration::from_secs(6), async {
+            loop {
+                if reg.list_runtime().await.iter().any(|row| {
+                    matches!(row.status, McpServerStatus::Running { tool_count: 1 })
+                }) {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        }).await.expect("unchanged server did not recover in the background");
+        assert_eq!(reg.list_all_tools().await[0].name, "echo");
+        initialize.assert_async().await;
+        initialized.assert_async().await;
+        list.assert_async().await;
+        reg.shutdown_all().await;
+    }
+
+    #[tokio::test]
+    async fn repeated_chat_primes_do_not_restart_a_persistently_failed_server() {
+        let reg = McpRegistry::new();
+        let cfg = make_config("offline", "offline", "/no/such/binary/at/all");
+        reg.set_prime_configs_for_test(vec![cfg.clone()]).await;
+        assert!(reg.prime_for_chat(None::<&tauri::AppHandle<tauri::Wry>>, None).await);
+        let initial = reg.inner.lock().await.handles[&cfg.id].config.raw["runtimeGeneration"].clone();
+        for _ in 0..6 {
+            assert!(reg.prime_for_chat(None::<&tauri::AppHandle<tauri::Wry>>, None).await);
+            assert_eq!(reg.inner.lock().await.handles[&cfg.id].config.raw["runtimeGeneration"], initial);
+        }
+
+        let retried = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let generation = reg.inner.lock().await.handles[&cfg.id].config.raw["runtimeGeneration"].clone();
+                if generation != initial {
+                    break generation;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        }).await.expect("the bounded background retry never ran");
+        for _ in 0..6 {
+            assert!(reg.prime_for_chat(None::<&tauri::AppHandle<tauri::Wry>>, None).await);
+            assert_eq!(reg.inner.lock().await.handles[&cfg.id].config.raw["runtimeGeneration"], retried);
+        }
+
+        // A user stop revokes the sleeping worker before its next attempt.
+        reg.stop_server(None::<&tauri::AppHandle<tauri::Wry>>, &cfg.id).await.unwrap();
+        tokio::time::sleep(Duration::from_secs(6)).await;
+        assert!(matches!(reg.list_runtime().await[0].status, McpServerStatus::Stopped));
+    }
+
+    #[tokio::test]
+    async fn manual_start_supersedes_a_sleeping_startup_retry() {
+        let reg = McpRegistry::new();
+        let cfg = make_config("offline", "offline", "/no/such/binary/at/all");
+        reg.set_prime_configs_for_test(vec![cfg.clone()]).await;
+        assert!(reg.prime_for_chat(None::<&tauri::AppHandle<tauri::Wry>>, None).await);
+        let initial = reg.inner.lock().await.handles[&cfg.id].config.raw["runtimeGeneration"].clone();
+
+        let manual = reg.ensure_started(None::<&tauri::AppHandle<tauri::Wry>>, cfg.clone()).await;
+        assert!(matches!(manual.status, McpServerStatus::Errored { .. }));
+        let manual_generation = reg.inner.lock().await.handles[&cfg.id].config.raw["runtimeGeneration"].clone();
+        assert_ne!(manual_generation, initial);
+
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        let inner = reg.inner.lock().await;
+        assert_eq!(inner.handles[&cfg.id].config.raw["runtimeGeneration"], manual_generation);
+        assert!(!inner.startup_retries.contains_key(&cfg.id));
+    }
+
+    #[tokio::test]
     async fn disabled_ids_short_circuit_ensure_started() {
         let reg = McpRegistry::new();
         reg.set_disabled_ids(
@@ -2197,6 +2910,116 @@ mod tests {
             ])
             .await;
         assert!(tools.is_empty());
+    }
+
+    #[tokio::test]
+    async fn project_tools_are_bound_to_the_callers_checkout() {
+        let first = tempfile::tempdir().unwrap();
+        let second = tempfile::tempdir().unwrap();
+        let first_scope = McpProjectScope::new(first.path());
+        let second_scope = McpProjectScope::new(second.path());
+        let registry = McpRegistry::new();
+        registry
+            .insert_running_server_for_test("global", vec![McpConfigSource::CodemuxUser])
+            .await;
+        registry
+            .insert_running_server_for_test_at(
+                "first",
+                vec![McpConfigSource::OpenCodeProject],
+                Some(&first_scope),
+            )
+            .await;
+        registry
+            .insert_running_server_for_test_at(
+                "second-local",
+                vec![McpConfigSource::ClaudeLocal],
+                Some(&second_scope),
+            )
+            .await;
+
+        let names = |tools: Vec<McpTool>| {
+            let mut names: Vec<String> = tools.into_iter().map(|tool| tool.prefixed_name).collect();
+            names.sort();
+            names
+        };
+        assert_eq!(
+            names(registry.list_tools_for_workspace(&[], Some("same-workspace"), Some(&first_scope)).await),
+            ["mcp__first__tool", "mcp__global__tool"],
+        );
+        assert_eq!(
+            names(registry.list_tools_for_workspace(&[], Some("same-workspace"), Some(&second_scope)).await),
+            ["mcp__global__tool", "mcp__second-local__tool"],
+        );
+        assert_eq!(
+            names(registry.list_tools_for_workspace(&[], Some("same-workspace"), None).await),
+            ["mcp__global__tool"],
+        );
+        assert!(registry.dispatch_tool_call_scoped("mcp__first__tool", serde_json::json!({}), None, Some(&first_scope)).await.unwrap_err().contains("no live transport"));
+        assert!(registry.dispatch_tool_call_scoped("mcp__first__tool", serde_json::json!({}), None, Some(&second_scope)).await.unwrap_err().contains("unknown MCP tool"));
+        assert!(registry.dispatch_tool_call("mcp__second-local__tool", serde_json::json!({}), None).await.unwrap_err().contains("unknown MCP tool"));
+    }
+
+    #[tokio::test]
+    async fn worktrees_with_shared_approval_do_not_share_running_tools() {
+        let first = tempfile::tempdir().unwrap();
+        let second = tempfile::tempdir().unwrap();
+        let first_scope = McpProjectScope::new(first.path());
+        let second_scope = McpProjectScope {
+            checkout: std::fs::canonicalize(second.path()).unwrap(),
+            approval_root: first_scope.approval_root.clone(),
+        };
+        let registry = McpRegistry::new();
+        for (id, scope) in [("first", &first_scope), ("second", &second_scope)] {
+            registry
+                .insert_running_server_for_test_at(
+                    id,
+                    vec![McpConfigSource::OpenCodeProject],
+                    Some(scope),
+                )
+                .await;
+        }
+        let first_tools = registry.list_tools_for_workspace(&[], None, Some(&first_scope)).await;
+        let second_tools = registry.list_tools_for_workspace(&[], None, Some(&second_scope)).await;
+        assert_eq!(first_tools.len(), 1);
+        assert_eq!(first_tools[0].server_id, "first");
+        assert_eq!(second_tools.len(), 1);
+        assert_eq!(second_tools[0].server_id, "second");
+        assert!(registry
+            .dispatch_tool_call_scoped("mcp__first__tool", serde_json::json!({}), None, Some(&second_scope))
+            .await
+            .unwrap_err()
+            .contains("unknown MCP tool"));
+    }
+
+    #[tokio::test]
+    async fn equal_tool_names_dispatch_to_the_callers_project() {
+        let first = tempfile::tempdir().unwrap();
+        let second = tempfile::tempdir().unwrap();
+        let first_scope = McpProjectScope::new(first.path());
+        let second_scope = McpProjectScope::new(second.path());
+        let registry = McpRegistry::new();
+        for (id, scope) in [("first", &first_scope), ("second", &second_scope)] {
+            registry
+                .insert_running_server_for_test_at(
+                    id,
+                    vec![McpConfigSource::OpenCodeProject],
+                    Some(scope),
+                )
+                .await;
+        }
+        {
+            let mut inner = registry.inner.lock().await;
+            for id in ["first", "second"] {
+                inner.handles.get_mut(id).unwrap().tools[0].prefixed_name = "mcp__shared__tool".into();
+            }
+        }
+        for (scope, expected) in [(&first_scope, "first"), (&second_scope, "second")] {
+            let error = registry
+                .dispatch_tool_call_scoped("mcp__shared__tool", serde_json::json!({}), None, Some(scope))
+                .await
+                .unwrap_err();
+            assert!(error.contains(&format!("MCP server '{expected}' has no live transport")), "{error}");
+        }
     }
 
     /// Regression guard: a large built-in tool surface must never
@@ -2427,6 +3250,7 @@ mod tests {
             transport: McpTransport::Http,
             raw: serde_json::json!({}),
             project_root: None,
+            checkout_root: None,
         };
         let row = reg
             .ensure_started(None::<&tauri::AppHandle<tauri::Wry>>, config)
@@ -2699,7 +3523,12 @@ mod project_trust_tests {
             let inner = reg.inner.lock().await;
             inner.cancel_calls.get(&config.id).unwrap().send_replace(true);
         }
-        let result = reg.dispatch_tool_call(&tool.prefixed_name, serde_json::json!({}), None).await;
+        let result = reg.dispatch_tool_call_scoped(
+            &tool.prefixed_name,
+            serde_json::json!({}),
+            None,
+            Some(&McpProjectScope::new(project.path())),
+        ).await;
         assert!(result.unwrap_err().contains("stopped during tools/call"));
         reg.shutdown_all().await;
     }
@@ -2979,6 +3808,7 @@ mod project_trust_tests {
             transport: super::super::McpTransport::Stdio,
             raw: serde_json::json!({}),
             project_root: None,
+            checkout_root: None,
         };
         let reg = McpRegistry::new();
         let row = reg
@@ -3130,6 +3960,7 @@ mod project_trust_tests {
             transport: super::super::McpTransport::Stdio,
             raw: serde_json::json!({}),
             project_root: (source == McpConfigSource::CodemuxProject).then(|| scratch.path().into()),
+            checkout_root: (source == McpConfigSource::CodemuxProject).then(|| scratch.path().into()),
         };
         let app = app();
         let reg = McpRegistry::new();

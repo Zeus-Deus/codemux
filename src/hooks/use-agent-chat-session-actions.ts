@@ -7,7 +7,7 @@ import {
   formatProviderError,
   parsePaneAlreadyBound,
 } from "@/lib/agent-chat/provider-error";
-import { sessionDisplayTitle } from "@/lib/agent-chat/session-history";
+import { resumeCursorForSession, sessionDisplayTitle } from "@/lib/agent-chat/session-history";
 import { toast } from "@/lib/toast";
 import { useAgentChatStore } from "@/stores/agent-chat-store";
 import { selectActiveWorkspaceId, useAppStore } from "@/stores/app-store";
@@ -32,7 +32,7 @@ export interface AgentChatSessionActions {
   provider: AgentChatProviderKind;
   /** Resume a persisted session: stop the current session, hydrate the
    *  new local thread with the picked chat's transcript, then start the
-   *  provider with the record's `sdk_session_id` as the resume cursor.
+   *  provider with the record's native id and any saved Codex catalog key.
    *  The record's persisted picker config (model / effort / context /
    *  permission mode) rides through to the launch so the resumed session
    *  runs in the same mode the user last chose — a NULL `permission_mode`
@@ -182,7 +182,7 @@ export function useAgentChatSessionActions(
             thread_id: newLocalThreadId,
             cwd,
             model: record.model,
-            resume_cursor: { resume: record.sdk_session_id },
+            resume_cursor: resumeCursorForSession(record),
             permission_mode: resolvedMode,
             effort: record.effort,
             context_window: record.context_window,
@@ -214,9 +214,7 @@ export function useAgentChatSessionActions(
           store.setPermissionMode(newThreadId, resolvedMode);
         }
         store.setSessionLaunchMode(newThreadId, resolvedMode);
-        toast.success(
-          `Resumed "${sessionDisplayTitle(record)}" — agent has the full history`,
-        );
+        toast.success(`Reopened "${sessionDisplayTitle(record)}"`);
       } catch (error) {
         if (adoptPaneBindingFromError(error)) return;
         toast.error(`Failed to reopen chat: ${formatProviderError(error)}`);

@@ -75,7 +75,8 @@ pub enum McpTransport {
 #[serde(rename_all = "camelCase")]
 pub struct McpServerConfig {
     /// Stable id derived from `(canonical config path | server name)`.
-    /// After dedupe, the canonical (lowest-rank) source's id wins.
+    /// After dedupe, the canonical source's id wins. A global user entry
+    /// takes priority over an identical checkout-local or project entry.
     pub id: String,
     /// User-facing alias (the key inside `mcpServers`).
     pub name: String,
@@ -94,11 +95,31 @@ pub struct McpServerConfig {
     /// Pass-through for unknown fields so we don't lose forward-compat info
     /// when round-tripping configs.
     pub raw: serde_json::Value,
-    /// Canonical root of the project whose own files define this server,
-    /// set by discovery for project sources (see [`is_project_source`]).
-    /// Approval is per project, so it is never read from a config file.
+    /// Canonical root used for project-file approval and Claude-local scope.
+    /// Set by discovery, never read from a config file or sent over IPC.
     #[serde(skip)]
     pub project_root: Option<std::path::PathBuf>,
+    /// Exact checkout where a project or Claude-local server was discovered.
+    /// Approval may be shared across Git worktrees, but tool access is not.
+    #[serde(skip)]
+    pub checkout_root: Option<std::path::PathBuf>,
+}
+
+/// The checkout a local chat was started in, fixed before it receives any
+/// registry tools. Project-file approvals follow registered Git worktrees;
+/// Claude's user-owned local entries are keyed to the exact checkout path.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct McpProjectScope {
+    pub checkout: std::path::PathBuf,
+    pub approval_root: std::path::PathBuf,
+}
+
+impl McpProjectScope {
+    pub fn new(path: &std::path::Path) -> Self {
+        let checkout = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+        let approval_root = project_trust::approval_root(&checkout);
+        Self { checkout, approval_root }
+    }
 }
 
 /// Sources read from files inside the project, which whoever wrote the
@@ -185,9 +206,8 @@ impl McpServerConfig {
         self
     }
 
-    /// Lowest-rank (most canonical) source for this entry. After dedupe
-    /// `sources[0]` is always the canonical one because we sort before
-    /// merging.
+    /// Canonical source for this entry. After dedupe `sources[0]` is the
+    /// selected source, which may outrank a lower-ranked scoped copy.
     pub fn primary_source(&self) -> McpConfigSource {
         self.sources.first().copied().unwrap_or(McpConfigSource::Codemux)
     }
@@ -241,8 +261,8 @@ pub fn source_rank(s: McpConfigSource) -> u8 {
 /// always stay as their own row. This preserves the "always on" badge
 /// even when a project file references Codemux's own command.
 ///
-/// The input is expected to be sorted by `(source_rank, name)` already so
-/// the first occurrence becomes canonical.
+/// The input is expected to be sorted by `(source_rank, name)` already.
+/// A later global user entry can replace an earlier scoped entry.
 pub fn dedupe_servers(servers: Vec<McpServerConfig>) -> Vec<McpServerConfig> {
     use std::collections::HashMap as Map;
 
@@ -310,11 +330,21 @@ pub fn dedupe_servers(servers: Vec<McpServerConfig>) -> Vec<McpServerConfig> {
             // A user-owned entry outranks a project file's copy of it, so
             // the merged row keeps the user's id (Settings' off switch),
             // `disabled` flag and remaining fields, whichever ranks first.
+            // A Claude-local entry is owned by the user but remains bound to
+            // one checkout. A global user entry must stay canonical when the
+            // same definition appears in both places.
+            let global_user_owned = |sources: &[McpConfigSource]| {
+                sources.iter().any(|source| {
+                    !is_project_source(*source) && *source != McpConfigSource::ClaudeLocal
+                })
+            };
             let user_owned = |sources: &[McpConfigSource]| {
                 sources.iter().any(|source| !is_project_source(*source))
             };
             let mut srv = srv;
-            if user_owned(&srv.sources) && !user_owned(&out[idx].sources) {
+            if (global_user_owned(&srv.sources) && !global_user_owned(&out[idx].sources))
+                || (user_owned(&srv.sources) && !user_owned(&out[idx].sources))
+            {
                 std::mem::swap(&mut out[idx], &mut srv);
             }
             // Merge: append the additional source(s) onto the canonical
@@ -351,6 +381,7 @@ mod tests {
             transport: McpTransport::Stdio,
             raw: serde_json::Value::Null,
             project_root: None,
+            checkout_root: None,
         }
     }
 
@@ -404,6 +435,19 @@ mod tests {
         assert_eq!(result[0].sources.len(), 2);
         assert_eq!(result[0].sources[0], McpConfigSource::ClaudeUser);
         assert_eq!(result[0].sources[1], McpConfigSource::CursorUser);
+    }
+
+    #[test]
+    fn identical_claude_local_entry_does_not_shadow_a_global_user_server() {
+        let mut local = make("shared", McpConfigSource::ClaudeLocal, "server", &[]);
+        local.project_root = Some("/checkout-a".into());
+        local.checkout_root = Some("/checkout-a".into());
+        let global = make("shared", McpConfigSource::CursorUser, "server", &[]);
+        let merged = dedupe_servers(vec![local, global.clone()]);
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].id, global.id);
+        assert_eq!(merged[0].sources, vec![McpConfigSource::CursorUser, McpConfigSource::ClaudeLocal]);
+        assert_eq!(merged[0].checkout_root, None);
     }
 
     #[test]

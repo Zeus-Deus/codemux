@@ -1240,6 +1240,7 @@ impl AgentProvider for HermesProvider {
                 vec![],
                 false,
             )
+            .for_project(Some(&input.cwd))
         });
         // Hermes 0.21.5 advertises no `mcpCapabilities` but takes HTTP servers.
         let mcp_servers = match &mcp {

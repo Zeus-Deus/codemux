@@ -7,12 +7,13 @@
 //! stream.
 
 use std::collections::{HashMap, VecDeque};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 use tokio::sync::{broadcast, Mutex, RwLock};
 #[path="managed_runtime.rs"]
 mod managed_runtime;
@@ -391,6 +392,7 @@ pub(crate) struct CodexSession {
     /// diagnostic / future use (e.g. rebinding the session to a new path).
     #[allow(dead_code)]
     pub cwd: PathBuf,
+    mcp_project_scope: Option<crate::mcp::McpProjectScope>,
     /// Wrapped JSON-RPC child. Shared via `Arc` with background tasks.
     child: RwLock<Arc<JsonRpcChild>>,
     chatgpt_runtime: Option<managed_runtime::ManagedSession>,
@@ -442,6 +444,9 @@ pub(crate) struct CodexSession {
     /// Codemux instructions for the tools listed at `thread/start`, added to
     /// every turn's developer instructions.
     guidance: Option<String>,
+    /// Hash of the checkout and exact dynamic tool catalog at thread/start.
+    /// Codex persists that catalog and thread/resume cannot replace it.
+    tool_catalog_key: String,
     /// The Plan pill: turns start in Codex's `plan` collaboration mode
     /// instead of `default`. Set by each composer send (see
     /// [`Self::select_collaboration_mode`]); the sandbox is untouched.
@@ -597,12 +602,22 @@ impl CodexSession {
             spawn.mcp_registry.as_ref(),
             spawn.remote.as_ref(),
         );
+        let mcp_project_scope = mcp_registry
+            .as_ref()
+            .map(|_| crate::mcp::McpProjectScope::new(&cwd));
         // Capture the live registry tool surface once for thread/start.
         // Codex persists dynamic tool definitions in the rollout, while the
         // request handler below always dispatches through the live registry.
         let initial_plugin_catalog = match mcp_registry.as_ref().filter(|_| managed.is_none()) {
             Some(registry) => registry.plugin_catalog(workspace_id.as_deref()).await,
             None => Vec::new(),
+        };
+        // Recovery can settle between the tool snapshot and the resume-key
+        // comparison. Remember both sides of that window before deciding a
+        // missing tool is a durable catalog change.
+        let catalog_recovering_before_snapshot = match mcp_registry.as_ref() {
+            Some(registry) => registry.has_visible_startup_retry(mcp_project_scope.as_ref()).await,
+            None => false,
         };
         let dynamic_tools = if let Some(context) = managed.as_ref() {
             Some(
@@ -625,9 +640,15 @@ impl CodexSession {
                 mcp_registry.as_ref(),
                 spawn.codex_home.is_some(),
                 &host_caller,
+                mcp_project_scope.as_ref(),
             )
             .await
         };
+        let catalog_checkout = mcp_project_scope
+            .as_ref()
+            .map(|scope| scope.checkout.clone())
+            .unwrap_or_else(|| std::fs::canonicalize(&cwd).unwrap_or_else(|_| cwd.clone()));
+        let tool_catalog_key = codex_tool_catalog_key(&catalog_checkout, dynamic_tools.as_deref());
 
         let tier_models = if grant.is_some() {
             let entries = read_model_catalog(&child).await
@@ -784,6 +805,35 @@ impl CodexSession {
             .and_then(|v| v.get("requireOriginal"))
             .and_then(Value::as_bool)
             .unwrap_or(false);
+        let catalog_recovering = catalog_recovering_before_snapshot || match mcp_registry.as_ref() {
+            Some(registry) => registry.has_visible_startup_retry(mcp_project_scope.as_ref()).await,
+            None => false,
+        };
+        let resume_cursor = match resume_cursor {
+            Some(cursor)
+                if codex_thread_id_from_resume_cursor(&cursor).is_some()
+                    && cursor.get("toolCatalogKey").and_then(Value::as_str)
+                        != Some(tool_catalog_key.as_str()) =>
+            {
+                if catalog_recovering {
+                    return Err(ProviderError::ValidationError {
+                        message: "MCP tools are recovering; retry this Codex chat when the tool catalog settles".into(),
+                    });
+                }
+                if require_original {
+                    return Err(ProviderError::ValidationError {
+                        message: "The original Codex thread has a different tool catalog or checkout and cannot be resumed safely".into(),
+                    });
+                }
+                let _ = event_tx.send(ProviderRuntimeEvent::RuntimeWarning {
+                    thread_id: Some(thread_id.clone()),
+                    message: "Codex tool access changed; starting a fresh thread".into(),
+                    original_payload: None,
+                });
+                None
+            }
+            other => other,
+        };
         let thread = match &resume_cursor {
             Some(cursor) => {
                 let resume_id = codex_thread_id_from_resume_cursor(cursor);
@@ -913,6 +963,7 @@ impl CodexSession {
             thread_id: thread_id.clone(),
             provider_session_id: ProviderSessionId(codex_thread_id.clone()),
             cwd,
+            mcp_project_scope,
             child: RwLock::new(Arc::clone(&child)),
             chatgpt_runtime: grant.as_ref().map(|g|managed_runtime::ManagedSession{owner:spawn.chatgpt_owner.as_ref().unwrap().clone(),spawn:spawn.clone(),env:env.iter().filter(|(k,_)|matches!(k.as_str(),"CODEMUX_WORKSPACE_ID"|"CODEMUX_PANE_ID"|"CODEMUX_HOOK_PORT"|"CODEMUX_CONTROL_SOCKET"|"CODEX_HOME")).map(|(k,v)|(k.clone(),v.clone())).collect(),revision:Mutex::new(g.revision.clone()),permission:permission_mode.clone(),models:Mutex::new(managed_models)}),
             runtime_lease: Mutex::new(runtime_lease.clone()),
@@ -929,6 +980,7 @@ impl CodexSession {
             managed: managed.clone(),
             host_caller,
             guidance: dynamic_tools.as_deref().and_then(developer_guidance),
+            tool_catalog_key,
             plugin_registry: mcp_registry.clone().filter(|_| managed.is_none()),
             plugin_catalog_seen: Mutex::new(plugin_snapshot.catalog_key),
             direct_tool_names: plugin_snapshot.direct_names,
@@ -1770,7 +1822,7 @@ impl CodexSession {
     pub async fn resume_cursor(&self) -> Value {
         // A known-empty snapshot still matters: plugins added while the app is
         // closed need a reminder after resume, rather than being treated as seen.
-        json!({"threadId":self.provider_session_id.0,"pluginTools":PluginToolSnapshot {
+        json!({"threadId":self.provider_session_id.0,"toolCatalogKey":self.tool_catalog_key,"pluginTools":PluginToolSnapshot {
             direct_names:self.direct_tool_names.clone(),catalog_key:self.plugin_catalog_seen.lock().await.clone(),
         }})
     }
@@ -2740,6 +2792,37 @@ pub(crate) fn codex_plan_label(plan_type: Option<&str>) -> Option<String> {
     })
 }
 
+/// A resumed Codex thread keeps its original dynamic tool definitions. Bind
+/// that persisted catalog to the exact checkout before deciding to resume.
+fn codex_tool_catalog_key(checkout: &Path, tools: Option<&[DynamicToolSpec]>) -> String {
+    let mut digest = Sha256::new();
+    digest.update(b"codemux-codex-tool-catalog-v1\0");
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        digest.update(checkout.as_os_str().as_bytes());
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStrExt;
+        for unit in checkout.as_os_str().encode_wide() {
+            digest.update(unit.to_le_bytes());
+        }
+    }
+    digest.update([u8::from(tools.is_some())]);
+    let mut specs = tools
+        .unwrap_or_default()
+        .iter()
+        .map(|tool| serde_json::to_vec(tool).expect("dynamic tool spec is serializable"))
+        .collect::<Vec<_>>();
+    specs.sort();
+    for spec in specs {
+        digest.update((spec.len() as u64).to_le_bytes());
+        digest.update(spec);
+    }
+    digest.finalize().iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
 fn codex_thread_id_from_resume_cursor(cursor: &Value) -> Option<String> {
     cursor
         .get("threadId")
@@ -3039,6 +3122,7 @@ fn spawn_incoming_requests_task(
                             handle_dynamic_tool_call_native(
                                 owned_registry.as_ref(),
                                 session.workspace_id.as_deref(),
+                                session.mcp_project_scope.as_ref(),
                                 Some((&host_caller, session.provider_session_id.0.as_str())),
                                 params, actor, &session.direct_tool_names,
                             ).await
@@ -3109,13 +3193,14 @@ async fn dynamic_tool_specs(
     registry: Option<&McpRegistry>,
     codex_home_managed: bool,
     host_caller: &crate::mcp::registry::HostCaller,
+    project: Option<&crate::mcp::McpProjectScope>,
 ) -> Option<Vec<DynamicToolSpec>> {
     let registry = registry?;
     let mut tools = if codex_home_managed {
-        registry.list_tools_for_workspace(&[], host_caller.workspace_id.as_deref()).await
+        registry.list_tools_for_workspace(&[], host_caller.workspace_id.as_deref(), project).await
     } else {
         registry
-            .list_tools_for_workspace(&[crate::mcp::McpConfigSource::CodexUser], host_caller.workspace_id.as_deref())
+            .list_tools_for_workspace(&[crate::mcp::McpConfigSource::CodexUser], host_caller.workspace_id.as_deref(), project)
             .await
     };
     tools.retain(|tool| crate::mcp::registry::native_tool_visible(tool, host_caller));
@@ -3161,12 +3246,13 @@ async fn handle_dynamic_tool_call(
     host: Option<(&crate::mcp::registry::HostCaller, &str)>,
     raw: Value,
 ) -> Value {
-    handle_dynamic_tool_call_native(registry, workspace_id, host, raw, None, &[]).await
+    handle_dynamic_tool_call_native(registry, workspace_id, None, host, raw, None, &[]).await
 }
 
 async fn handle_dynamic_tool_call_native(
     registry: Option<&McpRegistry>,
     workspace_id: Option<&str>,
+    project: Option<&crate::mcp::McpProjectScope>,
     host: Option<(&crate::mcp::registry::HostCaller, &str)>,
     raw: Value,
     actor: Option<crate::delegation::app::NativeActor>,
@@ -3193,8 +3279,8 @@ async fn handle_dynamic_tool_call_native(
                 _ if bridge.is_some() => bridge.unwrap(),
                 Some(result) => Ok(result),
                 None => match actor {
-                    Some(actor) => registry.dispatch_native_tool_call(&name, call.arguments, actor).await,
-                    None => registry.dispatch_tool_call(&name, call.arguments, workspace_id).await,
+                    Some(actor) => registry.dispatch_native_tool_call_scoped(&name, call.arguments, actor, project).await,
+                    None => registry.dispatch_tool_call_scoped(&name, call.arguments, workspace_id, project).await,
                 }
             }
         }
@@ -3995,7 +4081,7 @@ mod tests {
             if stop_before_capture { owner.invalidate(); db.stop_message_deliveries(&caller.thread_id).unwrap(); }
             let actor = crate::delegation::app::NativeActor { thread_id:caller.thread_id.clone(), provider:caller.provider, workspace_id:None, session_id:"session".into(), permission_mode:caller.permission_mode.clone(), permit:owner.capture_for_turn("turn") };
             if !stop_before_capture { owner.invalidate(); db.stop_message_deliveries(&caller.thread_id).unwrap(); }
-            let response = handle_dynamic_tool_call_native(Some(&registry), None, Some((&caller, "root")), json!({"threadId":"root","turnId":"turn","callId":"late","tool":"codemux_mcp__codemux__delegate_task","arguments":{}}), Some(actor), &[]).await;
+            let response = handle_dynamic_tool_call_native(Some(&registry), None, None, Some((&caller, "root")), json!({"threadId":"root","turnId":"turn","callId":"late","tool":"codemux_mcp__codemux__delegate_task","arguments":{}}), Some(actor), &[]).await;
             assert_eq!(response["success"], false, "a late host call must not acquire the post-Stop generation: {response}");
             assert!(response["contentItems"][0]["text"].as_str().unwrap().contains("revoked"));
         }
@@ -4025,6 +4111,7 @@ mod tests {
 
         let root = handle_dynamic_tool_call_native(
             Some(&registry),
+            None,
             None,
             Some((&caller, "codex-root")),
             request("codex-root"),
@@ -4106,12 +4193,41 @@ mod tests {
         let caller=crate::mcp::registry::HostCaller {control: None,thread_id:"thread".into(),provider:crate::agent_provider::ProviderKind::Codex,workspace_id:Some("ws".into()),permission_mode:None};
         for scope in ["all","plugin"] {
             let registry=crate::mcp::registry::test_support::plugin_fixture(scope).await;
-            let tools=dynamic_tool_specs(Some(&registry),false,&caller).await.unwrap();
+            let tools=dynamic_tool_specs(Some(&registry),false,&caller,None).await.unwrap();
             let tool=tools.iter().find(|DynamicToolSpec::Function{name,..}|name=="fixture__new_tool");
             if scope=="plugin" {assert!(tool.is_none());}
             else {let DynamicToolSpec::Function{description,..}=tool.unwrap();assert_eq!(description,"Use structured tools first.\n\nAlways use background delivery.");}
             registry.shutdown_all().await;
         }
+    }
+
+    #[tokio::test]
+    async fn project_tool_call_from_another_checkout_is_refused() {
+        let first = tempfile::tempdir().unwrap();
+        let second = tempfile::tempdir().unwrap();
+        let first_scope = crate::mcp::McpProjectScope::new(first.path());
+        let second_scope = crate::mcp::McpProjectScope::new(second.path());
+        let registry = McpRegistry::new();
+        registry
+            .insert_running_server_for_test_at(
+                "project",
+                vec![crate::mcp::McpConfigSource::OpenCodeProject],
+                Some(&first_scope),
+            )
+            .await;
+        let response = handle_dynamic_tool_call_native(
+            Some(&registry),
+            Some("ws-42"),
+            Some(&second_scope),
+            None,
+            json!({"threadId":"root","turnId":"turn","callId":"call",
+                "tool":"codemux_mcp__project__tool","arguments":{}}),
+            None,
+            &[],
+        )
+        .await;
+        assert_eq!(response["success"], false);
+        assert!(response["contentItems"][0]["text"].as_str().unwrap().contains("unknown MCP tool"));
     }
 
     #[tokio::test]
@@ -4126,7 +4242,7 @@ mod tests {
             permission_mode: None,
         };
         let local = crate::agent_provider::local_tool_registry(Some(&registry), None);
-        let published = dynamic_tool_specs(local.as_ref(), false, &caller).await.unwrap();
+        let published = dynamic_tool_specs(local.as_ref(), false, &caller, None).await.unwrap();
         assert_eq!(published.len(), 3); // shared tool plus the two live plugin entry points
 
         let device = crate::agent_provider::types::RemoteSpawnTarget {
@@ -4135,7 +4251,7 @@ mod tests {
             host_name: "ai-node".into(),
         };
         let on_device = crate::agent_provider::local_tool_registry(Some(&registry), Some(&device));
-        assert!(dynamic_tool_specs(on_device.as_ref(), true, &caller).await.is_none());
+        assert!(dynamic_tool_specs(on_device.as_ref(), true, &caller, None).await.is_none());
 
         // A call the device sends anyway, by a name it guessed, fails and
         // never reaches the registry.

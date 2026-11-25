@@ -136,11 +136,18 @@ pub fn parse_claude_wrapped_config(
                 // Use a synthetic id-path that distinguishes local-scope
                 // entries from the same name in user-scope.
                 let local_id_path = format!("{}#projects.{}", path_str, key);
-                out.extend(extract_servers(
+                let checkout = std::fs::canonicalize(root_path)
+                    .unwrap_or_else(|_| root_path.to_path_buf());
+                let mut local = extract_servers(
                     servers,
                     &local_id_path,
                     McpConfigSource::ClaudeLocal,
-                ));
+                );
+                for server in &mut local {
+                    server.project_root = Some(checkout.clone());
+                    server.checkout_root = Some(checkout.clone());
+                }
+                out.extend(local);
             }
         }
     }
@@ -260,6 +267,7 @@ fn extract_servers(
             transport,
             raw: file_raw(value),
             project_root: None,
+            checkout_root: None,
         });
     }
 
@@ -529,6 +537,8 @@ mod tests {
             by_name["local-scoped"].sources,
             vec![McpConfigSource::ClaudeLocal]
         );
+        assert_eq!(by_name["local-scoped"].project_root.as_deref(), Some(project_root.as_path()));
+        assert_eq!(by_name["local-scoped"].checkout_root.as_deref(), Some(project_root.as_path()));
     }
 
     #[test]

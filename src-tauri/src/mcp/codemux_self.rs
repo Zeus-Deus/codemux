@@ -32,6 +32,7 @@ pub fn codemux_self_config() -> McpServerConfig {
         transport: McpTransport::Stdio,
         raw: serde_json::Value::Null,
         project_root: None,
+        checkout_root: None,
     }
 }
 

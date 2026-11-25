@@ -589,7 +589,7 @@ async fn a_reopened_cursor_chat_takes_its_new_workspace() {
         .await
         .unwrap();
     timeout(Duration::from_secs(10), async {
-        while registry.list_tools_for_workspace(&[], Some("ws-a")).await.is_empty() {
+        while registry.list_tools_for_workspace(&[], Some("ws-a"), None).await.is_empty() {
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
     })

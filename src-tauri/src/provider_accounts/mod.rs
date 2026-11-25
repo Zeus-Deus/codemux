@@ -289,6 +289,17 @@ impl Removed {
 /// removal lands wholly before (the id is refused) or after (it clears the
 /// id). Returns whether the id was stored.
 pub fn store_reported_native(db: &DatabaseStore, thread_id: &str, native: &str) -> Result<bool, String> {
+    store_reported_native_with_catalog_key(db, thread_id, native, None)
+}
+
+/// Store a Codex catalog binding under the same account-removal decision as
+/// its native id. Other providers pass `None` and clear any stale binding.
+pub fn store_reported_native_with_catalog_key(
+    db: &DatabaseStore,
+    thread_id: &str,
+    native: &str,
+    codex_tool_catalog_key: Option<&str>,
+) -> Result<bool, String> {
     let mut removed = removed();
     let removed = removed.get_or_insert_with(Default::default);
     let provider = db
@@ -304,7 +315,7 @@ pub fn store_reported_native(db: &DatabaseStore, thread_id: &str, native: &str) 
             return Ok(false);
         }
     }
-    db.set_agent_chat_sdk_session_id(thread_id, native)?;
+    db.set_agent_chat_native_cursor(thread_id, native, codex_tool_catalog_key)?;
     Ok(true)
 }
 

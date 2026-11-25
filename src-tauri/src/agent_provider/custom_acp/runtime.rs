@@ -558,6 +558,7 @@ impl Session {
                     vec![],
                     false,
                 )
+                .for_project(Some(&cwd))
             })
         });
         let mut environment = launch.environment.clone();
