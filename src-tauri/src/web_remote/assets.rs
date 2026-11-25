@@ -40,20 +40,20 @@ pub async fn serve<R: Runtime>(
     headers: HeaderMap,
     Query(query): Query<AssetQuery>,
 ) -> Response {
-    if let Err(resp) = super::server::require_session(&app, &headers) {
-        return resp;
-    }
-
-    match open_asset(Path::new(&query.path)).await {
-        Ok(asset) => {
-            // Stream the file rather than buffering it whole — a web client
-            // may request a large image/media file.
-            let stream = tokio_util::io::ReaderStream::new(asset.file);
-            let body = axum::body::Body::from_stream(stream);
-            asset_response(asset.mime, asset.len, body)
-        }
-        Err(AssetError::NotFound) => (StatusCode::NOT_FOUND, "not found").into_response(),
-    }
+    let response = match super::server::require_session(&app, &headers) {
+        Err(resp) => resp,
+        Ok(_) => match open_asset(Path::new(&query.path)).await {
+            Ok(asset) => {
+                // Stream the file rather than buffering it whole — a web client
+                // may request a large image/media file.
+                let stream = tokio_util::io::ReaderStream::new(asset.file);
+                let body = axum::body::Body::from_stream(stream);
+                asset_response(asset.mime, asset.len, body)
+            }
+            Err(AssetError::NotFound) => (StatusCode::NOT_FOUND, "not found").into_response(),
+        },
+    };
+    super::private_response(response)
 }
 
 /// CSP applied when a scriptable asset is opened as a top-level document.
@@ -174,6 +174,57 @@ fn guess_mime(path: &Path) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::web_remote::{auth, server};
+    use tauri::Manager;
+
+    #[tokio::test]
+    async fn asset_responses_are_private_on_success_not_found_and_auth_failure() {
+        let app = tauri::test::mock_app();
+        let db = crate::database::DatabaseStore::new_in_memory();
+        db.web_remote_insert_session("asset-test", None, None, &auth::sha256_hex("token"), true)
+            .unwrap();
+        app.manage(db);
+
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::COOKIE,
+            format!("{}=token", server::SESSION_COOKIE).parse().unwrap(),
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("private.html");
+        tokio::fs::write(&path, b"private content").await.unwrap();
+
+        for (path, headers, status) in [
+            (
+                path.to_string_lossy().into_owned(),
+                headers.clone(),
+                StatusCode::OK,
+            ),
+            (
+                dir.path()
+                    .join("missing.html")
+                    .to_string_lossy()
+                    .into_owned(),
+                headers,
+                StatusCode::NOT_FOUND,
+            ),
+            (
+                path.to_string_lossy().into_owned(),
+                HeaderMap::new(),
+                StatusCode::UNAUTHORIZED,
+            ),
+        ] {
+            let response = serve(
+                State(app.handle().clone()),
+                headers,
+                Query(AssetQuery { path }),
+            )
+            .await;
+            assert_eq!(response.status(), status);
+            assert_eq!(response.headers()[header::CACHE_CONTROL], "private, no-store");
+            assert_eq!(response.headers()[header::REFERRER_POLICY], "no-referrer");
+        }
+    }
 
     #[tokio::test]
     async fn serves_regular_file_with_guessed_mime_and_length() {

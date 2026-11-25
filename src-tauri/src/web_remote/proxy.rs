@@ -211,22 +211,22 @@ pub async fn http_forward<R: Runtime>(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    if let Err(resp) = super::server::require_session(&app, &headers) {
-        return resp;
-    }
-    if !port_in_range(port) {
-        return (StatusCode::BAD_REQUEST, "port out of range").into_response();
-    }
     // Reject a percent-decoded CR/LF (or other control char) in the path before
     // it reaches the raw request line — no header/request smuggling to the
     // daemon. (`uri.query()` stays percent-encoded, so it needs no such guard.)
-    if has_control_char(&rest) {
-        return (StatusCode::BAD_REQUEST, "invalid path").into_response();
-    }
-    match forward(port, &method, &rest, uri.query(), &headers, &body).await {
-        Ok(resp) => resp,
-        Err(()) => (StatusCode::BAD_GATEWAY, "daemon unreachable").into_response(),
-    }
+    let response = if let Err(resp) = super::server::require_session(&app, &headers) {
+        resp
+    } else if !port_in_range(port) {
+        (StatusCode::BAD_REQUEST, "port out of range").into_response()
+    } else if has_control_char(&rest) {
+        (StatusCode::BAD_REQUEST, "invalid path").into_response()
+    } else {
+        match forward(port, &method, &rest, uri.query(), &headers, &body).await {
+            Ok(resp) => resp,
+            Err(()) => (StatusCode::BAD_GATEWAY, "daemon unreachable").into_response(),
+        }
+    };
+    super::private_response(response)
 }
 
 /// Open a raw TCP connection to the daemon, write a minimal single-segment
@@ -488,6 +488,74 @@ mod tests {
             }
         }
         panic!("no free loopback port in the browser daemon range");
+    }
+
+    #[tokio::test]
+    async fn browser_proxy_responses_are_private_on_success_and_errors() {
+        let app = tauri::test::mock_app();
+        let db = crate::database::DatabaseStore::new_in_memory();
+        db.web_remote_insert_session("proxy-test", None, None, &auth::sha256_hex("token"), true)
+            .unwrap();
+        app.manage(db);
+
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::COOKIE,
+            format!("{}=token", server::SESSION_COOKIE).parse().unwrap(),
+        );
+
+        let daemon = bind_test_daemon().await;
+        let port = daemon.local_addr().unwrap().port();
+        let daemon_task = tokio::spawn(async move {
+            for raw in [
+                b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\r\n{\"ok\":true}".as_slice(),
+                b"HTTP/1.1 403 Forbidden\r\nContent-Type: application/json\r\n\r\n{\"secret\":true}",
+            ] {
+                let (mut socket, _) = daemon.accept().await.unwrap();
+                let mut request = [0u8; 4096];
+                let n = socket.read(&mut request).await.unwrap();
+                assert!(n > 0);
+                socket.write_all(raw).await.unwrap();
+            }
+        });
+
+        for (rest, method, expected_status) in [
+            ("status", Method::GET, StatusCode::OK),
+            ("command", Method::POST, StatusCode::FORBIDDEN),
+        ] {
+            let response = http_forward(
+                State(app.handle().clone()),
+                Path((port, rest.to_owned())),
+                method,
+                format!("/proxy/browser/{port}/api/{rest}").parse().unwrap(),
+                headers.clone(),
+                Bytes::new(),
+            )
+            .await;
+            assert_eq!(response.status(), expected_status);
+            assert_eq!(response.headers()[header::CACHE_CONTROL], "private, no-store");
+            assert_eq!(response.headers()[header::REFERRER_POLICY], "no-referrer");
+        }
+        daemon_task.await.unwrap();
+
+        for (port, rest, request_headers, expected_status) in [
+            (port, "status", HeaderMap::new(), StatusCode::UNAUTHORIZED),
+            (0, "status", headers.clone(), StatusCode::BAD_REQUEST),
+            (port, "status\r\nInjected: true", headers, StatusCode::BAD_REQUEST),
+        ] {
+            let response = http_forward(
+                State(app.handle().clone()),
+                Path((port, rest.to_owned())),
+                Method::GET,
+                format!("/proxy/browser/{port}/api/status").parse().unwrap(),
+                request_headers,
+                Bytes::new(),
+            )
+            .await;
+            assert_eq!(response.status(), expected_status);
+            assert_eq!(response.headers()[header::CACHE_CONTROL], "private, no-store");
+            assert_eq!(response.headers()[header::REFERRER_POLICY], "no-referrer");
+        }
     }
 
     type TestSocket = WebSocketStream<TcpStream>;
