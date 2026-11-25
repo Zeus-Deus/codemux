@@ -4662,6 +4662,7 @@ mod tests {
         let mut stream = StreamSession {
             port: 9223,
             running: true,
+            browser_ready: true,
             pid: Some(41),
             pid_start_time: Some(100),
             stream_generation: 1,
@@ -4693,6 +4694,7 @@ mod tests {
         manager.sessions.lock().await.insert(session.clone(), StreamSession {
             port: identity.port,
             running: true,
+            browser_ready: true,
             pid: Some(identity.pid),
             pid_start_time: Some(identity.start_time),
             stream_generation: identity.generation,

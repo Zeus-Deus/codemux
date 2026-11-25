@@ -644,7 +644,7 @@ mod tests {
     async fn websocket_peer_check_sends_no_handshake_to_unrelated_listener() {
         let daemon = bind_test_daemon().await;
         let port = daemon.local_addr().unwrap().port();
-        let server = tokio::spawn(async move {
+        let upstream = tokio::spawn(async move {
             let (mut stream, _) = daemon.accept().await.unwrap();
             let mut buf = [0; 1];
             tokio::time::timeout(Duration::from_secs(2), stream.read(&mut buf))
@@ -653,12 +653,34 @@ mod tests {
                 .unwrap()
         });
         let (unrelated, identity) = unrelated_live_identity(port);
-        // bridge_ws uses this verified connection before client_async writes
-        // the WebSocket upgrade, so rejection here must send no handshake.
-        let connection = crate::agent_browser::connect_verified_stream_peer(identity).await;
-        let received = server.await.unwrap();
+        async fn direct_bridge(
+            State(identity): State<BrowserStreamIdentity>,
+            ws: WebSocketUpgrade,
+        ) -> Response {
+            ws.on_upgrade(move |socket| bridge_ws(socket, identity))
+        }
+        let bridge_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let bridge_address = bridge_listener.local_addr().unwrap();
+        let bridge_server = tokio::spawn(async move {
+            axum::serve(
+                bridge_listener,
+                axum::Router::new().route("/ws", axum::routing::get(direct_bridge)).with_state(identity),
+            )
+            .await
+            .unwrap();
+        });
+        let url = format!("ws://{bridge_address}/ws");
+        let (mut client, _) = tokio_tungstenite::client_async(
+            &url,
+            TcpStream::connect(bridge_address).await.unwrap(),
+        )
+        .await
+        .unwrap();
+        let received = upstream.await.unwrap();
+        assert_peer_closed(&mut client).await;
+        bridge_server.abort();
+        let _ = bridge_server.await;
         drop(unrelated);
-        assert!(connection.is_err());
         assert_eq!(received, 0, "rejected peer received WebSocket handshake bytes");
     }
 

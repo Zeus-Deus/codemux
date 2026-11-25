@@ -1,7 +1,7 @@
 //! App-local bridge for agent-browser's origin-restricted stream endpoint.
 //! Each URL carries a random capability tied to one verified daemon lifetime.
 
-use std::{collections::HashMap, sync::Arc};
+use std::{collections::HashMap, future::Future, sync::Arc};
 
 use axum::{
     body::Bytes,
@@ -104,14 +104,36 @@ impl BrowserStreamBridge {
 
         // Reuse one capability across overlapping panes for the same daemon,
         // but invalidate it when that daemon's generation changes.
-        let mut targets = self.targets.write().await;
-        let token = issue_token(&mut targets, browser_id, identity);
+        let token = publish_current_token(&self.targets, &browser_id, identity, || {
+            manager.verified_stream_identity(&browser_id)
+        })
+        .await?;
         let base = format!("127.0.0.1:{port}/{token}");
         Ok(BrowserStreamBridgeEndpoints {
             ws_url: format!("ws://{base}/ws"),
             http_base: format!("http://{base}"),
         })
     }
+}
+
+async fn publish_current_token<F, Fut>(
+    targets: &Arc<RwLock<HashMap<String, BridgeTarget>>>,
+    browser_id: &str,
+    captured: BrowserStreamIdentity,
+    verify: F,
+) -> Result<String, String>
+where
+    F: FnOnce() -> Fut,
+    Fut: Future<Output = Result<BrowserStreamIdentity, String>>,
+{
+    // Verification and publication share the token lock. An older endpoint
+    // request must not revoke a replacement daemon's capability after it
+    // finishes waiting for bridge startup.
+    let mut targets = targets.write().await;
+    if verify().await? != captured {
+        return Err("Browser session changed before its stream URL was issued".into());
+    }
+    Ok(issue_token(&mut targets, browser_id.to_owned(), captured))
 }
 
 fn issue_token(
@@ -329,5 +351,47 @@ mod tests {
         let replacement = issue_token(&mut targets, "browser-a".into(), newer);
         assert_ne!(replacement, token);
         assert!(!targets.contains_key(&token));
+    }
+
+    #[tokio::test]
+    async fn delayed_old_request_cannot_revoke_replacement_capability() {
+        let targets = Arc::new(RwLock::new(HashMap::new()));
+        let old = BrowserStreamIdentity {
+            port: 9223,
+            pid: 1,
+            start_time: 10,
+            generation: 1,
+        };
+        let replacement = BrowserStreamIdentity {
+            generation: 2,
+            ..old
+        };
+        let old_token = publish_current_token(&targets, "browser-a", old, || async { Ok(old) })
+            .await
+            .unwrap();
+        let (release_old, older_request_ready) = tokio::sync::oneshot::channel::<()>();
+        let older_targets = targets.clone();
+        let older_request = tokio::spawn(async move {
+            older_request_ready.await.unwrap();
+            publish_current_token(&older_targets, "browser-a", old, || async {
+                Ok(replacement)
+            })
+            .await
+        });
+        let replacement_token = publish_current_token(&targets, "browser-a", replacement, || async {
+            Ok(replacement)
+        })
+        .await
+        .unwrap();
+        assert_ne!(replacement_token, old_token);
+
+        // The first request captured `old` before the replacement, then
+        // reached token publication after the replacement request did.
+        release_old.send(()).unwrap();
+        let late = older_request.await.unwrap();
+        assert!(late.is_err());
+        let targets = targets.read().await;
+        assert_eq!(targets.len(), 1);
+        assert_eq!(targets[&replacement_token].identity, replacement);
     }
 }
