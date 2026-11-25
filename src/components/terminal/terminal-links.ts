@@ -79,10 +79,13 @@ export function resolveTerminalPath(path: string, cwd: string | null | undefined
   return normalizePath(absolute ? path : `${cwd}/${path}`);
 }
 
-/** The loopback hosts a dev server prints. These open inside Codemux. */
+/** The loopback hosts a dev server prints. These open inside Codemux, so
+ *  only web addresses qualify: `file://localhost/...` is not a dev server. */
 export function isLoopbackUrl(url: string): boolean {
   try {
-    const host = new URL(url).hostname.replace(/^\[|\]$/g, "");
+    const parsed = new URL(url);
+    if (parsed.protocol !== "http:" && parsed.protocol !== "https:") return false;
+    const host = parsed.hostname.replace(/^\[|\]$/g, "");
     return (
       host === "localhost" ||
       host.endsWith(".localhost") ||
@@ -93,6 +96,66 @@ export function isLoopbackUrl(url: string): boolean {
   } catch {
     return false;
   }
+}
+
+/** Schemes an OSC 8 hyperlink may open. Anything else (`file:`, `ssh:`,
+ *  custom app schemes) is program output asking to launch a local handler. */
+const HYPERLINK_SCHEMES = new Set(["http:", "https:", "mailto:"]);
+
+/**
+ * The address an OSC 8 hyperlink opens, or null when it must not open.
+ * Normalized through the URL parser, which percent-encodes control and
+ * non-ASCII characters, so the address shown to the user is the one opened.
+ */
+export function terminalHyperlinkTarget(uri: string): string | null {
+  try {
+    const url = new URL(uri);
+    return HYPERLINK_SCHEMES.has(url.protocol) ? url.href : null;
+  } catch {
+    return null;
+  }
+}
+
+/** True when a hyperlink's visible text is its own address, so the user
+ *  already sees where it goes. Any other label could be a disguise. */
+export function hyperlinkTextMatchesTarget(text: string, target: string): boolean {
+  const shown = text.trim();
+  if (shown === target) return true;
+  try {
+    return new URL(shown).href === target;
+  } catch {
+    return false;
+  }
+}
+
+const MAX_TITLE_URL = 500;
+
+/** Hover text for an OSC 8 hyperlink: its real address, then how to open it. */
+export function hyperlinkTitle(uri: string, hint: string): string {
+  const target = terminalHyperlinkTarget(uri);
+  // A refused address is shown raw, minus control and format (bidi) characters.
+  let shown = target ?? uri.replace(/[\p{Cc}\p{Cf}]/gu, "");
+  if (shown.length > MAX_TITLE_URL) shown = `${shown.slice(0, MAX_TITLE_URL)}…`;
+  return `${shown}\n${target ? hint : "This kind of link can't be opened from the terminal"}`;
+}
+
+/** The text drawn in a buffer range (1-based, inclusive, as xterm reports
+ *  link ranges). */
+export function readRangeText(term: Pick<Terminal, "buffer">, range: IBufferRange): string {
+  const buffer = term.buffer.active;
+  let text = "";
+  for (let y = range.start.y; y <= range.end.y; y++) {
+    const line = buffer.getLine(y - 1);
+    if (!line) break;
+    const from = y === range.start.y ? range.start.x - 1 : 0;
+    const to = y === range.end.y ? range.end.x - 1 : line.length - 1;
+    for (let x = from; x <= to && x < line.length; x++) {
+      const cell = line.getCell(x);
+      if (!cell || cell.getWidth() === 0) continue;
+      text += cell.getChars() || " ";
+    }
+  }
+  return text;
 }
 
 /**

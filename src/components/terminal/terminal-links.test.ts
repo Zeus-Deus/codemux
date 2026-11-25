@@ -3,10 +3,14 @@ import type { Terminal } from "@xterm/xterm";
 
 import {
   findTerminalLinks,
+  hyperlinkTextMatchesTarget,
+  hyperlinkTitle,
   isLoopbackUrl,
   rangeForMatch,
   readLogicalLine,
+  readRangeText,
   resolveTerminalPath,
+  terminalHyperlinkTarget,
 } from "./terminal-links";
 
 describe("findTerminalLinks", () => {
@@ -96,6 +100,60 @@ describe("isLoopbackUrl", () => {
     expect(isLoopbackUrl("http://app.localhost")).toBe(true);
     expect(isLoopbackUrl("https://github.com")).toBe(false);
   });
+
+  it("only treats web addresses as dev servers", () => {
+    expect(isLoopbackUrl("file://localhost/etc/passwd")).toBe(false);
+    expect(isLoopbackUrl("ftp://127.0.0.1/")).toBe(false);
+  });
+});
+
+describe("terminalHyperlinkTarget", () => {
+  it("allows web and mail addresses only", () => {
+    expect(terminalHyperlinkTarget("https://github.com/o/r")).toBe("https://github.com/o/r");
+    expect(terminalHyperlinkTarget("http://localhost:5173")).toBe("http://localhost:5173/");
+    expect(terminalHyperlinkTarget("mailto:dev@example.com")).toBe("mailto:dev@example.com");
+    expect(terminalHyperlinkTarget("file:///etc/passwd")).toBeNull();
+    expect(terminalHyperlinkTarget("file://localhost/etc/passwd")).toBeNull();
+    expect(terminalHyperlinkTarget("javascript:alert(1)")).toBeNull();
+    expect(terminalHyperlinkTarget("vscode://file/x")).toBeNull();
+    expect(terminalHyperlinkTarget("not a url")).toBeNull();
+  });
+});
+
+describe("hyperlinkTextMatchesTarget", () => {
+  it("matches a label that is its own address", () => {
+    expect(hyperlinkTextMatchesTarget("https://example.com/a", "https://example.com/a")).toBe(true);
+    // The parser's normalization (trailing slash) is not a disguise.
+    expect(hyperlinkTextMatchesTarget(" https://example.com ", "https://example.com/")).toBe(true);
+  });
+
+  it("rejects a label that names somewhere else", () => {
+    expect(
+      hyperlinkTextMatchesTarget("https://github.com/o/r/pull/7", "https://evil.example/oauth"),
+    ).toBe(false);
+    expect(hyperlinkTextMatchesTarget("docs", "https://example.com/")).toBe(false);
+    // Same host, different path still differs from what the reader sees.
+    expect(hyperlinkTextMatchesTarget("https://example.com/a", "https://example.com/b")).toBe(false);
+  });
+});
+
+describe("hyperlinkTitle", () => {
+  it("shows the real address above the hint", () => {
+    expect(hyperlinkTitle("https://evil.example/oauth", "Ctrl+click to open")).toBe(
+      "https://evil.example/oauth\nCtrl+click to open",
+    );
+  });
+
+  it("says when a link cannot be opened and strips control characters", () => {
+    expect(hyperlinkTitle("file:///etc/‮passwd\u0007", "Ctrl+click to open")).toBe(
+      "file:///etc/passwd\nThis kind of link can't be opened from the terminal",
+    );
+  });
+
+  it("truncates a very long address", () => {
+    const title = hyperlinkTitle(`https://example.com/${"a".repeat(1000)}`, "hint");
+    expect(title.split("\n")[0]).toHaveLength(501);
+  });
 });
 
 /** A buffer of fixed-width rows; `wide` marks two-cell glyphs. */
@@ -115,6 +173,17 @@ function fakeTerminal(rows: { cells: string[]; wrapped?: boolean }[]) {
     buffer: { active: { getLine: (y: number) => lines[y] } },
   } as unknown as Pick<Terminal, "buffer">;
 }
+
+describe("readRangeText", () => {
+  it("reads the cells inside a 1-based inclusive range, skipping wide-glyph spacers", () => {
+    const term = fakeTerminal([
+      { cells: ["x", "✅", "\u0000", "o", "k", " "] },
+      { cells: ["n", "e", "x", "t", " ", " "] },
+    ]);
+    expect(readRangeText(term, { start: { x: 2, y: 1 }, end: { x: 5, y: 1 } })).toBe("✅ok");
+    expect(readRangeText(term, { start: { x: 4, y: 1 }, end: { x: 2, y: 2 } })).toBe("ok ne");
+  });
+});
 
 describe("readLogicalLine", () => {
   it("joins wrapped rows and maps wide glyphs to their cells", () => {
