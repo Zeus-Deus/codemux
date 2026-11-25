@@ -129,6 +129,7 @@ fn retryable_startup_failure(handle: &McpServerHandle) -> bool {
 
 struct StartupRetryState {
     definition: McpServerConfig,
+    discovery_root: Option<PathBuf>,
     task_id: String,
     generation: String,
     active: bool,
@@ -244,6 +245,53 @@ impl std::fmt::Debug for McpRegistry {
 }
 
 impl McpRegistry {
+    async fn prime_discovery(&self, project_root: Option<&std::path::Path>) -> Vec<McpServerConfig> {
+        #[cfg(test)]
+        if let Some(configs) = self.inner.lock().await.prime_configs_for_test.clone() {
+            return configs;
+        }
+        discover_configs(project_root)
+    }
+
+    /// A retry may use its captured definition only while that definition is
+    /// still enabled in the same discovery scope. Read the files again after
+    /// the backoff, while the server lifecycle lock is held.
+    async fn retry_definition_is_current(
+        &self,
+        config: &McpServerConfig,
+        task_id: &str,
+    ) -> bool {
+        let root = {
+            let inner = self.inner.lock().await;
+            inner.startup_retries.get(&config.id)
+                .filter(|retry| retry.active && retry.task_id == task_id
+                    && same_prime_definition(&retry.definition, config))
+                .map(|retry| retry.discovery_root.clone())
+        };
+        let Some(root) = root else { return false };
+        let current = self.prime_discovery(root.as_deref()).await.into_iter().any(|discovered| {
+            discovered.id == config.id && !discovered.disabled
+                && same_prime_definition(&discovered, config)
+        });
+        if !current {
+            let mut inner = self.inner.lock().await;
+            if inner.startup_retries.get(&config.id).is_some_and(|retry| retry.task_id == task_id) {
+                inner.startup_retries.remove(&config.id);
+            }
+        }
+        current
+    }
+
+    /// A saved Codex catalog may be compared against the live tools while a
+    /// failed server is recovering. A mismatch must wait for that server's
+    /// next settled catalog instead of starting a replacement thread.
+    pub async fn has_visible_startup_retry(&self, project: Option<&McpProjectScope>) -> bool {
+        let inner = self.inner.lock().await;
+        inner.startup_retries.values().any(|retry| {
+            retry.active && visible_in_project(&retry.definition, project)
+        })
+    }
+
     /// Cheap clone of the registry handle. Exit-handler shorthand.
     pub fn clone_handle(&self) -> Self {
         self.clone()
@@ -683,6 +731,12 @@ impl McpRegistry {
         let lifecycle = server_lock.lock().await;
 
         if let Some((task_id, generation)) = retry_guard {
+            if !self.retry_definition_is_current(&config, task_id).await {
+                let inner = self.inner.lock().await;
+                return inner.handles.get(&id)
+                    .map(McpServerRuntime::from_handle)
+                    .unwrap_or_else(|| McpServerRuntime::from_handle(&McpServerHandle::discovered(config)));
+            }
             let inner = self.inner.lock().await;
             let Some(handle) = inner.handles.get(&id) else {
                 return McpServerRuntime::from_handle(&McpServerHandle::discovered(config));
@@ -1259,6 +1313,7 @@ impl McpRegistry {
         &self,
         app: Option<&AppHandle<R>>,
         config: &McpServerConfig,
+        project_root: Option<&std::path::Path>,
     ) {
         let id = config.id.clone();
         let task_id = uuid::Uuid::new_v4().to_string();
@@ -1284,6 +1339,7 @@ impl McpRegistry {
             }
             inner.startup_retries.insert(id.clone(), StartupRetryState {
                 definition: config.clone(),
+                discovery_root: project_root.map(std::path::Path::to_path_buf),
                 task_id: task_id.clone(),
                 generation: generation.clone(),
                 active: true,
@@ -1364,11 +1420,21 @@ impl McpRegistry {
         // (see `prime_lock`). The second waiter finds every server already
         // `Starting`/`Running` and no-ops through `ensure_started`.
         let _prime_guard = self.prime_lock.lock().await;
-        #[cfg(not(test))]
-        let configs = discover_configs(project_root);
-        #[cfg(test)]
-        let configs = self.inner.lock().await.prime_configs_for_test.clone()
-            .unwrap_or_else(|| discover_configs(project_root));
+        let configs = self.prime_discovery(project_root).await;
+        let stale_retries = {
+            let inner = self.inner.lock().await;
+            inner.startup_retries.iter()
+                .filter(|(_, retry)| retry.discovery_root.as_deref() == project_root)
+                .filter(|(id, retry)| !configs.iter().any(|config| {
+                    &config.id == *id && !config.disabled
+                        && same_prime_definition(&retry.definition, config)
+                }))
+                .map(|(id, _)| id.clone())
+                .collect::<Vec<_>>()
+        };
+        for id in stale_retries {
+            let _ = self.stop_server(app, &id).await;
+        }
         self.remember_native_scoped_sources(project_root, &configs).await;
         let mut settled = true;
         for cfg in configs {
@@ -1395,12 +1461,20 @@ impl McpRegistry {
                 None => self.ensure_started(app, cfg.clone()).await,
             };
             if !disabled && approved && matches!(row.status, McpServerStatus::Errored { .. }) {
-                self.schedule_startup_retry(app, &cfg).await;
+                self.schedule_startup_retry(app, &cfg, project_root).await;
             }
             // A previous prime may still be discovering this server. Terminal
             // failures are settled: the adapter's catalog hash decides
             // whether their absent tools change a saved Codex thread.
-            if !disabled && matches!(row.status, McpServerStatus::Discovered | McpServerStatus::Starting | McpServerStatus::Stopping) {
+            let recovering = if matches!(row.status, McpServerStatus::Starting) {
+                let inner = self.inner.lock().await;
+                inner.startup_retries.get(&cfg.id).is_some_and(|retry| {
+                    retry.active && same_prime_definition(&retry.definition, &cfg)
+                })
+            } else {
+                false
+            };
+            if !disabled && !recovering && matches!(row.status, McpServerStatus::Discovered | McpServerStatus::Starting | McpServerStatus::Stopping) {
                 settled = false;
             }
         }
@@ -1422,6 +1496,26 @@ impl McpRegistry {
         let mut handle = McpServerHandle::discovered(config);
         handle.status = McpServerStatus::Starting;
         self.inner.lock().await.handles.insert(handle.config.id.clone(), handle);
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn insert_recovering_starting_server_for_test(&self, mut config: McpServerConfig) {
+        if !config.raw.is_object() {
+            config.raw = serde_json::json!({});
+        }
+        config.raw["runtimeGeneration"] = serde_json::json!("retry-start");
+        let mut handle = McpServerHandle::discovered(config.clone());
+        handle.status = McpServerStatus::Starting;
+        let mut inner = self.inner.lock().await;
+        inner.startup_retries.insert(config.id.clone(), StartupRetryState {
+            definition: config.clone(),
+            discovery_root: None,
+            task_id: "test-recovery".into(),
+            generation: "retry-start".into(),
+            active: true,
+            next_cycle: Instant::now(),
+        });
+        inner.handles.insert(config.id.clone(), handle);
     }
 
     #[cfg(test)]
@@ -2506,6 +2600,51 @@ mod tests {
         assert!(matches!(handle.status, McpServerStatus::Errored { .. }));
         assert_ne!(handle.config.raw["runtimeGeneration"], generation);
         assert_eq!(handle.config.command, changed.command);
+    }
+
+    #[tokio::test]
+    async fn sleeping_retry_does_not_launch_a_removed_definition() {
+        let reg = McpRegistry::new();
+        let cfg = make_config("removed", "removed", "/no/such/binary/at/all");
+        reg.set_prime_configs_for_test(vec![cfg.clone()]).await;
+        assert!(reg.prime_for_chat(None::<&tauri::AppHandle<tauri::Wry>>, None).await);
+        let generation = reg.inner.lock().await.handles[&cfg.id].config.raw["runtimeGeneration"].clone();
+
+        // No prime runs after the edit: the sleeping worker must re-read
+        // discovery itself before reserving another process.
+        reg.set_prime_configs_for_test(Vec::new()).await;
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        let inner = reg.inner.lock().await;
+        assert_eq!(inner.handles[&cfg.id].config.raw["runtimeGeneration"], generation);
+        assert!(matches!(inner.handles[&cfg.id].status, McpServerStatus::Errored { .. }));
+        assert!(!inner.startup_retries.contains_key(&cfg.id));
+    }
+
+    #[tokio::test]
+    async fn prime_cancels_retry_when_source_disables_the_definition() {
+        let reg = McpRegistry::new();
+        let cfg = make_config("disabled-by-file", "disabled-by-file", "/no/such/binary/at/all");
+        reg.set_prime_configs_for_test(vec![cfg.clone()]).await;
+        assert!(reg.prime_for_chat(None::<&tauri::AppHandle<tauri::Wry>>, None).await);
+
+        let mut disabled = cfg.clone();
+        disabled.disabled = true;
+        reg.set_prime_configs_for_test(vec![disabled]).await;
+        assert!(reg.prime_for_chat(None::<&tauri::AppHandle<tauri::Wry>>, None).await);
+        assert!(matches!(reg.inner.lock().await.handles[&cfg.id].status, McpServerStatus::Stopped));
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        let inner = reg.inner.lock().await;
+        assert!(matches!(inner.handles[&cfg.id].status, McpServerStatus::Stopped));
+        assert!(!inner.startup_retries.contains_key(&cfg.id));
+    }
+
+    #[tokio::test]
+    async fn chat_prime_treats_background_retry_start_as_settled() {
+        let reg = McpRegistry::new();
+        let cfg = make_config("recovering", "recovering", "/no/such/binary/at/all");
+        reg.set_prime_configs_for_test(vec![cfg.clone()]).await;
+        reg.insert_recovering_starting_server_for_test(cfg).await;
+        assert!(reg.prime_for_chat(None::<&tauri::AppHandle<tauri::Wry>>, None).await);
     }
 
     #[tokio::test]

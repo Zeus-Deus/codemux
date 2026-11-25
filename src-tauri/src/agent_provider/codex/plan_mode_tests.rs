@@ -291,6 +291,61 @@ async fn a_resumed_thread_with_an_out_of_scope_saved_tool_starts_fresh() {
 }
 
 #[tokio::test]
+async fn a_recovering_mcp_catalog_resumes_only_when_its_saved_key_matches() {
+    let dir = tempfile::tempdir().unwrap();
+    let registry = McpRegistry::new();
+    registry.insert_recovering_starting_server_for_test(crate::mcp::McpServerConfig {
+        id: "recovering-server".into(),
+        name: "recovering-server".into(),
+        sources: vec![crate::mcp::McpConfigSource::CodemuxUser],
+        command: "/no/such/binary".into(),
+        args: Vec::new(),
+        env: std::collections::HashMap::new(),
+        disabled: false,
+        transport: crate::mcp::McpTransport::Stdio,
+        raw: json!({}),
+        project_root: None,
+        checkout_root: None,
+    }).await;
+    let scope = crate::mcp::McpProjectScope::new(dir.path());
+    let host_caller = crate::mcp::registry::HostCaller {
+        control: None,
+        thread_id: "resumed-during-recovery".into(),
+        provider: crate::agent_provider::ProviderKind::Codex,
+        workspace_id: None,
+        permission_mode: Some("danger-full-access".into()),
+    };
+    let tools = dynamic_tool_specs(Some(&registry), false, &host_caller, Some(&scope)).await;
+    let matching_key = codex_tool_catalog_key(&scope.checkout, tools.as_deref());
+    let provider = CodexAgentProvider::new(CodexProviderConfig {
+        codex_binary: fixture_binary(dir.path()),
+        mcp_registry: Some(registry),
+        ..Default::default()
+    });
+
+    let matching = ThreadId("matching-recovery".into());
+    let mut input = start_input(dir.path(), &matching);
+    input.resume_cursor = Some(json!({"threadId": "fixture-thread", "toolCatalogKey": matching_key}));
+    provider.start_session(input).await.unwrap();
+    assert!(std::fs::read_to_string(dir.path().join("wire.jsonl")).unwrap()
+        .contains("\"method\": \"thread/resume\""));
+    provider.stop_session(matching).await.unwrap();
+
+    std::fs::write(dir.path().join("wire.jsonl"), "").unwrap();
+    let mismatched = ThreadId("mismatched-recovery".into());
+    let mut input = start_input(dir.path(), &mismatched);
+    input.resume_cursor = Some(json!({"threadId": "fixture-thread", "toolCatalogKey": "stale-catalog"}));
+    let error = match provider.start_session(input).await {
+        Ok(_) => panic!("a stale catalog started a new thread during MCP recovery"),
+        Err(error) => error,
+    };
+    assert!(error.to_string().contains("retry this Codex chat"));
+    let messages = std::fs::read_to_string(dir.path().join("wire.jsonl")).unwrap();
+    assert!(!messages.contains("\"method\": \"thread/start\""));
+    assert!(!messages.contains("\"method\": \"thread/resume\""));
+}
+
+#[tokio::test]
 async fn a_required_original_thread_with_a_stale_tool_catalog_is_rejected() {
     let dir = tempfile::tempdir().unwrap();
     let provider = CodexAgentProvider::new(CodexProviderConfig {

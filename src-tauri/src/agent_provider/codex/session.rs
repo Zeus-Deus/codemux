@@ -798,12 +798,21 @@ impl CodexSession {
             .and_then(|v| v.get("requireOriginal"))
             .and_then(Value::as_bool)
             .unwrap_or(false);
+        let catalog_recovering = match mcp_registry.as_ref() {
+            Some(registry) => registry.has_visible_startup_retry(mcp_project_scope.as_ref()).await,
+            None => false,
+        };
         let resume_cursor = match resume_cursor {
             Some(cursor)
                 if codex_thread_id_from_resume_cursor(&cursor).is_some()
                     && cursor.get("toolCatalogKey").and_then(Value::as_str)
                         != Some(tool_catalog_key.as_str()) =>
             {
+                if catalog_recovering {
+                    return Err(ProviderError::ValidationError {
+                        message: "MCP tools are recovering; retry this Codex chat when the tool catalog settles".into(),
+                    });
+                }
                 if require_original {
                     return Err(ProviderError::ValidationError {
                         message: "The original Codex thread has a different tool catalog or checkout and cannot be resumed safely".into(),
