@@ -784,9 +784,13 @@ fn require_owned_browser_session_in(session: &str, dir: &std::path::Path) -> Res
 }
 
 fn stop_owned_browser_daemon(session: &str, record: &BrowserPidRecord, bin: &str) {
-    if read_agent_browser_daemon_pid(session) != Some(record.pid)
-        || !browser_process_matches(record, session)
-    {
+    if !browser_process_matches(record, session) {
+        return;
+    }
+    // Windows stops through a retained, identity-checked process handle. A
+    // missing or replaced PID file must not prevent cleanup of that process.
+    #[cfg(not(windows))]
+    if read_agent_browser_daemon_pid(session) != Some(record.pid) {
         return;
     }
     // On Windows the CLI resolves its control port from a separate file. It
@@ -897,15 +901,13 @@ fn kill_verified_browser_pid(record: &BrowserPidRecord, session: &str) {
 }
 
 /// Write the tracked PID to our own per-session PID file under
-/// `~/.codemux/run/`. Best-effort — failures are logged and swallowed
-/// because an agent-browser session can still function without the PID
-/// file (we just lose the safe-adoption path on next restart).
-fn write_session_pid(session_name: &str, record: &BrowserPidRecord) {
+/// `~/.codemux/run/`. Callers launching a daemon must handle a write failure
+/// before sending the first command, or they could leave it untracked.
+fn write_session_pid(session_name: &str, record: &BrowserPidRecord) -> std::io::Result<()> {
     use std::io::Write;
 
-    let Some(path) = session_pid_path(session_name) else {
-        return;
-    };
+    let path = session_pid_path(session_name)
+        .ok_or_else(|| std::io::Error::other("Cannot prepare private browser PID path"))?;
     let content = format!("{} {} {}\n", record.pid, record.start_time, record.token);
     #[cfg(windows)]
     let result = (|| -> std::io::Result<()> {
@@ -929,19 +931,20 @@ fn write_session_pid(session_name: &str, record: &BrowserPidRecord) {
         staged.persist(&path).map_err(|error| error.error)?;
         Ok(())
     })();
-    if let Err(error) = result {
+    if let Err(error) = &result {
         eprintln!(
             "[codemux::browser] failed to write PID file {}: {error}",
             path.display()
         );
     }
+    result
 }
 
 fn track_current_browser_daemon(session: &str) -> Option<BrowserPidRecord> {
     let pid = read_agent_browser_daemon_pid(session)?;
     let record = owned_browser_pid(session, pid)?;
     if record.token == browser_owner_token() {
-        write_session_pid(session, &record);
+        let _ = write_session_pid(session, &record);
     }
     Some(record)
 }
@@ -1675,7 +1678,7 @@ fn build_agent_browser_argv_groups(
 static BROWSER_DAEMON_START_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 #[cfg(target_os = "windows")]
-fn ensure_owned_browser_daemon(bin: &str, session: &str, stream_port: u16, timeout: Duration) -> std::io::Result<BrowserPidRecord> {
+fn ensure_owned_browser_daemon(bin: &str, session: &str, stream_port: u16, timeout: Duration) -> std::io::Result<(BrowserPidRecord, bool)> {
     use std::os::windows::process::CommandExt;
     const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
@@ -1711,7 +1714,7 @@ fn ensure_owned_browser_daemon(bin: &str, session: &str, stream_port: u16, timeo
         let dir = run_dir_for_session(session)
             .ok_or_else(|| std::io::Error::other("Cannot prepare private browser control directory"))?;
         if browser_daemon_version(session, &dir).as_ref() == Some(&expected_version) {
-            return Ok(record);
+            return Ok((record, false));
         }
         // A v0.24 daemon still has an unprotected stream endpoint. Terminate
         // only its verified process before starting the secure native daemon.
@@ -1748,16 +1751,28 @@ fn ensure_owned_browser_daemon(bin: &str, session: &str, stream_port: u16, timeo
             if pid == child.id() {
                 if let Some(record) = owned_browser_pid(session, pid) {
                     if connect_verified_browser_control(session, &record).is_ok() {
-                        return Ok(record);
+                        return Ok((record, true));
                     }
                 }
             }
         }
-        if let Some(status) = child.try_wait()? {
-            if let Some(dir) = run_dir_for_session(session) {
-                cleanup_stale_browser_lock_files_in(&dir, session, child.id());
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                if let Some(dir) = run_dir_for_session(session) {
+                    cleanup_stale_browser_lock_files_in(&dir, session, child.id());
+                }
+                return Err(std::io::Error::other(format!("Browser daemon exited before control startup: {status}")));
             }
-            return Err(std::io::Error::other(format!("Browser daemon exited before control startup: {status}")));
+            Ok(None) => {}
+            Err(error) => {
+                let pid = child.id();
+                let _ = child.kill();
+                let _ = child.wait();
+                if let Some(dir) = run_dir_for_session(session) {
+                    cleanup_stale_browser_lock_files_in(&dir, session, pid);
+                }
+                return Err(error);
+            }
         }
         if started.elapsed() >= timeout {
             let pid = child.id();
@@ -1785,9 +1800,51 @@ fn run_agent_browser_native(
     timeout: Duration,
 ) -> std::io::Result<std::process::Output> {
     let started = Instant::now();
-    let record = ensure_owned_browser_daemon(bin, session, stream_port, timeout)?;
+    let (record, started_here) = ensure_owned_browser_daemon(bin, session, stream_port, timeout)?;
+    track_browser_daemon_before_command(session, bin, &record, started_here)?;
     let remaining = timeout.saturating_sub(started.elapsed());
-    run_agent_browser_native_with_record(bin, argv, session, stream_port, discard_stderr, remaining, record)
+    let result = run_agent_browser_native_with_record(
+        bin,
+        argv,
+        session,
+        stream_port,
+        discard_stderr,
+        remaining,
+        record.clone(),
+    );
+    finish_browser_command(result, session, bin, &record, started_here)
+}
+
+#[cfg(windows)]
+fn track_browser_daemon_before_command(
+    session: &str,
+    bin: &str,
+    record: &BrowserPidRecord,
+    started_here: bool,
+) -> std::io::Result<()> {
+    if record.token == browser_owner_token() {
+        if let Err(error) = write_session_pid(session, record) {
+            if started_here {
+                stop_owned_browser_daemon(session, record, bin);
+            }
+            return Err(error);
+        }
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn finish_browser_command(
+    result: std::io::Result<std::process::Output>,
+    session: &str,
+    bin: &str,
+    record: &BrowserPidRecord,
+    started_here: bool,
+) -> std::io::Result<std::process::Output> {
+    if started_here && result.as_ref().map_or(true, |output| !output.status.success()) {
+        stop_owned_browser_daemon(session, record, bin);
+    }
+    result
 }
 
 #[cfg(target_os = "windows")]
@@ -1859,6 +1916,17 @@ fn require_successful_browser_stream_open(
     Ok(())
 }
 
+#[cfg(not(windows))]
+fn require_successful_browser_stream_open_status(
+    result: std::io::Result<std::process::ExitStatus>,
+) -> Result<(), String> {
+    let status = result.map_err(|error| format!("Browser stream open failed: {error}"))?;
+    if !status.success() {
+        return Err(format!("Browser stream open failed with status {status}"));
+    }
+    Ok(())
+}
+
 #[cfg(windows)]
 fn finish_browser_stream_open(
     result: std::io::Result<std::process::Output>,
@@ -1866,9 +1934,10 @@ fn finish_browser_stream_open(
     session: &str,
     bin: &str,
     record: &BrowserPidRecord,
+    started_here: bool,
 ) -> Result<(), String> {
     let result = require_successful_browser_stream_open(result, log_file);
-    if result.is_err() {
+    if result.is_err() && started_here {
         stop_owned_browser_daemon(session, record, bin);
     }
     result
@@ -3101,14 +3170,12 @@ impl AgentBrowserManager {
             #[cfg(target_os = "windows")]
             {
                 let started = Instant::now();
-                let record = ensure_owned_browser_daemon(&bin, &session, port, OPEN_TIMEOUT)
+                let (record, started_here) = ensure_owned_browser_daemon(&bin, &session, port, OPEN_TIMEOUT)
                     .map_err(|error| format!("Browser daemon startup failed: {error}"))?;
-                if record.token == browser_owner_token() {
-                    // The daemon exists before the CLI issues `open`. Persist
-                    // its identity now so failed opens remain visible to
-                    // teardown and the process-exit sweep.
-                    write_session_pid(&session, &record);
-                }
+                // The daemon exists before the CLI issues `open`. Persist
+                // its identity now so failed opens remain visible to teardown.
+                track_browser_daemon_before_command(&session, &bin, &record, started_here)
+                    .map_err(|error| format!("Cannot track browser daemon: {error}"))?;
                 let mut argv: Vec<String> = windows_executable_path_args();
                 argv.extend([
                     "open".into(),
@@ -3131,6 +3198,7 @@ impl AgentBrowserManager {
                     &session,
                     &bin,
                     &record,
+                    started_here,
                 )?;
             }
             #[cfg(not(target_os = "windows"))]
@@ -3148,7 +3216,15 @@ impl AgentBrowserManager {
                 if let Some(log) = log_file {
                     cmd.stderr(log);
                 }
-                let _ = launch_status_with_timeout(cmd, OPEN_TIMEOUT);
+                let opened = require_successful_browser_stream_open_status(
+                    launch_status_with_timeout(cmd, OPEN_TIMEOUT),
+                );
+                if let Err(error) = opened {
+                    if let Some(record) = track_current_browser_daemon(&session) {
+                        stop_owned_browser_daemon(&session, &record, &bin);
+                    }
+                    return Err(error);
+                }
             }
 
             // Probe the port up to ~5s; only mark
@@ -3373,17 +3449,76 @@ mod tests {
         let pid_path = dir.join(format!("{session}.pid"));
         let own_record_path = session_pid_path(&session).unwrap();
         std::fs::write(&pid_path, pid.to_string()).unwrap();
-        write_session_pid(&session, &record);
+        write_session_pid(&session, &record).unwrap();
 
         let output = std::process::Output {
             status: std::process::ExitStatus::from_raw(1),
             stdout: Vec::new(),
             stderr: b"open failed".to_vec(),
         };
-        assert!(finish_browser_stream_open(Ok(output), None, &session, "unused.exe", &record).is_err());
+        assert!(finish_browser_stream_open(Ok(output), None, &session, "unused.exe", &record, true).is_err());
         let stopped_waiting = Instant::now();
         while child.0.try_wait().unwrap().is_none() {
             assert!(stopped_waiting.elapsed() < Duration::from_secs(3), "failed open left an owned daemon running");
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        let _ = std::fs::remove_file(pid_path);
+        let _ = std::fs::remove_file(own_record_path);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn failed_first_browser_command_stops_a_tracked_daemon() {
+        struct ChildGuard(std::process::Child);
+        impl Drop for ChildGuard {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+
+        let temp = tempfile::tempdir().unwrap();
+        let binary = temp.path().join("agent-browser.exe");
+        std::fs::copy(which::which("ping").unwrap(), &binary).unwrap();
+        let session = format!("browser-first-command-{}", uuid::Uuid::new_v4().simple());
+        let token = browser_owner_token().to_owned();
+        let child = std::process::Command::new(&binary)
+            .args(["-t", "127.0.0.1"])
+            .env("CODEMUX_BROWSER_OWNER", &token)
+            .env("CODEMUX_BROWSER_SESSION", &session)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        let mut child = ChildGuard(child);
+        let pid = child.0.id();
+        let started_waiting = Instant::now();
+        let start_time = loop {
+            if let Some(start) = browser_process_start(pid, &session, &token) {
+                break start;
+            }
+            assert!(started_waiting.elapsed() < Duration::from_secs(3));
+            std::thread::sleep(Duration::from_millis(25));
+        };
+        let record = BrowserPidRecord { pid, start_time, token };
+        let dir = run_dir_for_session(&session).unwrap();
+        let pid_path = dir.join(format!("{session}.pid"));
+        let own_record_path = session_pid_path(&session).unwrap();
+        std::fs::write(&pid_path, pid.to_string()).unwrap();
+        track_browser_daemon_before_command(&session, "unused.exe", &record, true).unwrap();
+        assert_eq!(read_browser_pid_record(&own_record_path).unwrap().pid, pid);
+
+        let failed = finish_browser_command(
+            Err(std::io::Error::other("relay failed")),
+            &session,
+            "unused.exe",
+            &record,
+            true,
+        );
+        assert!(failed.is_err());
+        let stopped_waiting = Instant::now();
+        while child.0.try_wait().unwrap().is_none() {
+            assert!(stopped_waiting.elapsed() < Duration::from_secs(3), "failed command left its daemon running");
             std::thread::sleep(Duration::from_millis(25));
         }
         let _ = std::fs::remove_file(pid_path);
@@ -3639,6 +3774,23 @@ mod tests {
         let status = launch_status_with_timeout(cmd, Duration::from_secs(5))
             .expect("fast launch should complete");
         assert!(status.success());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn failed_unix_open_is_rejected_even_with_a_live_stream_port() {
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        assert!(probe_stream_port(port, 1, Duration::from_millis(0)));
+
+        let mut cmd = std::process::Command::new("sh");
+        cmd.args(["-c", "exit 7"]);
+        let result = launch_status_with_timeout(cmd, Duration::from_secs(5));
+        assert!(require_successful_browser_stream_open_status(result).is_err());
+        assert!(require_successful_browser_stream_open_status(Err(
+            std::io::Error::new(std::io::ErrorKind::TimedOut, "open timed out")
+        )).is_err());
+        assert!(probe_stream_port(port, 1, Duration::from_millis(0)));
     }
 
     #[cfg(unix)]
@@ -4514,7 +4666,7 @@ mod tests {
             start_time: 100,
             token: "a".repeat(32),
         };
-        write_session_pid(&name, &first);
+        write_session_pid(&name, &first).unwrap();
         let path = session_pid_path(&name).expect("path resolves");
         let on_disk = read_browser_pid_record(&path).unwrap();
         assert_eq!(on_disk.pid, 12345);
@@ -4542,7 +4694,7 @@ mod tests {
                 start_time: 200,
                 token: "b".repeat(32),
             };
-            write_session_pid(&name, &second);
+            write_session_pid(&name, &second).unwrap();
             assert_eq!(std::fs::read(&target).unwrap(), b"keep");
             assert_eq!(read_browser_pid_record(&path).unwrap().pid, 54321);
             assert!(!std::fs::symlink_metadata(&path).unwrap().file_type().is_symlink());
