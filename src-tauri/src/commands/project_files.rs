@@ -470,6 +470,7 @@ enum FolderRuleSource {
 struct FolderWalkFilter {
     rules: HashMap<PathBuf, FolderRuleSet>,
     global_rules: Option<Gitignore>,
+    global_rules_checked: bool,
     raw_visits: usize,
     exhausted: bool,
     had_error: bool,
@@ -480,6 +481,15 @@ struct FolderWalkFilter {
 }
 
 impl FolderWalkFilter {
+    fn check_global_rule_files(&mut self) -> Result<(), String> {
+        if !self.global_rules_checked {
+            self.global_rules =
+                Self::load_global_rule_files(&mut self.rule_bytes, &mut self.rule_lines)?;
+            self.global_rules_checked = true;
+        }
+        Ok(())
+    }
+
     fn load_global_rule_files(
         rule_bytes: &mut u64,
         rule_lines: &mut usize,
@@ -915,28 +925,28 @@ fn read_folder_for_attachment_with_limit(
     let path = canonical_path.as_path();
     let depth = max_depth.clamp(1, FOLDER_WALK_MAX_DEPTH);
 
-    let mut rule_bytes = 0;
-    let mut rule_lines = 0;
-    let global_rules = FolderWalkFilter::load_global_rule_files(&mut rule_bytes, &mut rule_lines)?;
-
     // The raw walker charges every candidate before filtering it. Rules are
     // compiled only from bounded bytes captured by the filter.
     let mut filter_state = FolderWalkFilter {
         rules: HashMap::new(),
-        global_rules,
+        global_rules: None,
+        global_rules_checked: false,
         raw_visits: 0,
         exhausted: false,
         had_error: false,
         fatal_error: None,
         checked_rule_dirs: HashSet::new(),
-        rule_bytes,
-        rule_lines,
+        rule_bytes: 0,
+        rule_lines: 0,
     };
     // The canonical root is shared by the rules and the raw walk so symlinked
     // entry paths cannot select a different set of parent rule files.
     let git_root = path
         .ancestors()
         .find(|ancestor| FolderWalkFilter::has_repository_marker(ancestor));
+    if git_root.is_some() {
+        filter_state.check_global_rule_files()?;
+    }
     for ancestor in path.ancestors() {
         let load_git_rules = git_root.is_some_and(|root| ancestor.starts_with(root));
         filter_state.check_rule_files(ancestor, load_git_rules)?;
@@ -981,6 +991,12 @@ fn read_folder_for_attachment_with_limit(
                         state.rules.get(ancestor).is_some_and(|rules| rules.has_git)
                     })
                     || FolderWalkFilter::has_repository_marker(parent);
+                if load_git_rules {
+                    if let Err(error) = state.check_global_rule_files() {
+                        state.fatal_error = Some(error);
+                        return true;
+                    }
+                }
                 if let Err(error) = state.check_rule_files(parent, load_git_rules) {
                     state.fatal_error = Some(error);
                     return true;
@@ -2811,6 +2827,7 @@ mod tests {
         let mut state = FolderWalkFilter {
             rules: HashMap::new(),
             global_rules: None,
+            global_rules_checked: false,
             raw_visits: 0,
             exhausted: false,
             had_error: false,
@@ -3039,10 +3056,76 @@ mod tests {
             return;
         }
         let dir = tempdir().unwrap();
+        fs::create_dir(dir.path().join(".git")).unwrap();
         let error = read_folder_for_attachment_blocking(
             dir.path().to_string_lossy().into_owned(),
             None,
             1,
+        )
+        .unwrap_err();
+        assert!(error.contains("ignore rule file exceeds 1 MiB"));
+    }
+
+    #[test]
+    fn oversized_global_exclude_is_loaded_only_for_visited_repositories() {
+        let dir = tempdir().unwrap();
+        let config = dir.path().join("global-git-config");
+        let global_ignore = dir.path().join("global-ignore");
+        let system_config = dir.path().join("system-git-config");
+        let xdg = dir.path().join("xdg");
+        fs::create_dir(&xdg).unwrap();
+        fs::write(&global_ignore, vec![b'x'; MAX_ATTACHMENT_IGNORE_FILE_BYTES as usize + 1])
+            .unwrap();
+        fs::write(
+            &config,
+            format!("[core]\nexcludesFile = {}\n", global_ignore.display()),
+        )
+        .unwrap();
+        fs::write(&system_config, "").unwrap();
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "commands::project_files::tests::global_exclude_scope_child",
+                "--nocapture",
+            ])
+            .env("CODEMUX_ATTACHMENT_GLOBAL_EXCLUDE_SCOPE_CHILD", "1")
+            .env("GIT_CONFIG_GLOBAL", config)
+            .env("GIT_CONFIG_SYSTEM", system_config)
+            .env("XDG_CONFIG_HOME", xdg)
+            .env("HOME", dir.path())
+            .env("USERPROFILE", dir.path())
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "stdout: {}\nstderr: {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[test]
+    fn global_exclude_scope_child() {
+        if std::env::var_os("CODEMUX_ATTACHMENT_GLOBAL_EXCLUDE_SCOPE_CHILD").is_none() {
+            return;
+        }
+        let dir = tempdir().unwrap();
+        fs::write(dir.path().join("visible.txt"), "x").unwrap();
+        let standalone = read_folder_for_attachment_blocking(
+            dir.path().to_string_lossy().into_owned(),
+            None,
+            2,
+        )
+        .unwrap();
+        assert!(standalone.tree.contains("visible.txt"));
+
+        let nested = dir.path().join("nested");
+        fs::create_dir_all(nested.join(".git")).unwrap();
+        fs::write(nested.join("repo.txt"), "x").unwrap();
+        let error = read_folder_for_attachment_blocking(
+            dir.path().to_string_lossy().into_owned(),
+            None,
+            2,
         )
         .unwrap_err();
         assert!(error.contains("ignore rule file exceeds 1 MiB"));
