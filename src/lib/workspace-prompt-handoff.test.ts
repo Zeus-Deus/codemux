@@ -50,3 +50,24 @@ it("warns and retains the prompt when a terminal command was not confirmed", () 
   );
   expect(toast.success).not.toHaveBeenCalled();
 });
+
+it("offers to reopen a confirmed tab after a partial launch", async () => {
+  const openAgent = vi.fn().mockResolvedValue(undefined);
+  saveWorkspacePrompt("ws-92", "Fix the app", true, "One of two tabs opened", "warning", openAgent);
+
+  const saved = Object.values(useChatDraftStore.getState().draftsById)[0];
+  expect(saved.inputDraft).toBe("Fix the app");
+  expect(saved.manualPromptRequired).toBe(true);
+  const options = vi.mocked(toast.warning).mock.calls[0][1];
+  expect(options?.action).toMatchObject({ label: "Copy prompt" });
+  expect(options?.cancel).toMatchObject({ label: "Open agent" });
+  const cancel = options?.cancel;
+  if (!cancel || typeof cancel !== "object" || !("onClick" in cancel)) {
+    throw new Error("Open agent action missing");
+  }
+  const preventDefault = vi.fn();
+  cancel.onClick({ preventDefault } as never);
+  await vi.waitFor(() => expect(openAgent).toHaveBeenCalledOnce());
+  expect(preventDefault).toHaveBeenCalledOnce();
+  expect(toast.success).not.toHaveBeenCalled();
+});

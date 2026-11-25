@@ -1286,7 +1286,13 @@ pub(crate) async fn dispatch_request_as<R: Runtime>(
                 fresh_terminal,
                 target_tab_id,
             )
-            .map(|()| serde_json::json!({ "ok": true }))
+            .map(|partial| match partial {
+                Some(partial) => serde_json::json!({
+                    "ok": false,
+                    "partial": partial,
+                }),
+                None => serde_json::json!({ "ok": true }),
+            })
         }
         "create_worktree_workspace" => {
             // Backs the legacy `worktree_create` stdio tool: git worktree,

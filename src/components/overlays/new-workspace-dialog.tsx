@@ -38,6 +38,7 @@ import {
 } from "lucide-react";
 import { toast } from "@/lib/toast";
 import { saveWorkspacePrompt } from "@/lib/workspace-prompt-handoff";
+import { PartialPresetLaunchError } from "@/lib/partial-preset-launch";
 import { selectActiveWorkspaceId, useAppStore } from "@/stores/app-store";
 import { useUIStore } from "@/stores/ui-store";
 import { PresetIcon } from "@/components/icons/preset-icon";
@@ -58,6 +59,7 @@ import {
   createWorktreeWorkspaceResult,
   importWorktreeWorkspace,
   activateWorkspace,
+  activateTab,
   getPresets,
   checkIsGitRepo,
   dbAddRecentProject,
@@ -1174,6 +1176,8 @@ export function NewWorkspaceDialog({ open, onOpenChange }: Props) {
       // A plain folder or imported checkout starts empty so createTab gives
       // us the exact terminal ID. Worktree creation returns its original ID.
       let launchError: string | null = null;
+      let partialLaunch: PartialPresetLaunchError | null = null;
+      let confirmedTabId: string | null = null;
       if (!adopted && (needsTerminalTab || selectedAgentId)) {
         try {
           const tabId = needsTerminalTab
@@ -1192,9 +1196,19 @@ export function NewWorkspaceDialog({ open, onOpenChange }: Props) {
             );
           }
         } catch (error) {
-          launchError = errorText(error);
+          if (error instanceof PartialPresetLaunchError && error.confirmedTabIds[0]) {
+            partialLaunch = error;
+            confirmedTabId = error.confirmedTabIds[0];
+            await activateTab(wsId, confirmedTabId).catch(() => {});
+          } else {
+            launchError = errorText(error);
+          }
         }
       }
+
+      const openConfirmedTab = confirmedTabId
+        ? () => activateWorkspace(wsId).then(() => activateTab(wsId, confirmedTabId))
+        : undefined;
 
       if (fullPrompt) {
         const agentOpened =
@@ -1206,13 +1220,18 @@ export function NewWorkspaceDialog({ open, onOpenChange }: Props) {
           wsId,
           fullPrompt,
           agentOpened,
-          launchError
+          partialLaunch
+            ? `${selectedAgent?.name ?? "Agent"} opened ${partialLaunch.confirmedTabIds.length} of ${partialLaunch.totalCommands} tabs. Another command failed. Copy the prompt into an open agent.`
+            : launchError
             ? `Workspace opened, but ${selectedAgent?.name ?? "the terminal"} could not start. The prompt is saved in Drafts.`
             : agentOpened
             ? `${selectedAgent?.name ?? "Agent"} opened without this task. Copy the prompt to start it.`
             : "Workspace opened without sending this prompt. It is saved for later.",
-          launchError ? "warning" : "success",
+          launchError || partialLaunch ? "warning" : "success",
+          openConfirmedTab,
         );
+      } else if (partialLaunch) {
+        toast.warning(`${selectedAgent?.name ?? "Agent"} opened ${partialLaunch.confirmedTabIds.length} of ${partialLaunch.totalCommands} tabs. Another command failed.`);
       } else if (launchError) {
         toast.error(`Workspace opened, but ${selectedAgent?.name ?? "the terminal"} could not start: ${launchError}`);
       }

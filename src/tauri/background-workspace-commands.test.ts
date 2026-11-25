@@ -1,9 +1,11 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   agentChatCreatePane,
+  applyPreset,
   createEmptyWorkspace,
   createWorktreeWorkspaceResult,
 } from "./commands";
+import { PartialPresetLaunchError } from "@/lib/partial-preset-launch";
 
 const invoke = vi.hoisted(() => vi.fn());
 vi.mock("@tauri-apps/api/core", () => ({ invoke, Channel: vi.fn() }));
@@ -50,5 +52,52 @@ describe("background workspace creation IPC", () => {
       workspaceId: "ws-new", provider: "claude", cwd: "/project",
       launchMode: null, threadId: "thread-new", select: false,
     });
+  });
+});
+
+describe("fresh preset launch IPC", () => {
+  it("surfaces confirmed tabs when a later command fails", async () => {
+    invoke.mockResolvedValue({
+      confirmed_tab_ids: ["tab-original"],
+      total_commands: 2,
+      error: "second terminal rejected the write",
+    });
+
+    const launch = applyPreset("ws-new", "preset", "current_terminal", null, null, true, "tab-original");
+    await expect(launch).rejects.toBeInstanceOf(PartialPresetLaunchError);
+    await expect(launch).rejects.toMatchObject({
+      confirmedTabIds: ["tab-original"],
+      totalCommands: 2,
+      message: expect.stringContaining("second terminal rejected the write"),
+    });
+    expect(invoke).toHaveBeenCalledWith("apply_preset", expect.objectContaining({
+      freshTerminal: true,
+      targetTabId: "tab-original",
+      initialPrompt: null,
+    }));
+  });
+
+  it("resolves after all command writes are confirmed", async () => {
+    invoke.mockResolvedValue(null);
+    await expect(applyPreset("ws-new", "preset", "current_terminal", null, null, true, "tab-original"))
+      .resolves.toBeUndefined();
+  });
+
+  it("keeps the partial launch result when the remote view refresh fails", async () => {
+    (window as { __CODEMUX_REMOTE__?: boolean }).__CODEMUX_REMOTE__ = true;
+    invoke
+      .mockResolvedValueOnce({
+        confirmed_tab_ids: ["tab-original"],
+        total_commands: 2,
+        error: "second terminal rejected the write",
+      })
+      .mockRejectedValueOnce(new Error("remote refresh unavailable"));
+
+    await expect(applyPreset("ws-new", "preset", "current_terminal", null, null, true, "tab-original"))
+      .rejects.toMatchObject({
+        confirmedTabIds: ["tab-original"],
+        totalCommands: 2,
+      });
+    expect(invoke).toHaveBeenCalledWith("get_app_state");
   });
 });

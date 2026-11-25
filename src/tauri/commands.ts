@@ -6,6 +6,7 @@ import { invoke, Channel } from "@tauri-apps/api/core";
 
 import { bytesToBase64 } from "@/lib/agent-chat/attachment-block";
 import { isRemoteClient } from "@/components/remote/is-remote-client";
+import { PartialPresetLaunchError, type PartialPresetLaunchResponse } from "@/lib/partial-preset-launch";
 import { useEditorStore } from "@/stores/editor-store";
 import {
   noteLocalActivationFallback,
@@ -1440,7 +1441,7 @@ export const applyPreset = async (
   targetTabId?: string,
 ) => {
   const sequence = beginRemoteNavigation();
-  await invoke("apply_preset", {
+  const partial = await invoke<PartialPresetLaunchResponse | null>("apply_preset", {
     workspaceId,
     presetId,
     overrideMode,
@@ -1449,7 +1450,15 @@ export const applyPreset = async (
     ...(freshTerminal !== undefined ? { freshTerminal } : {}),
     ...(targetTabId !== undefined ? { targetTabId } : {}),
   });
-  if (isRemoteClient()) await refreshRemoteWorkspaceView(workspaceId, undefined, undefined, sequence);
+  if (isRemoteClient()) {
+    try {
+      await refreshRemoteWorkspaceView(workspaceId, undefined, undefined, sequence);
+    } catch (error) {
+      // A failed refresh cannot erase tabs whose PTY writes were confirmed.
+      if (!partial) throw error;
+    }
+  }
+  if (partial) throw new PartialPresetLaunchError(partial);
 };
 
 export const setPresetBarVisible = (visible: boolean) =>

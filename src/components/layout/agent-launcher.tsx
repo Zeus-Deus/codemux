@@ -44,6 +44,8 @@ import { useTitlebarPinsStore } from "@/stores/titlebar-pins-store";
 import { useUIStore } from "@/stores/ui-store";
 import {
   applyPreset,
+  activateTab,
+  activateWorkspace,
   createBrowserPane,
   createTab,
 } from "@/tauri/commands";
@@ -562,6 +564,18 @@ export function DraftAgentLauncher({ draft }: DraftAgentLauncherProps) {
     void launchDraftWithPreset(draft.draftId, preset).then((result) => {
       if (!result.success) {
         toast.error(`${preset.name}: ${result.error ?? "Send failed"}`);
+      } else if (result.partialPreset) {
+        const partial = result.partialPreset;
+        toast.warning(`${preset.name} opened ${partial.confirmedCommands} of ${partial.totalCommands} tabs. Another command failed.${result.manualPromptRequired ? " The prompt remains in Drafts." : ""}`, {
+          action: {
+            label: "Open agent",
+            onClick: () => {
+              void activateWorkspace(result.workspaceId)
+                .then(() => activateTab(result.workspaceId, partial.confirmedTabId))
+                .catch((error) => toast.failure("Couldn't open agent tab", error));
+            },
+          },
+        });
       } else if (result.manualPromptRequired) {
         toast.info(`${preset.name} opened. Your prompt is saved in the draft; open it from the sidebar to copy it.`);
       }

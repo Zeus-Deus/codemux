@@ -6623,12 +6623,8 @@ const handlers: Record<string, Handler> = {
     return undefined;
   },
   /**
-   * Records the launch instead of spawning anything.
-   *
-   * The prompt is the whole point of the agent-handoff surfaces, and in
-   * dev there is no PTY to type it into — so it is echoed to the console
-   * and kept on `window.__codemuxAgentHandoffs`, which makes "did the
-   * prompt survive the route?" answerable from the browser console.
+   * Records the launch instead of spawning a PTY. The starting prompt stays
+   * in Drafts; the record lets the mock UI show which preset was selected.
    */
   apply_preset: (a) => {
     const record = {
@@ -6642,7 +6638,7 @@ const handlers: Record<string, Handler> = {
       `[mock] apply_preset → ${record.presetId} in ${record.workspaceId} (${record.overrideMode})`,
       record.prompt ?? "(no prompt)",
     );
-    return undefined;
+    return null;
   },
 
   // ── Editors / tooling ──

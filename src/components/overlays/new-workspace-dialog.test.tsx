@@ -6,6 +6,7 @@ import { TooltipProvider } from "@/components/ui/tooltip";
 import { useAppStore } from "@/stores/app-store";
 import { useUIStore } from "@/stores/ui-store";
 import { useChatDraftStore } from "@/stores/chat-draft-store";
+import { PartialPresetLaunchError } from "@/lib/partial-preset-launch";
 import type {
   AppStateSnapshot,
   ProviderChatCapabilities,
@@ -49,6 +50,7 @@ vi.mock("@/tauri/commands", () => ({
     .mockResolvedValue({ workspaceId: "ws-new", cwd: null, adopted: false, initialTabId: "tab-default" }),
   importWorktreeWorkspace: vi.fn().mockResolvedValue("ws-new"),
   activateWorkspace: vi.fn().mockResolvedValue(undefined),
+  activateTab: vi.fn().mockResolvedValue(undefined),
   renameWorkspace: vi.fn().mockResolvedValue(undefined),
   applyPreset: vi.fn().mockResolvedValue(undefined),
   dbAddRecentProject: vi.fn().mockResolvedValue(undefined),
@@ -127,6 +129,7 @@ import {
   getGitBranchInfo,
   createWorktreeWorkspaceResult,
   activateWorkspace,
+  activateTab,
   renameWorkspace,
   generateBranchName,
   generateRandomBranchName,
@@ -641,6 +644,36 @@ describe("Submit flow", () => {
     expect(saved.inputDraft).toBe("Fix the login bug");
     expect(saved.manualPromptRequired).toBe(false);
     expect(toast.success).not.toHaveBeenCalled();
+  });
+
+  it("keeps a partially launched worktree prompt and opens its confirmed tab", async () => {
+    setAppState("/path/to/project");
+    (applyPreset as Mock).mockRejectedValueOnce(new PartialPresetLaunchError({
+      confirmed_tab_ids: ["tab-default"],
+      total_commands: 2,
+      error: "second terminal rejected the write",
+    }));
+    renderDialog(true);
+
+    const dialog = await screen.findByRole("dialog");
+    fireEvent.change(within(dialog).getByPlaceholderText("What do you want to do?"), {
+      target: { value: "Fix the login bug" },
+    });
+    fireEvent.click(within(dialog).getByRole("button", { name: /Create/i }));
+
+    await waitFor(() => expect(toast.warning).toHaveBeenCalledWith(
+      expect.stringContaining("opened 1 of 2 tabs"),
+      expect.objectContaining({
+        action: expect.objectContaining({ label: "Copy prompt" }),
+        cancel: expect.objectContaining({ label: "Open agent" }),
+      }),
+    ));
+    expect(activateTab).toHaveBeenCalledWith("ws-new", "tab-default");
+    const saved = Object.values(useChatDraftStore.getState().draftsById)[0];
+    expect(saved.inputDraft).toBe("Fix the login bug");
+    expect(saved.manualPromptRequired).toBe(true);
+    expect(toast.success).not.toHaveBeenCalled();
+    expect(applyPreset).toHaveBeenCalledTimes(1);
   });
 
   it("threads a remembered model selection through to the confirmed preset launch", async () => {

@@ -2,11 +2,13 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 
 import type { ChatDraft, DraftId } from "@/stores/chat-draft-store";
 import type { TerminalPreset } from "@/tauri/types";
+import { PartialPresetLaunchError } from "@/lib/partial-preset-launch";
 
 // ── Module mocks ──
 
 vi.mock("@/tauri/commands", () => ({
   activateWorkspace: vi.fn().mockResolvedValue(undefined),
+  activateTab: vi.fn().mockResolvedValue(undefined),
   agentChatCreatePane: vi.fn().mockResolvedValue("pane-new"),
   agentChatSendTurn: vi.fn().mockResolvedValue({ turn_id: "turn-1", queued_id: null }),
   agentChatStartSession: vi.fn().mockResolvedValue("thread-echoed"),
@@ -69,6 +71,7 @@ import {
 } from "./materialize";
 import {
   activateWorkspace,
+  activateTab,
   agentChatCreatePane,
   agentChatSendTurn,
   agentChatStartSession,
@@ -144,6 +147,7 @@ function makeDraft(overrides: Partial<ChatDraft> = {}): ChatDraft {
 describe("materializeAndSend", () => {
   beforeEach(() => {
     vi.mocked(activateWorkspace).mockClear().mockResolvedValue(undefined);
+    vi.mocked(activateTab).mockClear().mockResolvedValue(undefined);
     vi.mocked(agentChatCreatePane).mockClear().mockResolvedValue("pane-new");
     vi.mocked(agentChatSendTurn).mockClear().mockResolvedValue({ turn_id: "turn-1", queued_id: null });
     vi.mocked(agentChatStartSession)
@@ -1690,6 +1694,33 @@ describe("materializeWithPreset", () => {
       // The workspace was created but not rolled back (locked policy).
       expect(createEmptyWorkspace).toHaveBeenCalled();
       expect(activateWorkspace).toHaveBeenCalled();
+    });
+
+    it("keeps the draft and opens the confirmed tab after a later command fails", async () => {
+      vi.mocked(applyPreset).mockRejectedValueOnce(new PartialPresetLaunchError({
+        confirmed_tab_ids: ["tab-cli"],
+        total_commands: 2,
+        error: "second terminal rejected the write",
+      }));
+      const actions = makeActions();
+      const draft = makeDraft({ target: { kind: "project", projectPath: "/projects/foo" } });
+
+      const result = await materializeWithPreset(
+        draft,
+        makePreset({ commands: ["agent-one", "agent-two"] }),
+        "fix this bug",
+        actions,
+      );
+
+      expect(result).toMatchObject({
+        success: true,
+        manualPromptRequired: true,
+        partialPreset: { confirmedTabId: "tab-cli", confirmedCommands: 1, totalCommands: 2 },
+      });
+      expect(activateTab).toHaveBeenCalledWith("ws-project", "tab-cli");
+      expect(actions.markManualPromptRequired).toHaveBeenCalledWith(draft.draftId);
+      expect(actions.markSendFailed).not.toHaveBeenCalled();
+      expect(actions.markPromoted).not.toHaveBeenCalled();
     });
   });
 

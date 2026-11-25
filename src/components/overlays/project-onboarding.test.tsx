@@ -3,6 +3,7 @@ import { describe, it, expect, vi, beforeEach } from "vitest";
 import { render, screen, fireEvent, act, cleanup, within } from "@testing-library/react";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import { ProjectOnboarding } from "./project-onboarding";
+import { PartialPresetLaunchError } from "@/lib/partial-preset-launch";
 
 // ── Mock Tauri commands ──
 //
@@ -23,6 +24,7 @@ vi.mock("@/tauri/commands", () => ({
   applyPreset: vi.fn().mockResolvedValue(undefined),
   importWorktreeWorkspace: vi.fn().mockResolvedValue("ws-new"),
   activateWorkspace: vi.fn().mockResolvedValue(undefined),
+  activateTab: vi.fn().mockResolvedValue(undefined),
   closeWorkspace: vi.fn().mockResolvedValue(undefined),
   detectPackageManager: vi.fn().mockResolvedValue([]),
   setProjectScripts: vi.fn().mockResolvedValue(undefined),
@@ -47,6 +49,7 @@ import {
   importWorktreeWorkspace,
   listWorktrees,
   activateWorkspace,
+  activateTab,
 } from "@/tauri/commands";
 import { toast } from "@/lib/toast";
 import { useUIStore } from "@/stores/ui-store";
@@ -180,6 +183,34 @@ describe("ProjectOnboarding — task and agent", () => {
       expect.objectContaining({ action: expect.objectContaining({ label: "Copy prompt" }) }),
     );
     expect(toast.success).not.toHaveBeenCalled();
+  });
+
+  it("keeps the task and links the confirmed tab when a later command fails", async () => {
+    mockApplyPreset.mockRejectedValueOnce(new PartialPresetLaunchError({
+      confirmed_tab_ids: ["tab-default"],
+      total_commands: 2,
+      error: "second terminal rejected the write",
+    }));
+    const { onComplete } = renderOnboarding();
+    await flushMountEffects();
+    await goToSetupStep();
+
+    fireEvent.click(screen.getByRole("button", { name: "Create & start Claude Code" }));
+    await vi.waitFor(() => expect(onComplete).toHaveBeenCalledOnce());
+
+    const saved = Object.values(useChatDraftStore.getState().draftsById)[0];
+    expect(saved.inputDraft).toBe("Add dark mode");
+    expect(saved.manualPromptRequired).toBe(true);
+    expect(activateTab).toHaveBeenCalledWith("ws-new", "tab-default");
+    expect(vi.mocked(toast.warning)).toHaveBeenCalledWith(
+      expect.stringContaining("opened 1 of 2 tabs"),
+      expect.objectContaining({
+        action: expect.objectContaining({ label: "Copy prompt" }),
+        cancel: expect.objectContaining({ label: "Open agent" }),
+      }),
+    );
+    expect(toast.success).not.toHaveBeenCalled();
+    expect(mockApplyPreset).toHaveBeenCalledTimes(1);
   });
 
   it("starts the agent the user last picked when it is still pinned", async () => {

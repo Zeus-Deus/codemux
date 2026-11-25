@@ -10,6 +10,7 @@ export function saveWorkspacePrompt(
   agentOpened: boolean,
   message: string,
   tone: "success" | "warning" = "success",
+  openAgent?: () => Promise<unknown>,
 ): void {
   if (!prompt) return;
   useChatDraftStore.getState().saveWorkspacePrompt(workspaceId, prompt, agentOpened);
@@ -25,5 +26,14 @@ export function saveWorkspacePrompt(
         });
       },
     },
+    ...(openAgent ? {
+      cancel: {
+        label: "Open agent",
+        onClick: (event: { preventDefault: () => void }) => {
+          event.preventDefault();
+          void openAgent().catch((error) => toast.failure("Couldn't open agent tab", error));
+        },
+      },
+    } : {}),
   });
 }
