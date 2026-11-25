@@ -22,6 +22,8 @@ export const hostKey = (id: number): MachineKey => `host:${id}`;
 export interface DeviceProvidersReport {
   host_id: number;
   helper_version: string | null;
+  running_version: string | null;
+  serve_alive: boolean | null;
   app_version: string;
   providers: ProviderUpdateReport[] | null;
   error: string | null;
@@ -41,6 +43,8 @@ export interface MachineState {
   providers: ProviderUpdateReport[];
   /** Devices only: the helper's version and this desktop's. */
   helperVersion?: string | null;
+  runningVersion?: string | null;
+  serveAlive?: boolean | null;
   appVersion?: string;
   error?: string | null;
 }
@@ -101,6 +105,10 @@ export function isOlderVersion(a: string, b: string): boolean {
 
 export function helperIsOutdated(state: MachineState | undefined): boolean {
   return !!state?.helperVersion && !!state.appVersion && isOlderVersion(state.helperVersion, state.appVersion);
+}
+
+export function helperNeedsRestart(state: MachineState | undefined): boolean {
+  return !!state?.helperVersion && !!state.runningVersion && state.helperVersion !== state.runningVersion;
 }
 
 /**
@@ -200,12 +208,14 @@ export const useUpdateAll = create<Store>((set, get) => {
         patchMachine(key, {
           providers: report.providers ?? [],
           helperVersion: report.helper_version,
+          runningVersion: report.running_version,
+          serveAlive: report.serve_alive,
           appVersion: report.app_version,
           error: report.error,
           checkedAt: Date.now(),
         });
       } catch (error) {
-        patchMachine(key, { error: String(error), helperVersion: null });
+        patchMachine(key, { error: String(error), helperVersion: null, runningVersion: null, serveAlive: null });
       } finally {
         patchMachine(key, { loading: false });
       }

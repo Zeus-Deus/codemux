@@ -756,11 +756,13 @@ fn run_serve_status(state_dir_arg: Option<PathBuf>) -> ExitCode {
         }
         Ok(Some(m)) => {
             let alive = codemux_lib::remote::manifest::pid_alive(m.pid);
-            // When alive, ask the running daemon how many live PTY sessions
-            // it has for diagnostics. Best-effort: a probe failure reports
-            // null.
-            let live_terminals = if alive {
-                probe_live_terminals(&m.endpoint, &m.secret)
+            // The installed binary can be newer than a running daemon after
+            // a session-safe upgrade. Ask the daemon for its own version so
+            // Settings can keep showing that restart requirement after a
+            // desktop relaunch. A failed probe reports null, never the
+            // installed version as though it were running.
+            let running = if alive {
+                probe_running_status(&m.endpoint, &m.secret)
             } else {
                 None
             };
@@ -770,7 +772,8 @@ fn run_serve_status(state_dir_arg: Option<PathBuf>) -> ExitCode {
                 "started_at": m.started_at,
                 "host_id": m.host_id,
                 "alive": alive,
-                "live_terminals": live_terminals,
+                "live_terminals": running.as_ref().and_then(|status| status.live_terminals),
+                "running_version": running.as_ref().and_then(|status| status.version.as_deref()),
             });
             println!("{}", payload);
             if alive {
@@ -786,11 +789,10 @@ fn run_serve_status(state_dir_arg: Option<PathBuf>) -> ExitCode {
     }
 }
 
-/// Best-effort probe of the running daemon's live PTY-session count via its
-/// `app_status` tool (`terminal_count`). Returns `None` on any failure
-/// (timeout, decode, daemon down) — callers treat `None` as "unknown".
+/// Best-effort probe of the running daemon's own version and live terminals
+/// via `app_status`. A failed probe leaves both values unknown.
 #[cfg(unix)]
-fn probe_live_terminals(endpoint: &str, secret: &str) -> Option<u64> {
+fn probe_running_status(endpoint: &str, secret: &str) -> Option<RunningServeStatus> {
     let http = reqwest::blocking::Client::builder()
         .timeout(std::time::Duration::from_secs(5))
         .build()
@@ -802,7 +804,17 @@ fn probe_live_terminals(endpoint: &str, secret: &str) -> Option<u64> {
         .send()
         .ok()?;
     let body: serde_json::Value = res.json().ok()?;
-    body.get("data")?.get("terminal_count")?.as_u64()
+    let data = body.get("data")?;
+    Some(RunningServeStatus {
+        live_terminals: data.get("terminal_count").and_then(serde_json::Value::as_u64),
+        version: data.get("version").and_then(serde_json::Value::as_str).map(str::to_owned),
+    })
+}
+
+#[cfg(unix)]
+struct RunningServeStatus {
+    live_terminals: Option<u64>,
+    version: Option<String>,
 }
 
 #[cfg(unix)]

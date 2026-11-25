@@ -29,6 +29,7 @@ import {
   PROVIDER_LABELS,
   buildPlan,
   helperIsOutdated,
+  helperNeedsRestart,
   hostKey,
   itemKey,
   useUpdateAll,
@@ -94,6 +95,7 @@ export function UpdatesSection() {
   const showLoading = useDelayedPending(loading);
   const appPending = app.available;
   const total = plan.items.length + (appPending ? 1 : 0);
+  const restartRequired = Object.values(known).some(helperNeedsRestart);
 
   const start = async (approved: UpdatePlan) => {
     setConfirming(null);
@@ -136,7 +138,7 @@ export function UpdatesSection() {
               onClick={() => setConfirming(plan)}
             >
               {running && <Spinner className="size-3.5" aria-hidden />}
-              {running ? "Updating…" : total ? `Update all (${total})` : "Up to date"}
+              {running ? "Updating…" : total ? `Update all (${total})` : restartRequired ? "Restart required" : "Up to date"}
             </Button>
           </>
         }
@@ -394,16 +396,23 @@ function HelperRow({ machine, state }: { machine: MachineKey; state: MachineStat
     );
   }
   const outdated = helperIsOutdated(state);
+  const restartRequired = helperNeedsRestart(state);
   const detail =
     item?.phase === "failed"
       ? { text: item.message ?? "Update failed", tone: "error" as const }
-      : item?.phase === "updated"
-        ? { text: `v${state.helperVersion}${item.message ? ` · ${item.message}` : ""}`, tone: "done" as const }
-        : outdated
+      : outdated
           ? { text: `v${state.helperVersion} → v${state.appVersion}`, tone: "available" as const }
-          : { text: `v${state.helperVersion} · up to date`, tone: "muted" as const };
+          : restartRequired
+            ? { text: `v${state.helperVersion} installed · v${state.runningVersion} running · Restart required`, tone: "error" as const }
+            : item?.phase === "updated"
+              ? { text: `v${state.helperVersion}${item.message ? ` · ${item.message}` : ""}`, tone: "done" as const }
+              : state.serveAlive === false
+                ? { text: `v${state.helperVersion} installed · service stopped`, tone: "muted" as const }
+                : !state.runningVersion
+                  ? { text: `v${state.helperVersion} installed · running version unavailable`, tone: "muted" as const }
+                  : { text: `v${state.helperVersion} · up to date`, tone: "muted" as const };
   return (
-    <Row icon={icon} title="Codemux" detail={detail.text} tone={detail.tone}>
+    <Row icon={restartRequired ? <CircleAlert className="size-4 text-destructive" aria-hidden /> : icon} title="Codemux" detail={detail.text} tone={detail.tone}>
       {item && item.phase !== "failed" ? (
         <ProgressBadge item={item} />
       ) : outdated ? (

@@ -4772,13 +4772,13 @@ const mockLocalProviders: MockProviderReport[] = [
   mockReport("cursor", "2026.09.28-6e1f2a4", "2026.09.28-6e1f2a4", "Omarchy system package", false, "This provider is owned by the system. Run `omarchy update` in a terminal, then restart Codemux."),
   mockReport("opencode", "1.18.35", "1.18.35", "Omarchy · mise"),
 ];
-const mockDeviceProviders = new Map<number, { helper: string; providers: MockProviderReport[] }>([
-  [2, { helper: "0.23.2", providers: [
+const mockDeviceProviders = new Map<number, { helper: string; running: string; providers: MockProviderReport[] }>([
+  [2, { helper: "0.23.2", running: "0.23.2", providers: [
     mockReport("claude", "2.3.9", "2.3.14", "Claude updater"),
     mockReport("codex", "0.161.0", "0.163.0", "npm"),
     mockReport("opencode", "1.18.30", "1.18.35", "npm"),
   ] }],
-  [3, { helper: "0.24.0", providers: [
+  [3, { helper: "0.24.0", running: "0.24.0", providers: [
     mockReport("codex", "0.163.0", "0.163.0", "npm"),
   ] }],
 ]);
@@ -6074,10 +6074,10 @@ const handlers: Record<string, Handler> = {
     const hostId = Number(a.hostId);
     const host = mockHosts.find((h) => h.id === hostId);
     if (!host || hostId === 1) {
-      return { host_id: hostId, helper_version: null, app_version: "0.24.0", providers: null, error: `couldn't connect to ${host?.name ?? "the device"} over SSH` };
+      return { host_id: hostId, helper_version: null, running_version: null, serve_alive: null, app_version: "0.24.0", providers: null, error: `couldn't connect to ${host?.name ?? "the device"} over SSH` };
     }
     const device = mockDeviceProviders.get(hostId)!;
-    return { host_id: hostId, helper_version: device.helper, app_version: "0.24.0", providers: device.providers.map((p) => ({ ...p })), error: null };
+    return { host_id: hostId, helper_version: device.helper, running_version: device.running, serve_alive: true, app_version: "0.24.0", providers: device.providers.map((p) => ({ ...p })), error: null };
   },
   provider_update_local: async (a) => {
     await new Promise((resolve) => setTimeout(resolve, 1600));

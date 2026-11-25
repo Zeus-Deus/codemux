@@ -31,8 +31,13 @@ const report = (provider: string, patch: Record<string, unknown> = {}) => ({
   ...patch,
 });
 
+let installedVersion = "0.23.0";
+let runningVersion = "0.23.0";
+
 beforeEach(() => {
   invoke.mockReset();
+  installedVersion = "0.23.0";
+  runningVersion = "0.23.0";
   useUpdateAll.setState({ machines: {}, items: {}, running: false, summary: null });
   invoke.mockImplementation(async (cmd: string) => {
     switch (cmd) {
@@ -42,8 +47,9 @@ beforeEach(() => {
           report("cursor", { can_update: false, manager: "Omarchy system package", message: "Run `omarchy update`" }),
         ];
       case "provider_updates_device":
-        return { host_id: 2, helper_version: "0.23.0", app_version: "0.24.0", providers: [report("codex")], error: null };
+        return { host_id: 2, helper_version: installedVersion, running_version: runningVersion, serve_alive: true, app_version: "0.24.0", providers: [report("codex")], error: null };
       case "device_helper_update":
+        installedVersion = "0.24.0";
         return { host_id: 2, status: "upgraded", from: "0.23.0", to: "0.24.0", message: "An already running headless service keeps its previous version until restarted." };
       case "provider_update_local":
         return report("claude", { installed_version: "1.1.0", available: false });
@@ -77,7 +83,23 @@ describe("UpdatesSection", () => {
     expect((options as { description: string }).description).toContain("buildbox · Codex: npm failed (exit 1)");
     expect(invoke).toHaveBeenCalledWith("provider_update_local", { provider: "claude" });
     expect(await screen.findByText(/EACCES: permission denied/)).toBeInTheDocument();
-    expect(screen.getByText(/headless service keeps its previous version until restarted/)).toBeInTheDocument();
+    expect(screen.getByText(/v0.24.0 installed · v0.23.0 running · Restart required/)).toBeInTheDocument();
     expect(screen.getByRole("status")).toHaveTextContent("2 updated, 1 failed");
+  });
+
+  it("shows a restart requirement after refreshing a device with an older running daemon", async () => {
+    installedVersion = "0.24.0";
+    runningVersion = "0.23.0";
+    invoke.mockImplementation(async (cmd: string) => {
+      if (cmd === "provider_updates_local") return [];
+      if (cmd === "provider_updates_device") {
+        return { host_id: 2, helper_version: installedVersion, running_version: runningVersion, serve_alive: true, app_version: "0.24.0", providers: [], error: null };
+      }
+      throw new Error(`unexpected ${cmd}`);
+    });
+
+    render(<UpdatesSection />);
+    expect(await screen.findByText("v0.24.0 installed · v0.23.0 running · Restart required")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Restart required" })).toBeDisabled();
   });
 });
