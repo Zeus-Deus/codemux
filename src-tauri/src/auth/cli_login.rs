@@ -40,7 +40,7 @@ use serde::Deserialize;
 use crate::auth::{
     api_base_url, api_client, clear_token, derive_auth_secret, is_token_expired, load_cached_user,
     load_stored_auth_method, load_token, login_email_api, save_auth, save_stored_auth_method,
-    AuthUser,
+    AuthApiError, AuthUser,
 };
 use crate::database::DatabaseStore;
 
@@ -98,24 +98,26 @@ impl LoginError {
     }
 }
 
-/// Map an `auth::api` error string onto a [`LoginError`].
+/// Map a typed `auth::api` error onto a [`LoginError`].
 ///
-/// `login_email_api` returns three shapes: `"Request failed: …"` for a
-/// transport error, `"Parse response: …"` for a 2xx whose body did not
-/// deserialize, and otherwise the server's own `error` field. Only the
-/// transport case is safe to echo verbatim; the server's message is not,
+/// Only a transport or local configuration error is safe to describe. The
+/// server's rejection message is not,
 /// because Better Auth distinguishes "email not verified" from "invalid
 /// credentials" and repeating that would leak whether an account exists.
-pub(crate) fn classify_api_error(raw: &str) -> LoginError {
-    if let Some(detail) = raw.strip_prefix("Request failed: ") {
-        return LoginError::Network(detail.to_string());
-    }
-    if let Some(detail) = raw.strip_prefix("Parse response: ") {
-        return LoginError::Local(format!(
+pub(crate) fn classify_api_error(error: AuthApiError) -> LoginError {
+    match error {
+        AuthApiError::Transport(detail) => LoginError::Network(detail),
+        AuthApiError::Redirect => LoginError::Config(
+            "The authentication endpoint redirected the request. Check CODEMUX_API_URL or your proxy configuration."
+                .into(),
+        ),
+        AuthApiError::Config(detail) => LoginError::Config(detail),
+        AuthApiError::Client(detail) => LoginError::Local(detail),
+        AuthApiError::Parse(detail) => LoginError::Local(format!(
             "The Codemux API returned an unexpected response ({detail})."
-        ));
+        )),
+        AuthApiError::Rejected(_) => LoginError::Credentials,
     }
-    LoginError::Credentials
 }
 
 // ── Sign-in ──────────────────────────────────────────────────────
@@ -148,7 +150,7 @@ pub(crate) async fn sign_in(
 
     let api_resp = login_email_api(email, &auth_secret)
         .await
-        .map_err(|e| classify_api_error(&e))?;
+        .map_err(classify_api_error)?;
 
     let user = AuthUser {
         id: api_resp.user.id.clone(),
@@ -791,14 +793,47 @@ mod tests {
         assert!(load_token(&db).is_none());
     }
 
+    #[tokio::test]
+    #[serial_test::serial(mockserver)]
+    async fn redirected_signin_reports_endpoint_configuration_not_bad_password() {
+        let mut origin = mockito::Server::new_async().await;
+        let mut destination = mockito::Server::new_async().await;
+        let leaked = destination
+            .mock("POST", "/capture")
+            .expect(0)
+            .create_async()
+            .await;
+        let redirect_target = format!("{}/capture", destination.url());
+        let redirect = origin
+            .mock("POST", "/api/auth/desktop/signin")
+            .with_status(307)
+            .with_header("location", &redirect_target)
+            .create_async()
+            .await;
+        let _guard = ApiUrlGuard::set(&origin.url());
+
+        let db = test_db();
+        let error = sign_in(&db, "someone@example.com", "pw".into())
+            .await
+            .expect_err("redirects must be refused");
+        assert!(matches!(error, LoginError::Config(_)), "{error:?}");
+        let message = error.user_message();
+        assert!(message.contains("CODEMUX_API_URL"), "{message}");
+        assert!(message.contains("proxy"), "{message}");
+        assert!(!message.contains("Check the email address"), "{message}");
+        assert!(load_token(&db).is_none());
+        redirect.assert_async().await;
+        leaked.assert_async().await;
+    }
+
     #[test]
     fn error_classification_splits_transport_from_credentials() {
         assert!(matches!(
-            classify_api_error("Request failed: error sending request"),
+            classify_api_error(AuthApiError::Transport("error sending request".into())),
             LoginError::Network(_)
         ));
         assert!(matches!(
-            classify_api_error("Parse response: missing field `token`"),
+            classify_api_error(AuthApiError::Parse("missing field `token`".into())),
             LoginError::Local(_)
         ));
         for server_msg in [
@@ -808,10 +843,14 @@ mod tests {
             "Authentication failed",
         ] {
             assert!(
-                matches!(classify_api_error(server_msg), LoginError::Credentials),
+                matches!(classify_api_error(AuthApiError::Rejected(server_msg.into())), LoginError::Credentials),
                 "{server_msg} should collapse into the generic credential error"
             );
         }
+        let redirect = classify_api_error(AuthApiError::Redirect).user_message();
+        assert!(redirect.contains("CODEMUX_API_URL"), "{redirect}");
+        assert!(redirect.contains("proxy"), "{redirect}");
+        assert!(!redirect.contains("Check the email address"), "{redirect}");
     }
 
     #[tokio::test]

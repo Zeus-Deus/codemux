@@ -33,7 +33,7 @@ pub mod derivation;
 // other auth helpers. API client helpers are `pub(crate)` — they're
 // only meant for use inside this crate's Tauri commands and
 // intentionally don't leak to consumers linking against codemux_lib.
-pub(crate) use api::{login_email_api, signup_email_api};
+pub(crate) use api::{login_email_api, signup_email_api, AuthApiError};
 pub use derivation::{derive_auth_secret, derive_login_credentials, AuthSecret, EncryptionKey};
 
 // ── Types ────────────────────────────────────────────────────────
