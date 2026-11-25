@@ -52,8 +52,8 @@ export function dirname(path: string): string {
 export function joinPath(dir: string, rel: string): string {
   const cleaned = rel.replace(/^\.\//, "");
   if (!dir) return cleaned;
-  if (/[\\/]$/.test(dir)) return `${dir}${cleaned}`;
   const sep = dir.includes("\\") && !dir.includes("/") ? "\\" : "/";
+  if (dir.endsWith(sep)) return `${dir}${cleaned}`;
   return `${dir}${sep}${cleaned}`;
 }
 

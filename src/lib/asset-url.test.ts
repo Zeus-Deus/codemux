@@ -90,6 +90,13 @@ describe("joinPath", () => {
     expect(joinPath("C:\\a\\b", "c.png")).toBe("C:\\a\\b\\c.png");
   });
 
+  it("treats a trailing backslash in a POSIX directory as part of its name", () => {
+    expect(joinPath("/tmp/folder\\", "image.png")).toBe("/tmp/folder\\/image.png");
+    expect(resolveAssetSrc("./image.png", "/tmp/folder\\/notes.md")).toBe(
+      "mock-asset:/tmp/folder\\/image.png",
+    );
+  });
+
   it("returns the relative path verbatim when dir is empty", () => {
     expect(joinPath("", "c.png")).toBe("c.png");
     expect(joinPath("", "./c.png")).toBe("c.png");
