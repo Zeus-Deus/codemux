@@ -805,7 +805,7 @@ pub async fn provider_update_device<R: tauri::Runtime>(
 }
 
 /// Bring a device's `codemux-remote` up to this build. Same gentle path as
-/// the background upgrader: the `serve` daemon restarts only when idle.
+/// the background upgrader: a running `serve` daemon is not restarted.
 #[tauri::command]
 pub async fn device_helper_update<R: tauri::Runtime>(
     app: tauri::AppHandle<R>,
@@ -824,18 +824,15 @@ pub async fn device_helper_update<R: tauri::Runtime>(
                 to: None,
                 message: None,
             },
-            UpgradeOutcome::Upgraded {
-                from,
-                to,
-                deferred_restart,
-            } => DeviceHelperUpdate {
+            UpgradeOutcome::Upgraded { from, to } => DeviceHelperUpdate {
                 host_id,
                 status: "upgraded".into(),
                 from: Some(from),
                 to: Some(to),
-                message: deferred_restart.map(|n| {
-                    format!("{n} running session(s) keep the old version until they finish")
-                }),
+                message: Some(
+                    "An already running headless service keeps its previous version until restarted."
+                        .into(),
+                ),
             },
             UpgradeOutcome::NotAttempted { reason } => DeviceHelperUpdate {
                 host_id,

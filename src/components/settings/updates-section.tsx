@@ -254,7 +254,7 @@ function Row({
           title={tone === "error" && typeof detail === "string" ? detail : undefined}
           className={cn(
             "text-label",
-            tone === "error" ? "line-clamp-2 break-words" : "truncate",
+            tone === "error" || tone === "done" ? "line-clamp-2 break-words" : "truncate",
             tone === "available" && "text-foreground",
             tone === "error" && "text-destructive",
             tone === "done" && "text-success",
@@ -398,7 +398,7 @@ function HelperRow({ machine, state }: { machine: MachineKey; state: MachineStat
     item?.phase === "failed"
       ? { text: item.message ?? "Update failed", tone: "error" as const }
       : item?.phase === "updated"
-        ? { text: `v${state.helperVersion}`, tone: "done" as const }
+        ? { text: `v${state.helperVersion}${item.message ? ` · ${item.message}` : ""}`, tone: "done" as const }
         : outdated
           ? { text: `v${state.helperVersion} → v${state.appVersion}`, tone: "available" as const }
           : { text: `v${state.helperVersion} · up to date`, tone: "muted" as const };

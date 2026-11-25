@@ -1654,7 +1654,7 @@ pub(crate) async fn ensure_remote_binary_current<R: tauri::Runtime>(
             return Ok(());
         }
         // Older: the gentle upgrade swaps the binary without killing the
-        // device's terminals and restarts `serve` only when it is idle.
+        // device's terminals or restarting an active `serve` daemon.
         Some(version) => {
             eprintln!(
                 "[hosts] {} has codemux-remote {version}, upgrading to {our_version}",

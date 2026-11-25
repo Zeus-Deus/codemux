@@ -16,7 +16,8 @@
 //!
 //! The upgrade is gentle. The new binary is uploaded beside the old one and
 //! swapped in atomically (running processes keep the old file), verified,
-//! and the `serve` daemon is restarted only when it has no live sessions.
+//! and the `serve` daemon starts if stopped but is never restarted while
+//! active. An active daemon picks up the new binary on its next restart.
 //! The pty-daemon behind the user's terminals is never killed; it picks up
 //! the new binary the next time it starts. A newer helper, installed by a
 //! newer desktop sharing the device, is never downgraded. A missing or
@@ -46,15 +47,14 @@ use tauri::{AppHandle, Manager, Runtime};
 
 use crate::database::{DatabaseStore, HostRecord};
 use crate::ssh::bootstrap::{
-    bootstrap_remote, provision_serve, BootstrapOptions, BootstrapResult, UPLOAD_DEADLINE,
+    bootstrap_remote, ensure_serve_running, BootstrapOptions, BootstrapResult, UPLOAD_DEADLINE,
 };
-use crate::ssh::exec::codemux_remote_command;
 use crate::ssh::probe::{probe_host, ProbeOptions, ProbeOutcome};
 use crate::ssh::sidecar::RuntimeRefresh;
 
 /// Budget for one whole upgrade: the upload's own deadline (a ~20 MB binary
-/// over a slow uplink takes minutes) plus the probe, verify, session check
-/// and daemon restart around it.
+/// over a slow uplink takes minutes) plus the probe, verify and service
+/// activation around it.
 const UPGRADE_BUDGET: Duration = Duration::from_secs(UPLOAD_DEADLINE.as_secs() + 3 * 60);
 
 /// How long the poller leaves a device alone after an automatic attempt on
@@ -261,14 +261,9 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 pub(crate) enum UpgradeOutcome {
     /// Already this build's version, or newer.
     AlreadyCurrent,
-    /// The new helper is on the device. `deferred_restart` counts the live
-    /// sessions that kept the `serve` daemon on the old binary; it switches
-    /// over when the daemon next restarts.
-    Upgraded {
-        from: String,
-        to: String,
-        deferred_restart: Option<u64>,
-    },
+    /// The new helper is on the device. A running `serve` daemon switches
+    /// over when it next restarts.
+    Upgraded { from: String, to: String },
     /// Nothing was tried: the device was offline, or its helper is missing
     /// or broken, and installing one needs the user's go-ahead.
     NotAttempted { reason: String },
@@ -306,16 +301,9 @@ async fn run_upgrade<R: Runtime>(
         Ok(UpgradeOutcome::NotAttempted { reason }) => {
             eprintln!("[hosts_upgrade] {} skipped: {reason}", host.name);
         }
-        Ok(UpgradeOutcome::Upgraded {
-            from,
-            to,
-            deferred_restart,
-        }) => {
-            let deferred = deferred_restart
-                .map(|n| format!("; serve restart deferred, {n} live session(s)"))
-                .unwrap_or_default();
+        Ok(UpgradeOutcome::Upgraded { from, to }) => {
             eprintln!(
-                "[hosts_upgrade] {} upgraded codemux-remote {from} → {to}{deferred}",
+                "[hosts_upgrade] {} upgraded codemux-remote {from} → {to}; serve starts if stopped, an active daemon updates on its next restart",
                 host.name
             );
         }
@@ -389,28 +377,12 @@ async fn check_and_upgrade<R: Runtime>(
         ));
     }
 
-    // Re-provisioning `serve` keeps its systemd unit in sync AND restarts
-    // the daemon onto the new binary, which kills any PTY agents the user
-    // runs ON the device (the "work on a device without pulling" flow). So
-    // ask the running daemon whether it has live sessions first, and if so
-    // leave it be: the new binary is already on disk and takes over when the
-    // daemon next restarts. An automatic upgrade must never end the user's
-    // work. Terminals of workspaces opened from a desktop live in the
-    // separate pty-daemon, which no upgrade touches.
-    if let Some(live) = probe_live_host_sessions(&host.ssh_target)
-        .await
-        .filter(|n| *n > 0)
-    {
-        return Ok(UpgradeOutcome::Upgraded {
-            from,
-            to,
-            deferred_restart: Some(live),
-        });
-    }
-
-    // No confirmed live sessions (idle, daemon down, or unknown): restart
-    // onto the new binary now.
-    if let Err(e) = provision_serve(
+    // Keep the unit in sync and start a stopped service. A running daemon
+    // keeps its terminals, including any opened during this SSH call, and
+    // uses the new binary after its next restart. A separate status probe
+    // cannot safely authorize restarting it because new work may begin
+    // after the probe.
+    if let Err(e) = ensure_serve_running(
         &host.ssh_target,
         "~/.local/bin/codemux-remote",
         Duration::from_secs(30),
@@ -420,71 +392,12 @@ async fn check_and_upgrade<R: Runtime>(
         // The binary IS current on disk; the daemon picks it up when it
         // next restarts.
         eprintln!(
-            "[hosts_upgrade] {} provision_serve failed after upgrade (binary is current, \
-             but the daemon needs a restart): {e}",
+            "[hosts_upgrade] {} ensure_serve_running failed after upgrade (binary is current, \
+             but the service may need to be started): {e}",
             host.name
         );
     }
-    Ok(UpgradeOutcome::Upgraded {
-        from,
-        to,
-        deferred_restart: None,
-    })
-}
-
-/// Probe the host daemon for its live PTY-session count by running
-/// `codemux-remote serve status` over SSH and reading `live_terminals` from
-/// its JSON output. Returns:
-/// - `Some(n)` — the daemon answered (`n` may be 0).
-/// - `None` — couldn't determine (daemon down, ssh error, or an OLD daemon
-///   binary whose `serve status` predates the field). Callers treat `None`
-///   as "no confirmed live sessions → safe to restart", because a daemon we
-///   can't reach has nothing to lose by restarting.
-async fn probe_live_host_sessions(ssh_target: &str) -> Option<u64> {
-    use std::process::Stdio;
-    let cmd_str = live_sessions_script();
-    let output = tokio::time::timeout(Duration::from_secs(12), async {
-        tokio::process::Command::new("ssh")
-            .args([
-                "-o",
-                "BatchMode=yes",
-                "-o",
-                "ConnectTimeout=10",
-                "-o",
-                "StrictHostKeyChecking=accept-new",
-                "--",
-                ssh_target,
-                &cmd_str,
-            ])
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .output()
-            .await
-    })
-    .await
-    .ok()?
-    .ok()?;
-    // `serve status` prints one JSON line to stdout (even when the daemon is
-    // down, with `live_terminals: null`). Find it and read the field.
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    for line in stdout.lines() {
-        if let Ok(v) = serde_json::from_str::<serde_json::Value>(line.trim()) {
-            if let Some(n) = v.get("live_terminals").and_then(|x| x.as_u64()) {
-                return Some(n);
-            }
-        }
-    }
-    None
-}
-
-/// Ask the helper this upgrade just installed, not an older copy elsewhere
-/// on PATH: one whose `serve status` predates `live_terminals` would answer
-/// "unknown", and the daemon would restart under the user's live sessions.
-/// The `~/.local/bin` copy also covers non-interactive SSH shells, which
-/// usually don't have that directory on PATH.
-fn live_sessions_script() -> String {
-    codemux_remote_command("serve status")
+    Ok(UpgradeOutcome::Upgraded { from, to })
 }
 
 // ── Claude runtime ─────────────────────────────────────────────────
@@ -668,16 +581,5 @@ mod tests {
             auto_upgrade_for(&reachable(None), target),
             AutoUpgrade::Nothing
         ));
-    }
-
-    #[test]
-    fn live_session_check_asks_the_helper_just_installed() {
-        // The upgrade installs to ~/.local/bin; an older copy on PATH must
-        // not answer whether restarting the daemon would end live work.
-        let script = live_sessions_script();
-        let local = script.find("$HOME/.local/bin/codemux-remote").unwrap();
-        let path = script.find("command -v codemux-remote").unwrap();
-        assert!(local < path, "~/.local/bin must be checked before PATH: {script}");
-        assert!(script.ends_with("\"$CMR\" serve status"), "{script}");
     }
 }

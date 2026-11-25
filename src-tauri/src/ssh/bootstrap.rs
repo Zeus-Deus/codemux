@@ -427,12 +427,9 @@ pub async fn provision_scheduler(
     .map_err(|e| format!("enabling the scheduler service: {e}"))
 }
 
-/// Provision the headless `codemux-remote serve` daemon on a host and restart
-/// it onto the newly installed binary. Call only when the caller can safely
-/// restart an existing service.
-///
 /// Installs a systemd **user** unit that runs `codemux-remote serve`,
-/// enables lingering so it survives logout and reboot, and starts it.
+/// enables lingering so it survives logout and reboot, and starts it if
+/// stopped. A running service and its terminals remain untouched.
 /// After this returns successfully, an MCP client on the host configured
 /// with `codemux-remote mcp` can manage the host's folders, git worktrees
 /// and shells with no further setup; the workspaces it registers show up
@@ -442,61 +439,10 @@ pub async fn provision_scheduler(
 /// Best-effort by contract: callers treat a failure as non-fatal —
 /// a host's push-workspace capability does not depend on serve, and
 /// not every host runs systemd.
-pub async fn provision_serve(
-    ssh_target: &str,
-    remote_install_path: &str,
-    deadline: Duration,
-) -> Result<(), String> {
-    provision_serve_with_activation(
-        ssh_target,
-        remote_install_path,
-        deadline,
-        ServeActivation::Restart,
-    )
-    .await
-}
-
-/// Install the unit and start it if stopped, without interrupting a running
-/// service or its terminals. Used by repair and manual reinstall paths where
-/// a status probe cannot safely authorize a later restart.
 pub async fn ensure_serve_running(
     ssh_target: &str,
     remote_install_path: &str,
     deadline: Duration,
-) -> Result<(), String> {
-    provision_serve_with_activation(
-        ssh_target,
-        remote_install_path,
-        deadline,
-        ServeActivation::StartIfStopped,
-    )
-    .await
-}
-
-#[derive(Clone, Copy)]
-enum ServeActivation {
-    StartIfStopped,
-    Restart,
-}
-
-fn serve_activation_script(unit: &str, activation: ServeActivation) -> String {
-    let start = match activation {
-        ServeActivation::StartIfStopped => format!("systemctl --user enable --now {unit}"),
-        ServeActivation::Restart => format!(
-            "systemctl --user enable {unit} && systemctl --user restart {unit}"
-        ),
-    };
-    format!(
-        "loginctl enable-linger \"$USER\" >/dev/null 2>&1; \
-         systemctl --user daemon-reload && {start}"
-    )
-}
-
-async fn provision_serve_with_activation(
-    ssh_target: &str,
-    remote_install_path: &str,
-    deadline: Duration,
-    activation: ServeActivation,
 ) -> Result<(), String> {
     use crate::automations::service;
 
@@ -523,11 +469,19 @@ async fn provision_serve_with_activation(
             .arg("-o")
             .arg("ConnectTimeout=10")
             .arg(ssh_target)
-            .arg(serve_activation_script(service::SERVE_SYSTEMD_UNIT_NAME, activation)),
+            .arg(serve_activation_script(service::SERVE_SYSTEMD_UNIT_NAME)),
         deadline,
     )
     .await
     .map_err(|e| format!("enabling the serve service: {e}"))
+}
+
+fn serve_activation_script(unit: &str) -> String {
+    format!(
+        "loginctl enable-linger \"$USER\" >/dev/null 2>&1; \
+         systemctl --user daemon-reload && \
+         systemctl --user enable --now {unit}"
+    )
 }
 
 /// Register a workspace in the remote daemon's registry via SSH.
@@ -804,11 +758,8 @@ mod tests {
     use super::*;
 
     #[test]
-    fn repair_activation_starts_stopped_service_without_restarting_running_service() {
-        let script = serve_activation_script(
-            "codemux-remote.service",
-            ServeActivation::StartIfStopped,
-        );
+    fn serve_activation_starts_stopped_service_without_restarting_running_service() {
+        let script = serve_activation_script("codemux-remote.service");
         assert!(script.contains("systemctl --user daemon-reload"));
         assert!(script.contains("systemctl --user enable --now codemux-remote.service"));
         assert!(!script.contains("systemctl --user restart"));

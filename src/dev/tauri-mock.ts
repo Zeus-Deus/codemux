@@ -6100,7 +6100,13 @@ const handlers: Record<string, Handler> = {
     const device = mockDeviceProviders.get(Number(a.hostId))!;
     const from = device.helper;
     device.helper = "0.24.0";
-    return { host_id: a.hostId, status: "upgraded", from, to: "0.24.0", message: null };
+    return {
+      host_id: a.hostId,
+      status: "upgraded",
+      from,
+      to: "0.24.0",
+      message: "An already running headless service keeps its previous version until restarted.",
+    };
   },
   // Opens the sign-in terminal tab like the backend, then treats the
   // sign-in as done: the next probe (Re-check, window focus, or a send)

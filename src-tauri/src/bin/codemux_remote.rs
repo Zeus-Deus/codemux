@@ -757,13 +757,8 @@ fn run_serve_status(state_dir_arg: Option<PathBuf>) -> ExitCode {
         Ok(Some(m)) => {
             let alive = codemux_lib::remote::manifest::pid_alive(m.pid);
             // When alive, ask the running daemon how many live PTY sessions
-            // it has. The desktop auto-upgrade reads `live_terminals` to
-            // DEFER a daemon restart that would otherwise kill host-side
-            // agents — the "don't end my work when I close my laptop"
-            // guarantee. `app_status` has been in the tool catalog since the
-            // daemon shipped, so this probe works even against an OLD running
-            // daemon during the first upgrade after this change. Best-effort:
-            // a probe failure reports null.
+            // it has for diagnostics. Best-effort: a probe failure reports
+            // null.
             let live_terminals = if alive {
                 probe_live_terminals(&m.endpoint, &m.secret)
             } else {

@@ -44,7 +44,7 @@ beforeEach(() => {
       case "provider_updates_device":
         return { host_id: 2, helper_version: "0.23.0", app_version: "0.24.0", providers: [report("codex")], error: null };
       case "device_helper_update":
-        return { host_id: 2, status: "upgraded", from: "0.23.0", to: "0.24.0", message: null };
+        return { host_id: 2, status: "upgraded", from: "0.23.0", to: "0.24.0", message: "An already running headless service keeps its previous version until restarted." };
       case "provider_update_local":
         return report("claude", { installed_version: "1.1.0", available: false });
       case "provider_update_device":
@@ -77,6 +77,7 @@ describe("UpdatesSection", () => {
     expect((options as { description: string }).description).toContain("buildbox · Codex: npm failed (exit 1)");
     expect(invoke).toHaveBeenCalledWith("provider_update_local", { provider: "claude" });
     expect(await screen.findByText(/EACCES: permission denied/)).toBeInTheDocument();
+    expect(screen.getByText(/headless service keeps its previous version until restarted/)).toBeInTheDocument();
     expect(screen.getByRole("status")).toHaveTextContent("2 updated, 1 failed");
   });
 });
