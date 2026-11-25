@@ -1880,7 +1880,7 @@ mod windows_key_security {
         if buffer.len() != 8 + data_len {
             return Err("iroh app directory reparse response has an invalid length".to_string());
         }
-        let (path_start, relative) = match tag {
+        let (path_start, relative): (usize, bool) = match tag {
             IO_REPARSE_TAG_MOUNT_POINT if data_len >= 8 => (16, false),
             IO_REPARSE_TAG_SYMLINK if data_len >= 12 && buffer.len() >= 20 => {
                 let flags = u32::from_le_bytes(buffer[16..20].try_into().unwrap());
