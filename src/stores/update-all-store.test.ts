@@ -69,6 +69,42 @@ describe("buildPlan", () => {
 });
 
 describe("refreshDevice", () => {
+  it.each(["reported error", "rejected check"])("skips cached device updates after a %s", async (failure) => {
+    const key = hostKey(2);
+    const previous = {
+      loading: false,
+      checkedAt: 123,
+      providers: [report("codex")],
+      helperVersion: "0.23.0",
+      appVersion: "0.24.0",
+    };
+    useUpdateAll.setState({ machines: { [key]: previous } });
+    if (failure === "rejected check") {
+      invoke.mockRejectedValue(new Error("SSH timed out"));
+    } else {
+      invoke.mockResolvedValue({
+        host_id: 2,
+        helper_version: null,
+        running_version: null,
+        serve_alive: null,
+        app_version: "0.24.0",
+        providers: null,
+        error: "SSH timed out",
+      });
+    }
+
+    await useUpdateAll.getState().refreshDevice(2, true);
+
+    const machines = useUpdateAll.getState().machines as Record<string, MachineState>;
+    expect(machines[key].providers).toEqual(previous.providers);
+    expect(machines[key].helperVersion).toBe(previous.helperVersion);
+    expect(machines[key].checkedAt).toBe(previous.checkedAt);
+    expect(buildPlan(machines, { [key]: "workstation" })).toEqual({
+      items: [],
+      skipped: [{ machine: key, label: "workstation", reason: failure === "rejected check" ? "Error: SSH timed out" : "SSH timed out" }],
+    });
+  });
+
   it("ignores a pre-install check that finishes after a helper update", async () => {
     useUpdateAll.setState({
       machines: {

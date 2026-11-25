@@ -120,7 +120,7 @@ export function buildPlan(machines: Record<string, MachineState>, names: Record<
   const skipped: SkippedItem[] = [];
   for (const [key, state] of Object.entries(machines) as [MachineKey, MachineState][]) {
     const name = names[key] ?? key;
-    if (key !== LOCAL && state.error && !state.helperVersion) {
+    if (key !== LOCAL && state.error) {
       skipped.push({ machine: key, label: name, reason: state.error });
       continue;
     }
