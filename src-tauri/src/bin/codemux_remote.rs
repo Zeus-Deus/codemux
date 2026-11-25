@@ -323,6 +323,8 @@ fn main() -> ExitCode {
                 "name": "codemux-remote",
                 "version": env!("CARGO_PKG_VERSION"),
                 "protocol_version": codemux_lib::pty_daemon::PROTOCOL_VERSION,
+                "guarded_shells": codemux_lib::pty_daemon::protocol::GUARDED_SHELLS_SUPPORTED,
+                "prepared_spawn": codemux_lib::pty_daemon::protocol::PREPARED_SPAWN_SUPPORTED,
             });
             println!("{}", payload);
             ExitCode::SUCCESS

@@ -238,12 +238,13 @@ pub(super) fn verify_daemon_protocol(version: &str, protocol: u32) -> Result<(),
 
 /// Check the live daemon that normal discovery would reuse. This probe
 /// sends only Hello and neither starts daemons nor changes remote paths.
+/// Returns false if no live daemon is present.
 pub(crate) async fn verify_workspace_daemon(
     ssh_target: &str,
     workspace_id: &str,
-) -> Result<(), String> {
+) -> Result<bool, String> {
     let Some(remote_socket) = probe_remote_socket(ssh_target, workspace_id).await? else {
-        return Ok(());
+        return Ok(false);
     };
     let local_socket = LocalSocket::allocate()?;
     let argv = build_forward_argv(
@@ -265,7 +266,7 @@ pub(crate) async fn verify_workspace_daemon(
         .map_err(|error| format!("Could not open the device daemon probe: {error}"))?;
     let result = verify_daemon_forward(&local_socket.path, &mut child).await;
     let _ = child.kill().await;
-    result
+    result.map(|()| true)
 }
 
 async fn verify_daemon_forward(path: &Path, child: &mut Child) -> Result<(), String> {
@@ -276,7 +277,13 @@ async fn verify_daemon_forward(path: &Path, child: &mut Child) -> Result<(), Str
         wait_for_socket(path, child, PROBE_TIMEOUT).await?;
         let client = PtyDaemonClient::connect(path).await.map_err(|e| e.to_string())?;
         let (_, version, protocol) = client.hello().await.map_err(|e| e.to_string())?;
-        verify_daemon_protocol(&version, protocol)
+        verify_daemon_protocol(&version, protocol)?;
+        if !client.supports_prepared_spawn() {
+            return Err(format!(
+                "The device's running terminal daemon ({version}) does not support prepared terminal spawns. Close its terminals and set up the device again before retrying."
+            ));
+        }
+        Ok(())
     })
     .await
     .map_err(|_| "The device's running terminal daemon did not answer the probe in time")?
@@ -550,7 +557,12 @@ mod tests {
         fs::write(&pid, std::process::id().to_string()).unwrap();
         fs::set_permissions(&pid, fs::Permissions::from_mode(0o600)).unwrap();
 
-        for protocol in [PROTOCOL_VERSION + 1, PROTOCOL_VERSION] {
+        for (protocol, guarded_shells, prepared_spawn, expected_error) in [
+            (PROTOCOL_VERSION + 1, true, true, Some("uses PTY protocol")),
+            (PROTOCOL_VERSION, false, true, Some("does not support prepared terminal spawns")),
+            (PROTOCOL_VERSION, true, false, Some("does not support prepared terminal spawns")),
+            (PROTOCOL_VERSION, true, true, None),
+        ] {
             let command = build_existing_daemon_command(socket.path.to_str().unwrap());
             let mut child = Command::new("sh")
                 .args(["-c", &command])
@@ -573,8 +585,8 @@ mod tests {
                     daemon_pid: std::process::id(),
                     daemon_version: "0.0.1".into(),
                     host_claude_plugin: false,
-                    guarded_shells: false,
-                    prepared_spawn: false,
+                    guarded_shells,
+                    prepared_spawn,
                 });
                 let mut frame = serde_json::to_vec(&reply).unwrap();
                 frame.push(b'\n');
@@ -588,11 +600,11 @@ mod tests {
             .await
             .expect("Probe must connect and close its client");
             let _ = child.kill().await;
-            if protocol == PROTOCOL_VERSION {
-                result.0.unwrap();
-            } else {
+            if let Some(expected_error) = expected_error {
                 let error = result.0.unwrap_err();
-                assert!(error.contains(&format!("uses PTY protocol {protocol}")), "{error}");
+                assert!(error.contains(expected_error), "{error}");
+            } else {
+                result.0.unwrap();
             }
             assert!(socket.path.exists(), "the live socket should remain intact");
         }
