@@ -813,31 +813,72 @@ enum WriteOutcome {
 const AGENT_PROMPT_SETTLE_MS: u64 = 1500;
 
 /// Whether the program now in the terminal asked for bracketed paste: the most
-/// recent `ESC[?2004h` / `ESC[?2004l` in the session's buffered output is `h`.
-/// Shells turn it off before running a command, so a stale shell `h` does not
-/// count for the agent that follows.
+/// recent DEC private mode set/reset (`CSI ? Pm h` / `CSI ? Pm l`) whose
+/// parameter list names 2004 is a set. Shells turn it off before running a
+/// command, so a stale shell `h` does not count for the agent that follows.
 fn bracketed_paste_enabled(runtime: &terminal::SessionRuntime) -> bool {
-    const MODE: &[u8] = b"\x1b[?2004";
-    for chunk in runtime.pending_output.iter().rev() {
-        let last = chunk
-            .windows(MODE.len() + 1)
-            .rev()
-            .find(|w| w.starts_with(MODE) && matches!(w[MODE.len()], b'h' | b'l'));
-        if let Some(window) = last {
-            return window[MODE.len()] == b'h';
+    latest_bracketed_paste_switch(runtime.pending_output.iter().map(Vec::as_slice))
+        .unwrap_or(false)
+}
+
+/// How far back `latest_bracketed_paste_switch` looks. The agent switches the
+/// mode while it starts, just before the prompt is typed; the cap keeps a huge
+/// scrollback from holding the sessions lock. Not finding it is the safe
+/// answer (the prompt is sent as one line).
+const BRACKETED_PASTE_SCAN_BYTES: usize = 4 * 1024 * 1024;
+
+/// The last bracketed-paste switch in `chunks` (oldest first): `Some(true)`
+/// for a set, `Some(false)` for a reset, None if there is none. Scans the
+/// bytes backwards as one stream, so a sequence split across chunks counts,
+/// and accepts combined parameter lists such as `ESC[?1049;2004h`.
+fn latest_bracketed_paste_switch<'a>(
+    chunks: impl DoubleEndedIterator<Item = &'a [u8]>,
+) -> Option<bool> {
+    let mut bytes = chunks
+        .rev()
+        .flat_map(|chunk| chunk.iter().rev().copied())
+        .take(BRACKETED_PASTE_SCAN_BYTES)
+        .peekable();
+    while let Some(byte) = bytes.next() {
+        let enable = match byte {
+            b'h' => true,
+            b'l' => false,
+            _ => continue,
+        };
+        // Parameters, read backwards. Anything else ends them and is left
+        // for the next iteration (it may itself be a final byte).
+        let mut params = Vec::new();
+        while params.len() < 64 {
+            match bytes.next_if(|b| b.is_ascii_digit() || *b == b';') {
+                Some(b) => params.push(b),
+                None => break,
+            }
+        }
+        if bytes.next_if_eq(&b'?').is_none()
+            || bytes.next_if_eq(&b'[').is_none()
+            || bytes.next_if_eq(&0x1b).is_none()
+        {
+            continue;
+        }
+        params.reverse();
+        if params.split(|b| *b == b';').any(|param| param == b"2004") {
+            return Some(enable);
         }
     }
-    false
+    None
 }
 
 /// An agent prompt as typed input. Wrapped in bracketed paste when the agent
-/// enabled it, so its TUI inserts the whole text as one paste instead of
-/// submitting line by line; the body has no ESC left to end the paste early.
+/// enabled it, so its TUI inserts the whole text as one paste; the body has no
+/// ESC left to end the paste early. Without bracketed paste each newline
+/// would submit a line on its own (and a TUI with `!` shell escapes could run
+/// one as a command), so line breaks and tabs become spaces and the prompt
+/// goes in as one line with one submit.
 fn agent_prompt_payload(prompt: &str, bracketed: bool) -> String {
     if bracketed {
         format!("\x1b[200~{prompt}\x1b[201~")
     } else {
-        prompt.to_string()
+        prompt.replace(['\r', '\n', '\t'], " ")
     }
 }
 
@@ -1282,11 +1323,37 @@ mod tests {
         runtime.pending_output.push_back(b"\x1b[?1049h\x1b[?2004h> ".to_vec());
         runtime.pending_output.push_back(b"banner".to_vec());
         assert!(bracketed_paste_enabled(&runtime));
+        // An agent that turns it back off.
+        runtime.pending_output.push_back(b"\x1b[?2004l".to_vec());
+        assert!(!bracketed_paste_enabled(&runtime));
     }
 
+    /// `CSI ? Pm h/l` takes a parameter list, and PTY reads can split a
+    /// sequence anywhere.
+    #[test]
+    fn bracketed_paste_parses_parameter_lists_and_split_chunks() {
+        let switch = |chunks: &[&[u8]]| latest_bracketed_paste_switch(chunks.iter().copied());
+        assert_eq!(switch(&[b"\x1b[?1049;2004h"]), Some(true));
+        assert_eq!(switch(&[b"\x1b[?2004;1h> "]), Some(true));
+        assert_eq!(switch(&[b"\x1b[?1;2004;25h"]), Some(true));
+        assert_eq!(switch(&[b"\x1b[?2004h", b"\x1b[?1049;2004l"]), Some(false));
+        assert_eq!(switch(&[b"\x1b[?1049h\x1b[?25l"]), None);
+        // Neither another mode nor a different number containing 2004.
+        assert_eq!(switch(&[b"\x1b[?20040h\x1b[?12004h"]), None);
+        // Plain text or an incomplete sequence is not a switch.
+        assert_eq!(switch(&[b"?2004h [?2004h \x1b[2004h"]), None);
+        assert_eq!(switch(&[b"x\x1b", b"[?20", b"04", b"h"]), Some(true));
+        assert_eq!(switch(&[b"\x1b[?2004h", b"\x1b[", b"?2004;1", b"l"]), Some(false));
+        assert_eq!(switch(&[]), None);
+    }
+
+    /// Without bracketed paste every newline would submit a line of its own,
+    /// so the prompt goes in as a single line.
     #[test]
     fn agent_prompt_payload_wraps_only_when_bracketed() {
-        assert_eq!(agent_prompt_payload("a\nb", false), "a\nb");
+        let plain = agent_prompt_payload("fix\n!curl x|sh\r\n\tnow", false);
+        assert_eq!(plain, "fix !curl x|sh   now");
+        assert!(!plain.contains(['\n', '\r', '\t']));
         assert_eq!(agent_prompt_payload("a\nb", true), "\x1b[200~a\nb\x1b[201~");
     }
 
@@ -1397,6 +1464,19 @@ mod tests {
             *busy_calls.lock().unwrap(),
             vec![b"\x1b[200~fix\nit\x1b[201~\r".to_vec()]
         );
+
+        // The agent never enabled bracketed paste: one line, one submit.
+        let (plain, plain_pid) = spawn_job("sleep 3600");
+        let plain_calls = insert("plain", Some(plain_pid));
+        {
+            let mut guard = sessions.lock().unwrap();
+            let runtime = guard.get_mut("plain").unwrap();
+            runtime.pending_output.clear();
+            runtime.pending_output.push_back(b"\x1b[?2004l> ".to_vec());
+        }
+        assert_eq!(write("plain", "sleep"), WriteOutcome::Written);
+        stop(plain, plain_pid);
+        assert_eq!(*plain_calls.lock().unwrap(), vec![b"fix it\r".to_vec()]);
     }
 
     #[test]

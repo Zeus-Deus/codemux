@@ -363,19 +363,39 @@ pub fn shell_escape_for_ansi_c_quotes(s: &str) -> String {
 /// them is doubled like `'`. Control characters would act as editing keys
 /// (Tab completes, ^C cancels), so line breaks become spaces and the rest are
 /// dropped.
+///
+/// Parsing is only half of it. Windows PowerShell 5.1 (and pwsh's legacy
+/// native-argument mode, which it still uses for `.cmd`/`.bat` shims) builds
+/// the child's command line by wrapping an argument that has whitespace in
+/// `"..."` without escaping what is inside. So the value itself must hold no
+/// double quote: every double-quote character becomes `'` (a `"` would end
+/// the wrapped argument and let the rest of the prompt add argv such as
+/// `--mcp-config`). It must not end in a backslash either (`\"` would escape
+/// the closing quote), and it always holds a space so it is always wrapped:
+/// an unwrapped `a&calc` would let cmd.exe run `calc` through a `.cmd` shim.
+/// A trailing space covers both.
 pub fn shell_quote_for_powershell(s: &str) -> String {
-    let mut out = String::with_capacity(s.len() + 2);
-    out.push('\'');
+    let mut body = String::with_capacity(s.len() + 1);
     for c in s.replace("\r\n", "\n").chars() {
         match c {
-            '\'' | '\u{2018}' | '\u{2019}' | '\u{201A}' | '\u{201B}' => {
-                out.push(c);
-                out.push(c);
-            }
-            '\n' | '\r' | '\t' => out.push(' '),
+            // Typographic and fullwidth forms too: Windows' best-fit mapping
+            // turns them into `"` for programs that read an ANSI command line.
+            '"' | '\u{201C}' | '\u{201D}' | '\u{201E}' | '\u{201F}' | '\u{FF02}' => body.push('\''),
+            '\n' | '\r' | '\t' => body.push(' '),
             c if c.is_control() => {}
-            c => out.push(c),
+            c => body.push(c),
         }
+    }
+    if body.ends_with('\\') || !body.contains(' ') {
+        body.push(' ');
+    }
+    let mut out = String::with_capacity(body.len() + 2);
+    out.push('\'');
+    for c in body.chars() {
+        if matches!(c, '\'' | '\u{2018}' | '\u{2019}' | '\u{201A}' | '\u{201B}') {
+            out.push(c);
+        }
+        out.push(c);
     }
     out.push('\'');
     out
@@ -673,6 +693,42 @@ mod tests {
             shell_quote_for_powershell("a'b\u{2019}c\r\nd\te\x03\x1b[31m$(id)`x"),
             "'a''b\u{2019}\u{2019}c d e[31m$(id)`x'"
         );
+    }
+
+    /// Windows PowerShell wraps a native argument in `"..."` without escaping
+    /// it, so a `"` in the prompt would end the argument and add argv (and a
+    /// trailing `\` would escape the closing quote). The quoted value holds
+    /// no double-quote character, never ends in a backslash, and always has a
+    /// space so it is always wrapped.
+    #[test]
+    fn powershell_quote_leaves_no_double_quote_or_trailing_backslash() {
+        let inner = |quoted: &str| -> String {
+            let body = quoted
+                .strip_prefix('\'')
+                .and_then(|rest| rest.strip_suffix('\''))
+                .expect("one single-quoted argument");
+            body.replace("''", "'")
+        };
+        for prompt in [
+            r#"fix" --mcp-config "C:\evil.json"#,
+            "fix \u{201C}it\u{201D} \u{FF02}now\u{201E}\u{201F}",
+            r#"path C:\dir\\"#,
+            r#"end\"#,
+            "a&calc",
+        ] {
+            let quoted = shell_quote_for_powershell(prompt);
+            let value = inner(&quoted);
+            for c in ['"', '\u{201C}', '\u{201D}', '\u{201E}', '\u{201F}', '\u{FF02}'] {
+                assert!(!value.contains(c), "{c:?} in {quoted:?}");
+            }
+            assert!(!value.ends_with('\\'), "trailing backslash in {quoted:?}");
+            assert!(value.contains(' '), "unwrapped argument {quoted:?}");
+        }
+        assert_eq!(
+            shell_quote_for_powershell(r#"fix" --mcp-config "x"#),
+            "'fix'' --mcp-config ''x'"
+        );
+        assert_eq!(shell_quote_for_powershell(r"end\"), r"'end\ '");
     }
 
     /// Nushell reads `$'...'` as an interpolated string and runs `(...)`, so
