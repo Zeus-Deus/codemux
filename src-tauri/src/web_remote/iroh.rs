@@ -856,26 +856,41 @@ async fn handle_connection<R: Runtime>(
     life: ListenerLife,
 ) {
     if let Ok(Ok((send, recv))) = timeout(HANDSHAKE_TIMEOUT, conn.accept_bi()).await {
-        handle_bi_stream(app, shared, send, recv, life).await;
+        handle_bi_stream(app, shared, &conn, send, recv, life).await;
     }
     conn.close(0u32.into(), b"control stream closed");
 }
 
-async fn reject_handshake(send: &mut SendStream, payload: &[u8]) {
-    let _ = timeout(HANDSHAKE_TIMEOUT, async {
-        write_frame(send, KIND_TEXT, payload).await.ok()?;
-        send.finish().ok()?;
-        // Let the peer receive the reply before its QUIC connection closes.
-        send.stopped().await.ok()
-    })
-    .await;
+async fn reject_handshake(
+    conn: &Connection,
+    send: &mut SendStream,
+    life: &mut ListenerLife,
+    payload: &[u8],
+) {
+    let delivery = timeout(HANDSHAKE_TIMEOUT, async {
+        if write_frame(send, KIND_TEXT, payload).await.is_ok() && send.finish().is_ok() {
+            // A QUIC ACK only confirms receipt by the transport. The browser
+            // closes the connection after decoding the denial.
+            conn.closed().await;
+        }
+    });
+    tokio::select! {
+        biased;
+        _ = life.stopped() => {}
+        _ = delivery => {}
+    }
 }
 
-async fn reject_account_handshake(send: &mut SendStream, reject: &AccountHandshakeReject) {
+async fn reject_account_handshake(
+    conn: &Connection,
+    send: &mut SendStream,
+    life: &mut ListenerLife,
+    reject: &AccountHandshakeReject,
+) {
     // A verifier outage ends the connection without a denial frame. Browsers
     // can use their usual transport retry and mint a fresh grant and nonce.
     if let Some(payload) = account_reject_frame_bytes(reject) {
-        reject_handshake(send, &payload).await;
+        reject_handshake(conn, send, life, &payload).await;
     }
 }
 
@@ -887,6 +902,7 @@ async fn reject_account_handshake(send: &mut SendStream, reject: &AccountHandsha
 async fn handle_bi_stream<R: Runtime>(
     app: AppHandle<R>,
     shared: Arc<Shared>,
+    conn: &Connection,
     mut send: SendStream,
     mut recv: RecvStream,
     mut life: ListenerLife,
@@ -911,7 +927,7 @@ async fn handle_bi_stream<R: Runtime>(
             Some(h) => h,
             None => {
                 let reject = AccountHandshakeReject::Malformed;
-                reject_account_handshake(&mut send, &reject).await;
+                reject_account_handshake(conn, &mut send, &mut life, &reject).await;
                 return;
             }
         };
@@ -932,7 +948,7 @@ async fn handle_bi_stream<R: Runtime>(
                 if matches!(reject, AccountHandshakeReject::Pending { .. }) {
                     super::emit_state_changed(&app);
                 }
-                reject_account_handshake(&mut send, &reject).await;
+                reject_account_handshake(conn, &mut send, &mut life, &reject).await;
                 return;
             }
         }
@@ -946,7 +962,7 @@ async fn handle_bi_stream<R: Runtime>(
         match session {
             Ok(s) => s.id,
             Err(reject) => {
-                reject_handshake(&mut send, &reject_frame_bytes(&reject)).await;
+                reject_handshake(conn, &mut send, &mut life, &reject_frame_bytes(&reject)).await;
                 return;
             }
         }
@@ -1848,6 +1864,73 @@ mod tests {
             std::net::SocketAddr::V6(v6) => {
                 std::net::SocketAddr::from((std::net::Ipv6Addr::LOCALHOST, v6.port()))
             }
+        }
+    }
+
+    #[tokio::test]
+    async fn iroh_direct_distinguishes_account_denial_from_verifier_disconnect() {
+        let server_ep = Endpoint::builder(presets::Minimal)
+            .alpns(vec![IROH_ALPN.to_vec()])
+            .bind()
+            .await
+            .unwrap();
+        let client_ep = Endpoint::builder(presets::Minimal).bind().await.unwrap();
+        let dial = iroh::EndpointAddr::new(server_ep.id()).with_ip_addr(loopback_addr(&server_ep));
+
+        for reject in [
+            AccountHandshakeReject::Unverified,
+            AccountHandshakeReject::VerifierUnavailable,
+        ] {
+            let (receipt_tx, receipt_rx) = tokio::sync::oneshot::channel();
+            let closing = std::cell::Cell::new(false);
+            let server = async {
+                let conn = server_ep.accept().await.unwrap().await.unwrap();
+                let (mut send, mut recv) = conn.accept_bi().await.unwrap();
+                let first = read_frame(&mut recv, &mut FrameDecoder::new(), &mut [0; 256])
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert!(is_account_handshake(&first));
+                assert!(receipt_tx.send(send.stopped()).is_ok());
+
+                let (_shutdown, receiver) = watch::channel(false);
+                reject_account_handshake(&conn, &mut send, &mut ListenerLife(receiver), &reject)
+                    .await;
+                drop(send);
+                closing.set(true);
+                conn.close(0u32.into(), b"control stream closed");
+            };
+            let client = async {
+                let conn = client_ep.connect(dial.clone(), IROH_ALPN).await.unwrap();
+                let (mut send, mut recv) = conn.open_bi().await.unwrap();
+                let hello = account_hello_frame("fixture-grant", "fixture-nonce");
+                write_frame(&mut send, hello.kind, &hello.payload).await.unwrap();
+                let receipt = receipt_rx.await.unwrap();
+                let mut decoder = FrameDecoder::new();
+                let mut buf = [0; 256];
+
+                if reject == AccountHandshakeReject::Unverified {
+                    // The transport has acknowledged the denial before the
+                    // client application polls its receive stream.
+                    assert_eq!(receipt.await.unwrap(), None);
+                    assert!(!closing.get(), "keep the connection open after the ACK");
+                    let reply = read_frame(&mut recv, &mut decoder, &mut buf).await.unwrap().unwrap();
+                    assert_eq!(
+                        serde_json::from_slice::<Value>(&reply.payload).unwrap(),
+                        json!({ "t": "unauthorized", "reason": "grant_invalid" })
+                    );
+                    assert!(read_frame(&mut recv, &mut decoder, &mut buf).await.unwrap().is_none());
+                    conn.close(0u32.into(), b"client-closed");
+                } else {
+                    let reply = read_frame(&mut recv, &mut decoder, &mut buf).await;
+                    assert!(matches!(reply, Ok(None) | Err(_)), "outage sent a frame: {reply:?}");
+                }
+            };
+            timeout(Duration::from_secs(8), async {
+                tokio::join!(biased; server, client);
+            })
+            .await
+            .expect("loopback denial or disconnect completed");
         }
     }
 
