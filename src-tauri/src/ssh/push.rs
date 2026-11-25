@@ -186,8 +186,32 @@ pub fn build_pull_rsync_argv(opts: &PullOptions<'_>) -> Vec<String> {
     ]
 }
 
+/// Whether `path` can be handed to the remote host as an rsync path. Older
+/// rsync (before 3.2.4, still common on servers and macOS) passes the remote
+/// path through the remote shell unquoted, so anything that shell would
+/// interpret is refused instead of transferred. A leading `~/` (or a bare
+/// `~`) stays allowed for the remote home; spaces are allowed because they
+/// cannot run anything.
+pub(crate) fn is_transfer_safe_remote_path(path: &str) -> bool {
+    let body = path
+        .strip_prefix("~/")
+        .or_else(|| (path == "~").then_some(""))
+        .unwrap_or(path);
+    !path.is_empty()
+        && body.chars().all(|c| {
+            c.is_ascii_alphanumeric() || matches!(c, ' ' | '.' | '_' | '/' | '@' | '+' | ',' | ':' | '=' | '%' | '-')
+        })
+}
+
+fn unsafe_remote_path_reason(path: &str) -> String {
+    format!("refusing remote path {path:?}: it holds characters the remote shell would interpret")
+}
+
 /// Push the worktree to the remote host.
 pub async fn push_workspace(opts: PushOptions<'_>) -> PushResult {
+    if !is_transfer_safe_remote_path(opts.remote_path) {
+        return PushResult::RsyncFailed { reason: unsafe_remote_path_reason(opts.remote_path) };
+    }
     if !opts.local_worktree.exists() {
         return PushResult::LocalNotFound {
             path: opts.local_worktree.display().to_string(),
@@ -263,6 +287,9 @@ pub async fn push_workspace(opts: PushOptions<'_>) -> PushResult {
 
 /// Pull the worktree back from the remote host.
 pub async fn pull_workspace_back(opts: PullOptions<'_>) -> PullResult {
+    if !is_transfer_safe_remote_path(opts.remote_path) {
+        return PullResult::RsyncFailed { reason: unsafe_remote_path_reason(opts.remote_path) };
+    }
     if !opts.local_worktree.exists() {
         // The local target dir must exist for rsync to write into. Try
         // to create it; if that fails (permissions, disk full), surface
@@ -799,6 +826,25 @@ mod tests {
         // quote.
         assert_eq!(shell_escape("~"), "~");
         assert_eq!(shell_escape("~alice"), "~alice");
+    }
+
+    #[test]
+    fn transfer_paths_refuse_shell_syntax_before_rsync() {
+        for ok in ["~/.codemux/worktrees/proj/branch", "/srv/code/my proj", "~", "/home/u/a@b+c,d=e%f:g"] {
+            assert!(is_transfer_safe_remote_path(ok), "{ok}");
+        }
+        for bad in ["", "~$(id)/x", "/srv/`id`", "/srv/a;id", "/srv/a|b", "/srv/a&b", "~alice/x", "/srv/a\nb", "/srv/'x'", "/srv/*", "/srv/a$b"] {
+            assert!(!is_transfer_safe_remote_path(bad), "{bad}");
+        }
+    }
+
+    #[tokio::test]
+    async fn push_and_pull_refuse_unsafe_paths_before_any_ssh() {
+        let dir = tempfile::tempdir().unwrap();
+        let push = push_workspace(PushOptions::new("unused-host", dir.path(), "~/x;touch /tmp/pwned")).await;
+        assert!(matches!(push, PushResult::RsyncFailed { ref reason } if reason.contains("refusing remote path")), "{push:?}");
+        let pull = pull_workspace_back(PullOptions::new("unused-host", "~/x$(id)", dir.path())).await;
+        assert!(matches!(pull, PullResult::RsyncFailed { ref reason } if reason.contains("refusing remote path")), "{pull:?}");
     }
 
     #[test]
