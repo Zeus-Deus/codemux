@@ -975,12 +975,12 @@ fn stop_owned_browser_daemon(session: &str, record: &BrowserPidRecord, bin: &str
     if read_agent_browser_daemon_pid(session) != Some(record.pid) {
         return;
     }
-    // On Windows the CLI resolves its control port from a separate file. It
-    // could send `close` to an unrelated listener after the PID check, so
-    // only terminate the repeatedly verified process tree below.
-    #[cfg(windows)]
+    // Windows retains a verified process handle. macOS closes through a
+    // verified connected peer below; a CLI path lookup could reach a
+    // replacement daemon after this PID check.
+    #[cfg(any(windows, target_os = "macos"))]
     let _ = bin;
-    #[cfg(not(windows))]
+    #[cfg(all(not(windows), not(target_os = "macos")))]
     {
         let mut cmd = std::process::Command::new("sh");
         if set_browser_owner_env(&mut cmd, session).is_ok() {
@@ -1000,6 +1000,159 @@ fn stop_owned_browser_daemon(session: &str, record: &BrowserPidRecord, bin: &str
     if browser_process_matches(record, session) {
         kill_verified_browser_pid(record, session);
     }
+}
+
+/// A full Unix listen backlog can block a normal connect indefinitely.
+/// Resolve the control socket under the same deadline as the close request.
+#[cfg(all(unix, any(test, target_os = "macos")))]
+fn connect_unix_browser_control_until(
+    socket_path: &std::path::Path,
+    deadline: Instant,
+) -> std::io::Result<std::os::unix::net::UnixStream> {
+    use std::os::fd::AsRawFd;
+
+    if Instant::now() >= deadline {
+        return Err(std::io::ErrorKind::TimedOut.into());
+    }
+    let socket = socket2::Socket::new(socket2::Domain::UNIX, socket2::Type::STREAM, None)?;
+    socket.set_nonblocking(true)?;
+    let address = socket2::SockAddr::unix(socket_path)?;
+    match socket.connect(&address) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock
+            || error.raw_os_error().is_some_and(|code| code == libc::EINPROGRESS || code == libc::EINTR) =>
+        {
+            loop {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                if remaining.is_zero() {
+                    return Err(std::io::ErrorKind::TimedOut.into());
+                }
+                let timeout_ms = remaining.as_millis().clamp(1, i32::MAX as u128) as i32;
+                let mut ready = libc::pollfd {
+                    fd: socket.as_raw_fd(),
+                    events: libc::POLLOUT,
+                    revents: 0,
+                };
+                let result = unsafe { libc::poll(&mut ready, 1, timeout_ms) };
+                if result == 0 {
+                    return Err(std::io::ErrorKind::TimedOut.into());
+                }
+                if result < 0 {
+                    let error = std::io::Error::last_os_error();
+                    if error.kind() == std::io::ErrorKind::Interrupted {
+                        continue;
+                    }
+                    return Err(error);
+                }
+                if let Some(error) = socket.take_error()? {
+                    return Err(error);
+                }
+                if ready.revents & libc::POLLOUT == 0 {
+                    return Err(std::io::Error::other("Browser control connection did not become writable"));
+                }
+                break;
+            }
+        }
+        Err(error) => return Err(error),
+    }
+    socket.set_nonblocking(false)?;
+    Ok(socket.into())
+}
+
+/// Send close on the connection whose kernel-reported peer is the verified
+/// daemon. Resolving the socket again through the CLI could reach a process
+/// that replaced the listener after the ownership check.
+#[cfg(all(unix, any(test, target_os = "macos")))]
+fn close_verified_unix_browser_peer(
+    socket_path: &std::path::Path,
+    expected_pid: u32,
+    deadline: Instant,
+    still_owned: impl FnOnce() -> bool,
+) -> Result<(), String> {
+    use std::io::{Read, Write};
+
+    let mut stream = connect_unix_browser_control_until(socket_path, deadline)
+        .map_err(|_| "Browser control socket is unavailable".to_string())?;
+    if unix_browser_control_peer_pid(&stream).ok() != Some(expected_pid) || !still_owned() {
+        return Err("Browser control peer changed during shutdown".into());
+    }
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    if remaining.is_zero() {
+        return Err("Browser close deadline elapsed".into());
+    }
+    stream.set_write_timeout(Some(remaining.min(PROC_CONTROL_TIMEOUT)))
+        .map_err(|_| "Could not bound browser close request".to_string())?;
+    let mut request = serde_json::json!({
+        "id": uuid::Uuid::new_v4().simple().to_string(),
+        "action": "close",
+    }).to_string();
+    request.push('\n');
+    stream.write_all(request.as_bytes()).map_err(|_| "Browser close request failed".to_string())?;
+
+    let mut response = Vec::new();
+    let mut chunk = [0u8; 512];
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err("Browser close response timed out".into());
+        }
+        stream.set_read_timeout(Some(remaining))
+            .map_err(|_| "Could not bound browser close response".to_string())?;
+        let read = stream.read(&mut chunk).map_err(|_| "Browser close response timed out".to_string())?;
+        if read == 0 {
+            return Err("Browser close response ended early".into());
+        }
+        let end = chunk[..read].iter().position(|byte| *byte == b'\n');
+        response.extend_from_slice(&chunk[..end.map_or(read, |index| index + 1)]);
+        if response.len() > 8 * 1024 {
+            return Err("Browser close response was too large".into());
+        }
+        if end.is_some() {
+            break;
+        }
+    }
+    let result: serde_json::Value = serde_json::from_slice(&response)
+        .map_err(|_| "Browser close response was invalid".to_string())?;
+    if result.get("success").and_then(serde_json::Value::as_bool) != Some(true) {
+        return Err("Browser daemon refused close".into());
+    }
+    Ok(())
+}
+
+#[cfg(all(unix, any(test, target_os = "macos")))]
+fn unix_browser_control_peer_pid(stream: &std::os::unix::net::UnixStream) -> std::io::Result<u32> {
+    use std::os::fd::AsRawFd;
+
+    #[cfg(target_os = "macos")]
+    {
+        let mut pid: libc::pid_t = 0;
+        let mut size = std::mem::size_of_val(&pid) as libc::socklen_t;
+        let result = unsafe {
+            libc::getsockopt(stream.as_raw_fd(), libc::SOL_LOCAL, libc::LOCAL_PEEREPID,
+                (&mut pid as *mut libc::pid_t).cast(), &mut size)
+        };
+        if result == 0 && size as usize == std::mem::size_of_val(&pid) && pid > 0 {
+            return Ok(pid as u32);
+        }
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let mut cred = std::mem::MaybeUninit::<libc::ucred>::zeroed();
+        let mut size = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
+        let result = unsafe {
+            libc::getsockopt(stream.as_raw_fd(), libc::SOL_SOCKET, libc::SO_PEERCRED,
+                cred.as_mut_ptr().cast(), &mut size)
+        };
+        if result == 0 && size as usize == std::mem::size_of::<libc::ucred>() {
+            let cred = unsafe { cred.assume_init() };
+            if cred.pid > 0 {
+                return Ok(cred.pid as u32);
+            }
+        }
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    let _ = stream;
+    Err(std::io::Error::other("Browser control peer PID is unavailable"))
 }
 
 #[cfg(windows)]
@@ -1113,14 +1266,29 @@ fn kill_verified_browser_pid(record: &BrowserPidRecord, session: &str) {
             std::thread::sleep(Duration::from_millis(25));
         }
     }
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(target_os = "macos")]
+    close_verified_browser_pid_until(record, session, Instant::now() + CLOSE_TIMEOUT);
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     {
-        // macOS has no ordinary process handle that can be used to send a
-        // signal after verifying this daemon. Some callers already attempted
-        // CLI close; failed-start and app-exit cleanup may leave an owned
-        // daemon alive rather than race a numeric PID signal into reuse.
         eprintln!("[codemux::browser] Cannot safely force-stop browser session {session} on this platform");
         let _ = record;
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn close_verified_browser_pid_until(record: &BrowserPidRecord, session: &str, deadline: Instant) {
+    let socket = run_dir_for_session(session).map(|dir| dir.join(format!("{session}.sock")));
+    let result = socket.ok_or_else(|| "Browser control path is unavailable".to_string())
+        .and_then(|path| close_verified_unix_browser_peer(
+            &path, record.pid, deadline, || browser_process_matches(record, session),
+        ));
+    if let Err(error) = result {
+        eprintln!("[codemux::browser] Could not gracefully close browser session {session}: {error}");
+        return;
+    }
+    let grace = Instant::now() + Duration::from_secs(1);
+    while browser_process_matches(record, session) && Instant::now() < grace && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(25));
     }
 }
 
@@ -1202,8 +1370,8 @@ fn rollback_failed_unix_open(session: &str, before_open: Option<&BrowserPidRecor
     if let Some(record) = track_current_browser_daemon(session)
         .filter(|record| failed_open_daemon_started_here(record, before_open))
     {
-        // Signal this exact process. A session-wide CLI `close` could race a
-        // second app that starts a replacement at the same control socket.
+        // Close or signal this exact process. A session-wide CLI `close`
+        // could reach a replacement at the same control socket.
         kill_verified_browser_pid(&record, session);
     }
 }
@@ -1325,7 +1493,10 @@ fn rollback_failed_unix_stream_open(session: &str, before_open: Option<&BrowserP
     // If teardown cannot confirm exit, later commands must still refuse this
     // launch attempt. A fresh attempt has a different marker and remains usable.
     mark_failed_stream_attempt(session, attempt);
+    #[cfg(not(target_os = "macos"))]
     rollback_failed_unix_open(session, before_open);
+    #[cfg(target_os = "macos")]
+    let _ = before_open;
 
     // The detached daemon can publish its PID after the launcher times out.
     // Finish rollback in the blocking launch worker before its session gate
@@ -1348,12 +1519,18 @@ fn rollback_failed_unix_stream_open(session: &str, before_open: Option<&BrowserP
             None
         };
         if let Some(record) = from_pid.or(from_process) {
-            // The launch marker identifies this process for a direct verified
-            // kill without overwriting a later attempt's PID record.
+            // The launch marker identifies this process without overwriting
+            // a later attempt's PID record. On macOS, its control socket may
+            // appear after the process, so keep trying a peer-bound close.
+            #[cfg(target_os = "macos")]
+            close_verified_browser_pid_until(&record, session, started + Duration::from_secs(5));
+            #[cfg(not(target_os = "macos"))]
             kill_verified_browser_pid(&record, session);
             if !browser_process_matches(&record, session) {
                 clear_failed_stream_attempt(session, attempt);
+                return;
             }
+            #[cfg(not(target_os = "macos"))]
             return;
         }
         std::thread::sleep(Duration::from_millis(50));
@@ -4028,8 +4205,8 @@ impl AgentBrowserManager {
     ///   1. Pop the session from the map under the lock — no other caller
     ///      can find it after this point, even if subsequent steps stall.
     ///   2. Verify the daemon's process marker, session, and start time.
-    ///   3. Issue a graceful CLI close, then signal that same daemon only if
-    ///      it is still running and still matches the ownership record.
+    ///   3. Close the verified daemon using the platform's bound process or
+    ///      control peer, with a Linux pidfd fallback when necessary.
     ///   4. Clean up our PID file under `~/.codemux/run/`.
     ///
     /// Returns Ok even if individual steps fail — close is idempotent and
@@ -4071,8 +4248,8 @@ impl AgentBrowserManager {
         let _ = removed;
 
         // Failed stream attempts keep their launch marker even after the
-        // taken port allocation is released. Closing the pane retries a
-        // direct kill of any still-live daemon from those attempts.
+        // taken port allocation is released. Closing the pane retries
+        // verified cleanup of any still-live daemon from those attempts.
         #[cfg(unix)]
         let had_failed_attempts = tokio::task::spawn_blocking({
             let session = session.clone();
@@ -4095,10 +4272,9 @@ impl AgentBrowserManager {
         Ok(())
     }
 
-    /// Best-effort teardown of the daemon behind a closed session:
-    /// graceful CLI `close` on Unix, then a kill of the verified daemon. Spawns
-    /// external processes — which is exactly why
-    /// `close()` only calls this in non-test builds.
+    /// Best-effort teardown of the daemon behind a closed session. Linux
+    /// uses CLI close with a pidfd fallback; macOS sends close to a verified
+    /// control peer. This can block, so close runs it off the async executor.
     #[cfg(not(test))]
     fn shutdown_session_processes(session: &str, removed: Option<StreamSession>) {
         let Some(removed) = removed else { return };
@@ -6149,6 +6325,148 @@ mod tests {
         };
         let record = test_browser_record(child.id(), start_time, token.to_owned());
         (temp, child, record)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn browser_close_sends_only_to_a_verified_connected_peer() {
+        use std::io::{BufRead, Write};
+        use std::os::unix::net::UnixListener;
+
+        let temp = tempfile::tempdir().unwrap();
+        let socket = temp.path().join("control.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        assert_eq!(
+            connect_unix_browser_control_until(&socket, Instant::now()).unwrap_err().kind(),
+            std::io::ErrorKind::TimedOut,
+        );
+        let server = std::thread::spawn(move || {
+            let mut received = Vec::new();
+            for _ in 0..3 {
+                let (mut stream, _) = listener.accept().unwrap();
+                stream.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+                let mut line = String::new();
+                std::io::BufReader::new(&stream).read_line(&mut line).unwrap();
+                if !line.is_empty() {
+                    received.push(serde_json::from_str::<serde_json::Value>(&line).unwrap());
+                    stream.write_all(b"{\"success\":true}\n").unwrap();
+                }
+            }
+            received
+        });
+
+        let deadline = || Instant::now() + Duration::from_secs(2);
+        assert!(close_verified_unix_browser_peer(&socket, std::process::id() + 1, deadline(), || true).is_err());
+        assert!(close_verified_unix_browser_peer(&socket, std::process::id(), deadline(), || false).is_err());
+        close_verified_unix_browser_peer(&socket, std::process::id(), deadline(), || true).unwrap();
+        let requests = server.join().unwrap();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0]["action"], "close");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn browser_close_response_uses_one_deadline_across_chunks() {
+        use std::io::{BufRead, Write};
+        use std::os::unix::net::UnixListener;
+
+        let temp = tempfile::tempdir().unwrap();
+        let socket = temp.path().join("control.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut line = String::new();
+            std::io::BufReader::new(&stream).read_line(&mut line).unwrap();
+            for _ in 0..20 {
+                if stream.write_all(b" ").is_err() { break; }
+                std::thread::sleep(Duration::from_millis(60));
+            }
+        });
+
+        let started = Instant::now();
+        let result = close_verified_unix_browser_peer(
+            &socket, std::process::id(), started + Duration::from_millis(250), || true,
+        );
+        assert!(result.is_err());
+        assert!(started.elapsed() < Duration::from_secs(1));
+        server.join().unwrap();
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_failed_open_daemon_fixture() {
+        use std::io::{BufRead, Write};
+        use std::os::unix::net::UnixListener;
+
+        let Ok(session) = std::env::var("CODEMUX_TEST_FAILED_OPEN_SESSION") else { return };
+        let release = std::env::var("CODEMUX_TEST_FAILED_OPEN_RELEASE").unwrap();
+        let dir = run_dir_for_session(&session).unwrap();
+        let started = Instant::now();
+        while !std::path::Path::new(&release).exists() {
+            assert!(started.elapsed() < Duration::from_secs(3), "fixture was never released");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        std::thread::sleep(Duration::from_millis(750));
+        std::fs::write(dir.join(format!("{session}.pid")), std::process::id().to_string()).unwrap();
+        let listener = UnixListener::bind(dir.join(format!("{session}.sock"))).unwrap();
+        let (mut stream, _) = listener.accept().unwrap();
+        stream.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+        let mut line = String::new();
+        std::io::BufReader::new(&stream).read_line(&mut line).unwrap();
+        let request: serde_json::Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(request["action"], "close");
+        stream.write_all(b"{\"success\":true}\n").unwrap();
+        std::process::exit(0);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn failed_mac_open_closes_its_late_published_daemon() {
+        let session = format!("browser-mac-late-{}", uuid::Uuid::new_v4().simple());
+        let attempt = uuid::Uuid::new_v4().simple().to_string();
+        let executable = std::env::current_exe().unwrap();
+        let temp = tempfile::tempdir_in(executable.parent().unwrap()).unwrap();
+        let daemon_binary = temp.path().join("agent-browser");
+        let release = temp.path().join("release");
+        std::fs::hard_link(executable, &daemon_binary).unwrap();
+        let mut daemon = std::process::Command::new(&daemon_binary)
+            .args(["--exact", "agent_browser::tests::macos_failed_open_daemon_fixture", "--nocapture"])
+            .env("CODEMUX_TEST_FAILED_OPEN_SESSION", &session)
+            .env("CODEMUX_TEST_FAILED_OPEN_RELEASE", &release)
+            .env("CODEMUX_BROWSER_OWNER", browser_owner_token())
+            .env("CODEMUX_BROWSER_SESSION", &session)
+            .env("CODEMUX_BROWSER_OPEN_ATTEMPT", &attempt)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn().unwrap();
+        let started = Instant::now();
+        while browser_process_start(daemon.id(), &session, browser_owner_token()).is_none() {
+            assert!(started.elapsed() < Duration::from_secs(3), "fixture daemon did not start");
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        let dir = run_dir_for_session(&session).unwrap();
+        let pid_path = dir.join(format!("{session}.pid"));
+        let socket_path = dir.join(format!("{session}.sock"));
+        assert!(!pid_path.exists(), "fixture published its PID before rollback");
+
+        std::fs::write(&release, b"go").unwrap();
+        rollback_failed_unix_stream_open(&session, None, &attempt);
+        let started = Instant::now();
+        let stopped = loop {
+            if daemon.try_wait().unwrap().is_some() { break true; }
+            if started.elapsed() >= Duration::from_secs(3) { break false; }
+            std::thread::sleep(Duration::from_millis(25));
+        };
+        if !stopped {
+            let _ = daemon.kill();
+            let _ = daemon.wait();
+        }
+        assert!(stopped, "failed macOS open left its late daemon running");
+        assert!(!failed_stream_attempts().lock().unwrap().get(&session)
+            .is_some_and(|attempts| attempts.contains(&attempt)));
+        let _ = std::fs::remove_file(pid_path);
+        let _ = std::fs::remove_file(socket_path);
+        clear_session_pid(&session);
     }
 
     #[cfg(target_os = "linux")]
