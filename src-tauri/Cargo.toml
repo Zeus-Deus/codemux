@@ -34,7 +34,9 @@ tar = "0.4"
 # builds. `codemux serve` hosts the full command surface on MockRuntime to run
 # headless (no display server) — see src/web_remote/serve.rs. The feature is
 # additive: the GUI path never instantiates the mock runtime.
-tauri = { version = "2", features = ["protocol-asset", "test"] }
+tauri = { package = "codemux-tauri-ipc-guard", path = "tauri-ipc-guard", features = ["protocol-asset", "test"] }
+# Keep upstream Tauri's build metadata available to tauri-build.
+tauri-core = { package = "tauri", version = "2" }
 tauri-plugin-opener = "2"
 serde = { version = "1", features = ["derive", "rc"] }
 serde_json = "1"
@@ -258,7 +260,7 @@ serial_test = "3"
 # mock app handle via `tauri::test::mock_app`. Feature unification
 # means this flag activates at every build, but the `test` feature
 # is additive and doesn't change runtime behavior.
-tauri = { version = "2", features = ["test"] }
+tauri = { package = "codemux-tauri-ipc-guard", path = "tauri-ipc-guard", features = ["test"] }
 # Self-referential dev-dependency: activates `test-fixtures` whenever
 # dev targets build (i.e. `cargo test`), so the fake_* helper bins are
 # compiled and `env!("CARGO_BIN_EXE_fake_*")` in the integration tests

@@ -17,8 +17,7 @@
 //! |-----------------------------------------|-----|-----|
 //! | `derive_auth_secret(password, email)`   | yes | yes |
 //! | POST `/api/auth/desktop/signin`         | yes | yes |
-//! | `save_auth(db, token, expires, user)`   | yes | yes |
-//! | `save_stored_auth_method(db, "email")`  | yes | yes |
+//! | Persist token, cached user, and auth method | yes | yes |
 //! | `AuthState::set_auth_method` (in-memory)| yes | n/a — no live app |
 //! | `auth-state-changed` / `sync-state-changed` events | yes | n/a — no webview |
 //!
@@ -38,9 +37,12 @@ use std::io::{BufRead, IsTerminal, Write};
 use serde::Deserialize;
 
 use crate::auth::{
-    api_base_url, clear_token, derive_auth_secret, is_token_expired, load_cached_user,
-    load_stored_auth_method, load_token, login_email_api, save_auth, save_stored_auth_method,
-    AuthUser,
+    api_base_url, clear_token, derive_auth_secret, is_token_expired, load_auth_record,
+    login_email_api, save_auth_at_revision, AuthUser, SIGN_IN_SESSION_CHANGED,
+};
+#[cfg(test)]
+use crate::auth::{
+    load_cached_user, load_stored_auth_method, load_token, save_auth, save_auth_with_method,
 };
 use crate::database::DatabaseStore;
 
@@ -132,6 +134,8 @@ pub(crate) async fn sign_in(
         ));
     }
 
+    let revision = db.auth_session_revision().map_err(LoginError::Local)?;
+
     // Same zero-knowledge derivation the GUI runs: the server only ever
     // sees the stretched secret. `login_email_api` takes `&AuthSecret`,
     // so the compiler refuses to let the raw password past this line.
@@ -150,15 +154,16 @@ pub(crate) async fn sign_in(
         image: api_resp.user.image.clone(),
     };
 
-    save_auth(db, &api_resp.token, &api_resp.expires_at, Some(&user))
-        .map_err(|e| LoginError::Local(format!("Could not persist the session: {e}")))?;
-    // Matches the GUI ordering: `save_auth` preserves any prior
-    // auth_method, so the new value is stamped right after. Non-fatal for
-    // the same reason it is in `signin_email` — the session itself is
-    // already stored, and `auth_method` only tailors Settings copy.
-    if let Err(err) = save_stored_auth_method(db, Some("email")) {
-        eprintln!("[codemux login] persisting auth_method=email failed: {err}");
-    }
+    save_auth_at_revision(
+        db,
+        revision,
+        &api_resp.token,
+        &api_resp.expires_at,
+        Some(&user),
+        "email",
+    )
+    .map_err(|e| LoginError::Local(format!("Could not persist the session: {e}")))?
+    .ok_or_else(|| LoginError::Local(SIGN_IN_SESSION_CHANGED.into()))?;
 
     Ok(user)
 }
@@ -249,18 +254,12 @@ pub(crate) async fn sign_in_with_token(
         return Err(LoginError::Local("A token is required.".to_string()));
     }
 
+    let revision = db.auth_session_revision().map_err(LoginError::Local)?;
     let (user, expires_at) = verify_bearer(token).await?;
 
-    save_auth(db, token, &expires_at, Some(&user))
-        .map_err(|e| LoginError::Local(format!("Could not persist the session: {e}")))?;
-    // `"token"` rather than `"email"`/`"github"`: the Settings → Sync
-    // section keys off this to decide which password form to offer, and a
-    // pasted bearer says nothing about whether the account has a sync
-    // password. An unrecognised value makes it fall through to the
-    // conservative branch, which is the correct answer here.
-    if let Err(err) = save_stored_auth_method(db, Some("token")) {
-        eprintln!("[codemux login] persisting auth_method=token failed: {err}");
-    }
+    save_auth_at_revision(db, revision, token, &expires_at, Some(&user), "token")
+        .map_err(|e| LoginError::Local(format!("Could not persist the session: {e}")))?
+        .ok_or_else(|| LoginError::Local(SIGN_IN_SESSION_CHANGED.into()))?;
 
     Ok(user)
 }
@@ -284,17 +283,19 @@ pub(crate) enum AuthStatusReport {
 }
 
 pub(crate) fn auth_status(db: &DatabaseStore) -> AuthStatusReport {
-    let (_token, expires_at) = match load_token(db) {
-        Some(pair) => pair,
-        None => return AuthStatusReport::SignedOut,
+    let Some(record) = load_auth_record(db) else {
+        return AuthStatusReport::SignedOut;
     };
-    if is_token_expired(&expires_at) {
-        return AuthStatusReport::Expired { expires_at };
+    let stored = record.stored;
+    if is_token_expired(&stored.expires_at) {
+        return AuthStatusReport::Expired {
+            expires_at: stored.expires_at,
+        };
     }
     AuthStatusReport::SignedIn {
-        user: load_cached_user(db),
-        expires_at,
-        method: load_stored_auth_method(db),
+        user: stored.user,
+        expires_at: stored.expires_at,
+        method: stored.auth_method,
     }
 }
 
@@ -350,10 +351,10 @@ pub(crate) fn status_exit_code(report: &AuthStatusReport) -> i32 {
 /// state without also deleting the *real* settings-sync cache: that path
 /// resolves through `dirs::data_dir()` with no test seam, so calling it
 /// from a unit test would clobber the running developer's cache.
-pub(crate) fn clear_session_record(db: &DatabaseStore) -> bool {
-    let had_session = load_token(db).is_some();
-    clear_token(db);
-    had_session
+pub(crate) fn clear_session_record(db: &DatabaseStore) -> Result<bool, String> {
+    let had_session = db.load_auth_token().is_some();
+    clear_token(db)?;
+    Ok(had_session)
 }
 
 /// Clear the cached session. Mirrors `commands::auth::sign_out`'s
@@ -364,10 +365,10 @@ pub(crate) fn clear_session_record(db: &DatabaseStore) -> bool {
 ///
 /// Returns `true` when there was something to clear, so the command can
 /// say "Signed out" versus "Already signed out" without a second read.
-pub(crate) fn sign_out(db: &DatabaseStore) -> bool {
-    let had_session = clear_session_record(db);
+pub(crate) fn sign_out(db: &DatabaseStore) -> Result<bool, String> {
+    let had_session = clear_session_record(db)?;
     crate::settings_sync::clear_cache();
-    had_session
+    Ok(had_session)
 }
 
 // ── Terminal input ───────────────────────────────────────────────
@@ -571,7 +572,7 @@ pub(crate) async fn ensure_signed_in(
 /// `codemux logout`.
 pub fn run_logout() -> Result<(), String> {
     let db = open_db()?;
-    if sign_out(&db) {
+    if sign_out(&db)? {
         println!("✓ Signed out. The cached session on this machine was cleared.");
     } else {
         println!("Already signed out — no cached session on this machine.");
@@ -684,6 +685,40 @@ mod tests {
             Some("email"),
             "CLI login must stamp auth_method exactly like the GUI signin"
         );
+    }
+
+    #[tokio::test]
+    async fn pending_email_login_cannot_undo_empty_session_logout() {
+        if crate::test_isolation::isolated(
+            "auth::cli_login::tests::pending_email_login_cannot_undo_empty_session_logout",
+        ) {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("auth.sqlite");
+        let db = DatabaseStore::test_file(&path);
+        let other = DatabaseStore::test_file(&path);
+        let email = "pending@example.test";
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("POST", "/api/auth/desktop/signin")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body_from_request(move |_| {
+                assert!(other.load_auth_token().is_none());
+                clear_token(&other).unwrap();
+                signin_mock_body(email).into_bytes()
+            })
+            .create_async()
+            .await;
+        let _guard = ApiUrlGuard::set(&server.url());
+
+        let error = sign_in(&db, email, "fixture-password".into())
+            .await
+            .unwrap_err();
+        mock.assert_async().await;
+        assert_eq!(error.user_message(), SIGN_IN_SESSION_CHANGED);
+        assert!(db.load_auth_token().is_none());
     }
 
     #[tokio::test]
@@ -861,6 +896,52 @@ mod tests {
             auth_status(&db),
             AuthStatusReport::SignedIn { .. }
         ));
+    }
+
+    #[tokio::test]
+    async fn pending_token_login_cannot_replace_a_newer_session() {
+        if crate::test_isolation::isolated(
+            "auth::cli_login::tests::pending_token_login_cannot_replace_a_newer_session",
+        ) {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("auth.sqlite");
+        let db = DatabaseStore::test_file(&path);
+        let other = DatabaseStore::test_file(&path);
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("GET", "/api/auth/desktop/verify")
+            .match_header("authorization", "Bearer pending-token")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body_from_request(move |_| {
+                let user = AuthUser {
+                    id: "new-account".into(),
+                    email: "new@example.test".into(),
+                    name: None,
+                    image: None,
+                };
+                save_auth_with_method(
+                    &other,
+                    "new-token",
+                    "2099-01-01T00:00:00Z",
+                    Some(&user),
+                    Some("email"),
+                )
+                .unwrap();
+                verify_mock_body("pending@example.test").into_bytes()
+            })
+            .create_async()
+            .await;
+        let _guard = ApiUrlGuard::set(&server.url());
+
+        let error = sign_in_with_token(&db, "pending-token").await.unwrap_err();
+        mock.assert_async().await;
+        assert_eq!(error.user_message(), SIGN_IN_SESSION_CHANGED);
+        assert_eq!(load_token(&db).unwrap().0, "new-token");
+        assert_eq!(load_cached_user(&db).unwrap().id, "new-account");
+        assert_eq!(load_stored_auth_method(&db).as_deref(), Some("email"));
     }
 
     #[tokio::test]
@@ -1043,7 +1124,7 @@ mod tests {
         // with no test seam. The session record is the part that matters
         // here — everything `codemux login` wrote.
         assert!(
-            clear_session_record(&db),
+            clear_session_record(&db).unwrap(),
             "reports that a session was cleared"
         );
         assert!(load_token(&db).is_none());
@@ -1052,9 +1133,28 @@ mod tests {
         assert!(matches!(auth_status(&db), AuthStatusReport::SignedOut));
 
         assert!(
-            !clear_session_record(&db),
+            !clear_session_record(&db).unwrap(),
             "second logout reports nothing to clear"
         );
+    }
+
+    #[test]
+    fn logout_reports_database_failure_and_retains_the_session() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("auth.sqlite");
+        let db = DatabaseStore::test_file(&path);
+        save_auth(&db, "tok", "2099-01-01T00:00:00Z", None).unwrap();
+        rusqlite::Connection::open(&path)
+            .unwrap()
+            .execute_batch(
+                "CREATE TRIGGER prevent_fixture_logout BEFORE DELETE ON auth_tokens
+                 BEGIN SELECT RAISE(ABORT, 'fixture rejected logout'); END;",
+            )
+            .unwrap();
+
+        let error = clear_session_record(&db).unwrap_err();
+        assert!(error.contains("fixture rejected logout"));
+        assert_eq!(load_token(&db).unwrap().0, "tok");
     }
 
     // ── Status / whoami ──────────────────────────────────────────
@@ -1077,8 +1177,14 @@ mod tests {
             name: Some("Who Ami".to_string()),
             image: None,
         };
-        save_auth(&db, "tok", "2099-03-04T05:06:07Z", Some(&user)).unwrap();
-        save_stored_auth_method(&db, Some("email")).unwrap();
+        save_auth_with_method(
+            &db,
+            "tok",
+            "2099-03-04T05:06:07Z",
+            Some(&user),
+            Some("email"),
+        )
+        .unwrap();
 
         let report = auth_status(&db);
         assert_eq!(status_exit_code(&report), 0);

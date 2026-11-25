@@ -18,16 +18,21 @@
 //! non-regular files return 404 — the route never produces a directory
 //! listing.
 
-use std::path::Path;
+use std::{io, path::Path};
 
+use axum::http::HeaderMap;
 use axum::{
     extract::{Query, State},
     http::{header, StatusCode},
     response::{IntoResponse, Response},
 };
-use axum::http::HeaderMap;
+use futures_util::TryStreamExt as _;
 use serde::Deserialize;
 use tauri::{AppHandle, Runtime};
+
+use super::server::{require_session, session_active};
+
+const ASSET_CHUNK_SIZE: usize = 64 * 1024;
 
 #[derive(Deserialize)]
 pub struct AssetQuery {
@@ -40,15 +45,31 @@ pub async fn serve<R: Runtime>(
     headers: HeaderMap,
     Query(query): Query<AssetQuery>,
 ) -> Response {
-    if let Err(resp) = super::server::require_session(&app, &headers) {
-        return resp;
+    let session = match require_session(&app, &headers) {
+        Ok(session) => session,
+        Err(response) => return response,
+    };
+
+    let opened = open_asset(Path::new(&query.path)).await;
+    if !session_active(&app, &session.id) {
+        return StatusCode::UNAUTHORIZED.into_response();
     }
 
-    match open_asset(Path::new(&query.path)).await {
+    match opened {
         Ok(asset) => {
-            // Stream the file rather than buffering it whole — a web client
-            // may request a large image/media file.
-            let stream = tokio_util::io::ReaderStream::new(asset.file);
+            // Check after each read. A body error aborts the transfer even
+            // when compression has removed the Content-Length header.
+            let stream = tokio_util::io::ReaderStream::with_capacity(asset.file, ASSET_CHUNK_SIZE)
+                .and_then(move |chunk| {
+                    std::future::ready(if session_active(&app, &session.id) {
+                        Ok(chunk)
+                    } else {
+                        Err(io::Error::new(
+                            io::ErrorKind::PermissionDenied,
+                            "asset session revoked",
+                        ))
+                    })
+                });
             let body = axum::body::Body::from_stream(stream);
             asset_response(asset.mime, asset.len, body)
         }
@@ -174,6 +195,80 @@ fn guess_mime(path: &Path) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn sign_out_aborts_a_gzip_account_asset_stream_and_keeps_code_pairing() {
+        use crate::database::DatabaseStore;
+        use crate::web_remote::{auth, server};
+        use axum::{body::Body, http::Request};
+        use futures_util::StreamExt as _;
+        use rand::{rngs::StdRng, RngCore, SeedableRng};
+        use std::io::Read as _;
+        use tauri::Manager as _;
+        use tower::ServiceExt as _;
+
+        let app = tauri::test::mock_app();
+        let db = DatabaseStore::new_in_memory();
+        auth::seed_account_browser(&db, "account", "account-browser");
+        db.web_remote_insert_session(
+            "paired",
+            None,
+            None,
+            &auth::sha256_hex("paired-browser"),
+            true,
+        )
+        .unwrap();
+        app.manage(db);
+
+        let fixture = tempfile::tempdir().unwrap();
+        let path = fixture.path().join("asset.txt");
+        // Ensure gzip yields data before it can consume the whole input.
+        let mut contents = vec![0; ASSET_CHUNK_SIZE * 8];
+        StdRng::seed_from_u64(1).fill_bytes(&mut contents);
+        tokio::fs::write(&path, &contents).await.unwrap();
+
+        let route = server::router(app.handle().clone());
+        let uri = format!("/api/assets?path={}", urlencoding::encode(&path.to_string_lossy()));
+        let request = |token| {
+            route.clone().oneshot(
+                Request::builder()
+                    .uri(uri.as_str())
+                    .header(header::AUTHORIZATION, token)
+                    .header(header::ACCEPT_ENCODING, "gzip")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+        };
+        let account = request("Bearer account-browser").await.unwrap();
+        let paired = request("Bearer paired-browser").await.unwrap();
+        for response in [&account, &paired] {
+            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(response.headers()[header::CONTENT_ENCODING], "gzip");
+            assert!(!response.headers().contains_key(header::CONTENT_LENGTH));
+        }
+        let mut account = account.into_body().into_data_stream();
+        let mut paired = paired.into_body().into_data_stream();
+        let account_first = account.next().await.unwrap().unwrap();
+        assert!(!account_first.is_empty() && account_first.len() < contents.len());
+        let mut paired_bytes = paired.next().await.unwrap().unwrap().to_vec();
+        assert!(!paired_bytes.is_empty() && paired_bytes.len() < contents.len());
+
+        app.state::<DatabaseStore>().clear_auth_token().unwrap();
+
+        assert!(account.any(|chunk| std::future::ready(chunk.is_err())).await);
+        while let Some(chunk) = paired.next().await {
+            paired_bytes.extend(chunk.unwrap());
+        }
+        let mut decoded = Vec::new();
+        flate2::read::GzDecoder::new(paired_bytes.as_slice())
+            .read_to_end(&mut decoded)
+            .unwrap();
+        assert_eq!(decoded, contents);
+        assert_eq!(
+            request("Bearer account-browser").await.unwrap().status(),
+            StatusCode::UNAUTHORIZED
+        );
+    }
 
     #[tokio::test]
     async fn serves_regular_file_with_guessed_mime_and_length() {

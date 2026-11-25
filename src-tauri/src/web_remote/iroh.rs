@@ -242,11 +242,11 @@ fn message_to_frame(msg: &Message) -> MessageFrame<'_> {
 /// re-encoding each through the codec. The single owner of `send` — every
 /// producer (invoke responses, channel router, event hub, the registry's Close)
 /// feeds `out_rx`, exactly as the WS writer task works.
-async fn writer_loop(mut send: SendStream, mut out_rx: OutboundRx) {
+async fn writer_loop(mut send: SendStream, mut out_rx: OutboundRx, db: &DatabaseStore) {
     while let Some(msg) = out_rx.recv().await {
         match message_to_frame(&msg) {
             MessageFrame::Wire(kind, payload) => {
-                if write_frame(&mut send, kind, payload).await.is_err() {
+                if !out_rx.can_forward(db) || write_frame(&mut send, kind, payload).await.is_err() {
                     break;
                 }
             }
@@ -515,16 +515,6 @@ fn evaluate_grant(
     })
 }
 
-/// Reuse an existing non-revoked account session for `uid` so repeated relay
-/// dials (e.g. retries while a session is pending approval) don't pile up
-/// duplicate `web_remote_sessions` rows. Returns `(session_id, approved)`.
-fn existing_account_session(db: &DatabaseStore, uid: &str) -> Option<(String, bool)> {
-    db.web_remote_list_sessions()
-        .into_iter()
-        .find(|s| s.source == "account" && s.account_user_id.as_deref() == Some(uid))
-        .map(|s| (s.id, s.approved))
-}
-
 /// Admit an account (grant) handshake: verify the grant with the control plane,
 /// run the accept matrix against this desktop's own identity, then mint (or
 /// reuse) an account-tagged session row. Returns the `session_id` to bind the
@@ -542,43 +532,34 @@ async fn authorize_account_handshake(
     own_node_id: &str,
     hello: &AccountHello,
 ) -> Result<String, AccountHandshakeReject> {
-    // Snapshot the approval policy up front so the non-Send config mutex guard
-    // is never held across the verify await.
-    let approve_policy = {
-        let cfg = shared.config.lock().unwrap();
-        super::account_session_approved(&cfg)
-    };
-    let own_user_id = crate::auth::load_cached_user(db).map(|u| u.id);
-
+    // Bind grant verification to the desktop session that started it.
+    let auth_record = db
+        .load_auth_token()
+        .ok_or(AccountHandshakeReject::WrongAccount)?;
+    let own_user_id = crate::auth::active_account_id_from_record(&auth_record)
+        .ok_or(AccountHandshakeReject::WrongAccount)?;
     let base = crate::auth::api_base_url();
     let resp = verify_grant(&base, &hello.grant)
         .await
         .map_err(|_| AccountHandshakeReject::Unverified)?;
 
-    let identity = evaluate_grant(&resp, own_node_id, own_user_id.as_deref(), &hello.nonce)?;
+    let identity = evaluate_grant(&resp, own_node_id, Some(&own_user_id), &hello.nonce)?;
 
-    // Mint once per account (reuse an existing row on retry), tagged
-    // `source="account"` + the verified account user id. The plaintext token is
-    // discarded — the iroh stream binds directly to `session_id`, so no bearer
-    // is ever presented on this transport.
-    let (session_id, approved) = match existing_account_session(db, &identity.user_id) {
-        Some(existing) => existing,
-        None => {
-            let id = uuid::Uuid::new_v4().to_string();
-            let token = super::auth::random_token();
-            let token_hash = super::auth::sha256_hex(&token);
-            db.web_remote_insert_account_session(
-                &id,
-                None,
-                None,
-                &token_hash,
-                approve_policy,
-                &identity.user_id,
-            )
-            .map_err(AccountHandshakeReject::Internal)?;
-            (id, approve_policy)
-        }
-    };
+    // The auth record comparison, lookup, and possible insert are atomic.
+    // Relay streams bind directly to the session ID, so discard the bearer.
+    let id = uuid::Uuid::new_v4().to_string();
+    let token_hash = super::auth::sha256_hex(&super::auth::random_token());
+    let cfg = shared.config.lock().unwrap();
+    let (session_id, approved) = db
+        .web_remote_get_or_insert_relay_account_session_if_unchanged(
+            &id,
+            &token_hash,
+            super::account_session_approved(&cfg),
+            &identity.user_id,
+            &auth_record,
+        )
+        .map_err(AccountHandshakeReject::Internal)?
+        .ok_or(AccountHandshakeReject::WrongAccount)?;
 
     if !approved {
         return Err(AccountHandshakeReject::Pending);
@@ -895,15 +876,34 @@ async fn handle_bi_stream<R: Runtime>(
     // 2. Register in the SHARED registry the WS transport + revocation use, so
     //    close_session / close_all sever this iroh session too.
     let (close_tx, mut close_rx) = watch::channel(false);
-    let (out_tx, out_rx) = super::server::outbound_channel(close_tx.clone());
+    let db = app.state::<DatabaseStore>();
+    let Some(account) = auth::AccountSessionGuard::new(&db, &session_id) else {
+        return;
+    };
+    let (out_tx, out_rx) =
+        super::server::outbound_channel(close_tx.clone(), account.account_session_id());
     let conn_id = shared
         .connections
         .register(&session_id, crate::web_remote::server::Transport::Relay, out_tx.clone(), close_tx.clone());
-    super::emit_state_changed(&app);
 
-    // 3. Acknowledge, then hand the send half to the writer task.
-    let _ = write_frame(&mut send, KIND_TEXT, &welcome_frame_bytes(&session_id)).await;
-    let writer = tauri::async_runtime::spawn(writer_loop(send, out_rx));
+    // 3. Acknowledge only while the newly registered connection is authorized.
+    if !auth::session_status(&db, &session_id).is_approved()
+        || out_tx.is_closed()
+        || write_frame(&mut send, KIND_TEXT, &welcome_frame_bytes(&session_id))
+            .await
+            .is_err()
+    {
+        shared.connections.unregister(conn_id);
+        return;
+    }
+    super::emit_state_changed(&app);
+    let writer = {
+        let app = app.clone();
+        tauri::async_runtime::spawn(async move {
+            let db = app.state::<DatabaseStore>();
+            writer_loop(send, out_rx, &db).await;
+        })
+    };
 
     // 4. Ordered dispatch lane (terminal input keeps client-send order), exactly
     //    as the WS reader does — `handle_text_frame` decides what routes here.
@@ -915,13 +915,19 @@ async fn handle_bi_stream<R: Runtime>(
         tauri::async_runtime::spawn(async move {
             while let Some((id, cmd, args)) = ordered_rx.recv().await {
                 super::dispatch::dispatch_invoke(&app, &router, conn_id, &out, id, cmd, args).await;
+                if out.is_closed() {
+                    break;
+                }
             }
         })
     };
 
     // 5. Reader loop: dispatch client frames until close / EOF / revocation.
+    let account_expired = account.expired();
+    tokio::pin!(account_expired);
     loop {
         tokio::select! {
+            _ = &mut account_expired => break,
             changed = close_rx.changed() => {
                 if changed.is_err() || *close_rx.borrow() {
                     break;
@@ -930,6 +936,9 @@ async fn handle_bi_stream<R: Runtime>(
             frame = read_frame(&mut recv, &mut decoder, &mut readbuf) => {
                 match frame {
                     Ok(Some(f)) if f.kind == KIND_TEXT => {
+                        if !account.active() {
+                            break;
+                        }
                         let txt = String::from_utf8_lossy(&f.payload);
                         super::server::handle_text_frame(
                             &app, &shared, conn_id, &out_tx, &ordered_tx, &txt,
@@ -947,11 +956,11 @@ async fn handle_bi_stream<R: Runtime>(
 
     // 6. Teardown — channels + event subscriptions die with the stream, same as
     //    the WS lifecycle.
+    close_tx.send_replace(true);
     shared.connections.unregister(conn_id);
     shared.channels.remove_conn(conn_id);
     shared.events.remove_conn(&app, conn_id);
     ordered_task.abort();
-    let _ = close_tx.send(true);
     drop(out_tx);
     writer.abort();
     super::emit_state_changed(&app);
@@ -1364,22 +1373,24 @@ mod tests {
         shared
     }
 
+    fn grant_admit_response(nonce: &str) -> String {
+        json!({
+            "valid": true,
+            "userId": OWN_UID,
+            "deviceId": "dev-1",
+            "nodeId": OWN_NODE,
+            "nonce": nonce,
+        })
+        .to_string()
+    }
+
     /// Mock the verify endpoint to echo a full admit response for `grant`.
     async fn mock_verify_admit(server: &mut mockito::Server, nonce: &str) -> mockito::Mock {
         server
             .mock("POST", "/api/devices/grant/verify")
             .with_status(200)
             .with_header("content-type", "application/json")
-            .with_body(
-                json!({
-                    "valid": true,
-                    "userId": OWN_UID,
-                    "deviceId": "dev-1",
-                    "nodeId": OWN_NODE,
-                    "nonce": nonce,
-                })
-                .to_string(),
-            )
+            .with_body(grant_admit_response(nonce))
             .create_async()
             .await
     }
@@ -1451,6 +1462,39 @@ mod tests {
         let row = db.web_remote_list_sessions().into_iter().next().expect("a pending row");
         assert_eq!(row.source, "account");
         assert!(!row.approved);
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(mockserver)]
+    async fn account_handshake_rejects_if_owner_signs_out_and_back_in_during_verification() {
+        let db = Arc::new(init_test_database());
+        seed_owner(&db);
+        let shared = shared_with_trust(true);
+
+        let mut server = mockito::Server::new_async().await;
+        let mock_db = Arc::clone(&db);
+        let mock = server
+            .mock("POST", "/api/devices/grant/verify")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body_from_request(move |_| {
+                mock_db.clear_auth_token().unwrap();
+                seed_owner(&mock_db);
+                grant_admit_response("n").into_bytes()
+            })
+            .create_async()
+            .await;
+
+        let hello = AccountHello {
+            grant: "g".into(),
+            nonce: "n".into(),
+        };
+        let err = run_account_admit(&server.url(), &db, &shared, &hello)
+            .await
+            .expect_err("the grant must be verified against an unchanged desktop session");
+        mock.assert_async().await;
+        assert_eq!(err, AccountHandshakeReject::WrongAccount);
+        assert!(db.web_remote_list_sessions().is_empty());
     }
 
     #[tokio::test]
@@ -1602,13 +1646,15 @@ mod tests {
         };
 
         let (close_tx, mut close_rx) = watch::channel(false);
-        let (out_tx, out_rx) = crate::web_remote::server::outbound_channel(close_tx.clone());
+        let account = auth::AccountSessionGuard::new(&db, &session_id).unwrap();
+        let (out_tx, out_rx) =
+            crate::web_remote::server::outbound_channel(close_tx.clone(), account.account_session_id());
         let conn_id = shared
             .connections
             .register(&session_id, crate::web_remote::server::Transport::Relay, out_tx.clone(), close_tx.clone());
 
         let _ = write_frame(&mut send, KIND_TEXT, &welcome_frame_bytes(&session_id)).await;
-        let writer = tokio::spawn(writer_loop(send, out_rx));
+        let writer = tokio::spawn(async move { writer_loop(send, out_rx, &db).await });
 
         loop {
             tokio::select! {

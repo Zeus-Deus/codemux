@@ -26,6 +26,8 @@ use axum::http::HeaderMap;
 use rand::RngCore;
 use sha2::{Digest, Sha256};
 
+use crate::database::{DatabaseStore, WebRemoteSessionRecord};
+
 /// Pairing tokens live 10 minutes.
 pub const PAIRING_TTL: Duration = Duration::from_secs(10 * 60);
 /// WS tickets live 30 seconds.
@@ -243,20 +245,117 @@ pub struct AuthedSession {
 /// Resolve a plaintext session token to a live (non-revoked) session by
 /// constant-time comparing its SHA-256 against every active row's hash.
 /// Returns `None` if nothing matches.
-pub fn authenticate(db: &crate::database::DatabaseStore, token: &str) -> Option<AuthedSession> {
+pub fn authenticate(db: &DatabaseStore, token: &str) -> Option<AuthedSession> {
     if token.is_empty() {
         return None;
     }
     let presented = sha256_hex(token);
-    let mut matched: Option<AuthedSession> = None;
+    let mut matched = None;
     // Scan every candidate (don't early-return) so timing does not leak
     // which/whether a row matched.
-    for (id, stored_hash, approved) in db.web_remote_active_session_hashes() {
+    for (id, stored_hash, _) in db.web_remote_active_session_hashes() {
         if constant_time_eq(presented.as_bytes(), stored_hash.as_bytes()) {
-            matched = Some(AuthedSession { id, approved });
+            matched = Some(id);
         }
     }
-    matched
+    let session = active_session(db, &matched?)?;
+    Some(AuthedSession { id: session.id, approved: session.approved })
+}
+
+pub(super) enum SessionStatus {
+    Active(WebRemoteSessionRecord),
+    Suspended,
+    Gone,
+}
+
+impl SessionStatus {
+    pub(super) fn is_approved(&self) -> bool {
+        matches!(self, Self::Active(session) if session.approved)
+    }
+}
+
+/// A host-paired browser is independent of the account on this host. Account
+/// browsers must still belong to its current, unexpired account.
+pub(super) fn session_status(db: &DatabaseStore, session_id: &str) -> SessionStatus {
+    match db.try_web_remote_session_with_auth(session_id) {
+        Ok(None) => SessionStatus::Gone,
+        Ok(Some((session, _))) if session.revoked => SessionStatus::Gone,
+        Ok(Some((session, record))) => {
+            if session.source == "account" {
+                let owner = record.as_deref().and_then(crate::auth::active_account_id_from_record);
+                if owner.is_none() || session.account_user_id.as_deref() != owner.as_deref() {
+                    return SessionStatus::Suspended;
+                }
+            }
+            SessionStatus::Active(session)
+        }
+        // Fail closed during a read error while preserving push subscriptions.
+        Err(_) => SessionStatus::Suspended,
+    }
+}
+
+pub(super) fn active_session(db: &DatabaseStore, session_id: &str) -> Option<WebRemoteSessionRecord> {
+    match session_status(db, session_id) {
+        SessionStatus::Active(session) => Some(session),
+        SessionStatus::Suspended | SessionStatus::Gone => None,
+    }
+}
+
+pub(super) struct AccountSessionGuard<'a> {
+    db: &'a DatabaseStore,
+    session_id: &'a str,
+    account_session: bool,
+}
+
+impl<'a> AccountSessionGuard<'a> {
+    pub(super) fn new(db: &'a DatabaseStore, session_id: &'a str) -> Option<Self> {
+        let session = active_session(db, session_id).filter(|session| session.approved)?;
+        Some(Self { db, session_id, account_session: session.source == "account" })
+    }
+
+    pub(super) fn account_session_id(&self) -> Option<&str> {
+        self.account_session.then_some(self.session_id)
+    }
+
+    pub(super) fn active(&self) -> bool {
+        !self.account_session
+            || session_status(self.db, self.session_id).is_approved()
+    }
+
+    pub(super) async fn expired(&self) {
+        if !self.account_session {
+            return std::future::pending().await;
+        }
+        // A separate CLI process may change the shared account record. Check
+        // idle streams too, including streams that only receive host events.
+        let mut interval = tokio::time::interval(Duration::from_secs(2));
+        loop {
+            interval.tick().await;
+            if !self.active() {
+                return;
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+pub(super) fn seed_account_browser(db: &DatabaseStore, session_id: &str, token: &str) {
+    let owner = crate::auth::AuthUser {
+        id: "fixture-owner".into(),
+        email: "owner@example.test".into(),
+        name: None,
+        image: None,
+    };
+    crate::auth::save_auth(db, "fixture-token", "2099-01-01T00:00:00Z", Some(&owner)).unwrap();
+    db.web_remote_insert_account_session(
+        session_id,
+        None,
+        None,
+        &sha256_hex(token),
+        true,
+        &owner.id,
+    )
+    .unwrap();
 }
 
 // ── Origin checks ───────────────────────────────────────────────────
@@ -435,6 +534,46 @@ mod tests {
             .unwrap();
         let authed = authenticate(&db, &token).expect("authenticates");
         assert!(!authed.approved, "pending session reports approved=false");
+    }
+
+    #[tokio::test]
+    async fn account_switch_and_logout_revoke_only_account_browsers() {
+        let db = init_test_database();
+        let mut user = crate::auth::AuthUser {
+            id: "first-owner".into(),
+            email: "owner@example.test".into(),
+            name: None,
+            image: None,
+        };
+        let expires_at = "2099-01-01T00:00:00Z";
+        crate::auth::save_auth(&db, "first-account-token", expires_at, Some(&user)).unwrap();
+        db.web_remote_insert_account_session(
+            "first", None, None, &sha256_hex("first-browser"), true, &user.id,
+        ).unwrap();
+        db.web_remote_insert_session(
+            "host-paired", None, None, &sha256_hex("paired-browser"), true,
+        ).unwrap();
+        let first = AccountSessionGuard::new(&db, "first").unwrap();
+
+        crate::auth::save_auth(&db, "refreshed-account-token", expires_at, Some(&user)).unwrap();
+        assert!(first.active());
+        assert!(authenticate(&db, "first-browser").is_some());
+
+        user.id = "second-owner".into();
+        crate::auth::save_auth(&db, "other-account-token", expires_at, Some(&user)).unwrap();
+        assert!(db.web_remote_get_session("first").unwrap().revoked);
+        assert!(!first.active());
+        assert!(authenticate(&db, "first-browser").is_none());
+        assert!(authenticate(&db, "paired-browser").is_some());
+
+        db.web_remote_insert_account_session(
+            "second", None, None, &sha256_hex("second-browser"), true, &user.id,
+        ).unwrap();
+        let second = AccountSessionGuard::new(&db, "second").unwrap();
+        db.clear_auth_token().unwrap();
+        tokio::time::timeout(Duration::from_secs(1), second.expired()).await.unwrap();
+        assert!(authenticate(&db, "second-browser").is_none());
+        assert!(authenticate(&db, "paired-browser").is_some());
     }
 
     #[test]

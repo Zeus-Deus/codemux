@@ -267,7 +267,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Mutex;
 
-const SCHEMA_VERSION: u32 = 24;
+const SCHEMA_VERSION: u32 = 25;
 
 pub struct DatabaseStore {
     conn: Mutex<Connection>,
@@ -697,6 +697,13 @@ fn create_schema(conn: &Connection) -> Result<(), String> {
             encrypted_data BLOB NOT NULL,
             updated_at TEXT NOT NULL DEFAULT (datetime('now'))
         );
+
+        CREATE TABLE IF NOT EXISTS auth_session_revision (
+            id INTEGER PRIMARY KEY CHECK (id = 1),
+            revision INTEGER NOT NULL CHECK (typeof(revision) = 'integer' AND revision >= 0)
+        );
+
+        INSERT OR IGNORE INTO auth_session_revision (id, revision) VALUES (1, 0);
 
         CREATE TABLE IF NOT EXISTS agent_chat_sessions (
             thread_id TEXT PRIMARY KEY,
@@ -5987,13 +5994,150 @@ impl DatabaseStore {
 
 impl DatabaseStore {
     pub fn save_auth_token(&self, encrypted_data: &[u8]) -> Result<(), String> {
-        let conn = self.conn.lock().unwrap();
+        self.replace_auth_token(encrypted_data, None, None)
+            .map(|_| ())
+    }
+
+    /// Save the verified owner and revoke another account's browser access
+    /// in the same transaction. Pairing-code sessions belong to the host.
+    pub(crate) fn save_auth_token_for_account(
+        &self,
+        encrypted_data: &[u8],
+        account_id: &str,
+    ) -> Result<(), String> {
+        self.replace_auth_token(encrypted_data, Some(account_id), None)
+            .map(|_| ())
+    }
+
+    pub(crate) fn auth_session_revision(&self) -> Result<i64, String> {
+        self.conn
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT revision FROM auth_session_revision WHERE id = 1",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(|error| format!("Failed to load auth session revision: {error}"))
+    }
+
+    /// Install a sign-in result only if its launch revision is still current.
+    pub(crate) fn save_auth_token_if_revision(
+        &self,
+        encrypted_data: &[u8],
+        account_id: Option<&str>,
+        expected_revision: i64,
+    ) -> Result<bool, String> {
+        self.replace_auth_token(encrypted_data, account_id, Some(expected_revision))
+    }
+
+    fn replace_auth_token(
+        &self,
+        encrypted_data: &[u8],
+        account_id: Option<&str>,
+        expected_revision: Option<i64>,
+    ) -> Result<bool, String> {
+        let mut conn = self.conn.lock().unwrap();
+        let transaction = conn.transaction().map_err(|error| error.to_string())?;
+        if !Self::advance_auth_revision(&transaction, expected_revision)? {
+            return Ok(false);
+        }
+        if let Some(account_id) = account_id {
+            Self::revoke_account_sessions(&transaction, Some(account_id))?;
+        }
+        Self::write_auth_token(&transaction, encrypted_data)?;
+        transaction.commit().map_err(|error| error.to_string())?;
+        Ok(true)
+    }
+
+    // The single row survives sign-out, including a sign-out performed while
+    // there is no token to delete. The first write obtains SQLite's writer
+    // lock before comparing the revision against a pending sign-in attempt.
+    fn advance_auth_revision(
+        conn: &Connection,
+        expected_revision: Option<i64>,
+    ) -> Result<bool, String> {
+        let updated = conn
+            .execute(
+                "UPDATE auth_session_revision SET revision = revision + 1
+             WHERE id = 1 AND (?1 IS NULL OR revision = ?1)",
+                params![expected_revision],
+            )
+            .map_err(|error| format!("Failed to advance auth session revision: {error}"))?;
+        if updated == 0 && expected_revision.is_none() {
+            return Err("Auth session revision is missing".into());
+        }
+        Ok(updated == 1)
+    }
+
+    fn write_auth_token(conn: &Connection, encrypted_data: &[u8]) -> Result<(), String> {
         conn.execute(
             "INSERT OR REPLACE INTO auth_tokens (id, encrypted_data, updated_at) VALUES (1, ?1, datetime('now'))",
             params![encrypted_data],
         )
         .map_err(|e| format!("Failed to save auth token: {e}"))?;
         Ok(())
+    }
+
+    /// Persist a verification or metadata update only for the auth record
+    /// observed before the operation started.
+    pub(crate) fn save_auth_token_if_current(
+        &self,
+        expected: &[u8],
+        encrypted_data: &[u8],
+        account_id: Option<&str>,
+    ) -> Result<bool, String> {
+        self.with_current_auth(expected, None, |conn| {
+            if let Some(account_id) = account_id {
+                Self::revoke_account_sessions(conn, Some(account_id))?;
+            }
+            Self::write_auth_token(conn, encrypted_data)
+        })
+        .map(|updated| updated.is_some())
+    }
+
+    fn revoke_account_sessions(conn: &Connection, except: Option<&str>) -> Result<(), String> {
+        conn.execute(
+            "UPDATE web_remote_sessions SET revoked = 1
+             WHERE revoked = 0 AND source = 'account'
+               AND (?1 IS NULL OR account_user_id IS NOT ?1)",
+            params![except],
+        )
+        .map_err(|error| format!("Failed to revoke account browser sessions: {error}"))?;
+        Ok(())
+    }
+
+    fn with_current_auth<T>(
+        &self,
+        expected: &[u8],
+        active_account: Option<&str>,
+        operation: impl FnOnce(&Connection) -> Result<T, String>,
+    ) -> Result<Option<T>, String> {
+        let mut conn = self.conn.lock().unwrap();
+        // Reserve the write transaction before reading, even against other
+        // SQLite connections in the CLI or desktop process.
+        let transaction = conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .map_err(|error| format!("Failed to begin auth transaction: {error}"))?;
+        let matches: bool = transaction
+            .query_row(
+                "SELECT EXISTS (SELECT 1 FROM auth_tokens WHERE id = 1 AND encrypted_data = ?1)",
+                params![expected],
+                |row| row.get(0),
+            )
+            .map_err(|error| format!("Failed to read current auth record: {error}"))?;
+        if !matches
+            || active_account.is_some_and(|account| {
+                crate::auth::active_account_id_from_record(expected).as_deref() != Some(account)
+            })
+        {
+            return Ok(None);
+        }
+        let result = operation(&transaction)?;
+        transaction
+            .commit()
+            .map_err(|error| format!("Failed to commit auth transaction: {error}"))?;
+        Ok(Some(result))
     }
 
     pub fn load_auth_token(&self) -> Option<Vec<u8>> {
@@ -6006,9 +6150,28 @@ impl DatabaseStore {
         .ok()
     }
 
-    pub fn clear_auth_token(&self) {
-        let conn = self.conn.lock().unwrap();
-        let _ = conn.execute("DELETE FROM auth_tokens WHERE id = 1", []);
+    pub fn clear_auth_token(&self) -> Result<(), String> {
+        let mut conn = self.conn.lock().unwrap();
+        let transaction = conn
+            .transaction()
+            .map_err(|error| format!("Failed to clear auth token: {error}"))?;
+        Self::erase_auth_record(&transaction)?;
+        transaction
+            .commit()
+            .map_err(|error| format!("Failed to clear auth token: {error}"))
+    }
+
+    pub(crate) fn clear_auth_token_if_current(&self, expected: &[u8]) -> Result<bool, String> {
+        self.with_current_auth(expected, None, Self::erase_auth_record)
+            .map(|cleared| cleared.is_some())
+    }
+
+    fn erase_auth_record(conn: &Connection) -> Result<(), String> {
+        Self::advance_auth_revision(conn, None)?;
+        Self::revoke_account_sessions(conn, None)?;
+        conn.execute("DELETE FROM auth_tokens WHERE id = 1", [])
+            .map_err(|error| format!("Failed to clear auth token: {error}"))?;
+        Ok(())
     }
 }
 
@@ -6065,6 +6228,7 @@ impl DatabaseStore {
     /// (already checked to equal the desktop's own signed-in user), so the
     /// device list can distinguish account-minted from pairing-minted devices
     /// and the row carries an audit trail of which account admitted it.
+    #[cfg(test)]
     pub fn web_remote_insert_account_session(
         &self,
         id: &str,
@@ -6075,6 +6239,69 @@ impl DatabaseStore {
         account_user_id: &str,
     ) -> Result<(), String> {
         let conn = self.conn.lock().unwrap();
+        Self::insert_web_remote_account_session(
+            &conn, id, name, user_agent, token_hash, approved, account_user_id,
+        )
+    }
+
+    /// Admit only against the active sign-in that predates verification.
+    pub(crate) fn web_remote_insert_account_session_if_unchanged(
+        &self,
+        id: &str,
+        name: Option<&str>,
+        user_agent: Option<&str>,
+        token_hash: &str,
+        approved: bool,
+        account_user_id: &str,
+        verified_auth: &[u8],
+    ) -> Result<bool, String> {
+        self.with_current_auth(verified_auth, Some(account_user_id), |conn| {
+            Self::insert_web_remote_account_session(
+                conn, id, name, user_agent, token_hash, approved, account_user_id,
+            )
+        })
+        .map(|inserted| inserted.is_some())
+    }
+
+    /// Resolve an approved or pending relay session against the same active
+    /// sign-in, including when the row already exists.
+    pub(crate) fn web_remote_get_or_insert_relay_account_session_if_unchanged(
+        &self,
+        id: &str,
+        token_hash: &str,
+        approved: bool,
+        account_user_id: &str,
+        verified_auth: &[u8],
+    ) -> Result<Option<(String, bool)>, String> {
+        self.with_current_auth(verified_auth, Some(account_user_id), |conn| {
+            let existing = conn.query_row(
+                "SELECT id, approved FROM web_remote_sessions
+                 WHERE revoked = 0 AND source = 'account' AND account_user_id = ?1
+                 ORDER BY created_at DESC, rowid DESC LIMIT 1",
+                params![account_user_id],
+                |row| Ok((row.get(0)?, row.get::<_, i64>(1)? != 0)),
+            )
+            .optional()
+            .map_err(|error| format!("Failed to read web_remote relay session: {error}"))?;
+            if let Some(existing) = existing {
+                return Ok(existing);
+            }
+            Self::insert_web_remote_account_session(
+                conn, id, None, None, token_hash, approved, account_user_id,
+            )?;
+            Ok((id.to_owned(), approved))
+        })
+    }
+
+    fn insert_web_remote_account_session(
+        conn: &Connection,
+        id: &str,
+        name: Option<&str>,
+        user_agent: Option<&str>,
+        token_hash: &str,
+        approved: bool,
+        account_user_id: &str,
+    ) -> Result<(), String> {
         conn.execute(
             "INSERT INTO web_remote_sessions
                 (id, name, user_agent, token_hash, created_at, last_seen_at, approved, revoked, source, account_user_id)
@@ -6095,6 +6322,25 @@ impl DatabaseStore {
             Self::row_to_web_remote_session,
         )
         .ok()
+    }
+
+    /// Read the session and its host auth record from the same SQLite snapshot.
+    pub(crate) fn try_web_remote_session_with_auth(
+        &self,
+        id: &str,
+    ) -> Result<Option<(WebRemoteSessionRecord, Option<Vec<u8>>)>, String> {
+        let conn = self.conn.lock().unwrap();
+        conn.query_row(
+            "SELECT s.id, s.name, s.user_agent, s.token_hash, s.created_at, s.last_seen_at,
+                    s.approved, s.revoked, s.source, s.account_user_id, a.encrypted_data
+             FROM web_remote_sessions s
+             LEFT JOIN auth_tokens a ON s.source = 'account' AND a.id = 1
+             WHERE s.id = ?1",
+            params![id],
+            |row| Ok((Self::row_to_web_remote_session(row)?, row.get(10)?)),
+        )
+        .optional()
+        .map_err(|error| format!("Failed to read remote session: {error}"))
     }
 
     /// All non-revoked sessions, newest first. This is what the desktop
@@ -6201,6 +6447,116 @@ impl DatabaseStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn failed_account_revocation_leaves_auth_and_sessions_intact() {
+        let db = init_test_database();
+        db.save_auth_token(b"sign-in fixture").unwrap();
+        let revision = db.auth_session_revision().unwrap();
+        db.web_remote_insert_account_session("account", None, None, "account-hash", true, "owner")
+            .unwrap();
+        db.web_remote_insert_session("pair", None, None, "pair-hash", true).unwrap();
+        db.conn.lock().unwrap().execute_batch(
+            "CREATE TRIGGER reject_fixture_revocation
+             BEFORE UPDATE OF revoked ON web_remote_sessions WHEN NEW.revoked = 1
+             BEGIN SELECT RAISE(ABORT, 'fixture rejected revocation'); END;",
+        ).unwrap();
+
+        assert!(db.clear_auth_token().unwrap_err().contains("fixture rejected revocation"));
+        assert_eq!(db.auth_session_revision().unwrap(), revision);
+        assert_eq!(db.load_auth_token().as_deref(), Some(b"sign-in fixture".as_slice()));
+        assert!(!db.web_remote_get_session("account").unwrap().revoked);
+
+        db.conn.lock().unwrap().execute_batch("DROP TRIGGER reject_fixture_revocation").unwrap();
+        db.clear_auth_token().unwrap();
+        assert!(db.load_auth_token().is_none());
+        assert!(db.web_remote_get_session("account").unwrap().revoked);
+        assert!(!db.web_remote_get_session("pair").unwrap().revoked);
+    }
+
+    #[test]
+    fn auth_revision_migration_preserves_existing_auth_and_survives_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("auth.sqlite");
+        {
+            let legacy = Connection::open(&path).unwrap();
+            legacy
+                .execute_batch(
+                    "CREATE TABLE auth_tokens (
+                    id INTEGER PRIMARY KEY CHECK (id = 1),
+                    encrypted_data BLOB NOT NULL,
+                    updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+                );",
+                )
+                .unwrap();
+            DatabaseStore::write_auth_token(&legacy, b"legacy-token").unwrap();
+        }
+
+        let desktop = DatabaseStore::test_file(&path);
+        let initial = desktop.auth_session_revision().unwrap();
+        assert_eq!(
+            desktop.load_auth_token().as_deref(),
+            Some(b"legacy-token".as_slice())
+        );
+        desktop.clear_auth_token().unwrap();
+        assert_eq!(desktop.auth_session_revision().unwrap(), initial + 1);
+        drop(desktop);
+
+        let reopened = DatabaseStore::test_file(&path);
+        assert_eq!(reopened.auth_session_revision().unwrap(), initial + 1);
+        assert!(reopened.load_auth_token().is_none());
+        assert!(!reopened
+            .save_auth_token_if_revision(b"stale-token", None, initial)
+            .unwrap());
+        assert!(reopened.load_auth_token().is_none());
+    }
+
+    #[test]
+    fn account_writes_and_admission_require_the_auth_record_from_before_verification() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sessions.sqlite");
+        let desktop = DatabaseStore::test_file(&path);
+        let cli = DatabaseStore { conn: Mutex::new(open_connection(&path).unwrap()) };
+        let owner = crate::auth::AuthUser {
+            id: "owner".into(), email: "fixture@example.test".into(), name: None, image: None,
+        };
+        let expiry = "2099-01-01T00:00:00Z";
+        crate::auth::save_auth(&desktop, "first-session", expiry, Some(&owner)).unwrap();
+        let first = desktop.load_auth_token().unwrap();
+
+        let admit_relay = |id: &str, snapshot: &[u8]| {
+            desktop.web_remote_get_or_insert_relay_account_session_if_unchanged(
+                id, id, false, &owner.id, snapshot,
+            ).unwrap()
+        };
+        assert_eq!(admit_relay("old-relay", &first), Some(("old-relay".into(), false)));
+        assert_eq!(admit_relay("duplicate", &first), Some(("old-relay".into(), false)));
+
+        cli.clear_auth_token().unwrap();
+        assert!(!desktop.save_auth_token_if_current(&first, &first, Some(&owner.id)).unwrap());
+        assert!(desktop.load_auth_token().is_none());
+        crate::auth::save_auth(&cli, "replacement-session", expiry, Some(&owner)).unwrap();
+        let current = desktop.load_auth_token().unwrap();
+        assert!(!desktop.clear_auth_token_if_current(&first).unwrap());
+        assert!(!desktop.save_auth_token_if_current(&first, &first, None).unwrap());
+        assert!(!desktop.web_remote_insert_account_session_if_unchanged(
+            "old-direct", None, None, "old-hash", true, &owner.id, &first,
+        ).unwrap());
+        assert_eq!(admit_relay("stale-relay", &first), None);
+        assert_eq!(desktop.load_auth_token(), Some(current.clone()));
+        assert!(desktop.web_remote_get_session("old-relay").unwrap().revoked);
+        assert_eq!(admit_relay("new-relay", &current), Some(("new-relay".into(), false)));
+        assert!(desktop.web_remote_insert_account_session_if_unchanged(
+            "new-direct", None, None, "new-hash", true, &owner.id, &current,
+        ).unwrap());
+
+        crate::auth::save_auth(&cli, "expired", "2000-01-01T00:00:00Z", Some(&owner)).unwrap();
+        let expired = desktop.load_auth_token().unwrap();
+        assert_eq!(admit_relay("expired-relay", &expired), None);
+        assert!(!desktop.web_remote_insert_account_session_if_unchanged(
+            "expired-direct", None, None, "expired-hash", true, &owner.id, &expired,
+        ).unwrap());
+    }
 
     fn sample_turn_checkpoint(
         thread_id: &str,

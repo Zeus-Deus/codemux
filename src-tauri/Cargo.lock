@@ -1263,6 +1263,7 @@ dependencies = [
  "clack-private-fs",
  "clap",
  "codemux",
+ "codemux-tauri-ipc-guard",
  "dirs",
  "dunce",
  "flate2",
@@ -1337,6 +1338,13 @@ dependencies = [
  "winx",
  "zbus 5.17.0",
  "zip",
+]
+
+[[package]]
+name = "codemux-tauri-ipc-guard"
+version = "0.1.0"
+dependencies = [
+ "tauri",
 ]
 
 [[package]]

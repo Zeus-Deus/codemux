@@ -48,6 +48,8 @@ use tower_http::compression::CompressionLayer;
 
 use tauri::{AppHandle, Manager, Runtime};
 
+use crate::database::DatabaseStore;
+
 use super::auth;
 use super::compress::{self, FrameCompressor, WireStats};
 use super::{Shared, WebRemoteState};
@@ -93,6 +95,25 @@ struct OutboundBudget {
     limit: usize,
     overflowed: AtomicBool,
     close: watch::Sender<bool>,
+    account_session_id: Option<String>,
+}
+
+impl OutboundBudget {
+    fn is_closed(&self) -> bool {
+        *self.close.borrow()
+    }
+
+    fn authorized(&self, approved: impl FnOnce(&str) -> bool) -> bool {
+        if self.is_closed() {
+            return false;
+        }
+        self.account_session_id.as_deref().is_none_or(|id| {
+            if !approved(id) {
+                self.close.send_replace(true);
+            }
+            !self.is_closed()
+        })
+    }
 }
 
 /// The writer's end of an [`OutboundTx`]. Receiving a frame releases its bytes.
@@ -111,17 +132,25 @@ fn queued_size(msg: &Message) -> usize {
 }
 
 /// Open a connection's outbound queue. Overflowing it trips `close`.
-pub(super) fn outbound_channel(close: watch::Sender<bool>) -> (OutboundTx, OutboundRx) {
-    outbound_channel_with_limit(close, MAX_OUTBOUND_QUEUED_BYTES)
+pub(super) fn outbound_channel(
+    close: watch::Sender<bool>,
+    account_session_id: Option<&str>,
+) -> (OutboundTx, OutboundRx) {
+    outbound_channel_with_limit(close, account_session_id, MAX_OUTBOUND_QUEUED_BYTES)
 }
 
-fn outbound_channel_with_limit(close: watch::Sender<bool>, limit: usize) -> (OutboundTx, OutboundRx) {
+fn outbound_channel_with_limit(
+    close: watch::Sender<bool>,
+    account_session_id: Option<&str>,
+    limit: usize,
+) -> (OutboundTx, OutboundRx) {
     let (tx, rx) = mpsc::unbounded_channel();
     let budget = Arc::new(OutboundBudget {
         queued: AtomicUsize::new(0),
         limit,
         overflowed: AtomicBool::new(false),
         close,
+        account_session_id: account_session_id.map(str::to_owned),
     });
     (
         OutboundTx { tx, budget: budget.clone() },
@@ -130,6 +159,16 @@ fn outbound_channel_with_limit(close: watch::Sender<bool>, limit: usize) -> (Out
 }
 
 impl OutboundTx {
+    pub(super) fn is_closed(&self) -> bool {
+        self.budget.is_closed()
+    }
+
+    pub(super) fn can_invoke<R: Runtime>(&self, app: &AppHandle<R>) -> bool {
+        self.budget.authorized(|id| {
+            auth::session_status(&app.state::<DatabaseStore>(), id).is_approved()
+        })
+    }
+
     /// Queue a frame for the writer. Fails once the receiver is gone or the
     /// connection has overflowed its budget.
     pub fn send(&self, msg: Message) -> Result<(), mpsc::error::SendError<Message>> {
@@ -157,6 +196,11 @@ impl OutboundTx {
 }
 
 impl OutboundRx {
+    pub(super) fn can_forward(&self, db: &DatabaseStore) -> bool {
+        self.budget
+            .authorized(|id| auth::session_status(db, id).is_approved())
+    }
+
     pub async fn recv(&mut self) -> Option<Message> {
         let msg = self.rx.recv().await?;
         self.budget.queued.fetch_sub(queued_size(&msg), Ordering::SeqCst);
@@ -174,7 +218,7 @@ impl OutboundRx {
 /// An outbound queue for unit tests that don't care about the close signal.
 #[cfg(test)]
 pub(super) fn test_outbound() -> (OutboundTx, OutboundRx) {
-    outbound_channel(watch::channel(false).0)
+    outbound_channel(watch::channel(false).0, None)
 }
 
 /// Ordered dispatch lane for invokes whose *arrival order* is load-bearing.
@@ -280,7 +324,7 @@ impl ConnectionRegistry {
     #[cfg(test)]
     pub(crate) fn connect_for_test(&self, session_id: &str) -> u64 {
         let close = watch::channel(false).0;
-        let (out, _) = outbound_channel(close.clone());
+        let (out, _) = outbound_channel(close.clone(), None);
         self.register(session_id, Transport::Lan, out, close)
     }
 
@@ -624,6 +668,7 @@ fn account_pair_error_response(err: super::account::AccountPairError) -> Respons
         E::DesktopSignedOut => error(StatusCode::FORBIDDEN, "account_signed_out"),
         E::AuthFailed => error(StatusCode::UNAUTHORIZED, "account_auth_failed"),
         E::Mismatch => error(StatusCode::FORBIDDEN, "account_mismatch"),
+        E::SessionChanged => error(StatusCode::CONFLICT, "account_session_changed"),
         E::Internal(reason) => {
             // Surface the concrete cause in the server log (never to the client)
             // so a failed mint is diagnosable without leaking internals.
@@ -723,10 +768,9 @@ async fn ws_upgrade<R: Runtime>(
     })
 }
 
-pub(super) fn session_active<R: Runtime>(app: &AppHandle<R>, session_id: &str) -> bool {
-    app.state::<crate::database::DatabaseStore>()
-        .web_remote_get_session(session_id)
-        .is_some_and(|s| !s.revoked && s.approved)
+pub(crate) fn session_active<R: Runtime>(app: &AppHandle<R>, session_id: &str) -> bool {
+    auth::active_session(&app.state::<crate::database::DatabaseStore>(), session_id)
+        .is_some_and(|session| session.approved)
 }
 
 /// Serve a frontend asset. Missing route-looking paths fall back to
@@ -826,15 +870,24 @@ async fn handle_socket<R: Runtime>(
     plaintext: bool,
 ) {
     let shared = app.state::<WebRemoteState>().shared();
-    app.state::<crate::database::DatabaseStore>()
-        .web_remote_touch_session(&session_id);
 
     let (mut sink, mut stream) = socket.split();
     let (close_tx, mut close_rx) = watch::channel(false);
-    let (out_tx, mut out_rx) = outbound_channel(close_tx.clone());
+    let db = app.state::<DatabaseStore>();
+    let Some(account) = auth::AccountSessionGuard::new(&db, &session_id) else {
+        return;
+    };
+    let (out_tx, mut out_rx) = outbound_channel(close_tx.clone(), account.account_session_id());
     let conn_id = shared
         .connections
         .register(&session_id, Transport::Lan, out_tx.clone(), close_tx.clone());
+    // Register before the final check so explicit device revocation can
+    // either see this connection or be observed in the database here.
+    if !auth::session_status(&db, &session_id).is_approved() {
+        shared.connections.unregister(conn_id);
+        return;
+    }
+    db.web_remote_touch_session(&session_id);
     if plaintext {
         shared.connections.mark_plaintext(conn_id);
     }
@@ -846,11 +899,16 @@ async fn handle_socket<R: Runtime>(
     // depends on encoding them in exactly the order they hit the wire.
     let stats = Arc::new(WireStats::default());
     let writer = {
+        let app = app.clone();
         let stats = stats.clone();
         tokio::spawn(async move {
+            let db = app.state::<DatabaseStore>();
             let mut compressor = compress_frames.then(FrameCompressor::new);
             while let Some(msg) = out_rx.recv().await {
                 let msg = compress::encode_and_account(compressor.as_mut(), &stats, msg);
+                if !out_rx.can_forward(&db) {
+                    break;
+                }
                 let is_close = matches!(msg, Message::Close(_));
                 if sink.send(msg).await.is_err() {
                     break;
@@ -877,6 +935,9 @@ async fn handle_socket<R: Runtime>(
         tokio::spawn(async move {
             while let Some((id, cmd, args)) = ordered_rx.recv().await {
                 super::dispatch::dispatch_invoke(&app, &router, conn_id, &out, id, cmd, args).await;
+                if out.is_closed() {
+                    break;
+                }
             }
         })
     };
@@ -905,8 +966,11 @@ async fn handle_socket<R: Runtime>(
     };
 
     // Reader: dispatch client frames until close/error/revocation.
+    let account_expired = account.expired();
+    tokio::pin!(account_expired);
     loop {
         tokio::select! {
+            _ = &mut account_expired => break,
             changed = close_rx.changed() => {
                 if changed.is_err() || *close_rx.borrow() {
                     break;
@@ -915,6 +979,9 @@ async fn handle_socket<R: Runtime>(
             incoming = stream.next() => {
                 match incoming {
                     Some(Ok(Message::Text(txt))) => {
+                        if !account.active() {
+                            break;
+                        }
                         handle_text_frame(&app, &shared, conn_id, &out_tx, &ordered_tx, &txt);
                     }
                     Some(Ok(Message::Pong(_))) => {
@@ -929,12 +996,12 @@ async fn handle_socket<R: Runtime>(
     }
 
     // Teardown: channels + event subscriptions die with the socket.
+    close_tx.send_replace(true);
     shared.connections.unregister(conn_id);
     shared.channels.remove_conn(conn_id);
     shared.events.remove_conn(&app, conn_id);
     pinger.abort();
     ordered_task.abort();
-    let _ = close_tx.send(true);
     drop(out_tx);
     writer.abort();
 
@@ -1146,7 +1213,7 @@ mod tests {
     #[test]
     fn outbound_queue_overflow_drops_the_connection() {
         let (close_tx, close_rx) = watch::channel(false);
-        let (out, mut rx) = outbound_channel_with_limit(close_tx, 10);
+        let (out, mut rx) = outbound_channel_with_limit(close_tx, None, 10);
 
         // Within budget; draining a frame releases its bytes.
         out.send(Message::Binary(vec![0; 6])).unwrap();
@@ -1163,6 +1230,24 @@ mod tests {
         assert!(rx.try_recv().is_ok());
         assert!(rx.try_recv().is_ok());
         assert!(out.send(Message::Text("x".into())).is_err());
+    }
+
+    #[tokio::test]
+    async fn queued_account_frames_are_blocked_after_logout() {
+        let db = crate::database::init_test_database();
+        auth::seed_account_browser(&db, "account", "account-browser");
+        let guard = auth::AccountSessionGuard::new(&db, "account").unwrap();
+        let (close, closed) = watch::channel(false);
+        let (out, mut rx) = outbound_channel(close, guard.account_session_id());
+        let (_, paired) = test_outbound();
+        assert!(rx.can_forward(&db));
+
+        out.send(Message::Text("queued before logout".into())).unwrap();
+        db.clear_auth_token().unwrap();
+        assert!(rx.recv().await.is_some());
+        assert!(!rx.can_forward(&db), "the writer must drop the queued frame");
+        assert!(*closed.borrow(), "the writer signals connection teardown");
+        assert!(paired.can_forward(&db), "code-paired writers do not depend on account auth");
     }
 
     #[test]
@@ -1292,7 +1377,8 @@ mod tests {
     fn account_pair_errors_map_to_expected_http_status() {
         // The browser account-login screen keys its copy off these exact
         // status/code pairs. Disabled/signed-out/mismatch are 403; a bad
-        // credential is 401 (non-enumerating); internal is 500.
+        // credential is 401, a changed desktop session is 409, and an
+        // internal failure is 500.
         use super::super::account::AccountPairError as E;
         assert_eq!(
             account_pair_error_response(E::Disabled).status(),
@@ -1309,6 +1395,10 @@ mod tests {
         assert_eq!(
             account_pair_error_response(E::AuthFailed).status(),
             StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(
+            account_pair_error_response(E::SessionChanged).status(),
+            StatusCode::CONFLICT
         );
         assert_eq!(
             account_pair_error_response(E::Internal("x".into())).status(),
