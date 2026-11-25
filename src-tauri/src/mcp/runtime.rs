@@ -187,13 +187,20 @@ pub async fn start_mcp_server_cancellable<G: Send>(
     spawn_guards: G,
 ) -> McpServerHandle {
     if matches!(config.transport, McpTransport::Http) {
-        // HTTP configs do not create a local process. The network handshake
-        // remains cancellable and must not hold the start or approval locks.
-        drop(spawn_guards);
+        // The first poll admits the outbound request while revocation is
+        // excluded by the approval guard. Release the guards immediately
+        // afterward so the network response cannot hold up revocation.
+        let http_start = start_http_mcp_server(config.clone());
+        tokio::pin!(http_start);
+        let mut admission_guards = Some(spawn_guards);
         return tokio::select! {
             biased;
             _ = cancellation(&mut cancelled) => stopped_handle(config.clone()),
-            handle = start_http_mcp_server(config.clone()) => handle,
+            handle = std::future::poll_fn(|cx| {
+                let result = std::future::Future::poll(http_start.as_mut(), cx);
+                drop(admission_guards.take());
+                result
+            }) => handle,
         };
     }
 

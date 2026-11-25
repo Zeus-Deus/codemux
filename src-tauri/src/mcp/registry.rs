@@ -48,7 +48,7 @@ use super::{McpConfigSource, McpServerConfig};
 #[cfg(test)]
 tokio::task_local! {
     static APPROVAL_CHECKED_GATE: (Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>);
-    static BEFORE_PROJECT_SPAWN_GATE: (Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>);
+    static BEFORE_PROJECT_ADMISSION_GATE: (Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>);
 }
 
 /// Tauri event the frontend listens to for live status updates.
@@ -712,7 +712,7 @@ impl McpRegistry {
         // the server lock here: stop waits for the startup call guard to drop.
         #[cfg(test)]
         if fingerprint.is_some() {
-            if let Ok((entered, release)) = BEFORE_PROJECT_SPAWN_GATE.try_with(Clone::clone) {
+            if let Ok((entered, release)) = BEFORE_PROJECT_ADMISSION_GATE.try_with(Clone::clone) {
                 entered.notify_one();
                 release.notified().await;
             }
@@ -1085,18 +1085,27 @@ impl McpRegistry {
         fingerprint: &str,
     ) -> Result<bool, String> {
         let approval_guard = self.project_approval_lock.lock().await;
-        let revoked = super::project_trust::revoke_approval(app, fingerprint)?;
         let configs: Vec<McpServerConfig> = {
             let inner = self.inner.lock().await;
-            inner
+            let configs: Vec<_> = inner
                 .handles
                 .values()
                 .filter(|handle| {
                     super::project_trust::fingerprint(&handle.config).as_deref() == Some(fingerprint)
                 })
                 .map(|handle| handle.config.clone())
-                .collect()
+                .collect();
+            // Close every in-flight reservation before deleting the approval.
+            // A pending HTTP first poll must see cancellation before it can
+            // send headers from a definition that is no longer approved.
+            for config in &configs {
+                if let Some(cancel) = inner.cancel_calls.get(&config.id) {
+                    cancel.send_replace(true);
+                }
+            }
+            configs
         };
+        let revoked = super::project_trust::revoke_approval(app, fingerprint)?;
         drop(approval_guard);
         for config in configs {
             let _ = self.stop_server(Some(app), &config.id).await;
@@ -2720,7 +2729,7 @@ mod project_trust_tests {
         let start_entered = entered.clone();
         let start_release = release.clone();
         let start = tokio::spawn(async move {
-            BEFORE_PROJECT_SPAWN_GATE.scope((start_entered, start_release), async move {
+            BEFORE_PROJECT_ADMISSION_GATE.scope((start_entered, start_release), async move {
                 start_reg.ensure_started(Some(&start_app), start_config).await
             }).await
         });
@@ -2813,6 +2822,61 @@ mod project_trust_tests {
             other => panic!("expected needsApproval, got {other:?}"),
         }
         untouched.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn revoking_before_http_admission_sends_no_project_headers() {
+        let mut server = mockito::Server::new_async().await;
+        let untouched = server.mock("POST", mockito::Matcher::Any)
+            .expect(0).create_async().await;
+        let project = tempfile::tempdir().unwrap();
+        write_project(project.path(), serde_json::json!({"remote": {
+            "type": "http",
+            "url": format!("{}/mcp", server.url()),
+            "headers": {"X-Secret": "{env:HOME}"},
+        }}));
+        let app = app();
+        let reg = McpRegistry::new();
+        let config = discovered(project.path(), "remote");
+        let fingerprint = super::super::project_trust::fingerprint(&config).unwrap();
+        super::super::project_trust::record_approval(app.handle(), &fingerprint, &config).unwrap();
+
+        let (entered, release) = (Arc::new(tokio::sync::Notify::new()), Arc::new(tokio::sync::Notify::new()));
+        let start_reg = reg.clone();
+        let start_app = app.handle().clone();
+        let start_config = config.clone();
+        let start_entered = entered.clone();
+        let start_release = release.clone();
+        let start = tokio::spawn(async move {
+            BEFORE_PROJECT_ADMISSION_GATE.scope((start_entered, start_release), async move {
+                start_reg.ensure_started(Some(&start_app), start_config).await
+            }).await
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(5), entered.notified())
+            .await.unwrap();
+        let revoke_reg = reg.clone();
+        let revoke_app = app.handle().clone();
+        let revoke_fingerprint = fingerprint.clone();
+        let revoke = tokio::spawn(async move {
+            revoke_reg.revoke_project_approval(&revoke_app, &revoke_fingerprint).await
+        });
+        for _ in 0..40 {
+            if !super::super::project_trust::is_approved(Some(app.handle()), &fingerprint) {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        assert!(!super::super::project_trust::is_approved(Some(app.handle()), &fingerprint));
+        release.notify_one();
+        tokio::time::timeout(std::time::Duration::from_secs(10), start)
+            .await.unwrap().unwrap();
+        assert!(tokio::time::timeout(std::time::Duration::from_secs(10), revoke)
+            .await.unwrap().unwrap().unwrap());
+        untouched.assert_async().await;
+        let row = reg.list_runtime().await.into_iter()
+            .find(|row| row.id == config.id).unwrap();
+        shown_fingerprint(&row);
+        reg.shutdown_all().await;
     }
 
     /// Servers from the user's own files start as before, with or without
