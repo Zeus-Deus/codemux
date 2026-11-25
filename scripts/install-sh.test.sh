@@ -276,6 +276,25 @@ else
     contains "ubuntu plan is a dry run"                "$OUT" "dry run"
     not_contains "ubuntu plan does not extract"        "$OUT" "appimage-extract"
 
+    for special in '#' '?'; do
+        if [ "$special" = '#' ]; then other='?'; else other='#'; fi
+        literal_dir="${TMPROOT}/local${special}artifacts"
+        literal_deb="${literal_dir}/codemux${other}build.deb"
+        mkdir -p "$literal_dir"
+        : > "$literal_deb"
+        OUT=$(run_dry "$UBUNTU" "$literal_deb")
+        is "local path with ${special} in directory and ${other} in filename succeeds" "$?" "0"
+        contains "literal special-character path is used" "$OUT" "$literal_deb"
+        contains "literal special-character path selects deb" "$OUT" "CODEMUX_ARTIFACT is a .deb"
+    done
+
+    OUT=$(CODEMUX_SIGNATURE_URL=https://downloads.example/package.sig run_dry "$UBUNTU" "$FAKE_DEB")
+    is "signature URL cannot silently accompany a local file" "$?" "1"
+    contains "local signature URL has a clear error" "$OUT" "requires a URL in CODEMUX_ARTIFACT"
+    OUT=$(CODEMUX_SIGNATURE_URL=file:///tmp/package.sig run_dry "$UBUNTU" "https://downloads.example/package.deb")
+    is "signature URL must use http(s)" "$?" "1"
+    contains "unsupported signature URL has a clear error" "$OUT" "must be an http(s) URL"
+
     FEDORA=$(mock_os_release fedora2 'ID=fedora' 'VERSION_ID=40' 'PRETTY_NAME="Fedora Linux 40"')
     FAKE_RPM="${TMPROOT}/codemux-9.9.9-1.x86_64.rpm"
     : > "$FAKE_RPM"
@@ -572,6 +591,9 @@ while [ $# -gt 1 ]; do
     shift
 done
 name="${1##*/}"; name="${name%%[?#]*}"
+if [ -n "${REQUIRED_SIGNATURE_URL:-}" ]; then
+    case "$name" in *.sig) [ "$1" = "$REQUIRED_SIGNATURE_URL" ] || exit 22 ;; esac
+fi
 src="${FIXTURE_DIR}/${name}"
 [ -f "$src" ] || exit 22
 if [ -n "$out" ]; then cp "$src" "$out"; else cat "$src"; fi
@@ -592,9 +614,12 @@ CURL
         CODEMUX_INSTALL_DIR="${TMPROOT}/opt/bin"
         # The installer's WORKDIR lands here, cleaned up with TMPROOT.
         TMPDIR="$SIGROOT"
-        unset CODEMUX_ARTIFACT CODEMUX_METHOD
+        unset CODEMUX_ARTIFACT CODEMUX_METHOD CODEMUX_SIGNATURE_URL
         [ -z "${2:-}" ] || CODEMUX_METHOD="$2"
         [ -z "${URL_ARTIFACT:-}" ] || CODEMUX_ARTIFACT="$URL_ARTIFACT"
+        [ -z "${URL_SIGNATURE:-}" ] || CODEMUX_SIGNATURE_URL="$URL_SIGNATURE"
+        REQUIRED_SIGNATURE_URL="${REQUIRED_SIGNATURE_URL:-}"
+        export REQUIRED_SIGNATURE_URL
         install_native_package() { cp "$2" "${SIGROOT}/installed"; }
         install_appimage() { cp "$1" "${SIGROOT}/installed"; }
         install_dependencies() { :; }
@@ -647,6 +672,22 @@ CURL
     is "the query URL installs the verified file" "$(cat "${SIGROOT}/installed" 2>/dev/null)" "genuine package"
     not_contains "a URL artifact is not called unchecked" "$(cat "${SIGROOT}/release.log")" "not checked"
 
+    # An authenticated mirror may require a different query token for the
+    # signature. The default public sibling must fail closed in that case.
+    PACKAGE_URL="https://downloads.example/codemux_9.9.9_amd64.deb?package_token=one#latest"
+    SIGNATURE_URL="https://downloads.example/signatures/codemux_9.9.9_amd64.deb.sig?signature_token=two"
+    REQUIRED_SIGNATURE_URL="$SIGNATURE_URL" URL_ARTIFACT="$PACKAGE_URL" run_release_install
+    is "query-protected signature rejects the public sibling URL" "$?" "1"
+    is "missing signature authorization installs nothing" "$(test ! -e "${SIGROOT}/installed" && echo yes)" "yes"
+    REQUIRED_SIGNATURE_URL="$SIGNATURE_URL" URL_ARTIFACT="$PACKAGE_URL" URL_SIGNATURE="$SIGNATURE_URL" run_release_install
+    is "explicit authenticated signature URL verifies" "$?" "0"
+    is "authenticated signature installs the verified file" "$(cat "${SIGROOT}/installed" 2>/dev/null)" "genuine package"
+    contains "authenticated signature reports verification" "$(cat "${SIGROOT}/release.log")" "signed with the Codemux release key"
+    printf 'not a signature\n' > "${RELEASE_DIR}/codemux_9.9.9_amd64.deb.sig"
+    REQUIRED_SIGNATURE_URL="$SIGNATURE_URL" URL_ARTIFACT="$PACKAGE_URL" URL_SIGNATURE="$SIGNATURE_URL" run_release_install
+    is "bad authenticated signature fails" "$?" "1"
+    is "bad authenticated signature installs nothing" "$(test ! -e "${SIGROOT}/installed" && echo yes)" "yes"
+
     # The same gate on the rpm (zypper --allow-unsigned-rpm) and AppImage paths.
     SUSE_LEAP=$(mock_os_release leap 'ID="opensuse-leap"' 'ID_LIKE="suse opensuse"' 'VERSION_ID="15.6"')
     for kind in rpm appimage; do
@@ -691,7 +732,12 @@ while [ $# -gt 1 ]; do
     case "$1" in -O) out="$2"; shift ;; -qO-) out="-" ;; esac
     shift
 done
-src="${FIXTURE_DIR}/${1##*/}"
+url="${1%%#*}"
+name="${url##*/}"; name="${name%%\?*}"
+if [ -n "${REQUIRED_SIGNATURE_URL:-}" ]; then
+    case "$name" in *.sig) [ "$1" = "$REQUIRED_SIGNATURE_URL" ] || exit 8 ;; esac
+fi
+src="${FIXTURE_DIR}/${name}"
 [ -f "$src" ] || exit 8
 if [ "$out" = "-" ]; then cat "$src"; else cp "$src" "$out"; fi
 WGET
@@ -704,6 +750,9 @@ WGET
     run_release_install
     is "signed release installs via wget" "$?" "0"
     is "wget path installs the verified file" "$(cat "${SIGROOT}/installed" 2>/dev/null)" "genuine package"
+    REQUIRED_SIGNATURE_URL="$SIGNATURE_URL" URL_ARTIFACT="$PACKAGE_URL" URL_SIGNATURE="$SIGNATURE_URL" run_release_install
+    is "authenticated signature verifies via wget" "$?" "0"
+    is "wget installs the authenticated verified file" "$(cat "${SIGROOT}/installed" 2>/dev/null)" "genuine package"
     printf 'trojaned package\n' > "${RELEASE_DIR}/codemux_9.9.9_amd64.deb"
     run_release_install
     is "replaced asset via wget fails" "$?" "1"

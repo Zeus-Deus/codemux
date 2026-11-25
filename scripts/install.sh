@@ -23,9 +23,11 @@
 #                              codemux_pinned_version below)
 #   CODEMUX_ARTIFACT           path or URL to a .deb / .rpm / .AppImage; skips
 #                              version resolution and download-by-name entirely.
-#                              A URL must come with <url>.sig and passes the
+#                              A URL needs a sibling <path>.sig and passes the
 #                              same signature check as a release download; a
 #                              local file is installed as given, unchecked
+#   CODEMUX_SIGNATURE_URL      explicit http(s) URL for the signature when a
+#                              CODEMUX_ARTIFACT URL uses separate access tokens
 #   CODEMUX_INSTALL_DIR        bin directory for the AppImage fallback
 #                              (default: /usr/local/bin, or ~/.local/bin non-root)
 #   CODEMUX_NO_DEPS=1          never touch the package manager for dependencies
@@ -142,8 +144,8 @@ codemux_pinned_version() {
     printf ''
 }
 
-# <url> without its ?query or #fragment, so file names and the .sig address
-# come from the path alone. A plain file path comes back unchanged.
+# <http(s) URL> without its ?query or #fragment, so file names and the
+# default .sig address come from the URL path alone. Do not use on local paths.
 codemux_url_path() {
     printf '%s' "${1%%[?#]*}"
 }
@@ -436,8 +438,10 @@ Environment
   CODEMUX_INSTALL_VERSION  version or tag to install (CODEMUX_VERSION also
                          works outside a Codemux terminal)
   CODEMUX_ARTIFACT       path or URL to a .deb / .rpm / .AppImage to install
-                         (a URL is signature-checked against <url>.sig like
+                         (a URL is signature-checked against <path>.sig like
                          a release download; a local file is not checked)
+  CODEMUX_SIGNATURE_URL  explicit http(s) signature URL for a URL artifact
+                         when its .sig needs a separate authenticated URL
   CODEMUX_INSTALL_DIR    bin directory for the AppImage fallback
   CODEMUX_NO_DEPS=1      never touch the package manager for dependencies
   CODEMUX_METHOD         force deb | rpm | appimage
@@ -678,17 +682,17 @@ signature_tools_help() {
     note "  curl -fsSL https://get.codemux.org/install.sh | CODEMUX_ARTIFACT=/path/to/package sh"
 }
 
-# Fetch <url>.sig and refuse to continue unless it signs <file> as <name>.
-verify_release_artifact() { # <file> <url> <name>
+# Fetch <signature-url> and refuse to continue unless it signs <file> as <name>.
+verify_release_artifact() { # <file> <signature-url> <name>
     step "Checking the release signature"
     if [ "$DRY_RUN" = "1" ]; then
-        printf '%b\n' "  ${C_DIM}would verify:${C_RESET} ${3} against ${2}.sig"
+        printf '%b\n' "  ${C_DIM}would verify:${C_RESET} ${3} against ${2}"
         return 0
     fi
     _va_dir="${WORKDIR}/verify"
     mkdir -p "$_va_dir"
-    fetch_text "${2}.sig" > "${_va_dir}/artifact.sig" 2>/dev/null \
-        || die "could not download ${2}.sig, so ${3} cannot be verified. Nothing was installed."
+    fetch_text "$2" > "${_va_dir}/artifact.sig" 2>/dev/null \
+        || die "could not download the signature for ${3}, so it cannot be verified. Nothing was installed."
     codemux_verify_signature "$1" "${_va_dir}/artifact.sig" "$3" "$_va_dir" \
         || die "${3} does not match its release signature. It may have been tampered with. Nothing was installed. Please report this at ${CODEMUX_RELEASES_URL%/releases}/issues"
     ok "signed with the Codemux release key"
@@ -1061,12 +1065,27 @@ main() {
         ok "distro family: ${FAMILY}"
     fi
 
+    if [ -n "${CODEMUX_SIGNATURE_URL:-}" ]; then
+        case "${CODEMUX_ARTIFACT:-}" in
+            http://*|https://*) : ;;
+            *) die "CODEMUX_SIGNATURE_URL requires a URL in CODEMUX_ARTIFACT" ;;
+        esac
+        case "$CODEMUX_SIGNATURE_URL" in
+            http://*|https://*) : ;;
+            *) die "CODEMUX_SIGNATURE_URL must be an http(s) URL" ;;
+        esac
+    fi
+
     # ── Choose the install method ────────────────────────────────────────
     if [ -n "${CODEMUX_METHOD:-}" ]; then
         METHOD="$CODEMUX_METHOD"
         note "CODEMUX_METHOD=${METHOD} (forced)"
     elif [ -n "${CODEMUX_ARTIFACT:-}" ]; then
-        METHOD=$(codemux_kind_from_filename "$(codemux_url_path "$CODEMUX_ARTIFACT")")
+        _method_name="$CODEMUX_ARTIFACT"
+        case "$_method_name" in
+            http://*|https://*) _method_name=$(codemux_url_path "$_method_name") ;;
+        esac
+        METHOD=$(codemux_kind_from_filename "$_method_name")
         [ "$METHOD" = "unknown" ] && die "cannot tell what CODEMUX_ARTIFACT is from its name: ${CODEMUX_ARTIFACT}"
         note "CODEMUX_ARTIFACT is a .${METHOD} — installing that"
     else
@@ -1110,19 +1129,20 @@ main() {
     if [ -n "${CODEMUX_ARTIFACT:-}" ]; then
         case "$CODEMUX_ARTIFACT" in
             http://*|https://*)
-                # A download is checked like any release package: <url>.sig
+                # A download is checked like any release package: its .sig
                 # must sign it under its own file name. Only a file already on
                 # this machine is the user's own call.
                 require_signature_tools
-                # Name and <path>.sig come from the URL path; the download
-                # itself uses the URL exactly as given.
+                # Name and the default <path>.sig come from the URL path. The
+                # package and any explicit signature URL are used as given.
                 _path=$(codemux_url_path "$CODEMUX_ARTIFACT")
                 _name=$(basename "$_path")
+                _signature_url="${CODEMUX_SIGNATURE_URL:-${_path}.sig}"
                 step "Downloading the artifact you pointed at"
                 _artifact="${WORKDIR}/${_name}"
                 download_to "$CODEMUX_ARTIFACT" "$_artifact"
                 say ""
-                verify_release_artifact "$_artifact" "$_path" "$_name"
+                verify_release_artifact "$_artifact" "$_signature_url" "$_name"
                 ;;
             *)
                 warn "CODEMUX_ARTIFACT is a local file, installed as given; its signature is not checked"
@@ -1153,7 +1173,7 @@ main() {
         download_to "$_url" "$_artifact"
         [ "$DRY_RUN" = "1" ] || ok "downloaded ($(du -h "$_artifact" 2>/dev/null | cut -f1))"
         say ""
-        verify_release_artifact "$_artifact" "$_url" "$(codemux_artifact_name "$METHOD" "$_version")"
+        verify_release_artifact "$_artifact" "${_url}.sig" "$(codemux_artifact_name "$METHOD" "$_version")"
     fi
 
     say ""
