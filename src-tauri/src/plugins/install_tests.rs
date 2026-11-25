@@ -52,8 +52,10 @@ fn fixture() -> Fixture {
     let second = git(&work, &["rev-parse", "HEAD"]);
     let origin = tmp.path().join("origin.git");
     git(tmp.path(), &["clone", "-q", "--bare", work.to_str().unwrap(), origin.to_str().unwrap()]);
-    // Allow fetching the first (non-tip) commit by id from the file remote.
+    // Serve like GitHub: any commit by id (the first is not a tip), and
+    // partial fetches, so a `--filter` git ignored would fail the tests.
     git(&origin, &["config", "uploadpack.allowAnySHA1InWant", "true"]);
+    git(&origin, &["config", "uploadpack.allowFilter", "true"]);
     let root = tmp.path().join("plugins");
     std::fs::create_dir_all(&root).unwrap();
     Fixture { url: format!("file://{}", origin.display()), first, second, root, _tmp: tmp }
@@ -182,6 +184,58 @@ fn only_commits_on_a_branch_or_tag_of_the_repository_install() {
     }
     let fetched = install::fetch_plugin(&test_git(), &f.url, Some(&format!("{tagged_parent}/codemux")), None, None).unwrap();
     assert_eq!(fetched.sha, tagged_parent);
+}
+
+/// Commits `count` more versions on the fixture's work tree and returns
+/// their ids, oldest first.
+fn commits(work: &Path, count: usize) -> Vec<String> {
+    (0..count)
+        .map(|n| {
+            std::fs::write(work.join("codemux/README.md"), format!("readme {n}")).unwrap();
+            git(work, &["commit", "-q", "-am", &format!("c{n}")]);
+            git(work, &["rev-parse", "HEAD"])
+        })
+        .collect()
+}
+
+#[test]
+fn provenance_search_is_bounded_and_says_when_it_gave_up() {
+    let f = fixture();
+    let origin = PathBuf::from(f.url.strip_prefix("file://").unwrap());
+    let work = origin.parent().unwrap().join("work");
+    let check = |sha: &str, depths: &[u32]| {
+        let git = test_git();
+        git.check_on_branch_or_tag_within(&f.url, sha, depths)
+    };
+    let push = |refspec: &str| git(&work, &["push", "-q", "-f", origin.to_str().unwrap(), refspec]);
+
+    // On a branch, eight commits below its tip: found once the search
+    // reaches it, and refused with the budget message before then.
+    let main = commits(&work, 8);
+    push("main");
+    check(&f.second, &[2, 4, 16]).unwrap();
+    let err = check(&f.second, &[2, 4]).unwrap_err();
+    assert!(err.contains("Could not confirm") && err.contains("within the last 4 commits"), "{err}");
+
+    // Reachable only through an annotated tag (no branch ever held it).
+    git(&work, &["checkout", "-q", "-b", "release", &f.first]);
+    let release = commits(&work, 3);
+    git(&work, &["tag", "-a", "v9", "-m", "v9"]);
+    push("refs/tags/v9");
+    check(&release[0], &[1, 3, 16]).unwrap();
+    check(&release[2], &[1]).unwrap();
+
+    // On no branch or tag: every history is complete within the search, so
+    // it is refused as unreachable, not as out of budget.
+    git(&work, &["checkout", "-q", "-b", "stray", &main[7]]);
+    let stray = commits(&work, 1);
+    push("HEAD:refs/heads/stray");
+    git(&origin, &["update-ref", "-d", "refs/heads/stray"]);
+    let err = check(&stray[0], &[2, 100]).unwrap_err();
+    assert!(err.contains("isn't on any branch or tag"), "{err}");
+    // A search too short to see everything can't call it unreachable.
+    let err = check(&stray[0], &[2]).unwrap_err();
+    assert!(err.contains("within the last 2 commits"), "{err}");
 }
 
 #[test]

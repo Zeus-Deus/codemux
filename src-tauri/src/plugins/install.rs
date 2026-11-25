@@ -21,6 +21,10 @@ use std::{
 pub const MAX_FILES: usize = 64;
 pub const MAX_TOTAL_BYTES: u64 = 32 * 1024 * 1024;
 const GIT_TIMEOUT: Duration = Duration::from_secs(90);
+/// How many commits back from each branch and tag tip a pinned commit is
+/// searched for: fetch this much history (commits only), look, then go
+/// deeper, and give up after the last.
+const PROVENANCE_DEPTHS: &[u32] = &[100, 1000, 5000];
 
 // ── URLs ──────────────────────────────────────────────────────────────
 
@@ -162,6 +166,11 @@ impl Git {
 
     /// Run git with an overall deadline and an output cap.
     fn run(&self, args: &[&str], stdin: Option<&[u8]>, max_out: u64) -> Result<Vec<u8>, String> {
+        self.run_by(args, stdin, max_out, Instant::now() + GIT_TIMEOUT)
+    }
+
+    /// [`Self::run`] with a deadline shared by several commands.
+    fn run_by(&self, args: &[&str], stdin: Option<&[u8]>, max_out: u64, deadline: Instant) -> Result<Vec<u8>, String> {
         let mut child = self
             .command()
             .args(args)
@@ -188,7 +197,6 @@ impl Git {
             let _ = (&mut err_pipe).take(16 * 1024).read_to_end(&mut buf);
             buf
         });
-        let deadline = Instant::now() + GIT_TIMEOUT;
         let status = loop {
             if let Some(status) = child.try_wait().map_err(|e| e.to_string())? {
                 break status;
@@ -270,42 +278,72 @@ impl Git {
     /// each repository's URL, so without this a fork's commit would install
     /// as if it came from the named repository.
     fn check_on_branch_or_tag(&self, url: &str, sha: &str) -> Result<(), String> {
+        self.check_on_branch_or_tag_within(url, sha, PROVENANCE_DEPTHS)
+    }
+
+    /// [`Self::check_on_branch_or_tag`], searching `depths` commits back from
+    /// each tip in turn. All of it shares one [`GIT_TIMEOUT`], and the fetched
+    /// history is commits only, so a huge repository can't make it unbounded.
+    pub(crate) fn check_on_branch_or_tag_within(&self, url: &str, sha: &str, depths: &[u32]) -> Result<(), String> {
+        let deadline = Instant::now() + GIT_TIMEOUT;
         // Fast path: a branch or tag tip (annotated tags list a peeled line).
-        let out = self.run(&["ls-remote", "--heads", "--tags", url], None, 8 * 1024 * 1024)?;
+        let out = self.run_by(&["ls-remote", "--heads", "--tags", url], None, 8 * 1024 * 1024, deadline)?;
         if String::from_utf8_lossy(&out).lines().any(|l| l.split('\t').next() == Some(sha)) {
             return Ok(());
         }
-        // Otherwise fetch the commit history (no trees or blobs) of every
-        // branch and tag, plus the commit itself, into a separate repository
-        // so the shallow install fetch is untouched, and ask which contain it.
+        // Otherwise look in the recent history of every branch and tag, in a
+        // separate repository so the shallow install fetch is untouched.
         let check = Self::with(self.exe.clone(), self.allow_file)?;
         check.set_origin(url)?;
-        let want = format!("+{sha}:refs/codemux/want");
-        check.run(
-            &[
-                "fetch", "-q", "--no-tags", "--no-write-fetch-head", "--filter=tree:0", "origin",
-                "+refs/heads/*:refs/codemux/heads/*", "+refs/tags/*:refs/codemux/tags/*", &want,
-            ],
-            None,
-            1024 * 1024,
-        )?;
-        let out = check.run(
-            &[
-                "for-each-ref", "--count=1", "--contains", sha, "--format=%(refname)", "refs/codemux/heads/",
-                "refs/codemux/tags/",
-            ],
-            None,
-            4096,
-        )?;
-        if !String::from_utf8_lossy(&out).trim().is_empty() {
-            return Ok(());
-        }
+        let fetch = |depth: &str, refspecs: &[&str]| {
+            let mut args =
+                vec!["fetch", "-q", "--no-tags", "--no-write-fetch-head", "--filter=tree:0", "--depth", depth, "origin"];
+            args.extend_from_slice(refspecs);
+            check.run_by(&args, None, 1024 * 1024, deadline).map(drop)
+        };
+        fetch("1", &[&format!("+{sha}:refs/codemux/want")])?;
         let repo = url.strip_suffix(".git").unwrap_or(url);
+        let mut searched = 0;
+        for depth in depths {
+            fetch(&depth.to_string(), &["+refs/heads/*:refs/codemux/heads/*", "+refs/tags/*:refs/codemux/tags/*"])?;
+            searched = *depth;
+            let out = check.run_by(
+                &[
+                    "for-each-ref", "--count=1", "--contains", sha, "--format=%(refname)", "refs/codemux/heads/",
+                    "refs/codemux/tags/",
+                ],
+                None,
+                4096,
+                deadline,
+            )?;
+            if !String::from_utf8_lossy(&out).trim().is_empty() {
+                return Ok(());
+            }
+            // No branch or tag history was cut short, so all of it is here and
+            // the commit isn't in it.
+            if !check.shallow_besides(sha)? {
+                return Err(format!(
+                    "Commit {} isn't on any branch or tag of {repo}. It may come from a fork or a pull request, \
+                     or its branch was rewritten.",
+                    &sha[..12]
+                ));
+            }
+        }
         Err(format!(
-            "Commit {} isn't on any branch or tag of {repo}. It may come from a fork or a pull request, \
-             or its branch was rewritten.",
+            "Could not confirm commit {} is from {repo} within the last {searched} commits of any branch or tag. \
+             Install a newer commit, or a branch or tag.",
             &sha[..12]
         ))
+    }
+
+    /// Whether any commit other than `sha` has history the shallow fetches
+    /// left out (`$GIT_DIR/shallow` lists those boundary commits).
+    fn shallow_besides(&self, sha: &str) -> Result<bool, String> {
+        match std::fs::read_to_string(self.dir.path().join("shallow")) {
+            Ok(list) => Ok(list.lines().map(str::trim).any(|l| !l.is_empty() && l != sha)),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+            Err(e) => Err(format!("Cannot read the fetched history: {e}")),
+        }
     }
 
     /// `(mode, oid, name)` for the entries of one folder (non-recursive).
