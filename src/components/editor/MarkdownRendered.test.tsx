@@ -50,6 +50,23 @@ describe("MarkdownRendered", () => {
     expect(img.getAttribute("alt")).toBe("alt");
   });
 
+  it.each([
+    ["/README.md", "mock-asset:/logo.png"],
+    ["C:\\README.md", "mock-asset:C:\\logo.png"],
+  ])("converts a root-level document image from %s", (filePath, expected) => {
+    const { container } = render(
+      <MarkdownRendered content="![Logo](./logo.png)" filePath={filePath} />,
+    );
+    expect(loadLocalImage(container).getAttribute("src")).toBe(expected);
+  });
+
+  it("keeps a relative image inert when the document path is relative", () => {
+    const { container } = render(
+      <MarkdownRendered content="![Logo](./logo.png)" filePath="README.md" />,
+    );
+    expect(container.querySelector("img, [data-testid='markdown-image-load']")).toBeNull();
+  });
+
   it("rewrites absolute image paths via convertFileSrc", () => {
     const { container } = render(
       <MarkdownRendered
@@ -255,9 +272,21 @@ describe("MarkdownRendered", () => {
   });
 
   it.each([
+    ["asset://localhost", "asset://localhost/%2Ftmp%2Fscreenshot.png"],
+    ["http://asset.localhost", "http://asset.localhost/C%3A%5CUsers%5Cme%5Cscreenshot.png"],
+  ])("defers a real convertFileSrc URL from %s", (assetPrefix, src) => {
+    mockTauri.enabled = true;
+    mockTauri.assetPrefix = assetPrefix;
+    const { container } = render(<MarkdownRendered content={`![Local](${src})`} />);
+    expect(loadLocalImage(container).getAttribute("src")).toBe(src);
+    expect(mockOpenUrl).not.toHaveBeenCalled();
+  });
+
+  it.each([
     "http://asset.localhost/%5C%5Cattacker.example%5Cshare%5Cpixel.png",
     "http://asset.localhost/%255C%255Cattacker.example%255Cshare%255Cpixel.png",
     "asset://localhost/%5C%5Cattacker.example%5Cshare%5Cpixel.png",
+    "asset://localhost/%2F%2Fattacker.example%2Fshare%2Fpixel.png",
   ])("keeps a network-backed native asset inert: %s", (src) => {
     mockTauri.enabled = true;
     mockTauri.assetPrefix = src.startsWith("http") ? "http://asset.localhost" : "asset://localhost";

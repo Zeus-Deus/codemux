@@ -60,10 +60,12 @@ describe("isAbsoluteFsPath", () => {
 describe("dirname", () => {
   it("returns the parent directory for POSIX paths", () => {
     expect(dirname("/a/b/c.md")).toBe("/a/b");
+    expect(dirname("/README.md")).toBe("/");
   });
 
   it("returns the parent directory for Windows paths", () => {
     expect(dirname("C:\\a\\b\\c.md")).toBe("C:\\a\\b");
+    expect(dirname("C:\\README.md")).toBe("C:\\");
   });
 
   it("returns empty string when there is no separator", () => {
@@ -91,6 +93,11 @@ describe("joinPath", () => {
   it("returns the relative path verbatim when dir is empty", () => {
     expect(joinPath("", "c.png")).toBe("c.png");
     expect(joinPath("", "./c.png")).toBe("c.png");
+  });
+
+  it("keeps root directories absolute without doubling the separator", () => {
+    expect(joinPath("/", "./logo.png")).toBe("/logo.png");
+    expect(joinPath("C:\\", "./logo.png")).toBe("C:\\logo.png");
   });
 });
 

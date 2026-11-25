@@ -37,6 +37,8 @@ export function isAbsoluteFsPath(src: string): boolean {
  */
 export function dirname(path: string): string {
   const idx = Math.max(path.lastIndexOf("/"), path.lastIndexOf("\\"));
+  if (idx === 0 && path.startsWith("/")) return "/";
+  if (idx === 2 && /^[a-zA-Z]:[\\/]/.test(path)) return path.slice(0, 3);
   return idx >= 0 ? path.slice(0, idx) : "";
 }
 
@@ -50,6 +52,7 @@ export function dirname(path: string): string {
 export function joinPath(dir: string, rel: string): string {
   const cleaned = rel.replace(/^\.\//, "");
   if (!dir) return cleaned;
+  if (/[\\/]$/.test(dir)) return `${dir}${cleaned}`;
   const sep = dir.includes("\\") && !dir.includes("/") ? "\\" : "/";
   return `${dir}${sep}${cleaned}`;
 }

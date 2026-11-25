@@ -424,7 +424,10 @@ function MarkdownRenderedImpl({
         // cannot reach a share. Keep it out of <img> until a deliberate click.
         const assetPath = nativeAssetPath(imagePath);
         if (assetPath !== null) {
-          if (isNetworkOrDeviceImagePath(assetPath)) {
+          // Tauri's asset handler strips the URL's first separator before
+          // percent-decoding the filesystem path. Inspect that same path:
+          // /%2Ftmp is a POSIX absolute file, but /%2F%2Fhost is a share.
+          if (isNetworkOrDeviceImagePath(assetPath.slice(1))) {
             return <InertImageReference src={imagePath} alt={label} />;
           }
           if (/^(?:asset|tauri):/i.test(imagePath)) {
@@ -460,7 +463,8 @@ function MarkdownRenderedImpl({
         const localPath = isAbsoluteFsPath(imagePath)
           ? imagePath
           : filePath ? joinPath(dirname(filePath), imagePath) : null;
-        if (!localPath || isNetworkOrDeviceImagePath(imagePath)
+        if (!localPath || !isAbsoluteFsPath(localPath)
+            || isNetworkOrDeviceImagePath(imagePath)
             || isNetworkOrDeviceImagePath(localPath)) {
           return <InertImageReference src={imagePath} alt={label} />;
         }
