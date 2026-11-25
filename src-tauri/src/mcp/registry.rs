@@ -48,6 +48,7 @@ use super::{McpConfigSource, McpServerConfig};
 #[cfg(test)]
 tokio::task_local! {
     static APPROVAL_CHECKED_GATE: (Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>);
+    static BEFORE_PROJECT_SPAWN_GATE: (Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>);
 }
 
 /// Tauri event the frontend listens to for live status updates.
@@ -621,8 +622,8 @@ impl McpRegistry {
         } else {
             None
         };
-        if let Some(fingerprint) = fingerprint {
-            if !super::project_trust::is_approved(app, &fingerprint) {
+        if let Some(ref fingerprint) = fingerprint {
+            if !super::project_trust::is_approved(app, fingerprint) {
                 let mut inner = self.inner.lock().await;
                 if let Some(existing) = inner.handles.get(&id).filter(|h| {
                     matches!(h.status, McpServerStatus::Running { .. } | McpServerStatus::Starting)
@@ -631,7 +632,7 @@ impl McpRegistry {
                 }
                 let summary = super::project_trust::summary(&config);
                 let mut handle = McpServerHandle::discovered(config);
-                handle.status = McpServerStatus::NeedsApproval { fingerprint, summary };
+                handle.status = McpServerStatus::NeedsApproval { fingerprint: fingerprint.clone(), summary };
                 let row = McpServerRuntime::from_handle(&handle);
                 inner.handles.insert(id, handle);
                 drop(inner);
@@ -704,12 +705,59 @@ impl McpRegistry {
         );
 
         drop(lifecycle);
-        // Drop the lock for the actual spawn — the handshake can take
-        // up to HANDSHAKE_TIMEOUT seconds and we don't want to block
-        // every other command on it.
-        let mut handle =
-            super::runtime::start_mcp_server_cancellable(config.clone(), Some(start_cancelled))
-                .await;
+        // A revocation or stop can complete after the reservation but before
+        // process creation. Recheck under the approval and registry locks,
+        // then hold them only through the actual spawn. The handshake can
+        // take much longer and must not block revocation. We cannot reacquire
+        // the server lock here: stop waits for the startup call guard to drop.
+        #[cfg(test)]
+        if fingerprint.is_some() {
+            if let Ok((entered, release)) = BEFORE_PROJECT_SPAWN_GATE.try_with(Clone::clone) {
+                entered.notify_one();
+                release.notified().await;
+            }
+        }
+        let spawn_approval_guard = if fingerprint.is_some() {
+            Some(self.project_approval_lock.lock().await)
+        } else {
+            None
+        };
+        let mut spawn_inner_guard = self.inner.lock().await;
+        let current = spawn_inner_guard.handles.get(&id).is_some_and(|handle| {
+            matches!(handle.status, McpServerStatus::Starting)
+                && handle.config.raw.get("runtimeGeneration")
+                    .and_then(serde_json::Value::as_str) == Some(&generation)
+        });
+        let still_approved = fingerprint.as_ref().is_none_or(|fingerprint| {
+            super::project_trust::is_approved(app, fingerprint)
+        });
+        let cancelled_before_spawn = *start_cancelled.borrow() || start_cancelled.has_changed().is_err();
+        if !current || cancelled_before_spawn || !still_approved {
+            if current && !still_approved {
+                let mut denied = McpServerHandle::discovered(config.clone());
+                denied.status = McpServerStatus::NeedsApproval {
+                    fingerprint: fingerprint.clone().expect("project approval fingerprint"),
+                    summary: super::project_trust::summary(&config),
+                };
+                let row = McpServerRuntime::from_handle(&denied);
+                spawn_inner_guard.cancel_calls.remove(&id);
+                spawn_inner_guard.handles.insert(id, denied);
+                drop(spawn_inner_guard);
+                drop(spawn_approval_guard);
+                emit_status_with_bus(app, &self.status_tx, &row);
+                return row;
+            }
+            drop(spawn_inner_guard);
+            drop(spawn_approval_guard);
+            return self.plugin_status(&id).await.unwrap_or_else(|| {
+                McpServerRuntime::from_handle(&McpServerHandle::discovered(config))
+            });
+        }
+        let mut handle = super::runtime::start_mcp_server_cancellable(
+            config.clone(),
+            Some(start_cancelled),
+            (spawn_inner_guard, spawn_approval_guard),
+        ).await;
         let row;
         let host_tools = self.collision_host_tools();
         {
@@ -2647,6 +2695,59 @@ mod project_trust_tests {
             .await.unwrap().unwrap();
         assert!(tokio::time::timeout(std::time::Duration::from_secs(10), revoke)
             .await.unwrap().unwrap().unwrap());
+        let row = reg.list_runtime().await.into_iter()
+            .find(|row| row.id == config.id).unwrap();
+        shown_fingerprint(&row);
+        reg.shutdown_all().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn revoking_after_reservation_but_before_spawn_runs_no_project_command() {
+        let (project, scratch) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let marker = scratch.path().join("started");
+        write_project(project.path(), serde_json::json!({"lint": touch_server(&marker)}));
+        let app = app();
+        let reg = McpRegistry::new();
+        let config = discovered(project.path(), "lint");
+        let fingerprint = super::super::project_trust::fingerprint(&config).unwrap();
+        super::super::project_trust::record_approval(app.handle(), &fingerprint, &config).unwrap();
+
+        let (entered, release) = (Arc::new(tokio::sync::Notify::new()), Arc::new(tokio::sync::Notify::new()));
+        let start_reg = reg.clone();
+        let start_app = app.handle().clone();
+        let start_config = config.clone();
+        let start_entered = entered.clone();
+        let start_release = release.clone();
+        let start = tokio::spawn(async move {
+            BEFORE_PROJECT_SPAWN_GATE.scope((start_entered, start_release), async move {
+                start_reg.ensure_started(Some(&start_app), start_config).await
+            }).await
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(5), entered.notified())
+            .await.unwrap();
+
+        let revoke_reg = reg.clone();
+        let revoke_app = app.handle().clone();
+        let revoke_fingerprint = fingerprint.clone();
+        let revoke = tokio::spawn(async move {
+            revoke_reg.revoke_project_approval(&revoke_app, &revoke_fingerprint).await
+        });
+        for _ in 0..40 {
+            if !super::super::project_trust::is_approved(Some(app.handle()), &fingerprint) {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        assert!(!super::super::project_trust::is_approved(Some(app.handle()), &fingerprint));
+        assert!(!marker.exists(), "the command has not run at the pre-spawn gate");
+        release.notify_one();
+
+        tokio::time::timeout(std::time::Duration::from_secs(10), start)
+            .await.unwrap().unwrap();
+        assert!(tokio::time::timeout(std::time::Duration::from_secs(10), revoke)
+            .await.unwrap().unwrap().unwrap());
+        assert!(stays_absent(&marker).await, "revoked project command still spawned");
         let row = reg.list_runtime().await.into_iter()
             .find(|row| row.id == config.id).unwrap();
         shown_fingerprint(&row);

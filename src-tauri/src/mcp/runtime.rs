@@ -178,14 +178,18 @@ impl McpServerHandle {
 /// `None` (we drop the child handle so the watchdog reaps it).
 ///
 pub async fn start_mcp_server(config: McpServerConfig) -> McpServerHandle {
-    start_mcp_server_cancellable(config, None).await
+    start_mcp_server_cancellable(config, None, ()).await
 }
 
-pub async fn start_mcp_server_cancellable(
+pub async fn start_mcp_server_cancellable<G: Send>(
     config: McpServerConfig,
     mut cancelled: Option<tokio::sync::watch::Receiver<bool>>,
+    spawn_guards: G,
 ) -> McpServerHandle {
     if matches!(config.transport, McpTransport::Http) {
+        // HTTP configs do not create a local process. The network handshake
+        // remains cancellable and must not hold the start or approval locks.
+        drop(spawn_guards);
         return tokio::select! {
             biased;
             _ = cancellation(&mut cancelled) => stopped_handle(config.clone()),
@@ -224,8 +228,14 @@ pub async fn start_mcp_server_cancellable(
         default_timeout: DEFAULT_REQUEST_TIMEOUT,
     };
 
+    if cancelled.as_ref().is_some_and(|rx| *rx.borrow() || rx.has_changed().is_err()) {
+        return stopped_handle(config);
+    }
     let immediate = config.raw.get("pluginImmediateShutdown").and_then(Value::as_bool) == Some(true);
     let spawned = if immediate { JsonRpcChild::spawn_immediate(spawn).await } else { JsonRpcChild::spawn(spawn).await };
+    // Process creation is now ordered against approval revocation and stop.
+    // Release the guards before the potentially long MCP handshake.
+    drop(spawn_guards);
     let child = match spawned {
         Ok(c) => Arc::new(c),
         Err(err) => {

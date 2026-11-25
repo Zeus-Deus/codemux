@@ -70,6 +70,7 @@ describe("McpSection", () => {
     listMcpServersMock.mockResolvedValueOnce([makeServer({ name: "outbound" })]);
     render(<McpSection projectRoot={null} />);
     expect(await screen.findByText("outbound")).toBeInTheDocument();
+    expect(screen.getByText(/OpenCode 1\.x chats receive no Codemux MCP tools/)).toBeInTheDocument();
     expect(screen.queryByRole("heading", { name: "Outside assistants" })).not.toBeInTheDocument();
     expect(screen.queryByRole("switch", { name: "Allow network connections" })).not.toBeInTheDocument();
     expect(agentConnectorStatus).not.toHaveBeenCalled();
