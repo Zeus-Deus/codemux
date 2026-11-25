@@ -551,13 +551,25 @@ impl FolderWalkFilter {
         })
     }
 
-    fn check_rule_files(&mut self, dir: &Path) -> Result<(), String> {
+    fn has_repository_marker(dir: &Path) -> bool {
+        dir.join(".git").metadata().is_ok() || dir.join(".jj").exists()
+    }
+
+    fn check_rule_files(&mut self, dir: &Path, load_git_rules: bool) -> Result<(), String> {
         if !self.checked_rule_dirs.insert(dir.to_path_buf()) {
             return Ok(());
         }
         let ignore = self.load_rule_file(dir, &dir.join(".ignore"))?;
-        let gitignore = self.load_rule_file(dir, &dir.join(".gitignore"))?;
-        let (has_git, git_exclude) = self.load_git_exclude(dir)?;
+        let gitignore = if load_git_rules {
+            self.load_rule_file(dir, &dir.join(".gitignore"))?
+        } else {
+            None
+        };
+        let (has_git, git_exclude) = if load_git_rules {
+            self.load_git_exclude(dir)?
+        } else {
+            (false, None)
+        };
         self.rules.insert(
             dir.to_path_buf(),
             FolderRuleSet {
@@ -922,12 +934,17 @@ fn read_folder_for_attachment_with_limit(
     };
     // The canonical root is shared by the rules and the raw walk so symlinked
     // entry paths cannot select a different set of parent rule files.
+    let git_root = path
+        .ancestors()
+        .find(|ancestor| FolderWalkFilter::has_repository_marker(ancestor));
     for ancestor in path.ancestors() {
-        filter_state.check_rule_files(ancestor)?;
+        let load_git_rules = git_root.is_some_and(|root| ancestor.starts_with(root));
+        filter_state.check_rule_files(ancestor, load_git_rules)?;
     }
     let filter = Arc::new(Mutex::new(filter_state));
     let filter_for_walk = Arc::clone(&filter);
     let root_for_filter = path.to_path_buf();
+    let root_has_git = git_root.is_some();
     // Keep filesystem iteration order here: sorting before the visit cap
     // would materialize every entry in a wide directory.
     let mut raw_walker = WalkBuilder::new(path);
@@ -959,7 +976,12 @@ fn read_folder_for_attachment_with_limit(
                 return false;
             }
             if let Some(parent) = entry.path().parent() {
-                if let Err(error) = state.check_rule_files(parent) {
+                let load_git_rules = root_has_git
+                    || parent.ancestors().any(|ancestor| {
+                        state.rules.get(ancestor).is_some_and(|rules| rules.has_git)
+                    })
+                    || FolderWalkFilter::has_repository_marker(parent);
+                if let Err(error) = state.check_rule_files(parent, load_git_rules) {
                     state.fatal_error = Some(error);
                     return true;
                 }
@@ -2619,6 +2641,7 @@ mod tests {
     #[test]
     fn symlinked_ignore_rules_are_rejected_before_parsing() {
         let dir = tempdir().unwrap();
+        fs::create_dir(dir.path().join(".git")).unwrap();
         fs::write(dir.path().join("rules"), "*.txt\n").unwrap();
         std::os::unix::fs::symlink("rules", dir.path().join(".gitignore")).unwrap();
         let error = read_folder_for_attachment_blocking(
@@ -2796,7 +2819,7 @@ mod tests {
             rule_bytes: 0,
             rule_lines: 0,
         };
-        state.check_rule_files(dir.path()).unwrap();
+        state.check_rule_files(dir.path(), true).unwrap();
         fs::write(&rules, vec![b'x'; MAX_ATTACHMENT_IGNORE_FILE_BYTES as usize + 1]).unwrap();
         assert!(state.is_ignored(&dir.path().join("ignored.txt"), false));
         assert!(!state.is_ignored(&dir.path().join("visible.txt"), false));
@@ -2938,6 +2961,36 @@ mod tests {
         )
         .unwrap();
         assert!(info.tree.contains("visible.log"));
+    }
+
+    #[test]
+    fn attaching_nested_repository_skips_oversized_outer_gitignore() {
+        let dir = tempdir().unwrap();
+        fs::create_dir(dir.path().join(".git")).unwrap();
+        fs::write(
+            dir.path().join(".gitignore"),
+            vec![b'x'; MAX_ATTACHMENT_IGNORE_FILE_BYTES as usize + 1],
+        )
+        .unwrap();
+        fs::write(dir.path().join(".ignore"), "*.tmp\n").unwrap();
+        let nested = dir.path().join("nested");
+        let child = nested.join("child");
+        fs::create_dir_all(nested.join(".git")).unwrap();
+        fs::create_dir(&child).unwrap();
+        fs::write(child.join("hidden.tmp"), "x").unwrap();
+        fs::write(child.join("visible.txt"), "x").unwrap();
+
+        let picked = walk_project(&child);
+        assert!(picked.paths.iter().any(|path| path == "visible.txt"));
+        assert!(!picked.paths.iter().any(|path| path == "hidden.tmp"));
+        let info = read_folder_for_attachment_blocking(
+            child.to_string_lossy().into_owned(),
+            None,
+            1,
+        )
+        .unwrap();
+        assert!(info.tree.contains("visible.txt"));
+        assert!(!info.tree.contains("hidden.tmp"));
     }
 
     #[test]
