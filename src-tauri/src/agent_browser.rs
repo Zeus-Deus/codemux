@@ -801,6 +801,17 @@ fn browser_control_listener_owned_by_pid(session: &str, dir: &std::path::Path, p
 }
 
 fn require_owned_browser_session(session: &str) -> Result<(), String> {
+    require_owned_browser_session_for_cleanup(session)?;
+    #[cfg(unix)]
+    if let Some(pid) = read_agent_browser_daemon_pid(session) {
+        if failed_stream_attempt_is_live(session, pid) {
+            return Err(format!("Browser session {session} belongs to a failed stream launch"));
+        }
+    }
+    Ok(())
+}
+
+fn require_owned_browser_session_for_cleanup(session: &str) -> Result<(), String> {
     validate_session_name(session)?;
     let dir = run_dir_for_session(session).ok_or("Cannot prepare private browser control directory")?;
     require_owned_browser_session_in(session, &dir)
@@ -954,6 +965,10 @@ fn kill_verified_browser_pid(record: &BrowserPidRecord, session: &str) {
             // the escalation signal.
             unsafe { libc::kill(pid, libc::SIGKILL) };
         }
+        let started = Instant::now();
+        while browser_process_matches(record, session) && started.elapsed() < Duration::from_secs(1) {
+            std::thread::sleep(Duration::from_millis(25));
+        }
     }
 }
 
@@ -1035,6 +1050,26 @@ fn rollback_failed_unix_open(session: &str, before_open: Option<&BrowserPidRecor
 }
 
 #[cfg(unix)]
+fn failed_stream_attempts() -> &'static std::sync::Mutex<HashMap<String, HashSet<String>>> {
+    static FAILED: OnceLock<std::sync::Mutex<HashMap<String, HashSet<String>>>> = OnceLock::new();
+    FAILED.get_or_init(|| std::sync::Mutex::new(HashMap::new()))
+}
+
+#[cfg(unix)]
+fn mark_failed_stream_attempt(session: &str, attempt: &str) {
+    let mut failed = failed_stream_attempts().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    failed.entry(session.to_owned()).or_default().insert(attempt.to_owned());
+}
+
+#[cfg(unix)]
+fn failed_stream_attempt_is_live(session: &str, pid: u32) -> bool {
+    let failed = failed_stream_attempts().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    failed.get(session).is_some_and(|attempts| {
+        attempts.iter().any(|attempt| browser_process_has_open_attempt(pid, attempt))
+    })
+}
+
+#[cfg(unix)]
 fn browser_process_has_open_attempt(pid: u32, attempt: &str) -> bool {
     use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System, UpdateKind};
 
@@ -1087,6 +1122,9 @@ fn browser_daemon_for_open_attempt(session: &str, attempt: &str) -> Option<Brows
 
 #[cfg(unix)]
 fn rollback_failed_unix_stream_open(session: &str, before_open: Option<&BrowserPidRecord>, attempt: &str) {
+    // If teardown cannot confirm exit, later commands must still refuse this
+    // launch attempt. A fresh attempt has a different marker and remains usable.
+    mark_failed_stream_attempt(session, attempt);
     rollback_failed_unix_open(session, before_open);
 
     // The detached daemon can publish its PID after the launcher times out.
@@ -1117,6 +1155,33 @@ fn rollback_failed_unix_stream_open(session: &str, before_open: Option<&BrowserP
         }
         std::thread::sleep(Duration::from_millis(50));
     }
+}
+
+#[cfg(not(windows))]
+fn verify_unix_stream_after_open(
+    session: &str,
+    port: u16,
+    before_open: Option<&BrowserPidRecord>,
+    attempt: &str,
+) -> Result<(bool, Option<u32>), String> {
+    let port_alive = probe_stream_port(port, 25, Duration::from_millis(200));
+    let mut record = track_current_browser_daemon(session);
+    if record.is_none() {
+        std::thread::sleep(Duration::from_millis(100));
+        record = track_current_browser_daemon(session);
+    }
+    let verified = match record {
+        _ if !port_alive => Err(format!("Browser daemon did not open stream port {port}")),
+        None => Err(format!("Could not verify ownership of browser session {session}")),
+        Some(record) if !listener_owned_by_pid(port, record.pid) => {
+            Err(format!("Browser stream port {port} is not owned by session {session}"))
+        }
+        Some(record) => Ok((true, Some(record.pid))),
+    };
+    if verified.is_err() {
+        rollback_failed_unix_stream_open(session, before_open, attempt);
+    }
+    verified
 }
 
 #[cfg(not(windows))]
@@ -1201,7 +1266,7 @@ fn previous_app_has_exited(record: &BrowserPidRecord) -> bool {
 }
 
 fn stop_previous_browser_daemon_before_stream(session: &str, bin: &str) -> Result<(), String> {
-    require_owned_browser_session(session)?;
+    require_owned_browser_session_for_cleanup(session)?;
     if let Some(pid) = read_agent_browser_daemon_pid(session) {
         if pid_alive(pid) {
             let record = owned_browser_pid(session, pid)
@@ -1394,9 +1459,12 @@ fn pid_alive(pid: u32) -> bool {
 struct StreamSession {
     /// Stream port allocated for this session.
     port: u16,
-    /// Whether the daemon is believed to be live. Only set true after a
-    /// successful TCP probe of `port`.
+    /// Whether a daemon process is believed to be live. Commands may set
+    /// this provisionally before the browser has attached.
     running: bool,
+    /// A successful command or stream open confirmed a browser was attached
+    /// to this daemon. A PID alone cannot make a pane stream ready.
+    browser_ready: bool,
     /// PID of the spawned agent-browser daemon, when known. None when
     /// the session was adopted from a stale PID file or when the
     /// agent-browser CLI didn't write its lock file in time.
@@ -1406,6 +1474,10 @@ struct StreamSession {
     /// optional reaper background task.
     #[allow(dead_code)]
     last_seen_at: Option<Instant>,
+}
+
+fn stream_can_reuse_browser(stream: &StreamSession) -> bool {
+    stream.running && stream.browser_ready
 }
 
 #[derive(Clone)]
@@ -2962,6 +3034,7 @@ impl AgentBrowserManager {
                 StreamSession {
                     port,
                     running: false,
+                    browser_ready: false,
                     pid: None,
                     last_seen_at: None,
                 },
@@ -2992,17 +3065,20 @@ impl AgentBrowserManager {
 
     /// Reconcile a provisional `running` flag with the verified daemon after
     /// a first or failed command. The lifecycle gate remains held by callers.
-    async fn refresh_running_session(&self, browser_id: &str, session: &str) -> bool {
+    async fn refresh_running_session(&self, browser_id: &str, session: &str, confirmed_ready: bool) -> bool {
         let session = session.to_owned();
         let pid = tokio::task::spawn_blocking(move || live_owned_browser_pid(&session))
             .await
             .ok()
             .flatten();
+        let mut ready = false;
         if let Some(entry) = self.sessions.lock().await.get_mut(browser_id) {
+            ready = pid.is_some() && (confirmed_ready || (entry.browser_ready && entry.pid == pid));
             entry.running = pid.is_some();
+            entry.browser_ready = ready;
             entry.pid = pid;
         }
-        pid.is_some()
+        ready
     }
 
     /// **Deprecated.** No-op kept for binary/source compatibility with any
@@ -3045,7 +3121,7 @@ impl AgentBrowserManager {
             let sessions = self.sessions.lock().await;
             sessions.get(browser_id).is_some_and(|s| s.running)
         };
-        if was_running && self.refresh_running_session(browser_id, &session).await {
+        if was_running && self.refresh_running_session(browser_id, &session, false).await {
             return Ok(());
         }
 
@@ -3090,6 +3166,7 @@ impl AgentBrowserManager {
 
         self.sessions.lock().await.entry(browser_id.to_string()).and_modify(|s| {
             s.running = true;
+            s.browser_ready = true;
             s.pid = Some(pid);
         });
         Ok(())
@@ -3134,6 +3211,7 @@ impl AgentBrowserManager {
         let mut sessions = self.sessions.lock().await;
         if let Some(s) = sessions.get_mut(browser_id) {
             s.running = false;
+            s.browser_ready = false;
             s.pid = None;
         }
     }
@@ -3193,7 +3271,11 @@ impl AgentBrowserManager {
         if action == "close" {
             self.note_close_finished(browser_id).await;
         } else if !was_running || result.is_err() {
-            self.refresh_running_session(browser_id, &session).await;
+            self.refresh_running_session(browser_id, &session, result.is_ok()).await;
+        } else if result.is_ok() {
+            self.sessions.lock().await.entry(browser_id.to_string()).and_modify(|s| {
+                s.browser_ready = true;
+            });
         }
 
         result
@@ -3389,9 +3471,11 @@ impl AgentBrowserManager {
         // A previously-marked-running session might still be live; verify with a
         // quick TCP probe so we don't return a URL pointing at a dead daemon.
         if let Some(port) = self.get_port(browser_id).await {
-            let already_running = {
+            let (already_running, ready_pid) = {
                 let sessions = self.sessions.lock().await;
-                sessions.get(browser_id).map_or(false, |s| s.running)
+                sessions.get(browser_id).map_or((false, None), |s| {
+                    (stream_can_reuse_browser(s), s.pid)
+                })
             };
             if already_running && probe_stream_port(port, 1, Duration::from_millis(0)) {
                 let owned = read_agent_browser_daemon_pid(&session)
@@ -3400,6 +3484,10 @@ impl AgentBrowserManager {
                     self.clear_stale_running_stream_allocation(browser_id, port).await;
                     return Err(format!("Could not verify ownership of browser session {session}"));
                 };
+                if ready_pid != Some(record.pid) {
+                    self.clear_stale_running_stream_allocation(browser_id, port).await;
+                    return Err(format!("Browser session {session} changed since its last successful open"));
+                }
                 if !listener_owned_by_pid(port, record.pid) {
                     self.clear_stale_running_stream_allocation(browser_id, port).await;
                     return Err(format!("Browser stream port {port} is not owned by session {session}"));
@@ -3415,6 +3503,7 @@ impl AgentBrowserManager {
                 .entry(browser_id.to_string())
                 .and_modify(|s| {
                     s.running = false;
+                    s.browser_ready = false;
                     s.pid = None;
                 });
         }
@@ -3507,8 +3596,11 @@ impl AgentBrowserManager {
                     rollback_failed_unix_stream_open(&session, before_open.as_ref(), &attempt);
                     return Err(error);
                 }
+                return verify_unix_stream_after_open(&session, port, before_open.as_ref(), &attempt);
             }
 
+            #[cfg(windows)]
+            {
             // Probe the port up to ~5s; only mark
             // running when we have actual evidence the daemon is alive.
             let port_alive = probe_stream_port(port, 25, Duration::from_millis(200));
@@ -3532,6 +3624,7 @@ impl AgentBrowserManager {
             }
 
             Ok((port_alive, Some(record.pid)))
+            }
         })
         .await
         .map_err(|e| format!("agent-browser launch task failed: {e}"))
@@ -3550,6 +3643,7 @@ impl AgentBrowserManager {
                 if let Some(record) = lingering {
                     self.sessions.lock().await.entry(browser_id.to_string()).and_modify(|entry| {
                         entry.running = false;
+                        entry.browser_ready = false;
                         entry.pid = Some(record.pid);
                     });
                     return Err(error);
@@ -3568,6 +3662,7 @@ impl AgentBrowserManager {
             .entry(browser_id.to_string())
             .and_modify(|s| {
                 s.running = port_alive;
+                s.browser_ready = port_alive;
                 s.pid = pid;
                 s.last_seen_at = now;
             });
@@ -4603,7 +4698,11 @@ mod tests {
             mgr.clear_failed_stream_allocation(&session, port).await;
         }
         let (port, blocker) = blocked.expect("could not reserve an allocated stream port");
-        mgr.sessions.lock().await.get_mut(&session).unwrap().running = true;
+        let mut sessions = mgr.sessions.lock().await;
+        let stream = sessions.get_mut(&session).unwrap();
+        stream.running = true;
+        stream.browser_ready = true;
+        drop(sessions);
 
         let error = mgr.start_stream(&session).await.unwrap_err();
         assert!(error.contains("Could not verify ownership"), "{error}");
@@ -5269,6 +5368,85 @@ mod tests {
     }
 
     #[cfg(unix)]
+    #[tokio::test]
+    async fn failed_first_command_daemon_cannot_satisfy_stream_fast_path() {
+        let session = format!("browser-unready-{}", uuid::Uuid::new_v4().simple());
+        let (_temp, mut daemon, _record) = browser_identity_fixture(&session, browser_owner_token());
+        let daemon_pid_path = run_dir_for_session(&session).unwrap().join(format!("{session}.pid"));
+        std::fs::write(&daemon_pid_path, daemon.id().to_string()).unwrap();
+
+        let manager = AgentBrowserManager::new();
+        manager.allocate_port(&session).await.unwrap();
+        assert!(!manager.note_action_start(&session, "open").await);
+        // A failed first automation open may leave its daemon and stream
+        // socket alive, but it has not attached a browser to that stream.
+        assert!(!manager.refresh_running_session(&session, &session, false).await);
+        let sessions = manager.sessions.lock().await;
+        let tracked = sessions.get(&session).unwrap();
+        assert!(tracked.running);
+        assert_eq!(tracked.pid, Some(daemon.id()));
+        assert!(!stream_can_reuse_browser(tracked));
+        drop(sessions);
+
+        let _ = daemon.kill();
+        let _ = daemon.wait();
+        let _ = std::fs::remove_file(daemon_pid_path);
+        clear_session_pid(&session);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn post_open_wrong_listener_rolls_back_its_daemon() {
+        let session = format!("browser-wrong-port-{}", uuid::Uuid::new_v4().simple());
+        let attempt = uuid::Uuid::new_v4().simple().to_string();
+        let (_temp, mut daemon, _record) = browser_identity_fixture_with_attempt(
+            &session, browser_owner_token(), Some(&attempt),
+        );
+        let daemon_pid_path = run_dir_for_session(&session).unwrap().join(format!("{session}.pid"));
+        std::fs::write(&daemon_pid_path, daemon.id().to_string()).unwrap();
+        // Another process wins the selected port after the bind check. The
+        // sidecar can still report a successful open on a fallback port.
+        let other_listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let port = other_listener.local_addr().unwrap().port();
+        let result = verify_unix_stream_after_open(&session, port, None, &attempt);
+        assert!(result.as_ref().is_err_and(|error| error.contains("not owned")), "{result:?}");
+        let started = Instant::now();
+        while daemon.try_wait().unwrap().is_none() && started.elapsed() < Duration::from_secs(3) {
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        let stopped = daemon.try_wait().unwrap().is_some();
+        if !stopped {
+            let _ = daemon.kill();
+            let _ = daemon.wait();
+        }
+        assert!(stopped, "failed stream verification left its daemon alive");
+        assert!(other_listener.local_addr().is_ok(), "rollback stopped the unrelated listener");
+        let _ = std::fs::remove_file(daemon_pid_path);
+        clear_session_pid(&session);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn failed_stream_attempt_is_ineligible_for_browser_commands() {
+        let session = format!("browser-failed-quarantine-{}", uuid::Uuid::new_v4().simple());
+        let attempt = uuid::Uuid::new_v4().simple().to_string();
+        let (_temp, mut daemon, _record) = browser_identity_fixture_with_attempt(
+            &session, browser_owner_token(), Some(&attempt),
+        );
+        let daemon_pid_path = run_dir_for_session(&session).unwrap().join(format!("{session}.pid"));
+        std::fs::write(&daemon_pid_path, daemon.id().to_string()).unwrap();
+        mark_failed_stream_attempt(&session, &attempt);
+        assert!(require_owned_browser_session_for_cleanup(&session).is_ok());
+        assert!(require_owned_browser_session(&session)
+            .is_err_and(|error| error.contains("failed stream launch")));
+
+        let _ = daemon.kill();
+        let _ = daemon.wait();
+        let _ = std::fs::remove_file(daemon_pid_path);
+        clear_session_pid(&session);
+    }
+
+    #[cfg(unix)]
     #[test]
     fn timed_out_command_tracks_daemon_after_late_pid_publication() {
         let session = format!("browser-late-pid-{}", uuid::Uuid::new_v4().simple());
@@ -5373,8 +5551,12 @@ mod tests {
         started_rx.await.unwrap();
 
         let (queued_tx, mut queued_rx) = tokio::sync::oneshot::channel();
+        let queued_session = session.clone();
         let queued = tokio::spawn(run_detached_browser_lifecycle(session.clone(), async move {
-            let _ = queued_tx.send(());
+            let still_owned = read_agent_browser_daemon_pid(&queued_session)
+                .and_then(|pid| owned_browser_pid(&queued_session, pid))
+                .is_some();
+            let _ = queued_tx.send(still_owned);
             Ok(())
         }));
         assert!(
@@ -5390,6 +5572,8 @@ mod tests {
         let daemon_pid_path = run_dir_for_session(&session).unwrap().join(format!("{session}.pid"));
         std::fs::write(&daemon_pid_path, daemon.id().to_string()).unwrap();
         tokio::time::timeout(Duration::from_secs(7), rollback).await.unwrap().unwrap().unwrap();
+        queued.await.unwrap().unwrap();
+        assert!(!queued_rx.await.unwrap(), "queued command entered while the failed daemon was still owned");
         let started = Instant::now();
         while daemon.try_wait().unwrap().is_none() && started.elapsed() < Duration::from_secs(3) {
             tokio::time::sleep(Duration::from_millis(25)).await;
@@ -5400,8 +5584,6 @@ mod tests {
             let _ = daemon.wait();
         }
         assert!(stopped, "queued work could reuse the failed daemon");
-        queued.await.unwrap().unwrap();
-        queued_rx.await.unwrap();
         let _ = std::fs::remove_file(daemon_pid_path);
         clear_session_pid(&session);
     }
