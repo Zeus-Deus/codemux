@@ -569,8 +569,25 @@ fn account_transport(peer: SocketAddr, headers: &HeaderMap) -> AccountTransport 
     classify_account_transport(peer, headers, token.as_deref(), *allow_loopback_http)
 }
 
-fn pairing_response_headers(transport: AccountTransport, session_token: &str) -> HeaderMap {
-    let secure = if matches!(transport, AccountTransport::HttpsProxy(_)) {
+fn validated_https_origin(headers: &HeaderMap) -> Result<bool, Response> {
+    if !auth::origin_ok(headers) {
+        return Err(error(StatusCode::FORBIDDEN, "origin_mismatch"));
+    }
+    Ok(single_header(headers, header::ORIGIN.as_str())
+        .and_then(|origin| origin.parse::<Uri>().ok())
+        .is_some_and(|origin| {
+            origin
+                .scheme_str()
+                .is_some_and(|scheme| scheme.eq_ignore_ascii_case("https"))
+        }))
+}
+
+fn pairing_response_headers(
+    transport: AccountTransport,
+    https_origin: bool,
+    session_token: &str,
+) -> HeaderMap {
+    let secure = if https_origin || matches!(transport, AccountTransport::HttpsProxy(_)) {
         "; Secure"
     } else {
         ""
@@ -597,9 +614,10 @@ async fn pair<R: Runtime>(
     headers: HeaderMap,
     Json(body): Json<PairBody>,
 ) -> Response {
-    if !auth::origin_ok(&headers) {
-        return error(StatusCode::FORBIDDEN, "origin_mismatch");
-    }
+    let https_origin = match validated_https_origin(&headers) {
+        Ok(https) => https,
+        Err(response) => return response,
+    };
     let shared = app.state::<WebRemoteState>().shared();
     let transport = account_transport(peer, &headers);
 
@@ -649,7 +667,7 @@ async fn pair<R: Runtime>(
 
     // HttpOnly so JS can't read it; SameSite=Strict so a cross-site page
     // can't drive authed asset GETs with the stored cookie.
-    let out_headers = pairing_response_headers(transport, &session_token);
+    let out_headers = pairing_response_headers(transport, https_origin, &session_token);
     (
         StatusCode::OK,
         out_headers,
@@ -683,9 +701,10 @@ async fn pair_account<R: Runtime>(
     headers: HeaderMap,
     Json(body): Json<PairAccountBody>,
 ) -> Response {
-    if !auth::origin_ok(&headers) {
-        return error(StatusCode::FORBIDDEN, "origin_mismatch");
-    }
+    let https_origin = match validated_https_origin(&headers) {
+        Ok(https) => https,
+        Err(response) => return response,
+    };
     let transport = account_transport(peer, &headers);
     if transport == AccountTransport::Insecure || !headers.contains_key(header::ORIGIN) {
         return error(StatusCode::FORBIDDEN, "account_secure_transport_required");
@@ -726,7 +745,7 @@ async fn pair_account<R: Runtime>(
 
     // HttpOnly + SameSite=Strict cookie, identical to /api/pair, so authed
     // asset/`<img>` GETs work for account sessions too.
-    let out_headers = pairing_response_headers(transport, &outcome.session_token);
+    let out_headers = pairing_response_headers(transport, https_origin, &outcome.session_token);
     (
         StatusCode::OK,
         out_headers,
@@ -1257,6 +1276,66 @@ mod tests {
     use tokio::sync::mpsc;
 
     #[test]
+    fn pairing_cookie_https_origin_sets_secure_without_proxy_authentication() {
+        let peer = "127.0.0.1:12345".parse().unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert(header::HOST, "remote.example".parse().unwrap());
+        headers.insert(header::ORIGIN, "https://remote.example".parse().unwrap());
+        headers.insert("x-forwarded-proto", "https".parse().unwrap());
+
+        let transport = classify_account_transport(peer, &headers, None, false);
+        assert_eq!(transport, AccountTransport::Insecure);
+        let https_origin = validated_https_origin(&headers).unwrap();
+        let response = pairing_response_headers(transport, https_origin, "session");
+        assert!(response[header::SET_COOKIE].to_str().unwrap().ends_with("; Secure"));
+    }
+
+    #[test]
+    fn pairing_cookie_http_origin_ignores_forwarded_proto() {
+        let peer = "127.0.0.1:12345".parse().unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert(header::HOST, "remote.example".parse().unwrap());
+        headers.insert(header::ORIGIN, "http://remote.example".parse().unwrap());
+        headers.insert("x-forwarded-proto", "https".parse().unwrap());
+
+        let transport = classify_account_transport(peer, &headers, None, false);
+        assert_eq!(transport, AccountTransport::Insecure);
+        let https_origin = validated_https_origin(&headers).unwrap();
+        let response = pairing_response_headers(transport, https_origin, "session");
+        assert!(!response[header::SET_COOKIE].to_str().unwrap().contains("; Secure"));
+    }
+
+    #[test]
+    fn pairing_cookie_authenticated_proxy_sets_secure_without_origin() {
+        let peer = "127.0.0.1:12345".parse().unwrap();
+        let token = "a".repeat(64);
+        let mut headers = HeaderMap::new();
+        headers.insert(header::HOST, "remote.example".parse().unwrap());
+        headers.insert("x-forwarded-proto", "https".parse().unwrap());
+        headers.insert(TLS_PROXY_TOKEN_HEADER, token.parse().unwrap());
+        headers.insert(TLS_PROXY_CLIENT_IP_HEADER, "192.0.2.20".parse().unwrap());
+
+        let transport = classify_account_transport(peer, &headers, Some(&token), false);
+        assert!(matches!(transport, AccountTransport::HttpsProxy(_)));
+        let https_origin = validated_https_origin(&headers).unwrap();
+        assert!(!https_origin);
+        let response = pairing_response_headers(transport, https_origin, "session");
+        assert!(response[header::SET_COOKIE].to_str().unwrap().ends_with("; Secure"));
+        assert_eq!(response[header::CACHE_CONTROL], "no-store");
+    }
+
+    #[test]
+    fn pairing_cookie_mismatched_https_origin_is_rejected() {
+        let mut headers = HeaderMap::new();
+        headers.insert(header::HOST, "remote.example".parse().unwrap());
+        headers.insert(header::ORIGIN, "https://other.example".parse().unwrap());
+
+        let response = validated_https_origin(&headers).unwrap_err();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        assert!(response.headers().get(header::SET_COOKIE).is_none());
+    }
+
+    #[test]
     fn direct_http_account_pairing_requires_an_explicit_loopback_opt_in() {
         use AccountTransport::*;
         let local: SocketAddr = "127.0.0.1:12345".parse().unwrap();
@@ -1307,10 +1386,6 @@ mod tests {
 
         let first = classify(&headers);
         assert_eq!(first, HttpsProxy(ip));
-        let response = pairing_response_headers(first, "synthetic-session-token");
-        assert!(response[header::SET_COOKIE].to_str().unwrap().ends_with("; Secure"));
-        assert_eq!(response[header::CACHE_CONTROL], "no-store");
-
         let quotas = auth::RateLimiter::default();
         for _ in 0..auth::RATE_LIMIT_MAX {
             assert!(quotas.check_and_record(first.pairing_ip(local.ip())));
