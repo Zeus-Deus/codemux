@@ -38,7 +38,7 @@ use std::io::{BufRead, IsTerminal, Write};
 use serde::Deserialize;
 
 use crate::auth::{
-    api_base_url, clear_token, derive_auth_secret, is_token_expired, load_cached_user,
+    api_base_url, api_client, clear_token, derive_auth_secret, is_token_expired, load_cached_user,
     load_stored_auth_method, load_token, login_email_api, save_auth, save_stored_auth_method,
     AuthUser,
 };
@@ -217,7 +217,8 @@ struct VerifySession {
 async fn verify_bearer(token: &str) -> Result<(AuthUser, String), LoginError> {
     let base = api_base_url().map_err(LoginError::Config)?;
     let url = format!("{base}/api/auth/desktop/verify");
-    let resp = reqwest::Client::new()
+    let resp = api_client(&base)
+        .map_err(LoginError::Config)?
         .get(&url)
         .header("Authorization", format!("Bearer {token}"))
         .send()

@@ -333,7 +333,7 @@ fn upsert_body<'a>(
 
 async fn push_unlinked(token: &str, db: &DatabaseStore) -> Result<(), String> {
     let base = api_base_url()?;
-    let client = reqwest::Client::new();
+    let client = crate::auth::api_client(&base)?;
     let (local_to_server, _) = host_maps(db);
     let dirty = db.list_dirty_automations();
     let mut any_failed = false;

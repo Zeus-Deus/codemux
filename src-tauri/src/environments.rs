@@ -147,8 +147,9 @@ pub async fn environment_account_request(
             body: json!({ "error": "signed_out" }),
         });
     };
-    let url = format!("{}{}", crate::auth::api_base_url()?, request.path);
-    let client = reqwest::Client::new();
+    let base = crate::auth::api_base_url()?;
+    let url = format!("{base}{}", request.path);
+    let client = crate::auth::api_client(&base)?;
     let builder = match request.method.as_str() {
         "GET" => client.get(&url),
         _ => client.post(&url).json(&request.body.unwrap_or_else(|| json!({}))),

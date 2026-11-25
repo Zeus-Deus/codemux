@@ -20,7 +20,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::auth::api_base_url;
+use crate::auth::{api_base_url, api_client};
 
 /// Wire-format skill row, returned by GET / POST / PUT.
 /// `remote_id` is a stringified BIGSERIAL (Stage 1 contract).
@@ -69,7 +69,7 @@ struct CreateUpdateResponse {
 /// newest-updated first. Names + contents come back as plaintext.
 pub async fn list_skills(token: &str) -> Result<Vec<SkillWire>, String> {
     let base = api_base_url()?;
-    let resp = reqwest::Client::new()
+    let resp = api_client(&base)?
         .get(format!("{base}/api/skills"))
         .bearer_auth(token)
         .send()
@@ -92,7 +92,7 @@ pub async fn create_skill(
     upload: &SkillUpload,
 ) -> Result<SkillWire, String> {
     let base = api_base_url()?;
-    let resp = reqwest::Client::new()
+    let resp = api_client(&base)?
         .post(format!("{base}/api/skills"))
         .bearer_auth(token)
         .json(upload)
@@ -121,7 +121,7 @@ pub async fn update_skill(
     upload: &SkillUpload,
 ) -> Result<SkillWire, String> {
     let base = api_base_url()?;
-    let resp = reqwest::Client::new()
+    let resp = api_client(&base)?
         .put(format!("{base}/api/skills/{remote_id}"))
         .bearer_auth(token)
         .json(upload)
@@ -142,7 +142,7 @@ pub async fn update_skill(
 /// success (idempotent intent).
 pub async fn delete_skill(token: &str, remote_id: &str) -> Result<(), String> {
     let base = api_base_url()?;
-    let resp = reqwest::Client::new()
+    let resp = api_client(&base)?
         .delete(format!("{base}/api/skills/{remote_id}"))
         .bearer_auth(token)
         .send()
@@ -160,7 +160,7 @@ pub async fn delete_skill(token: &str, remote_id: &str) -> Result<(), String> {
 /// is fine.
 pub async fn wipe_skills(token: &str) -> Result<(), String> {
     let base = api_base_url()?;
-    let resp = reqwest::Client::new()
+    let resp = api_client(&base)?
         .delete(format!("{base}/api/skills"))
         .bearer_auth(token)
         .send()
