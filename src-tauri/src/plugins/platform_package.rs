@@ -418,6 +418,7 @@ impl PlatformPackageStore {
         subdir: Option<&str>,
     ) -> Result<PlatformSnapshot, String> {
         validate_git_source(url, git_ref)?;
+        super::require_bounded_network_git_install()?;
         if let Some(subdir) = subdir {
             safe_package_path(
                 Path::new(if cfg!(windows) { "C:/git" } else { "/git" }),
@@ -776,6 +777,21 @@ mod tests {
         )
         .unwrap();
         assert!(collect_local(tmp.path()).is_err());
+    }
+
+    #[tokio::test]
+    async fn network_git_staging_is_refused_before_creating_a_fetch_repo() {
+        let tmp = tempfile::tempdir().unwrap();
+        let package_root = tmp.path().join("packages");
+        let store = PlatformPackageStore::new(package_root.clone());
+        let error = store.stage_git("https://127.0.0.1:1/plugin.git", Some("main"), None)
+            .await.err().unwrap();
+        assert!(error.contains("Network Git plugin installs are temporarily disabled"), "{error}");
+        assert!(!package_root.exists());
+
+        let local = tmp.path().join("source");
+        fixture(&local, "export function activate(){}");
+        assert!(store.stage_local(&local).is_ok());
     }
     #[cfg(unix)]
     #[test]

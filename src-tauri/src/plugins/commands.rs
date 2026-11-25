@@ -438,6 +438,9 @@ pub enum InstallSource {
 }
 
 fn plan_for(root: &std::path::Path, catalog: &super::catalog::Catalog, source: &InstallSource) -> Result<Plan, String> {
+    // Every source in this legacy installer resolves through a network Git
+    // repository, including catalog updates. Refuse before creating one.
+    super::require_bounded_network_git_install()?;
     match source {
         InstallSource::Git { url, git_ref } => plan_git(root, catalog, url, git_ref.as_deref()),
         InstallSource::Catalog { id } => plan_catalog(root, catalog, id),
@@ -553,6 +556,26 @@ pub async fn plugins_remove<R: Runtime>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn network_git_install_preview_and_update_refuse_before_fetching() {
+        let root = tempfile::tempdir().unwrap();
+        let catalog = super::super::catalog::Catalog {
+            schema_version: 1,
+            revision: 0,
+            plugins: Vec::new(),
+            blocked: Vec::new(),
+        };
+        for source in [
+            InstallSource::Catalog { id: "example".into() },
+            InstallSource::Update { id: "example".into() },
+            InstallSource::Git { url: "https://github.com/example/plugin".into(), git_ref: None },
+        ] {
+            let error = plan_for(root.path(), &catalog, &source).err().unwrap();
+            assert!(error.contains("Network Git plugin installs are temporarily disabled"), "{error}");
+        }
+        assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 0);
+    }
 
     fn plan(root: &std::path::Path, source: &str, repo: &str) -> Result<Plan, String> {
         finish_plan(

@@ -379,6 +379,11 @@ pub fn fetch_plugin(
     want: Option<&str>,
     subdir: Option<&str>,
 ) -> Result<Fetched, String> {
+    // Keep the lower-level fetch closed too, so a new caller cannot bypass
+    // the command-level refusal. `allow_file` is only used by local fixtures.
+    if !git.allow_file {
+        super::require_bounded_network_git_install()?;
+    }
     git.set_origin(fetch_url)?;
     // `/tree/<ref>/<folder>`: the ref may itself contain slashes, so pick the
     // longest remote ref that prefixes it (a leading sha also works).

@@ -5,6 +5,13 @@ use super::{list, InstallMarker, ENTRY_FILE, MARKER_FILE};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+#[test]
+fn production_git_fetch_refuses_network_before_contact() {
+    let git = Git::new().unwrap();
+    let result = install::fetch_plugin(&git, "https://127.0.0.1:1/plugin.git", None, None, None);
+    assert!(result.err().unwrap().contains("Network Git plugin installs are temporarily disabled"));
+}
+
 fn git(dir: &Path, args: &[&str]) -> String {
     let out = Command::new("git")
         .current_dir(dir)

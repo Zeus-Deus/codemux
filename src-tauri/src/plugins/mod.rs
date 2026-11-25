@@ -44,6 +44,13 @@ pub const MAX_SOURCE_BYTES: u64 = 16 * 1024 * 1024;
 pub const ENTRY_FILE: &str = "plugin.js";
 pub const MARKER_FILE: &str = ".codemux-plugin.json";
 
+/// Git's fetch path can write a large pack before the sampled disk guard
+/// notices it. Keep network installs unavailable until acquisition can enforce
+/// one byte budget before every write; local plugin folders remain usable.
+pub(super) fn require_bounded_network_git_install() -> Result<(), String> {
+    Err("Network Git plugin installs are temporarily disabled for security. Add a reviewed plugin from a local folder instead.".into())
+}
+
 /// `CODEMUX_DISABLE_PLUGINS=1` loads no plugin at all, bundled ones included.
 pub fn disabled_by_env() -> bool {
     std::env::var("CODEMUX_DISABLE_PLUGINS")
