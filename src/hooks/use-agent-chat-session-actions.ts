@@ -214,9 +214,7 @@ export function useAgentChatSessionActions(
           store.setPermissionMode(newThreadId, resolvedMode);
         }
         store.setSessionLaunchMode(newThreadId, resolvedMode);
-        toast.success(
-          `Resumed "${sessionDisplayTitle(record)}" — agent has the full history`,
-        );
+        toast.success(`Reopened "${sessionDisplayTitle(record)}"`);
       } catch (error) {
         if (adoptPaneBindingFromError(error)) return;
         toast.error(`Failed to reopen chat: ${formatProviderError(error)}`);

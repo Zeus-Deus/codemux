@@ -227,6 +227,8 @@ struct RegistryInner {
     /// handle may also appear in a checkout's Claude-local or project file;
     /// that native source must hide the handle only in that checkout.
     native_scoped_sources: HashMap<PathBuf, HashSet<(String, McpConfigSource)>>,
+    #[cfg(test)]
+    prime_configs_for_test: Option<Vec<McpServerConfig>>,
 }
 
 impl Default for McpRegistry {
@@ -245,6 +247,8 @@ impl Default for McpRegistry {
                 calls_in_flight: HashMap::new(),
                 disabled_ids: HashSet::new(),
                 native_scoped_sources: HashMap::new(),
+                #[cfg(test)]
+                prime_configs_for_test: None,
             })),
             status_tx,
             prime_lock: Arc::new(Mutex::new(())),
@@ -1155,20 +1159,49 @@ impl McpRegistry {
         &self,
         app: Option<&AppHandle<R>>,
         project_root: Option<&std::path::Path>,
-    ) {
+    ) -> bool {
         // Serialize concurrent primes so a warm-up prime and the
         // start-session backstop prime can't double-spawn the same child
         // (see `prime_lock`). The second waiter finds every server already
         // `Starting`/`Running` and no-ops through `ensure_started`.
         let _prime_guard = self.prime_lock.lock().await;
+        #[cfg(not(test))]
         let configs = discover_configs(project_root);
+        #[cfg(test)]
+        let configs = self.inner.lock().await.prime_configs_for_test.clone()
+            .unwrap_or_else(|| discover_configs(project_root));
         self.remember_native_scoped_sources(project_root, &configs).await;
+        let mut ready = true;
         for cfg in configs {
             if cfg.disabled {
                 continue;
             }
-            let _ = self.ensure_started(app, cfg).await;
+            let disabled = self.is_disabled(&cfg.id).await;
+            let row = self.ensure_started(app, cfg).await;
+            // A previous prime may still be starting this server. A failed
+            // handshake also leaves its prior tool catalog unverified.
+            if !disabled && !matches!(row.status, McpServerStatus::Running { .. } | McpServerStatus::NeedsApproval { .. }) {
+                ready = false;
+            }
         }
+        ready
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn set_prime_configs_for_test(&self, configs: Vec<McpServerConfig>) {
+        self.inner.lock().await.prime_configs_for_test = Some(configs);
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn has_native_scope_for_test(&self, checkout: &std::path::Path) -> bool {
+        self.inner.lock().await.native_scoped_sources.contains_key(checkout)
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn insert_starting_server_for_test(&self, config: McpServerConfig) {
+        let mut handle = McpServerHandle::discovered(config);
+        handle.status = McpServerStatus::Starting;
+        self.inner.lock().await.handles.insert(handle.config.id.clone(), handle);
     }
 
     async fn remember_native_scoped_sources(

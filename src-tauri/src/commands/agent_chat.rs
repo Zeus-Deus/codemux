@@ -1551,16 +1551,22 @@ pub async fn agent_chat_start_session_guarded<R: Runtime>(
         let registry = mcp_registry.inner().clone_handle();
         let project_path = input.cwd.clone();
         const MCP_PRIME_BUDGET: Duration = Duration::from_secs(8);
+        let app_for_prime = app.clone();
+        let prime = tokio::spawn(async move {
+            registry.prime_for_chat(Some(&app_for_prime), Some(&project_path)).await
+        });
         match tokio::time::timeout(
             MCP_PRIME_BUDGET,
-            registry.prime_for_chat(Some(&app), Some(&project_path)),
+            prime,
         )
         .await
         {
-            Ok(()) => eprintln!("[codemux::agent_chat] mcp prime_for_chat completed within budget"),
+            Ok(Ok(true)) => eprintln!("[codemux::agent_chat] mcp prime_for_chat completed within budget"),
+            Ok(Ok(false)) => eprintln!("[codemux::agent_chat] mcp prime_for_chat finished with unavailable tools"),
+            Ok(Err(error)) => eprintln!("[codemux::agent_chat] mcp prime_for_chat failed: {error}"),
             Err(_) => eprintln!(
                 "[codemux::agent_chat] mcp prime_for_chat exceeded {}s budget — \
-                 starting session with whatever tools are ready",
+                 continuing startup in the background with whatever tools are ready",
                 MCP_PRIME_BUDGET.as_secs()
             ),
         }
@@ -3301,6 +3307,30 @@ async fn ensure_live_session_locked<R: Runtime>(
     );
     let env = rebuild.env;
 
+    // A cold process has not discovered this checkout's MCP tools yet. A
+    // Codex resume compares its saved catalog against the live registry, so
+    // do the same checkout prime as normal startup before that comparison.
+    // Keep an unfinished prime running after the wait budget; a partial
+    // catalog must not make a saved conversation start fresh by accident.
+    if let Some(mcp_registry) = app
+        .try_state::<crate::mcp::registry::McpRegistry>()
+        .filter(|_| device.is_none())
+    {
+        let registry = mcp_registry.inner().clone_handle();
+        let project_path = cwd.clone();
+        let app_for_prime = app.clone();
+        let prime = tokio::spawn(async move {
+            registry.prime_for_chat(Some(&app_for_prime), Some(&project_path)).await
+        });
+        let ready = matches!(
+            tokio::time::timeout(std::time::Duration::from_secs(8), prime).await,
+            Ok(Ok(true))
+        );
+        if !ready && provider_kind == ProviderKind::Codex && rebuild.native.is_some() {
+            return Err("MCP tools are still starting or unavailable; retry when they are ready.".into());
+        }
+    }
+
     // Build the resume cursor from the persisted id, but for Claude run a
     // preflight: if the CLI's on-disk session JSONL is confirmed gone,
     // skip the cursor and start fresh rather than wedging the rebuild on a
@@ -3413,11 +3443,8 @@ async fn ensure_live_session_locked<R: Runtime>(
         control.verify_start(app, &resume_input)?;
     }
     let cancellation = Arc::new(crate::agent_control::NativeStartCancellation {gate:native_thread_gate(app, &thread_id.0),generation});
-    match impl_.start_session_with_cancellation(resume_input, Some(cancellation.clone())).await {
-        Ok(session) => {
-            record_native_worker_mode(app, &thread_id.0, provider_kind, permission_mode.clone());
-            if let Some(state) = app.try_state::<NativeControlState>() {state.observe_event(&ProviderRuntimeEvent::SessionStateChanged {thread_id:session.thread_id,status:session.status});}
-        }
+    let session = match impl_.start_session_with_cancellation(resume_input, Some(cancellation.clone())).await {
+        Ok(session) => session,
         Err(err)
             if resume_cursor.is_some()
                 && !require_original
@@ -3436,12 +3463,27 @@ async fn ensure_live_session_locked<R: Runtime>(
             if let Some(control) = control {
                 control.verify_start(app, &fresh)?;
             }
-            let session = impl_.start_session_with_cancellation(fresh, Some(cancellation)).await.map_err(provider_err)?;
-            record_native_worker_mode(app, &thread_id.0, provider_kind, permission_mode.clone());
-            if let Some(state) = app.try_state::<NativeControlState>() {state.observe_event(&ProviderRuntimeEvent::SessionStateChanged {thread_id:session.thread_id,status:session.status});}
+            impl_.start_session_with_cancellation(fresh, Some(cancellation)).await.map_err(provider_err)?
         }
         Err(err) => return Err(provider_err(err)),
+    };
+    if let Some(cursor) = session.resume_cursor.as_ref() {
+        if let Some(native) = extract_sdk_session_id(cursor) {
+            let db: State<'_, DatabaseStore> = app.state();
+            if let Err(error) = crate::provider_accounts::store_reported_native_with_catalog_key(
+                &db,
+                &thread_id.0,
+                &native,
+                (provider_kind == ProviderKind::Codex)
+                    .then(|| codex_tool_catalog_key(cursor))
+                    .flatten(),
+            ) {
+                eprintln!("[codemux::agent_chat] failed to persist rebuilt resume cursor: {error}");
+            }
+        }
     }
+    record_native_worker_mode(app, &thread_id.0, provider_kind, permission_mode.clone());
+    if let Some(state) = app.try_state::<NativeControlState>() {state.observe_event(&ProviderRuntimeEvent::SessionStateChanged {thread_id:session.thread_id,status:session.status});}
     record_session_host(&thread_id.0, remote.as_ref().map(|remote| remote.host_id));
     Ok(())
 }
@@ -13071,6 +13113,7 @@ mod tests {
         started_on: Mutex<Vec<Option<i64>>>,
         started_cursors: Mutex<Vec<Option<serde_json::Value>>>,
         returned_cursor: Option<serde_json::Value>,
+        fail_resume_once: std::sync::atomic::AtomicBool,
         stop_started: tokio::sync::Notify,
         stop_completed: tokio::sync::Notify,
         stop_release: Option<Arc<tokio::sync::Notify>>,
@@ -13096,6 +13139,14 @@ mod tests {
                 .lock()
                 .unwrap()
                 .push(input.remote.map(|remote| remote.host_id));
+            if input.resume_cursor.is_some()
+                && self.fail_resume_once.swap(false, std::sync::atomic::Ordering::SeqCst)
+            {
+                return Err(ProviderError::ProcessError {
+                    message: "test resume failed".into(),
+                    source: None,
+                });
+            }
             self.live.lock().unwrap().insert(input.thread_id.0.clone());
             Ok(crate::agent_provider::ProviderSession {
                 thread_id: input.thread_id,
@@ -13251,6 +13302,113 @@ mod tests {
         assert_eq!(
             *provider.started_cursors.lock().unwrap(),
             vec![None, Some(json!({"resume": "native-codex", "toolCatalogKey": key}))]
+        );
+    }
+
+    #[tokio::test]
+    async fn codex_rebuild_keeps_a_replacement_cursor_for_the_next_rebuild() {
+        let thread = "replacement-cursor-chat";
+        let old_key = "a".repeat(64);
+        let new_key = "b".repeat(64);
+        let provider = Arc::new(PlacementProvider {
+            returned_cursor: Some(json!({"threadId": "new-native", "toolCatalogKey": new_key})),
+            ..Default::default()
+        });
+        let (app, _) = placement_app(thread, None, provider.clone()).await;
+        let handle = app.handle().clone();
+        let db = handle.state::<DatabaseStore>();
+        db.set_agent_chat_native_cursor(thread, "old-native", Some(&old_key))
+            .unwrap();
+
+        ensure_live_session(&handle, ProviderKind::Codex, &ThreadId(thread.into()))
+            .await
+            .unwrap();
+        let record = db.get_agent_chat_session(thread).unwrap();
+        assert_eq!(record.sdk_session_id.as_deref(), Some("new-native"));
+        assert_eq!(record.codex_tool_catalog_key.as_deref(), Some(new_key.as_str()));
+
+        provider.stop_session(ThreadId(thread.into())).await.unwrap();
+        ensure_live_session(&handle, ProviderKind::Codex, &ThreadId(thread.into()))
+            .await
+            .unwrap();
+        assert_eq!(
+            *provider.started_cursors.lock().unwrap(),
+            vec![
+                Some(json!({"resume": "old-native", "toolCatalogKey": old_key})),
+                Some(json!({"resume": "new-native", "toolCatalogKey": new_key})),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn codex_fresh_retry_persists_its_replacement_cursor() {
+        let thread = "fresh-retry-cursor-chat";
+        let old_key = "a".repeat(64);
+        let new_key = "b".repeat(64);
+        let provider = Arc::new(PlacementProvider {
+            returned_cursor: Some(json!({"threadId": "new-native", "toolCatalogKey": new_key})),
+            fail_resume_once: std::sync::atomic::AtomicBool::new(true),
+            ..Default::default()
+        });
+        let (app, _) = placement_app(thread, None, provider.clone()).await;
+        let handle = app.handle().clone();
+        let db = handle.state::<DatabaseStore>();
+        db.set_agent_chat_native_cursor(thread, "old-native", Some(&old_key))
+            .unwrap();
+
+        ensure_live_session(&handle, ProviderKind::Codex, &ThreadId(thread.into()))
+            .await
+            .unwrap();
+        let record = db.get_agent_chat_session(thread).unwrap();
+        assert_eq!(record.sdk_session_id.as_deref(), Some("new-native"));
+        assert_eq!(record.codex_tool_catalog_key.as_deref(), Some(new_key.as_str()));
+
+        provider.stop_session(ThreadId(thread.into())).await.unwrap();
+        ensure_live_session(&handle, ProviderKind::Codex, &ThreadId(thread.into()))
+            .await
+            .unwrap();
+        assert_eq!(
+            *provider.started_cursors.lock().unwrap(),
+            vec![
+                Some(json!({"resume": "old-native", "toolCatalogKey": old_key})),
+                None,
+                Some(json!({"resume": "new-native", "toolCatalogKey": new_key})),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn codex_cold_rebuild_waits_for_its_checkout_catalog() {
+        let thread = "cold-catalog-chat";
+        let key = "a".repeat(64);
+        let provider = Arc::new(PlacementProvider {
+            returned_cursor: Some(json!({"threadId": "native-codex", "toolCatalogKey": key})),
+            ..Default::default()
+        });
+        let (app, _) = placement_app(thread, None, provider.clone()).await;
+        let mcp = crate::mcp::registry::McpRegistry::default();
+        let self_config = crate::mcp::codemux_self::codemux_self_config();
+        mcp.set_prime_configs_for_test(vec![self_config.clone()]).await;
+        mcp.insert_starting_server_for_test(self_config).await;
+        app.manage(mcp.clone_handle());
+        let handle = app.handle().clone();
+        handle.state::<DatabaseStore>()
+            .set_agent_chat_native_cursor(thread, "native-codex", Some(&key))
+            .unwrap();
+
+        let pending = ensure_live_session(&handle, ProviderKind::Codex, &ThreadId(thread.into())).await;
+        assert!(pending.unwrap_err().contains("MCP tools are still starting"));
+        assert!(provider.started_cursors.lock().unwrap().is_empty());
+
+        mcp.insert_native_delegation_tools_for_test().await;
+        ensure_live_session(&handle, ProviderKind::Codex, &ThreadId(thread.into()))
+            .await
+            .unwrap();
+        let checkout = crate::mcp::McpProjectScope::new(std::path::Path::new("/tmp")).checkout;
+        assert!(mcp.has_native_scope_for_test(&checkout).await);
+        assert_eq!(
+            *provider.started_cursors.lock().unwrap(),
+            vec![Some(json!({"resume": "native-codex", "toolCatalogKey": key}))]
         );
     }
 
