@@ -26,10 +26,11 @@ pub(crate) const PROVENANCE_UNCONFIRMED: &str = "Could not confirm commit";
 pub const MAX_FILES: usize = 64;
 pub const MAX_TOTAL_BYTES: u64 = 32 * 1024 * 1024;
 const GIT_TIMEOUT: Duration = Duration::from_secs(90);
-// Checked during and after each fetch. This is a sampled guard, not a
-// filesystem quota: an in-flight pack can briefly exceed this amount.
-const MAX_PROVENANCE_BYTES: u64 = 64 * 1024 * 1024;
-const GIT_DISK_LIMIT: &str = "Git provenance download exceeded its disk limit";
+// Checked during and after Git commands that can fetch objects. This is a
+// sampled guard, not a filesystem quota: an in-flight pack can exceed it.
+const MAX_GIT_REPO_BYTES: u64 = 64 * 1024 * 1024;
+const MAX_PROVENANCE_BYTES: u64 = MAX_GIT_REPO_BYTES;
+const GIT_DISK_LIMIT: &str = "Git download exceeded its disk limit";
 const GIT_DEADLINE: &str = "Git took too long; check your connection and try again";
 /// How many commits back from each branch and tag tip a pinned commit is
 /// searched for: fetch this much history (commits only), look, then go
@@ -124,6 +125,7 @@ fn is_sha(value: &str) -> bool {
 pub struct Git {
     exe: PathBuf,
     dir: tempfile::TempDir,
+    disk_limit: u64,
     /// Tests fetch from a local bare repository over `file://`.
     allow_file: bool,
 }
@@ -191,9 +193,15 @@ impl Git {
             .prefix("codemux-plugin-fetch-")
             .tempdir()
             .map_err(|e| format!("Cannot create a temporary folder: {e}"))?;
-        let git = Self { exe, dir, allow_file };
+        let git = Self { exe, dir, disk_limit: MAX_GIT_REPO_BYTES, allow_file };
         git.run_by(&["init", "--bare", "-q", "--template="], None, 4096, deadline)?;
         Ok(git)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_disk_limit(mut self, bytes: u64) -> Self {
+        self.disk_limit = bytes;
+        self
     }
 
     fn command(&self) -> Command {
@@ -231,9 +239,11 @@ impl Git {
         cmd
     }
 
-    /// Run git with an overall deadline and an output cap.
+    /// Run git with a deadline, output cap, and sampled temporary disk guard.
     fn run(&self, args: &[&str], stdin: Option<&[u8]>, max_out: u64) -> Result<Vec<u8>, String> {
-        self.run_by(args, stdin, max_out, Instant::now() + GIT_TIMEOUT)
+        // `cat-file` and `ls-tree` may lazily fetch promisor objects. Guard
+        // the initial commit fetch and these reads, not just provenance.
+        self.run_by_limited(args, stdin, max_out, Instant::now() + GIT_TIMEOUT, Some(self.disk_limit))
     }
 
     /// [`Self::run`] with a deadline shared by several commands.
@@ -253,6 +263,11 @@ impl Git {
     ) -> Result<Vec<u8>, String> {
         if Instant::now() >= deadline {
             return Err(GIT_DEADLINE.into());
+        }
+        if let Some(limit) = disk_limit {
+            if directory_budget_exceeded(self.dir.path(), limit)? {
+                return Err(GIT_DISK_LIMIT.into());
+            }
         }
         let mut child = self
             .command()
@@ -376,7 +391,7 @@ impl Git {
             &["config", "extensions.partialClone", "origin"],
             &["config", "remote.origin.url", url],
             &["config", "remote.origin.promisor", "true"],
-            &["config", "remote.origin.partialclonefilter", "blob:none"],
+            &["config", "remote.origin.partialclonefilter", "tree:0"],
         ] {
             self.run_by(args, None, 4096, deadline)?;
         }
@@ -399,7 +414,7 @@ impl Git {
         let refspec = format!("+{want}:refs/codemux/want");
         self.run(
             &[
-                "fetch", "-q", "--no-tags", "--no-write-fetch-head", "--depth", "1", "--filter=blob:none",
+                "fetch", "-q", "--no-tags", "--no-write-fetch-head", "--depth", "1", "--filter=tree:0",
                 "origin", &refspec,
             ],
             None,

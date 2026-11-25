@@ -311,6 +311,57 @@ fn provenance_checks_release_tags_before_costly_default_history() {
 }
 
 #[test]
+fn initial_commit_fetch_stops_when_repository_exceeds_disk_guard() {
+    let f = fixture();
+    let origin = PathBuf::from(f.url.strip_prefix("file://").unwrap());
+    let work = origin.parent().unwrap().join("work");
+    large_commit(&work);
+    git(&work, &["push", "-q", origin.to_str().unwrap(), "main"]);
+
+    let error = install::fetch_plugin(
+        &test_git().with_disk_limit(1024 * 1024),
+        &f.url,
+        None,
+        Some("main"),
+        None,
+    )
+    .err()
+    .unwrap();
+    assert!(error.contains("Git download exceeded its disk limit"), "{error}");
+}
+
+#[test]
+fn lazy_blob_fetch_stops_when_repository_exceeds_disk_guard() {
+    let f = fixture();
+    let origin = PathBuf::from(f.url.strip_prefix("file://").unwrap());
+    let work = origin.parent().unwrap().join("work");
+    let mut seed = 1u64;
+    let large_blob: Vec<u8> = (0..2_000_000)
+        .map(|_| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed as u8
+        })
+        .collect();
+    std::fs::write(work.join("codemux/large.bin"), large_blob).unwrap();
+    git(&work, &["add", "codemux/large.bin"]);
+    git(&work, &["commit", "-q", "-m", "large plugin file"]);
+    git(&work, &["push", "-q", origin.to_str().unwrap(), "main"]);
+
+    let error = install::fetch_plugin(
+        &test_git().with_disk_limit(1024 * 1024),
+        &f.url,
+        None,
+        Some("main"),
+        None,
+    )
+    .err()
+    .unwrap();
+    assert!(error.contains("Git download exceeded its disk limit"), "{error}");
+}
+
+#[test]
 fn a_local_or_linked_folder_is_never_replaced() {
     let f = fixture();
     std::fs::create_dir_all(f.root.join("hello")).unwrap();
