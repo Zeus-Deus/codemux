@@ -4516,8 +4516,8 @@ impl AgentBrowserManager {
         // The agent-facing "close" goes through run_command (not close()),
         // so completed attempts must reset its state before the next open.
         let before_launch = result.as_ref().err().is_some_and(|error| !error.may_have_launched);
-        if before_launch {
-            if !was_running && !viewport_may_have_launched {
+        if before_launch && !viewport_may_have_launched {
+            if !was_running {
                 let mut sessions = self.sessions.lock().await;
                 if let Some(entry) = sessions.get_mut(browser_id) {
                     if entry.pid.is_none() && !entry.browser_ready && !entry.confirmation_pending {
@@ -6207,6 +6207,30 @@ mod tests {
             command, Duration::from_secs(2), &session,
         ).unwrap();
         assert!(output.status.success());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn failed_viewport_launch_then_missing_action_releases_first_session() {
+        let session = format!("browser-viewport-retry-{}", uuid::Uuid::new_v4().simple());
+        let manager = AgentBrowserManager::new();
+        manager.allocate_port(&session).await.unwrap();
+        let was_running = manager.note_action_start(&session, "open").await;
+        assert!(!was_running);
+
+        let mut viewport = std::process::Command::new("sh");
+        viewport.args(["-c", "exit 1"]);
+        let output = output_capture_and_track_browser_daemon_with_status(
+            viewport, Duration::from_secs(2), &session,
+        ).unwrap();
+        assert!(!output.status.success());
+
+        let result = Err(BrowserActionFailure::before_launch("main action did not spawn".into()));
+        manager.reconcile_action_attempt(&session, &session, "open", was_running, true, &result).await;
+        assert!(manager.sessions.lock().await.get(&session).is_none());
+        manager.allocate_port(&session).await.unwrap();
+        assert!(!manager.note_action_start(&session, "open").await);
+        assert!(manager.sessions.lock().await.get(&session).unwrap().running);
     }
 
     #[cfg(unix)]
