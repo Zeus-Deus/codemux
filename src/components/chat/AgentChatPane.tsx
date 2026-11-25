@@ -72,6 +72,7 @@ import { hasUltrathinkInBodyText } from "@/lib/agent-chat/ultrathink";
 import { basename } from "@/lib/path";
 import { ATTACHMENT_HARD_LIMIT } from "@/lib/agent-chat/attachment-limits";
 import { metadataFromSessionContext } from "@/lib/agent-chat/session-handoff";
+import { resumeCursorForSession } from "@/lib/agent-chat/session-history";
 import { switchRefusal } from "@/lib/agent-chat/provider-switch";
 import { utilitySelectionFromStores } from "@/lib/utility-agent";
 import { toast } from "@/lib/toast";
@@ -1094,7 +1095,8 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
   // falling back to the provider default only when the row (or its
   // model column) is absent. Fetching FIRST and seeding once avoids
   // flashing the Opus default and then swapping to the persisted
-  // model. `resumeCursor` is restored from `sdk_session_id` so a
+  // model. `resumeCursor` is restored from `sdk_session_id` and Codex's
+  // saved catalog key so a
   // picker-triggered silent restart resumes the SDK session instead
   // of starting fresh.
   //
@@ -1179,7 +1181,7 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
         if (!current || current.resumeCursor == null)
           setStoreResumeCursor(
             seedThreadId,
-            record.sdk_session_id ? { resume: record.sdk_session_id } : null,
+            resumeCursorForSession(record),
           );
       }
     })();

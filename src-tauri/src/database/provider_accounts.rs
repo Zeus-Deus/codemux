@@ -161,7 +161,7 @@ impl DatabaseStore {
             rows
         };
         tx.execute(
-            "UPDATE agent_chat_sessions SET sdk_session_id = NULL
+            "UPDATE agent_chat_sessions SET sdk_session_id = NULL, codex_tool_catalog_key = NULL
              WHERE EXISTS (SELECT 1 FROM provider_account_bindings b
                            WHERE b.thread_id = agent_chat_sessions.thread_id
                              AND b.provider = agent_chat_sessions.provider

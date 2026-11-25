@@ -5,6 +5,7 @@ import type { AgentChatSessionRecord } from "@/tauri/commands";
 import {
   groupSessionsByDate,
   parseSqliteTimestamp,
+  resumeCursorForSession,
   sessionDisplayTitle,
 } from "./session-history";
 
@@ -27,6 +28,26 @@ function makeSession(
     ...overrides,
   };
 }
+
+describe("resumeCursorForSession", () => {
+  it("restores a Codex catalog binding only for its saved native thread", () => {
+    const key = "a".repeat(64);
+    expect(resumeCursorForSession(makeSession({
+      provider: "codex",
+      sdk_session_id: "native-thread",
+      codex_tool_catalog_key: key,
+    }))).toEqual({ resume: "native-thread", toolCatalogKey: key });
+    expect(resumeCursorForSession(makeSession({
+      provider: "codex",
+      sdk_session_id: "legacy-thread",
+    }))).toEqual({ resume: "legacy-thread" });
+    expect(resumeCursorForSession(makeSession({
+      provider: "claude",
+      sdk_session_id: "sdk-session",
+      codex_tool_catalog_key: key,
+    }))).toEqual({ resume: "sdk-session" });
+  });
+});
 
 describe("parseSqliteTimestamp", () => {
   it("parses a SQLite `datetime('now')`-formatted UTC string", () => {

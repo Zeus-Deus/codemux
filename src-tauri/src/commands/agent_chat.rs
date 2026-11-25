@@ -1321,15 +1321,22 @@ pub async fn agent_chat_start_session_guarded<R: Runtime>(
             ProviderKind::Acp => "acp",
             ProviderKind::OpenCode => "opencode",
         };
-        let persisted_sdk_session_id = {
+        let persisted_cursor = {
             let db: State<'_, DatabaseStore> = app.state();
             db.get_agent_chat_session(&input.thread_id.0)
                 .filter(|record| record.provider == provider_name)
-                .and_then(|record| record.sdk_session_id)
+                .and_then(|record| {
+                    record.sdk_session_id.map(|id| {
+                        native_resume_cursor(
+                            provider,
+                            &id,
+                            record.codex_tool_catalog_key.as_deref(),
+                            false,
+                        )
+                    })
+                })
         };
-        if let Some(sdk_session_id) = persisted_sdk_session_id {
-            input.resume_cursor = Some(serde_json::json!({ "resume": sdk_session_id }));
-        }
+        input.resume_cursor = persisted_cursor;
     }
     // Trace the resume wire so the dev console shows whether a
     // resume_cursor actually reached the provider, and with what
@@ -1714,20 +1721,21 @@ pub async fn agent_chat_start_session_guarded<R: Runtime>(
         // leaving the FIRST dead-run rebuild with no conversation context
         // (OpenCode and Codex return their cursors at start; Claude's SDK id
         // arrives later by event). Best-effort like the neighboring persists.
-        if let Some(sdk_session_id) = session
-            .resume_cursor
-            .as_ref()
-            .and_then(extract_sdk_session_id)
-        {
-            // Not if a removal took the account this session started on.
-            if let Err(error) = crate::provider_accounts::store_reported_native(
-                &db,
-                &session.thread_id.0,
-                &sdk_session_id,
-            ) {
-                eprintln!(
-                    "[codemux::agent_chat] failed to persist start-time resume cursor: {error}"
-                );
+        if let Some(cursor) = session.resume_cursor.as_ref() {
+            if let Some(sdk_session_id) = extract_sdk_session_id(cursor) {
+                // Not if a removal took the account this session started on.
+                if let Err(error) = crate::provider_accounts::store_reported_native_with_catalog_key(
+                    &db,
+                    &session.thread_id.0,
+                    &sdk_session_id,
+                    (provider == ProviderKind::Codex)
+                        .then(|| codex_tool_catalog_key(cursor))
+                        .flatten(),
+                ) {
+                    eprintln!(
+                        "[codemux::agent_chat] failed to persist start-time resume cursor: {error}"
+                    );
+                }
             }
         }
         // Persist the per-thread chat config the session started with so
@@ -3118,9 +3126,9 @@ pub(super) fn resolve_start_permission_mode(
 /// attached frontend `Channel`, the pane snapshot, and the store slice
 /// all stay valid with zero migration.
 ///
-/// Resume strategy: pass `resume_cursor: {"resume": <sdk_session_id>}`
-/// when the row carries one (Claude reads `resume`/`sessionId`; codex /
-/// opencode consume their own cursor shapes best-effort). If the
+/// Resume strategy: pass the saved native id and, for Codex, its catalog
+/// binding when the row carries one. Legacy Codex rows lacking a binding
+/// start fresh. If the
 /// resume-start fails (e.g. the SDK rejects a stale session id), retry
 /// once as a FRESH session — the visible transcript already hydrates from
 /// the DB, so the user keeps their history even though the provider
@@ -3319,10 +3327,12 @@ async fn ensure_live_session_locked<R: Runtime>(
             }
             None
         }
-        Some(id) if require_original => {
-            Some(serde_json::json!({ "resume": id, "requireOriginal": true }))
-        }
-        Some(id) => Some(serde_json::json!({ "resume": id })),
+        Some(id) => Some(native_resume_cursor(
+            provider_kind,
+            id,
+            record.codex_tool_catalog_key.as_deref(),
+            require_original,
+        )),
         None => None,
     };
 
@@ -8665,7 +8675,12 @@ pub fn forward_event<R: Runtime>(app: &AppHandle<R>, mut event: ProviderRuntimeE
         // late; it isn't stored (where it would outlive the removal's
         // in-memory refusal) and merges nothing.
         let stored = |native: &str| {
-            crate::provider_accounts::store_reported_native(&db, &thread_id.0, native).unwrap_or_else(|error| {
+            crate::provider_accounts::store_reported_native_with_catalog_key(
+                &db,
+                &thread_id.0,
+                native,
+                codex_tool_catalog_key(resume_cursor),
+            ).unwrap_or_else(|error| {
                 eprintln!("[codemux::agent_chat] failed to persist sdk_session_id: {error}");
                 true
             })
@@ -10678,6 +10693,34 @@ pub fn extract_sdk_session_id(cursor: &serde_json::Value) -> Option<String> {
         .or_else(|| cursor.get("threadId"))
         .and_then(|v| v.as_str())
         .map(|s| s.to_string())
+}
+
+fn codex_tool_catalog_key(cursor: &serde_json::Value) -> Option<&str> {
+    cursor
+        .get("toolCatalogKey")
+        .and_then(serde_json::Value::as_str)
+        .filter(|key| key.len() == 64 && key.bytes().all(|byte| byte.is_ascii_hexdigit()))
+}
+
+/// Reconstruct only the binding that was saved with this native thread.
+/// A missing key remains missing so the Codex adapter starts fresh or, for
+/// an exact-original request, refuses to resume.
+fn native_resume_cursor(
+    provider: ProviderKind,
+    native_id: &str,
+    codex_catalog_key: Option<&str>,
+    require_original: bool,
+) -> serde_json::Value {
+    let mut cursor = serde_json::json!({ "resume": native_id });
+    if provider == ProviderKind::Codex {
+        if let Some(key) = codex_catalog_key {
+            cursor["toolCatalogKey"] = key.into();
+        }
+    }
+    if require_original {
+        cursor["requireOriginal"] = true.into();
+    }
+    cursor
 }
 
 /// Whether `session_id` looks like a value we are willing to probe for on
@@ -13026,6 +13069,8 @@ mod tests {
         live: Mutex<std::collections::HashSet<String>>,
         stopped: Mutex<Vec<String>>,
         started_on: Mutex<Vec<Option<i64>>>,
+        started_cursors: Mutex<Vec<Option<serde_json::Value>>>,
+        returned_cursor: Option<serde_json::Value>,
         stop_started: tokio::sync::Notify,
         stop_completed: tokio::sync::Notify,
         stop_release: Option<Arc<tokio::sync::Notify>>,
@@ -13046,6 +13091,7 @@ mod tests {
             &self,
             input: StartSessionInput,
         ) -> Result<crate::agent_provider::ProviderSession, ProviderError> {
+            self.started_cursors.lock().unwrap().push(input.resume_cursor.clone());
             self.started_on
                 .lock()
                 .unwrap()
@@ -13056,7 +13102,7 @@ mod tests {
                 provider: ProviderKind::Codex,
                 session_id: crate::agent_provider::ProviderSessionId("session".into()),
                 status: SessionStatus::Ready,
-                resume_cursor: None,
+                resume_cursor: self.returned_cursor.clone(),
             })
         }
         async fn send_turn(
@@ -13166,6 +13212,46 @@ mod tests {
         app.manage(state);
         app.manage(registry);
         (app, workspace)
+    }
+
+    #[tokio::test]
+    async fn codex_catalog_key_round_trips_through_chat_storage_and_rebuild() {
+        let thread = "catalog-bound-chat";
+        let key = "a".repeat(64);
+        let provider = Arc::new(PlacementProvider {
+            returned_cursor: Some(json!({"threadId": "native-codex", "toolCatalogKey": key})),
+            ..Default::default()
+        });
+        let (app, _) = placement_app(thread, None, provider.clone()).await;
+        app.manage(ObservabilityStore::default());
+        let handle = app.handle().clone();
+        let pane = handle.state::<AppStateStore>()
+            .agent_chat_pane_id_for_thread(thread)
+            .unwrap();
+        let input: StartSessionInput = serde_json::from_value(json!({
+            "thread_id": thread,
+            "cwd": "/tmp",
+            "additional_directories": [],
+        }))
+        .unwrap();
+        agent_chat_start_session(handle.clone(), pane, ProviderKind::Codex, input, None)
+            .await
+            .unwrap();
+
+        let record = handle.state::<DatabaseStore>()
+            .get_agent_chat_session(thread)
+            .unwrap();
+        assert_eq!(record.sdk_session_id.as_deref(), Some("native-codex"));
+        assert_eq!(record.codex_tool_catalog_key.as_deref(), Some(key.as_str()));
+
+        provider.stop_session(ThreadId(thread.into())).await.unwrap();
+        ensure_live_session(&handle, ProviderKind::Codex, &ThreadId(thread.into()))
+            .await
+            .unwrap();
+        assert_eq!(
+            *provider.started_cursors.lock().unwrap(),
+            vec![None, Some(json!({"resume": "native-codex", "toolCatalogKey": key}))]
+        );
     }
 
     /// Pulling a workspace back must not leave its chat editing the device

@@ -130,8 +130,13 @@ fn merge_agent_chat_session_rows(
                  sdk_session_id,
                  (SELECT sdk_session_id FROM agent_chat_sessions
                   WHERE {group} AND sdk_session_id IS NOT NULL
-                  ORDER BY last_active_at DESC LIMIT 1)
+                  ORDER BY last_active_at DESC, thread_id DESC LIMIT 1)
              ),
+             codex_tool_catalog_key = CASE WHEN sdk_session_id IS NULL THEN
+                 (SELECT codex_tool_catalog_key FROM agent_chat_sessions
+                  WHERE {group} AND sdk_session_id IS NOT NULL
+                  ORDER BY last_active_at DESC, thread_id DESC LIMIT 1)
+                 ELSE codex_tool_catalog_key END,
              title = COALESCE(
                  title,
                  (SELECT title FROM agent_chat_sessions
@@ -235,7 +240,7 @@ fn merge_agent_chat_session_rows(
 
 fn agent_chat_session(conn: &Connection, thread_id: &str) -> Option<AgentChatSessionRecord> {
         conn.query_row(
-            "SELECT thread_id, sdk_session_id, workspace_id, cwd, provider, title, created_at, last_active_at, model, effort, context_window, permission_mode, fast_mode, (SELECT i.provider FROM agent_chat_local_imports i WHERE i.thread_id=agent_chat_sessions.thread_id), COALESCE(service_tier, CASE WHEN fast_mode = 1 THEN 'fast' ELSE 'default' END)
+            "SELECT thread_id, sdk_session_id, workspace_id, cwd, provider, title, created_at, last_active_at, model, effort, context_window, permission_mode, fast_mode, (SELECT i.provider FROM agent_chat_local_imports i WHERE i.thread_id=agent_chat_sessions.thread_id), COALESCE(service_tier, CASE WHEN fast_mode = 1 THEN 'fast' ELSE 'default' END), codex_tool_catalog_key
              FROM agent_chat_sessions WHERE thread_id = ?1",
             params![thread_id],
             |row| {
@@ -255,6 +260,7 @@ fn agent_chat_session(conn: &Connection, thread_id: &str) -> Option<AgentChatSes
                     permission_mode: row.get(11)?,
                     fast_mode: row.get::<_, Option<i64>>(12)?.unwrap_or(0) != 0,
                     service_tier: row.get(14)?,
+                    codex_tool_catalog_key: row.get(15)?,
                 })
             },
         )
@@ -283,14 +289,16 @@ pub struct RecentProject {
 
 /// Persisted record for an agent-chat session so the history dropdown
 /// can reopen prior chats after the app restarts. One row per pane's
-/// lifetime thread_id; the `sdk_session_id` column carries the Claude
-/// Agent SDK session UUID (populated once the SDK's first message
-/// lands) and is what the "resume" path feeds back into
-/// `StartSessionInput::resume_cursor`.
+/// lifetime thread_id; `sdk_session_id` carries the provider-native id used
+/// for resume. Codex also stores the catalog binding that must accompany it.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AgentChatSessionRecord {
     pub thread_id: String,
     pub sdk_session_id: Option<String>,
+    /// Catalog bound to a Codex thread's persisted dynamic tools and checkout.
+    /// Older rows have no key and must start a fresh native thread.
+    #[serde(default)]
+    pub codex_tool_catalog_key: Option<String>,
     /// Local imports are read-only snapshots, not provider-native resumes.
     #[serde(default)]
     pub imported_from: Option<String>,
@@ -703,6 +711,7 @@ fn create_schema(conn: &Connection) -> Result<(), String> {
         CREATE TABLE IF NOT EXISTS agent_chat_sessions (
             thread_id TEXT PRIMARY KEY,
             sdk_session_id TEXT,
+            codex_tool_catalog_key TEXT,
             workspace_id TEXT NOT NULL,
             cwd TEXT,
             provider TEXT NOT NULL,
@@ -1290,6 +1299,7 @@ fn create_schema(conn: &Connection) -> Result<(), String> {
         "ALTER TABLE agent_chat_sessions ADD COLUMN permission_mode TEXT",
         "ALTER TABLE agent_chat_sessions ADD COLUMN fast_mode INTEGER",
         "ALTER TABLE agent_chat_sessions ADD COLUMN service_tier TEXT",
+        "ALTER TABLE agent_chat_sessions ADD COLUMN codex_tool_catalog_key TEXT",
         // Web-remote account mode (Stage A): how a session was admitted and,
         // for account-minted sessions, the verified Codemux account user id.
         // `source` defaults to 'pair' so every pre-existing (pairing-token) row
@@ -4118,6 +4128,10 @@ impl DatabaseStore {
                      WHEN agent_chat_sessions.provider != ?4 THEN NULL
                      ELSE agent_chat_sessions.sdk_session_id
                  END,
+                 codex_tool_catalog_key = CASE
+                     WHEN agent_chat_sessions.provider != ?4 THEN NULL
+                     ELSE agent_chat_sessions.codex_tool_catalog_key
+                 END,
                  provider = ?4,
                  last_active_at = datetime('now')",
             params![thread_id, workspace_id, cwd, provider],
@@ -4150,6 +4164,9 @@ impl DatabaseStore {
                      (SELECT sdk_session_id FROM agent_chat_sessions WHERE thread_id = ?1),
                      sdk_session_id
                  ),
+                 codex_tool_catalog_key = CASE WHEN sdk_session_id IS NULL THEN
+                     (SELECT codex_tool_catalog_key FROM agent_chat_sessions WHERE thread_id = ?1)
+                     ELSE codex_tool_catalog_key END,
                  created_at = COALESCE(
                      (SELECT created_at FROM agent_chat_sessions WHERE thread_id = ?1),
                      created_at
@@ -4203,21 +4220,32 @@ impl DatabaseStore {
         Ok(())
     }
 
-    /// Record the Claude Agent SDK session UUID once the sidecar's
-    /// `sdk-session-id` notification has resolved. This is the value
-    /// that later feeds `StartSessionInput::resume_cursor` when the
-    /// user reopens the chat from the history dropdown.
+    /// Record a provider-native session id without a Codex catalog binding.
+    /// Legacy Codex ids saved through this path safely start a fresh thread.
     pub fn set_agent_chat_sdk_session_id(
         &self,
         thread_id: &str,
         sdk_session_id: &str,
     ) -> Result<(), String> {
+        self.set_agent_chat_native_cursor(thread_id, sdk_session_id, None)
+    }
+
+    /// Persist the native id and its Codex tool-catalog binding together.
+    /// A provider change or a new id without a binding clears the old key.
+    pub fn set_agent_chat_native_cursor(
+        &self,
+        thread_id: &str,
+        sdk_session_id: &str,
+        codex_tool_catalog_key: Option<&str>,
+    ) -> Result<(), String> {
         let conn = self.conn.lock().unwrap();
         conn.execute(
             "UPDATE agent_chat_sessions
-                 SET sdk_session_id = ?2, last_active_at = datetime('now')
+                 SET sdk_session_id = ?2,
+                     codex_tool_catalog_key = CASE WHEN provider = 'codex' THEN ?3 ELSE NULL END,
+                     last_active_at = datetime('now')
                  WHERE thread_id = ?1",
-            params![thread_id, sdk_session_id],
+            params![thread_id, sdk_session_id, codex_tool_catalog_key],
         )
         .map_err(|e| format!("Failed to set sdk_session_id: {e}"))?;
         Ok(())
@@ -4234,7 +4262,7 @@ impl DatabaseStore {
         let conn = self.conn.lock().unwrap();
         conn.execute(
             "UPDATE agent_chat_sessions
-                 SET sdk_session_id = NULL
+                 SET sdk_session_id = NULL, codex_tool_catalog_key = NULL
                  WHERE thread_id = ?1",
             params![thread_id],
         )
@@ -4393,6 +4421,7 @@ impl DatabaseStore {
                 permission_mode: row.get(11)?,
                 fast_mode: row.get::<_, Option<i64>>(12)?.unwrap_or(0) != 0,
                 service_tier: row.get(14)?,
+                codex_tool_catalog_key: row.get(15)?,
             })
         };
         // Only surface rows that actually have an sdk_session_id —
@@ -4404,7 +4433,7 @@ impl DatabaseStore {
         // silent restarts that never got interacted with.
         if let Some(cwd) = cwd {
             let mut stmt = match conn.prepare(
-                "SELECT thread_id, sdk_session_id, workspace_id, cwd, provider, title, created_at, last_active_at, model, effort, context_window, permission_mode, fast_mode, (SELECT i.provider FROM agent_chat_local_imports i WHERE i.thread_id=agent_chat_sessions.thread_id), COALESCE(service_tier, CASE WHEN fast_mode = 1 THEN 'fast' ELSE 'default' END)
+                "SELECT thread_id, sdk_session_id, workspace_id, cwd, provider, title, created_at, last_active_at, model, effort, context_window, permission_mode, fast_mode, (SELECT i.provider FROM agent_chat_local_imports i WHERE i.thread_id=agent_chat_sessions.thread_id), COALESCE(service_tier, CASE WHEN fast_mode = 1 THEN 'fast' ELSE 'default' END), codex_tool_catalog_key
                  FROM agent_chat_sessions
                  WHERE workspace_id = ?1 AND cwd = ?2 AND (sdk_session_id IS NOT NULL OR EXISTS(SELECT 1 FROM agent_chat_local_imports i WHERE i.thread_id=agent_chat_sessions.thread_id))
                  ORDER BY last_active_at DESC LIMIT ?3",
@@ -4417,7 +4446,7 @@ impl DatabaseStore {
                 .unwrap_or_default()
         } else {
             let mut stmt = match conn.prepare(
-                "SELECT thread_id, sdk_session_id, workspace_id, cwd, provider, title, created_at, last_active_at, model, effort, context_window, permission_mode, fast_mode, (SELECT i.provider FROM agent_chat_local_imports i WHERE i.thread_id=agent_chat_sessions.thread_id), COALESCE(service_tier, CASE WHEN fast_mode = 1 THEN 'fast' ELSE 'default' END)
+                "SELECT thread_id, sdk_session_id, workspace_id, cwd, provider, title, created_at, last_active_at, model, effort, context_window, permission_mode, fast_mode, (SELECT i.provider FROM agent_chat_local_imports i WHERE i.thread_id=agent_chat_sessions.thread_id), COALESCE(service_tier, CASE WHEN fast_mode = 1 THEN 'fast' ELSE 'default' END), codex_tool_catalog_key
                  FROM agent_chat_sessions
                  WHERE workspace_id = ?1 AND (sdk_session_id IS NOT NULL OR EXISTS(SELECT 1 FROM agent_chat_local_imports i WHERE i.thread_id=agent_chat_sessions.thread_id))
                  ORDER BY last_active_at DESC LIMIT ?2",
@@ -8140,6 +8169,35 @@ mod tests {
                 .as_deref(),
             Some("sdk-uuid-abc")
         );
+    }
+
+    #[test]
+    fn codex_catalog_key_follows_and_clears_with_native_session() {
+        let db = init_test_database();
+        let key = "a".repeat(64);
+        db.upsert_agent_chat_session("old", "ws-1", Some("/repo"), "codex")
+            .unwrap();
+        db.set_agent_chat_native_cursor("old", "native-1", Some(&key))
+            .unwrap();
+        db.upsert_agent_chat_session("new", "ws-1", Some("/repo"), "codex")
+            .unwrap();
+        db.migrate_agent_chat_session("old", "new").unwrap();
+        let record = db.get_agent_chat_session("new").unwrap();
+        assert_eq!(record.sdk_session_id.as_deref(), Some("native-1"));
+        assert_eq!(record.codex_tool_catalog_key.as_deref(), Some(key.as_str()));
+
+        db.clear_agent_chat_sdk_session_id("new").unwrap();
+        let record = db.get_agent_chat_session("new").unwrap();
+        assert!(record.sdk_session_id.is_none());
+        assert!(record.codex_tool_catalog_key.is_none());
+
+        db.set_agent_chat_native_cursor("new", "native-2", Some(&key))
+            .unwrap();
+        db.upsert_agent_chat_session("new", "ws-1", Some("/repo"), "claude")
+            .unwrap();
+        let record = db.get_agent_chat_session("new").unwrap();
+        assert!(record.sdk_session_id.is_none());
+        assert!(record.codex_tool_catalog_key.is_none());
     }
 
     #[test]

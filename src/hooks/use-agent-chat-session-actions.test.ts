@@ -362,6 +362,23 @@ describe("useAgentChatSessionActions — handleSelect (resume)", () => {
     });
   });
 
+  it("passes a saved Codex catalog key when reopening history", async () => {
+    const key = "a".repeat(64);
+    const { result } = renderHook(() =>
+      useAgentChatSessionActions(makePane({ provider: "codex" })),
+    );
+    await result.current.handleSelect(makeRecord({
+      provider: "codex",
+      sdk_session_id: "native-thread",
+      codex_tool_catalog_key: key,
+    }));
+    const [, , input] = vi.mocked(agentChatStartSession).mock.calls[0];
+    expect(input.resume_cursor).toEqual({
+      resume: "native-thread",
+      toolCatalogKey: key,
+    });
+  });
+
   it("does not reuse a stale permission token when resuming OpenCode", async () => {
     const { result } = renderHook(() =>
       useAgentChatSessionActions(makePane({ provider: "opencode" })),

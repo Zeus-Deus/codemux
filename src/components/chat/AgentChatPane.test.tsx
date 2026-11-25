@@ -3028,6 +3028,22 @@ describe("AgentChatPane mount-seed effect (design F)", () => {
     });
   });
 
+  it("seeds the saved Codex catalog key on pane hydration", async () => {
+    const key = "b".repeat(64);
+    vi.mocked(agentChatGetSession).mockResolvedValue(
+      makeRecord({
+        provider: "codex",
+        sdk_session_id: "native-codex",
+        codex_tool_catalog_key: key,
+      }),
+    );
+    render(<AgentChatPane pane={{ ...pane, provider: "codex", thread_id: "thread-x" }} />);
+    await waitFor(() => expect(setResumeCursorMock).toHaveBeenCalledWith(
+      "thread-x",
+      { resume: "native-codex", toolCatalogKey: key },
+    ));
+  });
+
   it("seeds resumeCursor null when the row has no sdk_session_id", async () => {
     vi.mocked(agentChatGetSession).mockResolvedValue(
       makeRecord({ model: "claude-sonnet-4-6", sdk_session_id: null }),
