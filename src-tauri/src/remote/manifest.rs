@@ -59,39 +59,43 @@ pub fn write(path: &Path, manifest: &Manifest) -> Result<(), String> {
     let parent = path.parent().ok_or_else(|| {
         "manifest path has no parent directory".to_string()
     })?;
-    super::config::ensure_private_dir(parent)
-        .map_err(|e| format!("create state dir: {e}"))?;
+    let name = path
+        .file_name()
+        .ok_or_else(|| "manifest path has no file name".to_string())?;
+    let dir =
+        super::config::open_private_dir(parent).map_err(|e| format!("create state dir: {e}"))?;
 
     let payload = serde_json::to_vec_pretty(manifest)
         .map_err(|e| format!("serialise manifest: {e}"))?;
 
-    // Atomic-replace: write to a sibling tempfile, then rename.
-    let tmp_path = path.with_extension("json.tmp");
-    {
-        use std::io::Write;
-        let mut file = std::fs::OpenOptions::new()
-            .create(true)
-            .truncate(true)
-            .write(true)
-            .open(&tmp_path)
+    // The unique 0600 file and final rename are both relative to the same
+    // verified directory handle. A stale legacy temp symlink is never opened.
+    use cap_fs_ext::{FollowSymlinks, OpenOptionsFollowExt};
+    use cap_std::fs::{OpenOptions, OpenOptionsExt};
+    use std::io::Write;
+    let temp = format!(".manifest-{}.tmp", uuid::Uuid::new_v4());
+    let mut options = OpenOptions::new();
+    options
+        .write(true)
+        .create_new(true)
+        .follow(FollowSymlinks::No)
+        .mode(0o600);
+    let result = (|| {
+        let mut file = dir
+            .open_with(&temp, &options)
             .map_err(|e| format!("open manifest tmpfile: {e}"))?;
-
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            file.set_permissions(std::fs::Permissions::from_mode(0o600))
-                .map_err(|e| format!("chmod manifest tmpfile: {e}"))?;
-        }
-
         file.write_all(&payload)
             .map_err(|e| format!("write manifest: {e}"))?;
         file.sync_all()
             .map_err(|e| format!("fsync manifest: {e}"))?;
+        drop(file);
+        dir.rename(&temp, &dir, Path::new(name))
+            .map_err(|e| format!("rename manifest into place: {e}"))
+    })();
+    if result.is_err() {
+        let _ = dir.remove_file(&temp);
     }
-
-    std::fs::rename(&tmp_path, path)
-        .map_err(|e| format!("rename manifest into place: {e}"))?;
-    Ok(())
+    result
 }
 
 /// Read the manifest from disk. Returns `Ok(None)` if the file is
@@ -212,6 +216,32 @@ mod tests {
         write(&path, &m).unwrap();
         let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o600, "manifest must be 0600, got {mode:o}");
+    }
+
+    #[test]
+    fn stale_temp_symlink_cannot_redirect_manifest_write() {
+        let state = TempDir::new().unwrap();
+        let outside = TempDir::new().unwrap();
+        let target = outside.path().join("unrelated.txt");
+        std::fs::write(&target, b"keep this file").unwrap();
+        let path = state.path().join("manifest.json");
+        let legacy_temp = path.with_extension("json.tmp");
+        std::os::unix::fs::symlink(&target, &legacy_temp).unwrap();
+        std::os::unix::fs::symlink(&target, &path).unwrap();
+
+        let manifest = Manifest::new("http://127.0.0.1:1".into(), "h".into());
+        write(&path, &manifest).unwrap();
+
+        assert_eq!(std::fs::read(&target).unwrap(), b"keep this file");
+        assert!(std::fs::symlink_metadata(&legacy_temp)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert!(!std::fs::symlink_metadata(&path)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert_eq!(read(&path).unwrap().unwrap().secret, manifest.secret);
     }
 
     #[test]

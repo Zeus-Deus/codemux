@@ -36,13 +36,27 @@ pub fn default_state_dir() -> PathBuf {
 /// default state directory is ours to tighten; an existing custom directory
 /// may be shared with other tools, so its mode is never changed here.
 pub fn ensure_private_dir(dir: &std::path::Path) -> std::io::Result<()> {
-    ensure_private_dir_with_default(dir, &default_state_dir())
+    open_private_dir(dir).map(|_| ())
 }
 
+/// Return the verified directory handle for operations that must stay inside
+/// the checked state directory even if its pathname changes afterward.
+pub(crate) fn open_private_dir(dir: &std::path::Path) -> std::io::Result<cap_std::fs::Dir> {
+    open_private_dir_with_default(dir, &default_state_dir())
+}
+
+#[cfg(test)]
 fn ensure_private_dir_with_default(
     dir: &std::path::Path,
     default: &std::path::Path,
 ) -> std::io::Result<()> {
+    open_private_dir_with_default(dir, default).map(|_| ())
+}
+
+fn open_private_dir_with_default(
+    dir: &std::path::Path,
+    default: &std::path::Path,
+) -> std::io::Result<cap_std::fs::Dir> {
     use cap_fs_ext::DirExt;
     use std::io::{Error, ErrorKind};
     use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
@@ -103,7 +117,7 @@ fn ensure_private_dir_with_default(
             .into_std()
             .set_permissions(std::fs::Permissions::from_mode(0o700))?;
     }
-    Ok(())
+    Ok(opened)
 }
 
 /// Manifest file inside a given state-dir.

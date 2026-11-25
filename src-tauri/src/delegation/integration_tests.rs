@@ -1098,7 +1098,6 @@ async fn control_launch_lost_reply_restart_follow_and_normal_idle_native_parent_
     for folder in [
         "home/codex",
         "bin",
-        "remote-state",
         "checkout",
         "parent-checkout",
     ] {
@@ -2042,7 +2041,6 @@ async fn codex_delayed_native_admission_is_denied_after_completed_stop() {
     for folder in [
         "home/codex",
         "bin",
-        "remote-state",
         "checkout",
         "parent-checkout",
     ] {
