@@ -17,10 +17,14 @@ use std::io::Read;
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::time::{Duration, Instant};
 
+pub(crate) const MAX_CAPTURE_BYTES: usize = 8 * 1024 * 1024;
+
 pub(crate) struct TimedOutput {
     pub success: bool,
     pub stdout: String,
     pub stderr: String,
+    /// Only set for a successful command using the bounded-prefix mode.
+    pub stdout_truncated: bool,
 }
 
 pub(crate) enum TimedFailure {
@@ -30,6 +34,17 @@ pub(crate) enum TimedFailure {
     Wait(std::io::Error),
     /// The deadline lapsed; the child was killed and reaped.
     Timeout,
+    /// A child produced more output than the hosting integration can retain.
+    OutputTooLarge {
+        stream: &'static str,
+        limit_bytes: usize,
+    },
+}
+
+#[derive(Default)]
+pub(crate) struct CapturedPipe {
+    pub(crate) bytes: Vec<u8>,
+    pub(crate) exceeded_limit: bool,
 }
 
 /// Run `cmd` to completion or to `timeout`, whichever comes first.
@@ -38,8 +53,25 @@ pub(crate) enum TimedFailure {
 /// — only the stdio wiring is imposed here, because draining the pipes
 /// is the entire point.
 pub(crate) fn run_timed(
+    cmd: Command,
+    timeout: Duration,
+) -> Result<TimedOutput, TimedFailure> {
+    run_timed_with_policy(cmd, timeout, false)
+}
+
+/// Keep a successful command's bounded stdout prefix for callers that already
+/// label truncated output. Structured responses must use `run_timed` instead.
+pub(crate) fn run_timed_stdout_prefix(
+    cmd: Command,
+    timeout: Duration,
+) -> Result<TimedOutput, TimedFailure> {
+    run_timed_with_policy(cmd, timeout, true)
+}
+
+fn run_timed_with_policy(
     mut cmd: Command,
     timeout: Duration,
+    allow_successful_stdout_prefix: bool,
 ) -> Result<TimedOutput, TimedFailure> {
     cmd.stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -50,11 +82,24 @@ pub(crate) fn run_timed(
     let stderr = drain(child.stderr.take());
 
     match wait_with_deadline(child, Instant::now() + timeout) {
-        Ok(status) => Ok(TimedOutput {
-            success: status.success(),
-            stdout: join(stdout),
-            stderr: join(stderr),
-        }),
+        Ok(status) => {
+            let stdout = join(stdout);
+            let stderr = join(stderr);
+            if stderr.exceeded_limit
+                || (stdout.exceeded_limit && (!allow_successful_stdout_prefix || !status.success()))
+            {
+                return Err(TimedFailure::OutputTooLarge {
+                    stream: if stderr.exceeded_limit { "stderr" } else { "stdout" },
+                    limit_bytes: MAX_CAPTURE_BYTES,
+                });
+            }
+            Ok(TimedOutput {
+                success: status.success(),
+                stdout: String::from_utf8_lossy(&stdout.bytes).into_owned(),
+                stderr: String::from_utf8_lossy(&stderr.bytes).into_owned(),
+                stdout_truncated: stdout.exceeded_limit,
+            })
+        }
         Err(failure) => {
             // Whichever way the wait failed, the child has been killed and
             // reaped by now. The drain threads are deliberately not joined:
@@ -178,20 +223,35 @@ fn wait_with_deadline(mut child: Child, deadline: Instant) -> Result<ExitStatus,
     }
 }
 
-/// Read one pipe to EOF on its own thread.
-fn drain<R: Read + Send + 'static>(pipe: Option<R>) -> Option<std::thread::JoinHandle<String>> {
-    let mut pipe = pipe?;
-    Some(std::thread::spawn(move || {
-        let mut buf = Vec::new();
-        // Bytes, not `read_to_string`: a CLI that emits invalid UTF-8
-        // (a diff of a binary file) must degrade to replacement
-        // characters rather than losing the whole read.
-        pipe.read_to_end(&mut buf).ok();
-        String::from_utf8_lossy(&buf).into_owned()
-    }))
+/// Read one pipe to EOF on its own thread, discarding bytes past the cap so
+/// the child can exit without blocking on a full OS pipe.
+fn drain<R: Read + Send + 'static>(
+    pipe: Option<R>,
+) -> Option<std::thread::JoinHandle<CapturedPipe>> {
+    let pipe = pipe?;
+    Some(std::thread::spawn(move || capture_pipe(pipe)))
 }
 
-fn join(handle: Option<std::thread::JoinHandle<String>>) -> String {
+/// Retain at most one stream's budget while consuming the rest to EOF.
+pub(crate) fn capture_pipe<R: Read>(mut pipe: R) -> CapturedPipe {
+    let mut captured = CapturedPipe::default();
+    let mut chunk = [0u8; 8192];
+    loop {
+        match pipe.read(&mut chunk) {
+            Ok(0) => break,
+            Ok(count) => {
+                let keep = count.min(MAX_CAPTURE_BYTES.saturating_sub(captured.bytes.len()));
+                captured.bytes.extend_from_slice(&chunk[..keep]);
+                captured.exceeded_limit |= keep < count;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(_) => break,
+        }
+    }
+    captured
+}
+
+fn join(handle: Option<std::thread::JoinHandle<CapturedPipe>>) -> CapturedPipe {
     handle
         .and_then(|h| h.join().ok())
         .unwrap_or_default()
@@ -251,6 +311,56 @@ mod tests {
         .ok()
         .expect("must not time out on a large payload");
         assert_eq!(out.stderr.len(), 200_000);
+    }
+
+    #[test]
+    fn oversized_stdout_is_drained_and_rejected() {
+        let script = format!("head -c {} /dev/zero", MAX_CAPTURE_BYTES + 200_000);
+        let result = run_timed(sh(&script), Duration::from_secs(20));
+        assert!(matches!(
+            result,
+            Err(TimedFailure::OutputTooLarge {
+                stream: "stdout",
+                limit_bytes: MAX_CAPTURE_BYTES
+            })
+        ));
+    }
+
+    #[test]
+    fn oversized_stderr_is_drained_and_rejected() {
+        let script = format!("head -c {} /dev/zero 1>&2", MAX_CAPTURE_BYTES + 200_000);
+        let result = run_timed(sh(&script), Duration::from_secs(20));
+        assert!(matches!(
+            result,
+            Err(TimedFailure::OutputTooLarge {
+                stream: "stderr",
+                limit_bytes: MAX_CAPTURE_BYTES
+            })
+        ));
+    }
+
+    #[test]
+    fn successful_prefix_mode_keeps_bounded_stdout() {
+        let script = format!("head -c {} /dev/zero", MAX_CAPTURE_BYTES + 200_000);
+        let output = run_timed_stdout_prefix(sh(&script), Duration::from_secs(20))
+            .ok()
+            .expect("successful diff output should retain its prefix");
+        assert!(output.success);
+        assert_eq!(output.stdout.len(), MAX_CAPTURE_BYTES);
+        assert!(output.stdout_truncated);
+    }
+
+    #[test]
+    fn prefix_mode_rejects_oversized_failed_or_stderr_output() {
+        for script in [
+            format!("head -c {} /dev/zero; exit 4", MAX_CAPTURE_BYTES + 200_000),
+            format!("head -c {} /dev/zero 1>&2", MAX_CAPTURE_BYTES + 200_000),
+        ] {
+            assert!(matches!(
+                run_timed_stdout_prefix(sh(&script), Duration::from_secs(20)),
+                Err(TimedFailure::OutputTooLarge { .. })
+            ));
+        }
     }
 
     #[test]

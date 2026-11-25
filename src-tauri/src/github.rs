@@ -1189,10 +1189,13 @@ fn get_pr_diff_capped_inner(
         run_gh_timed(repo_path, &args, ISSUE_FETCH_TIMEOUT)?
     };
 
-    if !full || output.len() <= max_bytes {
-        return Ok(output);
-    }
+    Ok(format_pr_diff_preview(output, full, max_bytes, number))
+}
 
+fn format_pr_diff_preview(output: String, full: bool, max_bytes: usize, number: u32) -> String {
+    if !full || output.len() <= max_bytes {
+        return output;
+    }
     // Full diff exceeded the cap — truncate at a char boundary and
     // signpost what was cut so the agent doesn't silently miss
     // hunks. The trailing pointer mirrors `get_github_issue`'s
@@ -1201,12 +1204,12 @@ fn get_pr_diff_capped_inner(
     while end > 0 && !output.is_char_boundary(end) {
         end -= 1;
     }
-    Ok(format!(
+    format!(
         "{}\n\n[Diff truncated at {}KB — use `gh pr diff {}` for the full patch]",
         &output[..end],
         max_bytes / 1024,
         number,
-    ))
+    )
 }
 
 const BRANCH_PR_LOOKUP_TIMEOUT: Duration = Duration::from_secs(10);
@@ -3962,6 +3965,17 @@ fn parse_incoming_pr_json(v: &serde_json::Value) -> IncomingPrItem {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bounded_full_diff_prefix_still_produces_a_marked_preview() {
+        let prefix = format!("x{}", " ".repeat(crate::git_provider::exec::MAX_CAPTURE_BYTES - 1));
+        for max_bytes in [MAX_PR_DIFF_BYTES, MAX_PR_REVIEW_DIFF_BYTES] {
+            let preview = format_pr_diff_preview(prefix.clone(), true, max_bytes, 42);
+            assert!(preview.starts_with('x'));
+            assert!(preview.contains(&format!("[Diff truncated at {}KB", max_bytes / 1024)));
+            assert!(preview.len() < max_bytes + 100);
+        }
+    }
 
     #[test]
     fn created_pr_url_is_the_last_url_gh_prints() {

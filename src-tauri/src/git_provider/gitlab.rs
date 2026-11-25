@@ -35,7 +35,7 @@ use serde_json::Value;
 
 use super::cache::{TtlCache, DETAIL_TTL, LIST_TTL};
 use super::detect::{run_git, DetectedProvider, ProviderKind};
-use super::exec::{run_timed, TimedFailure};
+use super::exec::{run_timed, run_timed_stdout_prefix, TimedFailure};
 use super::provider::{Capabilities, OperationCapabilities, SourceControlProvider};
 use crate::execution::{sanitize_gui_env_std, sanitize_gui_env_std_keep_dbus};
 use crate::github::{
@@ -197,6 +197,9 @@ fn glab_failure(failure: TimedFailure, timeout: Duration) -> String {
         TimedFailure::Timeout => {
             format!("glab command timed out after {}s", timeout.as_secs())
         }
+        TimedFailure::OutputTooLarge { stream, limit_bytes } => {
+            format!("glab {stream} exceeded the {} MiB output limit", limit_bytes / (1024 * 1024))
+        }
     }
 }
 
@@ -205,12 +208,34 @@ fn glab_failure(failure: TimedFailure, timeout: Duration) -> String {
 /// A non-zero exit is an `Err` even when stdout parsed — the pollers key
 /// their preserve-vs-clear decision on exactly that distinction.
 fn run_glab_timed(repo_path: &Path, args: &[&str], timeout: Duration) -> Result<String, String> {
+    run_glab_timed_inner(repo_path, args, timeout, false)
+}
+
+fn run_glab_diff_timed(repo_path: &Path, args: &[&str], timeout: Duration) -> Result<String, String> {
+    run_glab_timed_inner(repo_path, args, timeout, true)
+}
+
+fn run_glab_timed_inner(
+    repo_path: &Path,
+    args: &[&str],
+    timeout: Duration,
+    allow_successful_stdout_prefix: bool,
+) -> Result<String, String> {
     let mut cmd = glab_command(args);
     cmd.current_dir(repo_path);
-    let output = run_timed(cmd, timeout).map_err(|e| glab_failure(e, timeout))?;
+    let output = if allow_successful_stdout_prefix {
+        run_timed_stdout_prefix(cmd, timeout)
+    } else {
+        run_timed(cmd, timeout)
+    }
+    .map_err(|e| glab_failure(e, timeout))?;
 
     if output.success {
-        return Ok(output.stdout.trim_end().to_string());
+        return Ok(if output.stdout_truncated {
+            output.stdout
+        } else {
+            output.stdout.trim_end().to_string()
+        });
     }
     Err(format!(
         "glab {} failed: {}",
@@ -220,6 +245,22 @@ fn run_glab_timed(repo_path: &Path, args: &[&str], timeout: Duration) -> Result<
         // just "glab api failed: ".
         first_non_empty(&output.stderr, &output.stdout),
     ))
+}
+
+fn format_mr_diff_preview(output: String, number: u32) -> String {
+    if output.len() <= MAX_PR_DIFF_BYTES {
+        return output;
+    }
+    let mut end = MAX_PR_DIFF_BYTES;
+    while end > 0 && !output.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!(
+        "{}\n\n[Diff truncated at {}KB — use `glab mr diff {}` for the full patch]",
+        &output[..end],
+        MAX_PR_DIFF_BYTES / 1024,
+        number,
+    )
 }
 
 fn first_non_empty(primary: &str, fallback: &str) -> String {
@@ -1695,24 +1736,12 @@ impl SourceControlProvider for GitLabProvider {
             }
 
             self.require_ready()?;
-            let output = run_glab_timed(
+            let output = run_glab_diff_timed(
                 repo_path,
                 &["mr", "diff", &number.to_string(), "--raw"],
                 LIST_TIMEOUT,
             )?;
-            if output.len() <= MAX_PR_DIFF_BYTES {
-                return Ok(output);
-            }
-            let mut end = MAX_PR_DIFF_BYTES;
-            while end > 0 && !output.is_char_boundary(end) {
-                end -= 1;
-            }
-            Ok(format!(
-                "{}\n\n[Diff truncated at {}KB — use `glab mr diff {}` for the full patch]",
-                &output[..end],
-                MAX_PR_DIFF_BYTES / 1024,
-                number,
-            ))
+            Ok(format_mr_diff_preview(output, number))
         })
     }
 
@@ -2205,6 +2234,71 @@ impl GitLabProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn full_mr_diff_retains_a_marked_preview_after_capture_cap() {
+        use std::os::unix::fs::PermissionsExt;
+
+        if std::env::var_os("CODEMUX_GLAB_DIFF_PREFIX_FIXTURE").is_none() {
+            let fixture = tempfile::tempdir().unwrap();
+            let glab = fixture.path().join("glab");
+            std::fs::write(
+                &glab,
+                format!(
+                    "#!/bin/sh\nif [ \"$1\" = mr ] && [ \"$2\" = diff ]; then printf y; head -c {} /dev/zero | tr '\\000' ' '; else exit 99; fi\n",
+                    super::super::exec::MAX_CAPTURE_BYTES + 200_000
+                ),
+            )
+            .unwrap();
+            std::fs::set_permissions(&glab, std::fs::Permissions::from_mode(0o755)).unwrap();
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "git_provider::gitlab::tests::full_mr_diff_retains_a_marked_preview_after_capture_cap",
+                    "--nocapture",
+                ])
+                .env("CODEMUX_GLAB_DIFF_PREFIX_FIXTURE", fixture.path())
+                .env(
+                    "PATH",
+                    format!(
+                        "{}:{}",
+                        fixture.path().display(),
+                        std::env::var("PATH").unwrap_or_default()
+                    ),
+                )
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "stdout: {}\nstderr: {}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+
+        let root = std::path::PathBuf::from(std::env::var_os("CODEMUX_GLAB_DIFF_PREFIX_FIXTURE").unwrap());
+        let output = run_glab_diff_timed(
+            &root,
+            &["mr", "diff", "42", "--raw"],
+            Duration::from_secs(20),
+        )
+        .unwrap();
+        assert_eq!(output.len(), super::super::exec::MAX_CAPTURE_BYTES);
+        let preview = format_mr_diff_preview(output, 42);
+        assert!(preview.starts_with('y'));
+        assert!(preview.contains("[Diff truncated at 100KB"));
+    }
+
+    #[test]
+    fn oversized_cli_output_has_a_bounded_diagnostic() {
+        let message = glab_failure(
+            TimedFailure::OutputTooLarge { stream: "stderr", limit_bytes: 8 * 1024 * 1024 },
+            CALL_TIMEOUT,
+        );
+        assert_eq!(message, "glab stderr exceeded the 8 MiB output limit");
+    }
 
     fn provider() -> GitLabProvider {
         GitLabProvider::from_detection(&DetectedProvider {
