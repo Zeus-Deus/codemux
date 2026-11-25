@@ -2201,7 +2201,7 @@ mod tests {
     fn direct_browser_actions_and_close_keep_executable_path_intact() {
         let bin = "/tmp/my browser/agent-browser";
         let groups = build_agent_browser_argv_groups(
-            "app.v2",
+            "app-v2",
             "click",
             &serde_json::json!({"selector": "button[data-id='save now']"}),
         ).unwrap();
@@ -2211,15 +2211,15 @@ mod tests {
         let action_args = action.get_args().map(|arg| arg.to_string_lossy().into_owned()).collect::<Vec<_>>();
         assert_eq!(
             action_args,
-            ["click", "button[data-id='save now']", "--session", "app.v2"],
+            ["click", "button[data-id='save now']", "--session", "app-v2"],
         );
 
-        let close = browser_cli_command(bin, &["close", "--session", "app.v2"], 0);
+        let close = browser_cli_command(bin, &["close", "--session", "app-v2"], 0);
         assert_eq!(close.get_program(), std::ffi::OsStr::new(bin));
         let close_args = close.get_args().map(|arg| arg.to_string_lossy().into_owned()).collect::<Vec<_>>();
         assert_eq!(
             close_args,
-            ["close", "--session", "app.v2"],
+            ["close", "--session", "app-v2"],
         );
     }
 
@@ -2235,7 +2235,7 @@ mod tests {
     #[tokio::test]
     async fn direct_browser_callers_reject_unsafe_session_names() {
         let manager = AgentBrowserManager::new();
-        for session in ["browser-$(id)", "browser;touch", "../escape", "browser name"] {
+        for session in ["browser-$(id)", "browser;touch", "../escape", "browser name", "app.v2"] {
             assert!(manager.allocate_port(session).await.is_err());
             assert!(manager.spawn(session).await.is_err());
             assert!(manager.start_stream(session).await.is_err());
