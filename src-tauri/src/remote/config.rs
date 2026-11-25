@@ -32,6 +32,22 @@ pub fn default_state_dir() -> PathBuf {
     PathBuf::from(".codemux-remote")
 }
 
+/// Create `dir` (and any missing parents) owner-only, and tighten it to
+/// 0700 when it already exists. The state dir is what keeps the registry,
+/// setup logs and daemon secret away from other local users, and one-shot
+/// CLI calls create it as well as `serve`, so every entry point uses this.
+/// Only `dir` itself is chmodded; existing parents are left alone.
+pub fn ensure_private_dir(dir: &std::path::Path) -> std::io::Result<()> {
+    use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+    // A bare relative file name has an empty parent: the current directory,
+    // which is not ours to chmod.
+    if dir.as_os_str().is_empty() {
+        return Ok(());
+    }
+    std::fs::DirBuilder::new().recursive(true).mode(0o700).create(dir)?;
+    std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))
+}
+
 /// Manifest file inside a given state-dir.
 pub fn manifest_path(state_dir: &std::path::Path) -> PathBuf {
     state_dir.join("manifest.json")

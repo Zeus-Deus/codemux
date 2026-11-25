@@ -59,12 +59,16 @@ impl WorkspaceStore {
     /// `origin_host_id`. `workspaces_root` is where blank workspaces
     /// are materialised when a caller doesn't supply a path.
     pub fn open(db_path: &Path, host_id: String, workspaces_root: PathBuf) -> Result<Self, WorkspaceError> {
+        // The registry (paths, branches, notes, remotes) and the setup logs
+        // next to it are private to this user.
         if let Some(parent) = db_path.parent() {
-            std::fs::create_dir_all(parent)
+            super::config::ensure_private_dir(parent)
                 .map_err(|e| WorkspaceError::Io(format!("create db dir: {e}")))?;
         }
+        // Checkouts keep the user's normal umask.
         std::fs::create_dir_all(&workspaces_root)
             .map_err(|e| WorkspaceError::Io(format!("create workspaces root: {e}")))?;
+        create_private_db_file(db_path)?;
 
         let conn = Connection::open(db_path).map_err(|e| WorkspaceError::Db(e.to_string()))?;
         // One-shot CLI calls (`project ensure`, `worktree create`) write to
@@ -606,6 +610,21 @@ fn git_remote_origin_url(dir: &str) -> Option<String> {
     }
 }
 
+/// Create the database file 0600 before SQLite opens it, and tighten one an
+/// older version left at the umask default. SQLite gives its -wal and -shm
+/// files the main file's mode, so they stay private too.
+fn create_private_db_file(db_path: &Path) -> Result<(), WorkspaceError> {
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .mode(0o600)
+        .open(db_path)
+        .map_err(|e| WorkspaceError::Io(format!("create db file: {e}")))?;
+    file.set_permissions(std::fs::Permissions::from_mode(0o600))
+        .map_err(|e| WorkspaceError::Io(format!("secure db file: {e}")))
+}
+
 fn basename(path: &str) -> String {
     PathBuf::from(path)
         .file_name()
@@ -623,6 +642,47 @@ mod tests {
         let db_path = dir.path().join("codemux.db");
         let ws_root = dir.path().join("workspaces");
         WorkspaceStore::open(&db_path, "test-host".into(), ws_root).unwrap()
+    }
+
+    fn mode(path: &Path) -> u32 {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::metadata(path).unwrap().permissions().mode() & 0o777
+    }
+
+    /// One-shot CLI calls open the store without `serve`, so opening it
+    /// must make a fresh state dir and its database private.
+    #[test]
+    fn open_creates_a_private_state_dir_and_database() {
+        let dir = TempDir::new().unwrap();
+        let state = dir.path().join("codemux-remote");
+        let db = state.join("codemux.db");
+        let store = WorkspaceStore::open(&db, "test-host".into(), state.join("workspaces")).unwrap();
+        store.create(None, dir.path().to_string_lossy().into(), None, None).unwrap();
+        assert_eq!(mode(&state), 0o700);
+        assert_eq!(mode(&db), 0o600);
+        for sidecar in ["codemux.db-wal", "codemux.db-shm"] {
+            let path = state.join(sidecar);
+            if path.exists() {
+                assert_eq!(mode(&path), 0o600, "{sidecar}");
+            }
+        }
+    }
+
+    /// Installs from before the fix left the state dir 0755 and the
+    /// database 0644. Opening the store tightens both.
+    #[test]
+    fn open_tightens_an_existing_state_dir_and_database() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = TempDir::new().unwrap();
+        let state = dir.path().join("codemux-remote");
+        let db = state.join("codemux.db");
+        drop(WorkspaceStore::open(&db, "test-host".into(), state.join("workspaces")).unwrap());
+        std::fs::set_permissions(&state, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::set_permissions(&db, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        WorkspaceStore::open(&db, "test-host".into(), state.join("workspaces")).unwrap();
+        assert_eq!(mode(&state), 0o700);
+        assert_eq!(mode(&db), 0o600);
     }
 
     #[test]

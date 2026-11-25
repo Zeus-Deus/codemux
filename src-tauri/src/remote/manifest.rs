@@ -59,15 +59,8 @@ pub fn write(path: &Path, manifest: &Manifest) -> Result<(), String> {
     let parent = path.parent().ok_or_else(|| {
         "manifest path has no parent directory".to_string()
     })?;
-    std::fs::create_dir_all(parent)
+    super::config::ensure_private_dir(parent)
         .map_err(|e| format!("create state dir: {e}"))?;
-
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        // Best-effort chmod 0700 on the state dir.
-        let _ = std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700));
-    }
 
     let payload = serde_json::to_vec_pretty(manifest)
         .map_err(|e| format!("serialise manifest: {e}"))?;

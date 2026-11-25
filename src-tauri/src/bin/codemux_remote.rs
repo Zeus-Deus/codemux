@@ -640,7 +640,7 @@ fn run_serve(port: Option<u16>, state_dir_arg: Option<PathBuf>) -> ExitCode {
 async fn run_serve_async(port: Option<u16>, state_dir: PathBuf) -> Result<(), String> {
     use codemux_lib::remote::{config, manifest, pty::PtyManager, server, workspace::WorkspaceStore};
 
-    std::fs::create_dir_all(&state_dir).map_err(|e| format!("create state dir: {e}"))?;
+    config::ensure_private_dir(&state_dir).map_err(|e| format!("create state dir: {e}"))?;
 
     // Bind first so we know what port to write into the manifest.
     let listener = server::bind_listener(port).await?;

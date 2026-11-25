@@ -136,11 +136,50 @@ pub fn meta_path_for(workspace_id: &str, pane_id: &str) -> PathBuf {
 }
 
 // ── Write ──────────────────────────────────────────────────────
+//
+// Scrollback is full terminal output, which often holds tokens and `env`
+// dumps, so the tree is owner-only: directories 0700 and files 0600.
+
+/// Create `dir` owner-only, tightening it if it already exists.
+fn private_dir(dir: &Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+        fs::DirBuilder::new().recursive(true).mode(0o700).create(dir)?;
+        fs::set_permissions(dir, fs::Permissions::from_mode(0o700))
+    }
+    #[cfg(not(unix))]
+    fs::create_dir_all(dir)
+}
+
+/// Replace `path` atomically with an owner-only file. The temp file is
+/// created 0600, so rewriting a file an older version left 0644 fixes it.
+fn write_private(path: &Path, contents: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    let dir = path.parent().unwrap_or_else(|| Path::new("."));
+    let mut file = tempfile::NamedTempFile::new_in(dir)?;
+    file.write_all(contents)?;
+    file.persist(path).map_err(|e| e.error)?;
+    Ok(())
+}
+
+/// Tighten the scrollback tree left by versions that wrote it with the
+/// default umask. The base directory is the boundary, so making it 0700 is
+/// enough for files that are not rewritten again. Does not create it.
+fn secure_existing_base(base: &Path) {
+    if base.is_dir() {
+        if let Err(e) = private_dir(base) {
+            eprintln!("[codemux::scrollback] Failed to make scrollback dir private: {e}");
+        }
+    }
+}
 
 /// Save a single pane's scrollback to disk.
 pub fn save_scrollback(payload: &ScrollbackPayload) -> Result<(), String> {
     let ws_dir = workspace_dir(&payload.workspace_id);
-    fs::create_dir_all(&ws_dir).map_err(|e| format!("Failed to create scrollback dir: {e}"))?;
+    private_dir(&scrollback_base())
+        .and_then(|()| private_dir(&ws_dir))
+        .map_err(|e| format!("Failed to create scrollback dir: {e}"))?;
 
     let now_ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -162,13 +201,13 @@ pub fn save_scrollback(payload: &ScrollbackPayload) -> Result<(), String> {
     };
 
     let data_file = data_path(&payload.workspace_id, &payload.pane_id);
-    fs::write(&data_file, &payload.data)
+    write_private(&data_file, payload.data.as_bytes())
         .map_err(|e| format!("Failed to write scrollback data: {e}"))?;
 
     let meta_file = meta_path(&payload.workspace_id, &payload.pane_id);
     let meta_json = serde_json::to_string_pretty(&meta)
         .map_err(|e| format!("Failed to serialize scrollback meta: {e}"))?;
-    fs::write(&meta_file, meta_json)
+    write_private(&meta_file, meta_json.as_bytes())
         .map_err(|e| format!("Failed to write scrollback meta: {e}"))?;
 
     Ok(())
@@ -313,6 +352,7 @@ pub(crate) fn cleanup_on_startup(
     active_workspace_ids: &[String],
     max_bytes: u64,
 ) {
+    secure_existing_base(base);
     if recovery_pending || crate::state::retained_layouts().unreadable {
         eprintln!("[codemux::scrollback] Skipping startup cleanup during layout recovery");
         return;
@@ -533,7 +573,7 @@ pub fn refresh_stale_scrollback_metadata(store: &crate::state::AppStateStore) {
         let path = meta_path(&ws_id, &pane_id);
         match serde_json::to_string_pretty(&meta) {
             Ok(json) => {
-                if let Err(e) = fs::write(&path, json) {
+                if let Err(e) = write_private(&path, json.as_bytes()) {
                     eprintln!(
                         "[codemux::scrollback] Failed to refresh metadata for {}/{}: {e}",
                         ws_id, pane_id
@@ -710,6 +750,54 @@ mod tests {
             adapter_id: None,
             alternate_buffer: false,
         }
+    }
+
+    #[cfg(unix)]
+    fn mode(path: &Path) -> u32 {
+        use std::os::unix::fs::PermissionsExt;
+        fs::metadata(path).unwrap().permissions().mode() & 0o777
+    }
+
+    /// Scrollback is full terminal output, so a save keeps it owner-only.
+    #[cfg(unix)]
+    #[test]
+    fn save_writes_owner_only_dirs_and_files() {
+        if crate::test_isolation::isolated("scrollback::tests::save_writes_owner_only_dirs_and_files") {
+            return;
+        }
+        save_scrollback(&test_payload("ws-private", "pane-1")).unwrap();
+        assert_eq!(mode(&scrollback_base()), 0o700);
+        assert_eq!(mode(&workspace_dir("ws-private")), 0o700);
+        assert_eq!(mode(&data_path("ws-private", "pane-1")), 0o600);
+        assert_eq!(mode(&meta_path("ws-private", "pane-1")), 0o600);
+        assert!(load_scrollback("ws-private", "pane-1").is_some());
+    }
+
+    /// Trees written by older versions at the default umask are tightened:
+    /// the base on startup, and each file when it is rewritten.
+    #[cfg(unix)]
+    #[test]
+    fn existing_world_readable_scrollback_is_tightened() {
+        use std::os::unix::fs::PermissionsExt;
+        if crate::test_isolation::isolated("scrollback::tests::existing_world_readable_scrollback_is_tightened") {
+            return;
+        }
+        let base = scrollback_base();
+        let ws_dir = workspace_dir("ws-old");
+        fs::create_dir_all(&ws_dir).unwrap();
+        let data = data_path("ws-old", "pane-1");
+        fs::write(&data, "old").unwrap();
+        for (path, old) in [(&base, 0o755), (&ws_dir, 0o755), (&data, 0o644)] {
+            fs::set_permissions(path, fs::Permissions::from_mode(old)).unwrap();
+        }
+
+        cleanup_on_startup(&base, true, false, &["ws-old".into()], u64::MAX);
+        assert_eq!(mode(&base), 0o700);
+
+        save_scrollback(&test_payload("ws-old", "pane-1")).unwrap();
+        assert_eq!(mode(&ws_dir), 0o700);
+        assert_eq!(mode(&data), 0o600);
+        assert_eq!(fs::read_to_string(&data).unwrap(), test_payload("ws-old", "pane-1").data);
     }
 
     #[test]
