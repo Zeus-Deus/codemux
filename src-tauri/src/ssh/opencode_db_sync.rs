@@ -128,10 +128,12 @@ fn remote_quote(path: &str) -> String {
 }
 
 /// Shell steps that create [`REMOTE_BUNDLE_DIR`] owner-only, so any bundle
-/// written into it is private whatever its own mode.
+/// written into it is private whatever its own mode. They stop unless the
+/// folder is a real directory (not a symlink) owned by the remote user, and
+/// `chmod` only runs after that check.
 fn remote_bundle_dir_prep() -> String {
     let dir = remote_quote(REMOTE_BUNDLE_DIR);
-    format!("umask 077 && mkdir -p {dir} && chmod 700 {dir}")
+    format!("umask 077 && mkdir -p {dir} && [ -d {dir} ] && [ ! -L {dir} ] && [ -O {dir} ] && chmod 700 {dir}")
 }
 
 /// Login-shell script (fed to `bash -ls` over stdin) that imports a
@@ -623,8 +625,10 @@ mod tests {
     fn remote_bundles_are_private_and_out_of_shared_tmp() {
         let bundle = unique_remote_bundle();
         assert!(bundle.starts_with("~/.cache/codemux/opencode-sync/codemux-opencode-"));
-        let prep = "umask 077 && mkdir -p ~/'.cache/codemux/opencode-sync' \
-                    && chmod 700 ~/'.cache/codemux/opencode-sync'";
+        let dir = "~/'.cache/codemux/opencode-sync'";
+        let prep = format!(
+            "umask 077 && mkdir -p {dir} && [ -d {dir} ] && [ ! -L {dir} ] && [ -O {dir} ] && chmod 700 {dir}"
+        );
         assert_eq!(remote_bundle_dir_prep(), prep);
         // The export creates the private folder before writing into it.
         let s = remote_extract_script("/home/me/ws", &bundle);
@@ -650,6 +654,26 @@ mod tests {
         assert_eq!(mode(&dir), 0o700);
         let file = home.path().join(bundle.strip_prefix("~/").unwrap());
         assert_eq!(mode(&file), 0o600);
+    }
+
+    #[test]
+    fn remote_bundle_dir_prep_refuses_a_symlinked_folder() {
+        use std::os::unix::fs::PermissionsExt;
+        let home = tempfile::tempdir().unwrap();
+        let elsewhere = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(elsewhere.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::create_dir_all(home.path().join(".cache/codemux")).unwrap();
+        std::os::unix::fs::symlink(elsewhere.path(), home.path().join(".cache/codemux/opencode-sync")).unwrap();
+        let status = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(format!("{} && echo data > {}", remote_bundle_dir_prep(), remote_quote(&unique_remote_bundle())))
+            .env("HOME", home.path())
+            .status()
+            .unwrap();
+        assert!(!status.success());
+        assert_eq!(std::fs::read_dir(elsewhere.path()).unwrap().count(), 0, "nothing written through the link");
+        let mode = std::fs::metadata(elsewhere.path()).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o755, "the link target keeps its mode");
     }
 
     #[test]

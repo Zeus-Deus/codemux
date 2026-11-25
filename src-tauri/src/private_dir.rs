@@ -51,11 +51,13 @@ fn candidate_roots() -> Vec<PathBuf> {
 
 /// `<root>/<app>/<name>` once every directory on the way is safe.
 ///
-/// On Unix the root is resolved and it and each of its ancestors must be a
-/// directory owned by root or this user that others cannot write to (a
-/// sticky directory such as `/tmp` is fine, since others cannot rename what
-/// this user puts there). Otherwise someone else could swap the folders below
-/// it after they pass their checks.
+/// On Unix the part of the root that already exists is resolved first, and
+/// it and each of its ancestors must be a directory owned by root or this
+/// user that others cannot write to (a sticky directory such as `/tmp` is
+/// fine, since others cannot rename what this user puts there). Otherwise
+/// someone else could swap the folders below it after they pass their
+/// checks. Only then are the missing folders created, one level at a time
+/// and without following symlinks, each checked before the next.
 fn private_dir_under(root: &Path, name: &str) -> io::Result<PathBuf> {
     if !root.is_absolute() {
         return Err(io::Error::new(
@@ -64,16 +66,52 @@ fn private_dir_under(root: &Path, name: &str) -> io::Result<PathBuf> {
         ));
     }
     #[cfg(unix)]
-    let root = {
-        use std::os::unix::fs::DirBuilderExt;
-        std::fs::DirBuilder::new().recursive(true).mode(0o700).create(root)?;
-        let root = std::fs::canonicalize(root)?;
-        for ancestor in root.ancestors() {
-            check_trusted_ancestor(ancestor)?;
-        }
-        root
-    };
+    let root = verified_root(root)?;
     ensure_private_dir(&root.join(crate::APP_DIR_NAME), name)
+}
+
+/// Resolve and check the existing part of `root`, then create the rest.
+#[cfg(unix)]
+fn verified_root(root: &Path) -> io::Result<PathBuf> {
+    use std::path::Component;
+    let mut existing = root;
+    let mut missing = Vec::new();
+    loop {
+        match std::fs::symlink_metadata(existing) {
+            Ok(_) => break,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                let (Some(parent), Some(Component::Normal(last))) =
+                    (existing.parent(), existing.components().next_back())
+                else {
+                    return Err(error);
+                };
+                missing.push(last.to_owned());
+                existing = parent;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    let mut dir = std::fs::canonicalize(existing)?;
+    for ancestor in dir.ancestors() {
+        check_trusted_ancestor(ancestor)?;
+    }
+    for component in missing.into_iter().rev() {
+        dir.push(component);
+        create_dir_once(&dir)?;
+        check_owned(&dir, 0o022)?;
+    }
+    Ok(dir)
+}
+
+/// `mkdir` one level, owner-only. An existing entry is left for the caller
+/// to check; `mkdir` never follows a symlink in the last component.
+#[cfg(unix)]
+fn create_dir_once(path: &Path) -> io::Result<()> {
+    use std::os::unix::fs::DirBuilderExt;
+    match std::fs::DirBuilder::new().mode(0o700).create(path) {
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => Ok(()),
+        other => other,
+    }
 }
 
 #[cfg(unix)]
@@ -99,24 +137,24 @@ fn check_trusted_ancestor(path: &Path) -> io::Result<()> {
 /// other code created. The new directory must not be group- or
 /// world-writable, since others may already have put files in it; this code
 /// always creates it 0700, and sets it to 0700 again in case it was widened.
+/// Each level is created on its own and checked before anything is created
+/// inside it; the caller vouches for the folder that holds `parent`.
 pub(crate) fn ensure_private_dir(parent: &Path, name: &str) -> io::Result<PathBuf> {
     let dir = parent.join(name);
-    let mut builder = std::fs::DirBuilder::new();
-    builder.recursive(true);
     #[cfg(unix)]
     {
-        use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
-        builder.mode(0o700);
-        builder.create(&dir)?;
-        // Tighten the parent first so nobody can swap the child after its
-        // check.
+        use std::os::unix::fs::PermissionsExt;
+        create_dir_once(parent)?;
+        // Tighten the parent before creating inside it, so nobody can swap
+        // the child after its check.
         check_owned(parent, 0o002)?;
         std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700))?;
+        create_dir_once(&dir)?;
         check_owned(&dir, 0o022)?;
         std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))?;
     }
     #[cfg(not(unix))]
-    builder.create(&dir)?;
+    std::fs::create_dir_all(&dir)?;
     Ok(dir)
 }
 
@@ -214,6 +252,7 @@ mod tests {
         assert!(ensure_private_dir(root.path(), "shared").is_err());
         assert_eq!(mode(&shared), 0o777, "a refused directory is left alone");
         assert!(ensure_private_dir(&shared, "inner").is_err());
+        assert!(!shared.join("inner").exists(), "nothing is created under a refused parent");
 
         let elsewhere = tempfile::tempdir().unwrap();
         std::os::unix::fs::symlink(elsewhere.path(), root.path().join("link")).unwrap();
@@ -256,6 +295,39 @@ mod tests {
         assert_eq!(dir, good.join(crate::APP_DIR_NAME).join("things"));
         assert_eq!(mode(&dir), 0o700);
         assert_eq!(mode(&good.join(crate::APP_DIR_NAME)), 0o700);
+    }
+
+    #[test]
+    fn nothing_is_created_below_a_root_others_can_write() {
+        let base = tempfile::tempdir().unwrap();
+        let open = base.path().join("open");
+        std::fs::create_dir(&open).unwrap();
+        std::fs::set_permissions(&open, std::fs::Permissions::from_mode(0o777)).unwrap();
+        assert!(private_dir_under(&open.join("runtime/deeper"), "things").is_err());
+        assert!(!open.join("runtime").exists(), "checks run before anything is created");
+    }
+
+    #[test]
+    fn missing_root_folders_are_created_owner_only() {
+        let base = tempfile::tempdir().unwrap();
+        let root = base.path().join("cache/nested");
+        let dir = private_dir_under(&root, "things").unwrap();
+        let base = std::fs::canonicalize(base.path()).unwrap();
+        assert_eq!(dir, base.join("cache/nested").join(crate::APP_DIR_NAME).join("things"));
+        assert_eq!(mode(&base.join("cache")), 0o700);
+        assert_eq!(mode(&base.join("cache/nested")), 0o700);
+    }
+
+    #[test]
+    fn a_symlink_planted_for_a_missing_root_folder_is_refused() {
+        let base = tempfile::tempdir().unwrap();
+        let elsewhere = tempfile::tempdir().unwrap();
+        // The root's last folder already exists as a symlink: it resolves,
+        // so the target is checked like any root. A symlink further down is
+        // refused because the app folder must be a real directory.
+        std::os::unix::fs::symlink(elsewhere.path(), base.path().join(crate::APP_DIR_NAME)).unwrap();
+        assert!(private_dir_under(base.path(), "things").is_err());
+        assert!(!elsewhere.path().join("things").exists());
     }
 
     #[test]
