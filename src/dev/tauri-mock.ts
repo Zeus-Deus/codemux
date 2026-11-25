@@ -5077,6 +5077,8 @@ const handlers: Record<string, Handler> = {
   // Toolbar/viewport/inspector commands shell out to the CLI in the
   // real app; the mock accepts and ignores them.
   agent_browser_run: () => null,
+  agent_browser_pending_confirmation: () => null,
+  agent_browser_respond_confirmation: () => null,
 
   // The right-panel deck's browser pane hosts the workspace's ONE agent
   // browser session. The mock mirrors the real

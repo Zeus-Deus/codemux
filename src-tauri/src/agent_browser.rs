@@ -4652,12 +4652,12 @@ mod tests {
         let native = browser_open_command("/tmp/my browser/agent-browser", session, 9223).unwrap();
         assert_eq!(native.get_program(), std::ffi::OsStr::new("/tmp/my browser/agent-browser"));
         let args: Vec<_> = native.get_args().map(|arg| arg.to_string_lossy().into_owned()).collect();
-        assert_eq!(args, ["open", "about:blank", "--session", session]);
+        assert_eq!(args, ["open", "about:blank", "--json", "--session", session]);
 
         let npx = browser_open_command("npx agent-browser", session, 9223).unwrap();
         assert_eq!(npx.get_program(), std::ffi::OsStr::new("npx"));
         let args: Vec<_> = npx.get_args().map(|arg| arg.to_string_lossy().into_owned()).collect();
-        assert_eq!(args, ["agent-browser", "open", "about:blank", "--session", session]);
+        assert_eq!(args, ["agent-browser", "open", "about:blank", "--json", "--session", session]);
 
         assert!(browser_open_command("/tmp/my browser/agent-browser", "browser-'$(id);x", 9223).is_err());
     }
