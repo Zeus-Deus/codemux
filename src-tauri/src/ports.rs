@@ -786,7 +786,8 @@ fn run_docker_ps() -> Option<String> {
             None
         }
         Err(crate::git_provider::exec::TimedFailure::Wait(_))
-        | Err(crate::git_provider::exec::TimedFailure::Timeout) => None,
+        | Err(crate::git_provider::exec::TimedFailure::Timeout)
+        | Err(crate::git_provider::exec::TimedFailure::OutputTooLarge { .. }) => None,
     }
 }
 

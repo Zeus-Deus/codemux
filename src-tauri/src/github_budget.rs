@@ -9,7 +9,9 @@ use std::path::{Path, PathBuf};
 use std::sync::{Condvar, Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use crate::git_provider::exec::{TimedFailure, TimedOutput};
+use crate::git_provider::exec::{
+    capture_pipe, CapturedPipe, TimedFailure, TimedOutput, MAX_CAPTURE_BYTES,
+};
 
 #[path = "github_http.rs"]
 mod http;
@@ -1297,6 +1299,9 @@ fn execute(
         TimedFailure::Timeout => format!("gh command timed out after {}s", timeout.as_secs()),
         TimedFailure::Spawn(_) => "Failed to start GitHub CLI".into(),
         TimedFailure::Wait(_) => "Failed to wait for GitHub CLI".into(),
+        TimedFailure::OutputTooLarge { stream, limit_bytes } => {
+            format!("gh {stream} exceeded the {} MiB output limit", limit_bytes / (1024 * 1024))
+        }
     })?;
     output_result(args, output)
 }
@@ -1698,11 +1703,8 @@ fn run_with_stdin(
     let drain = |pipe: Option<Box<dyn Read + Send>>| {
         let (tx, rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
-            let mut bytes = Vec::new();
-            if let Some(mut pipe) = pipe {
-                let _ = pipe.read_to_end(&mut bytes);
-            }
-            let _ = tx.send(String::from_utf8_lossy(&bytes).into_owned());
+            let captured = pipe.map(capture_pipe).unwrap_or_default();
+            let _ = tx.send(captured);
         });
         rx
     };
@@ -1725,14 +1727,22 @@ fn run_with_stdin(
                     .recv_timeout(deadline.saturating_duration_since(Instant::now()))
                     .map_err(|_| TimedFailure::Timeout)?;
                 written.map_err(TimedFailure::Wait)?;
+                let stdout: CapturedPipe = out
+                    .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+                    .map_err(|_| TimedFailure::Timeout)?;
+                let stderr: CapturedPipe = err
+                    .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+                    .map_err(|_| TimedFailure::Timeout)?;
+                if stdout.exceeded_limit || stderr.exceeded_limit {
+                    return Err(TimedFailure::OutputTooLarge {
+                        stream: if stdout.exceeded_limit { "stdout" } else { "stderr" },
+                        limit_bytes: MAX_CAPTURE_BYTES,
+                    });
+                }
                 return Ok(TimedOutput {
                     success: status.success(),
-                    stdout: out
-                        .recv_timeout(deadline.saturating_duration_since(Instant::now()))
-                        .map_err(|_| TimedFailure::Timeout)?,
-                    stderr: err
-                        .recv_timeout(deadline.saturating_duration_since(Instant::now()))
-                        .map_err(|_| TimedFailure::Timeout)?,
+                    stdout: String::from_utf8_lossy(&stdout.bytes).into_owned(),
+                    stderr: String::from_utf8_lossy(&stderr.bytes).into_owned(),
                 });
             }
             Ok(None) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(5)),
@@ -3368,5 +3378,28 @@ mod tests {
             .unwrap();
         // Our runner owns this PID and has reaped it before returning.
         assert_eq!(unsafe { libc::kill(pid, 0) }, -1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stdin_runner_rejects_oversized_stdout_and_stderr() {
+        for (stream, redirect) in [("stdout", ""), ("stderr", " 1>&2")] {
+            let mut command = std::process::Command::new("/bin/sh");
+            command.args([
+                "-c",
+                &format!(
+                    "head -c {} /dev/zero{redirect}",
+                    MAX_CAPTURE_BYTES + 200_000
+                ),
+            ]);
+            let result = run_with_stdin(command, "", Duration::from_secs(20));
+            match result {
+                Err(TimedFailure::OutputTooLarge { stream: actual, limit_bytes }) => {
+                    assert_eq!(actual, stream);
+                    assert_eq!(limit_bytes, MAX_CAPTURE_BYTES);
+                }
+                _ => panic!("{stream} overflow was not reported"),
+            }
+        }
     }
 }

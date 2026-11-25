@@ -197,6 +197,9 @@ fn glab_failure(failure: TimedFailure, timeout: Duration) -> String {
         TimedFailure::Timeout => {
             format!("glab command timed out after {}s", timeout.as_secs())
         }
+        TimedFailure::OutputTooLarge { stream, limit_bytes } => {
+            format!("glab {stream} exceeded the {} MiB output limit", limit_bytes / (1024 * 1024))
+        }
     }
 }
 
@@ -2205,6 +2208,15 @@ impl GitLabProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn oversized_cli_output_has_a_bounded_diagnostic() {
+        let message = glab_failure(
+            TimedFailure::OutputTooLarge { stream: "stderr", limit_bytes: 8 * 1024 * 1024 },
+            CALL_TIMEOUT,
+        );
+        assert_eq!(message, "glab stderr exceeded the 8 MiB output limit");
+    }
 
     fn provider() -> GitLabProvider {
         GitLabProvider::from_detection(&DetectedProvider {
