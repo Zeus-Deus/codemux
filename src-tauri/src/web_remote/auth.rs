@@ -537,7 +537,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn account_switch_and_logout_revoke_only_account_browsers() {
+    async fn new_account_signin_and_logout_revoke_only_account_browsers() {
         let db = init_test_database();
         let mut user = crate::auth::AuthUser {
             id: "first-owner".into(),
@@ -555,9 +555,14 @@ mod tests {
         ).unwrap();
         let first = AccountSessionGuard::new(&db, "first").unwrap();
 
-        crate::auth::save_auth(&db, "refreshed-account-token", expires_at, Some(&user)).unwrap();
+        crate::auth::load_auth_record(&db).unwrap()
+            .save_verified_user(&db, &user).unwrap().unwrap();
         assert!(first.active());
         assert!(authenticate(&db, "first-browser").is_some());
+
+        crate::auth::save_auth(&db, "new-account-token", expires_at, Some(&user)).unwrap();
+        assert!(!first.active());
+        assert!(authenticate(&db, "first-browser").is_none());
 
         user.id = "second-owner".into();
         crate::auth::save_auth(&db, "other-account-token", expires_at, Some(&user)).unwrap();

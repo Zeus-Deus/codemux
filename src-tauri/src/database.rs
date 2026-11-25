@@ -272,6 +272,10 @@ const SCHEMA_VERSION: u32 = 25;
 pub struct DatabaseStore {
     conn: Mutex<Connection>,
     rejected_auth_records: Mutex<HashSet<Vec<u8>>>,
+    // Browser sessions cannot trust a cached account merely because its
+    // encrypted token survived a prior process. Verification is process-local
+    // so a failed durable 401 revocation never revives on restart.
+    verified_account_auth_records: Mutex<HashSet<Vec<u8>>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1584,6 +1588,7 @@ impl DatabaseStore {
         Self {
             conn: Mutex::new(conn),
             rejected_auth_records: Mutex::new(HashSet::new()),
+            verified_account_auth_records: Mutex::new(HashSet::new()),
         }
     }
 
@@ -6100,28 +6105,43 @@ impl DatabaseStore {
         Ok(())
     }
 
-    fn current_auth_is_rejected(&self, conn: &Connection) -> Result<bool, String> {
-        let current: Option<Vec<u8>> = conn
-            .query_row("SELECT encrypted_data FROM auth_tokens WHERE id = 1", [], |row| row.get(0))
-            .optional()
-            .map_err(|error| format!("Failed to read current auth record: {error}"))?;
-        Ok(current.is_some_and(|record| self.rejected_auth_records.lock().unwrap().contains(&record)))
-    }
-
     pub fn save_auth_token(&self, encrypted_data: &[u8]) -> Result<(), String> {
-        self.replace_auth_token(encrypted_data, None, None)
+        self.replace_auth_token(encrypted_data, None)
             .map(|_| ())
     }
 
-    /// Save the verified owner and revoke another account's browser access
-    /// in the same transaction. Pairing-code sessions belong to the host.
+    /// A new sign-in revokes prior account browsers, including browsers of the
+    /// same account. A previous process may have rejected the old host token
+    /// while SQLite was unwritable, so preserving those rows could revive
+    /// them after this new token is verified. Pairing-code sessions remain.
     pub(crate) fn save_auth_token_for_account(
         &self,
         encrypted_data: &[u8],
-        account_id: &str,
     ) -> Result<(), String> {
-        self.replace_auth_token(encrypted_data, Some(account_id), None)
-            .map(|_| ())
+        self.replace_auth_token(encrypted_data, None)?;
+        self.mark_account_auth_verified_if_current(encrypted_data);
+        Ok(())
+    }
+
+    /// A successful authoritative account check may activate only the exact
+    /// record it checked. A concurrent sign-out or sign-in changes that blob.
+    pub(crate) fn mark_account_auth_verified_if_current(&self, expected: &[u8]) -> bool {
+        let conn = self.conn.lock().unwrap();
+        let current: bool = conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM auth_tokens WHERE id = 1 AND encrypted_data = ?1)",
+                params![expected],
+                |row| row.get(0),
+            )
+            .unwrap_or(false);
+        if !current || self.rejected_auth_records.lock().unwrap().contains(expected) {
+            return false;
+        }
+        self.verified_account_auth_records
+            .lock()
+            .unwrap()
+            .insert(expected.to_vec());
+        true
     }
 
     pub(crate) fn auth_session_revision(&self) -> Result<i64, String> {
@@ -6141,13 +6161,12 @@ impl DatabaseStore {
         encrypted_data: &[u8],
         expected_revision: i64,
     ) -> Result<bool, String> {
-        self.replace_auth_token(encrypted_data, None, Some(expected_revision))
+        self.replace_auth_token(encrypted_data, Some(expected_revision))
     }
 
     fn replace_auth_token(
         &self,
         encrypted_data: &[u8],
-        account_id: Option<&str>,
         expected_revision: Option<i64>,
     ) -> Result<bool, String> {
         let mut conn = self.conn.lock().unwrap();
@@ -6155,14 +6174,7 @@ impl DatabaseStore {
         if !Self::advance_auth_revision(&transaction, expected_revision)? {
             return Ok(false);
         }
-        let rejected = self.current_auth_is_rejected(&transaction)?;
-        // A new sign-in cannot revive account browser sessions that were
-        // suspended after a rejected token could not be durably cleared.
-        if rejected {
-            Self::revoke_account_sessions(&transaction, None)?;
-        } else if let Some(account_id) = account_id {
-            Self::revoke_account_sessions(&transaction, Some(account_id))?;
-        }
+        Self::revoke_account_sessions(&transaction, None)?;
         Self::write_auth_token(&transaction, encrypted_data)?;
         transaction.commit().map_err(|error| error.to_string())?;
         Ok(true)
@@ -6241,13 +6253,16 @@ impl DatabaseStore {
         encrypted_data: &[u8],
         account_id: Option<&str>,
     ) -> Result<bool, String> {
-        self.with_current_auth(expected, None, false, |conn| {
+        let updated = self.with_current_auth(expected, None, false, |conn| {
             if let Some(account_id) = account_id {
                 Self::revoke_account_sessions(conn, Some(account_id))?;
             }
             Self::write_auth_token(conn, encrypted_data)
-        })
-        .map(|updated| updated.is_some())
+        })?.is_some();
+        if updated && account_id.is_some() {
+            self.mark_account_auth_verified_if_current(encrypted_data);
+        }
+        Ok(updated)
     }
 
     fn revoke_account_sessions(conn: &Connection, except: Option<&str>) -> Result<(), String> {
@@ -6284,6 +6299,8 @@ impl DatabaseStore {
         if !matches
             || (!allow_rejected
                 && self.rejected_auth_records.lock().unwrap().contains(expected))
+            || (active_account.is_some()
+                && !self.verified_account_auth_records.lock().unwrap().contains(expected))
             || active_account.is_some_and(|account| {
                 crate::auth::active_account_id_from_record(expected).as_deref() != Some(account)
             })
@@ -6323,6 +6340,7 @@ impl DatabaseStore {
         // Even if SQLite cannot start or commit the revocation transaction,
         // reject this record for local and account-browser access now.
         self.rejected_auth_records.lock().unwrap().insert(expected.to_vec());
+        self.verified_account_auth_records.lock().unwrap().remove(expected);
         self.with_current_auth(expected, None, true, |conn| {
             Self::require_persistent_auth_connection(conn)?;
             Self::erase_auth_record(conn)
@@ -6508,8 +6526,12 @@ impl DatabaseStore {
         .optional()
         .map_err(|error| format!("Failed to read remote session: {error}"))?;
         let rejected = self.rejected_auth_records.lock().unwrap();
+        let verified = self.verified_account_auth_records.lock().unwrap();
         Ok(result.map(|(session, record)| {
-            let record = record.filter(|bytes| !rejected.contains(bytes));
+            let record = record.filter(|bytes| {
+                !rejected.contains(bytes)
+                    && (session.source != "account" || verified.contains(bytes))
+            });
             (session, record)
         }))
     }
@@ -6620,6 +6642,33 @@ mod tests {
     use super::*;
 
     #[test]
+    fn account_browser_requires_fresh_host_verification_after_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("auth.sqlite");
+        let browser_token = "browser-token";
+        let browser_hash = crate::web_remote::auth::sha256_hex(browser_token);
+        let user = crate::auth::AuthUser {
+            id: "owner".into(),
+            email: "owner@example.test".into(),
+            name: None,
+            image: None,
+        };
+        let db = DatabaseStore::test_file(&path);
+        crate::auth::save_auth(&db, "host-token", "2099-01-01T00:00:00Z", Some(&user)).unwrap();
+        db.web_remote_insert_account_session(
+            "account-browser", None, None, &browser_hash, true, &user.id,
+        ).unwrap();
+        assert!(crate::web_remote::auth::authenticate(&db, browser_token).is_some());
+        drop(db);
+
+        let reopened = DatabaseStore::test_file(&path);
+        assert!(crate::web_remote::auth::authenticate(&reopened, browser_token).is_none());
+        let auth_record = reopened.load_auth_token().unwrap();
+        assert!(reopened.mark_account_auth_verified_if_current(&auth_record));
+        assert!(crate::web_remote::auth::authenticate(&reopened, browser_token).is_some());
+    }
+
+    #[test]
     fn failed_account_revocation_leaves_auth_and_sessions_intact() {
         let db = init_test_database();
         db.save_auth_token(b"sign-in fixture").unwrap();
@@ -6716,6 +6765,8 @@ mod tests {
         assert_eq!(admit_relay("stale-relay", &first), None);
         assert_eq!(desktop.load_auth_token(), Some(current.clone()));
         assert!(desktop.web_remote_get_session("old-relay").unwrap().revoked);
+        assert_eq!(admit_relay("new-relay", &current), None);
+        assert!(desktop.mark_account_auth_verified_if_current(&current));
         assert_eq!(admit_relay("new-relay", &current), Some(("new-relay".into(), false)));
         assert!(desktop.web_remote_insert_account_session_if_unchanged(
             "new-direct", None, None, "new-hash", true, &owner.id, &current,
@@ -8168,8 +8219,8 @@ mod tests {
         for account_id in [None, Some("account-1")] {
             let db = init_test_database();
             match account_id {
-                Some(account_id) => db
-                    .save_auth_token_for_account(b"cached session", account_id)
+                Some(_) => db
+                    .save_auth_token_for_account(b"cached session")
                     .unwrap(),
                 None => db.save_auth_token(b"cached session").unwrap(),
             }

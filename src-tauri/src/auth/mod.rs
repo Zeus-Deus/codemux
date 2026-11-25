@@ -108,6 +108,10 @@ pub(crate) struct AuthRecord {
 }
 
 impl AuthRecord {
+    pub(crate) fn encrypted(&self) -> &[u8] {
+        &self.encrypted
+    }
+
     fn new(
         token: &str,
         expires_at: &str,
@@ -503,7 +507,7 @@ pub(crate) fn save_auth_with_method(
 ) -> Result<AuthRecord, String> {
     let record = AuthRecord::new(token, expires_at, user, method)?;
     match user {
-        Some(user) => db.save_auth_token_for_account(&record.encrypted, &user.id)?,
+        Some(_) => db.save_auth_token_for_account(&record.encrypted)?,
         None => db.save_auth_token(&record.encrypted)?,
     }
     Ok(record)
@@ -1064,6 +1068,52 @@ mod tests {
         ).unwrap();
         assert_eq!(load_token(&db).unwrap().0, "new-token");
         assert!(db.web_remote_get_session("account-browser").unwrap().revoked);
+    }
+
+    #[test]
+    fn failed_unauthorized_clear_stays_suspended_after_reopen_until_retry_commits() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("auth.sqlite");
+        let user = AuthUser {
+            id: "account-1".into(),
+            email: "test@example.com".into(),
+            name: None,
+            image: None,
+        };
+        let db = DatabaseStore::test_file(&db_path);
+        let record = save_auth_with_method(
+            &db, "invalid-token", "2099-01-01T00:00:00Z", Some(&user), Some("email"),
+        ).unwrap();
+        let browser_token = "browser-token";
+        let browser_hash = crate::web_remote::auth::sha256_hex(browser_token);
+        db.web_remote_insert_account_session(
+            "account-browser", None, None, &browser_hash, true, &user.id,
+        ).unwrap();
+        rusqlite::Connection::open(&db_path).unwrap().execute_batch(
+            "CREATE TRIGGER reject_auth_clear BEFORE DELETE ON auth_tokens
+             BEGIN SELECT RAISE(ABORT, 'fixture rejected clear'); END;",
+        ).unwrap();
+        assert!(db.clear_auth_token_if_current(&record.encrypted).is_err());
+        assert!(crate::web_remote::auth::authenticate(&db, browser_token).is_none());
+        drop(db);
+
+        let reopened = DatabaseStore::test_file(&db_path);
+        assert!(!reopened.web_remote_get_session("account-browser").unwrap().revoked);
+        assert!(crate::web_remote::auth::authenticate(&reopened, browser_token).is_none());
+        assert!(!reopened.web_remote_insert_account_session_if_unchanged(
+            "new-browser", None, None, "new-hash", true, &user.id, &record.encrypted,
+        ).unwrap());
+
+        rusqlite::Connection::open(&db_path).unwrap()
+            .execute_batch("DROP TRIGGER reject_auth_clear")
+            .unwrap();
+        assert!(reopened.clear_auth_token_if_current(&record.encrypted).unwrap());
+        drop(reopened);
+
+        let recovered = DatabaseStore::test_file(&db_path);
+        assert!(recovered.load_auth_token().is_none());
+        assert!(recovered.web_remote_get_session("account-browser").unwrap().revoked);
+        assert!(crate::web_remote::auth::authenticate(&recovered, browser_token).is_none());
     }
 
     #[test]

@@ -1,5 +1,5 @@
 use std::time::Instant;
-use tauri::{Emitter, State};
+use tauri::{Emitter, Manager, State};
 
 use crate::auth::{
     api_base_url, derive_auth_secret, is_token_expired, load_auth_record,
@@ -82,6 +82,71 @@ async fn verify_token(token: &str) -> VerifyOutcome {
             VerifyOutcome::Unauthorized
         }
         Ok(_) | Err(_) => VerifyOutcome::Offline,
+    }
+}
+
+/// A new backend process must not trust old account browser sessions until
+/// the account API has validated this host's exact stored token. This also
+/// keeps a rejected token suspended after a previous process could not write
+/// its revocation to SQLite. Offline verification leaves browsers suspended.
+pub(crate) async fn verify_stored_account_for_remote(db: &DatabaseStore) {
+    let Some(record) = load_auth_record(db) else {
+        return;
+    };
+    if record.stored.user.is_none() {
+        return;
+    }
+    loop {
+        if !record.is_current(db) {
+            return;
+        }
+        let outcome = if is_token_expired(&record.stored.expires_at) {
+            VerifyOutcome::Unauthorized
+        } else {
+            verify_token(&record.stored.token).await
+        };
+        match outcome {
+            VerifyOutcome::Verified(user) => {
+                if record.stored.user.as_ref().is_some_and(|cached| cached.id == user.id) {
+                    db.mark_account_auth_verified_if_current(record.encrypted());
+                    return;
+                }
+                // A different server-side owner invalidates this host's old
+                // browser rows. Require a new sign-in for the new identity.
+                if let Err(error) = db.clear_auth_token_if_current(record.encrypted()) {
+                    log::warn!("[auth] Could not persist changed account revocation: {error}");
+                    retry_rejected_auth_revocation(db, record.encrypted()).await;
+                }
+                return;
+            }
+            VerifyOutcome::Unauthorized => {
+                if let Err(error) = db.clear_auth_token_if_current(record.encrypted()) {
+                    log::warn!("[auth] Could not persist rejected account revocation: {error}");
+                    retry_rejected_auth_revocation(db, record.encrypted()).await;
+                }
+                return;
+            }
+            VerifyOutcome::Offline => {}
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+    }
+}
+
+async fn retry_rejected_auth_revocation(db: &DatabaseStore, expected: &[u8]) {
+    let mut delay = std::time::Duration::from_secs(5);
+    loop {
+        tokio::time::sleep(delay).await;
+        match db.clear_auth_token_if_current(expected) {
+            Ok(_) => return,
+            Err(error) => {
+                log::warn!("[auth] Retrying rejected account revocation: {error}");
+                // An in-memory fallback has no durable database to recover.
+                if db.require_persistent_auth_storage().is_err() {
+                    return;
+                }
+            }
+        }
+        delay = (delay * 2).min(std::time::Duration::from_secs(60));
     }
 }
 
@@ -310,12 +375,21 @@ pub async fn refresh_session<R: tauri::Runtime>(
             Ok(refresh.unwrap_or_else(|| current_local_refresh(&db, &auth_state)))
         }
         VerifyOutcome::Unauthorized => {
-            if auth_state.clear_session_if_current(&db, session_generation, &record, || {
+            let cleared = auth_state.clear_session_if_current(&db, session_generation, &record, || {
                 emit_signed_out(&app);
-            })? {
-                Ok(signed_out_refresh())
-            } else {
-                Ok(current_local_refresh(&db, &auth_state))
+            });
+            match cleared {
+                Ok(true) => Ok(signed_out_refresh()),
+                Ok(false) => Ok(current_local_refresh(&db, &auth_state)),
+                Err(error) => {
+                    let app = app.clone();
+                    let expected = record.encrypted().to_vec();
+                    tauri::async_runtime::spawn(async move {
+                        let db = app.state::<DatabaseStore>();
+                        retry_rejected_auth_revocation(&db, &expected).await;
+                    });
+                    Err(error)
+                }
             }
         }
         VerifyOutcome::Offline => {
@@ -606,6 +680,26 @@ struct VerifyResp {
 mod tests {
     use super::*;
 
+    struct ApiUrlGuard(Option<std::ffi::OsString>);
+
+    impl ApiUrlGuard {
+        fn set(url: &str) -> Self {
+            let previous = std::env::var_os("CODEMUX_API_URL");
+            std::env::set_var("CODEMUX_API_URL", url);
+            Self(previous)
+        }
+    }
+
+    impl Drop for ApiUrlGuard {
+        fn drop(&mut self) {
+            if let Some(previous) = &self.0 {
+                std::env::set_var("CODEMUX_API_URL", previous);
+            } else {
+                std::env::remove_var("CODEMUX_API_URL");
+            }
+        }
+    }
+
     fn cached_user() -> AuthUser {
         AuthUser {
             id: "u1".into(),
@@ -613,6 +707,39 @@ mod tests {
             name: None,
             image: None,
         }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(mockserver)]
+    async fn fresh_host_verification_restores_account_browser_after_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("auth.sqlite");
+        let browser_token = "browser-token";
+        let db = DatabaseStore::test_file(&path);
+        crate::auth::save_auth(
+            &db, "host-token", "2099-01-01T00:00:00Z", Some(&cached_user()),
+        ).unwrap();
+        db.web_remote_insert_account_session(
+            "account-browser", None, None,
+            &crate::web_remote::auth::sha256_hex(browser_token), true, "u1",
+        ).unwrap();
+        drop(db);
+
+        let reopened = DatabaseStore::test_file(&path);
+        assert!(crate::web_remote::auth::authenticate(&reopened, browser_token).is_none());
+        let mut server = mockito::Server::new_async().await;
+        let mock = server.mock("GET", "/api/auth/desktop/verify")
+            .match_header("authorization", "Bearer host-token")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(serde_json::json!({
+                "user": { "id": "u1", "email": "u1@example.com", "name": null, "image": null }
+            }).to_string())
+            .create_async().await;
+        let _api = ApiUrlGuard::set(&server.url());
+        verify_stored_account_for_remote(&reopened).await;
+        mock.assert_async().await;
+        assert!(crate::web_remote::auth::authenticate(&reopened, browser_token).is_some());
     }
 
     #[test]
