@@ -11,15 +11,14 @@
 //! | 2 | persist `enabled` + `relay_mode_enabled` | [`super::update_config_headless`] while no backend owns the config |
 //! | 3 | keep it running across logout/reboot | a systemd **user** unit running `codemux serve` |
 //!
-//! ## Why step 3 branches on a running instance
+//! ## Why a running instance is rejected
 //!
 //! `codemux serve` refuses to start when a GUI or another `serve` already
 //! holds this machine's control endpoint (they would fight over the DB, the
 //! PTY daemon, and the web-remote port). Installing a unit next to a running
 //! desktop app would therefore produce a service that fails on every start.
-//! The running-instance branch still exists, but the control socket now
-//! refuses its Admin requests. Change access in desktop Settings, or stop a
-//! manually started backend before using the headless CLI.
+//! The control socket refuses Admin requests. Change access in desktop
+//! Settings, or stop a manually started backend before using the headless CLI.
 //!
 //! ## Why the config write is split the same way
 //!
@@ -27,10 +26,11 @@
 //! change; a direct settings-row write would be silently clobbered by the next
 //! toggle. With nothing running there is no such owner, so the headless
 //! load-modify-save in [`super::update_config_headless`] is the only way to
-//! configure a box *before* anything is up. `connect off` stops an active
-//! managed service when systemd is available, then takes the layout lock
-//! before using that local write path. Without a user bus, it still disables
-//! relay once ownership is clear and reports the unit left installed.
+//! configure a box *before* anything is up. `connect` checks layout ownership
+//! before login and holds the layout lock through that write. `connect off`
+//! stops an active managed service when systemd is available, then takes the
+//! same lock before using that local write path. Without a user bus, it still
+//! disables relay once ownership is clear and reports the unit left installed.
 //!
 //! ## Relay is config-driven, not flag-driven
 //!
@@ -51,7 +51,9 @@ use std::time::Duration;
 
 use serde_json::{json, Value};
 
-use super::{WebRemoteConfig, DEFAULT_PORT};
+use super::WebRemoteConfig;
+#[cfg(test)]
+use super::DEFAULT_PORT;
 use crate::auth::cli_login;
 use crate::control::{send_control_request, ControlRequest};
 
@@ -955,11 +957,10 @@ fn default_host() -> Option<SystemdUserHost> {
 
 /// `codemux connect [--email …] [--scope …] [--port N]`.
 pub async fn run_connect(opts: ConnectOptions) -> Result<(), String> {
-    // Socket administration is unavailable without independent owner proof.
-    // Refuse a live backend before login can prompt for or persist a session.
-    if crate::control::control_server_reachable() {
-        return Err("A Codemux instance is already running. Change From-anywhere access in desktop Settings, or stop the instance and run `codemux connect` again.".into());
-    }
+    // Do not prompt for credentials when a backend owns this layout but has
+    // not yet opened its control socket. Login can take long enough for a
+    // backend to start, so acquire ownership again before the config write.
+    drop(require_stopped_connect_owner()?);
     let db = crate::database::init_database()?;
 
     // Step 1 — account. Everything downstream (relay registration, discovery
@@ -969,14 +970,10 @@ pub async fn run_connect(opts: ConnectOptions) -> Result<(), String> {
         .identity()
         .to_string();
 
-    let instance_running = crate::control::control_server_reachable();
-
-    // Step 2 — configuration. Exactly one of the two write paths, per the
-    // module note: the running instance owns its in-memory config, so with one
-    // up we go through the control socket and never touch the settings row.
-    let cfg = if instance_running {
-        configure_via_control_socket(opts.scope.clone(), opts.port).await?
-    } else {
+    // Step 2 — configuration. Keep the layout lock through load-modify-save;
+    // a backend that appeared during login must be handled in Settings.
+    let cfg = {
+        let _layout_lock = require_stopped_connect_owner()?;
         super::update_config_headless(&db, |cfg| {
             apply_connect_request(cfg, opts.scope.clone(), opts.port)
         })?
@@ -984,26 +981,20 @@ pub async fn run_connect(opts: ConnectOptions) -> Result<(), String> {
 
     // Step 3 — keep it running.
     let host = default_host();
-    let service = if instance_running {
-        // `serve` refuses to start alongside another instance, so a unit here
-        // would fail on every start. The running instance is already serving.
-        ServiceReport::RunningInstance
-    } else {
-        let host_ref = host.as_ref().map(|h| h as &dyn ServiceHost);
-        match unsupported_reason(host_ref) {
-            Some(reason) => ServiceReport::Unsupported {
-                reason,
-                fallback: manual_fallback(),
-            },
-            None => {
-                let host_ref = host_ref.expect("a supported host exists");
-                let exec = resolve_exec_path()?;
-                let unit = systemd_unit(
-                    &exec.display().to_string(),
-                    std::env::var("CODEMUX_API_URL").ok().as_deref(),
-                );
-                ServiceReport::Installed(install_service(host_ref, &unit)?)
-            }
+    let host_ref = host.as_ref().map(|h| h as &dyn ServiceHost);
+    let service = match unsupported_reason(host_ref) {
+        Some(reason) => ServiceReport::Unsupported {
+            reason,
+            fallback: manual_fallback(),
+        },
+        None => {
+            let host_ref = host_ref.expect("a supported host exists");
+            let exec = resolve_exec_path()?;
+            let unit = systemd_unit(
+                &exec.display().to_string(),
+                std::env::var("CODEMUX_API_URL").ok().as_deref(),
+            );
+            ServiceReport::Installed(install_service(host_ref, &unit)?)
         }
     };
 
@@ -1023,84 +1014,18 @@ pub async fn run_connect(opts: ConnectOptions) -> Result<(), String> {
     Ok(())
 }
 
-/// Configure a RUNNING instance: flip relay mode on, then enable web remote
-/// (with any scope/port). Two calls because they are two different concerns in
-/// the running app — the parallel iroh endpoint and the LAN listener. Relay
-/// goes first because it does not depend on the listener: with it on, a
-/// listener that can't bind (port taken, no tailnet yet) leaves the instance
-/// serving relay-only instead of rolling the whole enable back.
-async fn configure_via_control_socket(
-    scope: Option<String>,
-    port: Option<u16>,
-) -> Result<WebRemoteConfig, String> {
-    // Decide relay-only on the instance's switches BEFORE turning relay mode on
-    // below, which would make a config with neither way in look relay-only. An
-    // instance that can't answer gets the listener, as before.
-    let keep_relay_only = match send_control_request(ControlRequest {
-        command: "web_remote_status".into(),
-        params: json!({}),
-    })
-    .await
-    {
-        Ok(resp) if resp.ok => resp.data.is_some_and(|s| {
-            super::keeps_lan_disabled(
-                s["relay_mode_enabled"].as_bool().unwrap_or(false),
-                s["lan_enabled"].as_bool().unwrap_or(true),
-                false,
-                scope.is_some() || port.is_some(),
-            )
-        }),
-        _ => false,
-    };
+const CONNECT_RUNNING_BACKEND_GUIDANCE: &str = "A Codemux instance already owns this configuration. Change From-anywhere access in desktop Settings, or stop the instance and run `codemux connect` again.";
 
-    let relay = send_control_request(ControlRequest {
-        command: "web_remote_set_relay".into(),
-        params: json!({ "enabled": true }),
-    })
-    .await?;
-    if !relay.ok {
-        return Err(relay
-            .error
-            .unwrap_or_else(|| "the running Codemux instance refused to enable relay mode".into()));
+/// The layout lock covers backends that have not opened a control socket yet.
+/// Check the socket while holding it for older backends using another layout.
+fn require_stopped_connect_owner() -> Result<std::fs::File, String> {
+    let lock = crate::state::acquire_layout_lock().map_err(|error| {
+        format!("Cannot safely configure From-anywhere access: {error} {CONNECT_RUNNING_BACKEND_GUIDANCE}")
+    })?;
+    if crate::control::control_server_reachable() {
+        return Err(CONNECT_RUNNING_BACKEND_GUIDANCE.into());
     }
-
-    // `keep_relay_only`: this is `connect`, not `remote enable`, so a relay-only
-    // setup stays relay-only unless a scope/port flag asks for the listener.
-    let mut params = json!({ "keep_relay_only": keep_relay_only });
-    if let Some(s) = scope {
-        params["scope"] = json!(s);
-    }
-    if let Some(p) = port {
-        params["port"] = json!(p);
-    }
-    let enable = send_control_request(ControlRequest {
-        command: "web_remote_enable".into(),
-        params,
-    })
-    .await?;
-    if !enable.ok {
-        return Err(enable
-            .error
-            .unwrap_or_else(|| "the running Codemux instance refused to enable remote access".into()));
-    }
-
-    // The enable response carries the authoritative post-change status.
-    let data = enable.data.unwrap_or(json!({}));
-    let status = &data["status"];
-    Ok(WebRemoteConfig {
-        enabled: status["enabled"].as_bool().unwrap_or(true),
-        lan_enabled: status["lan_enabled"].as_bool().unwrap_or(true),
-        port: status["port"]
-            .as_u64()
-            .and_then(|p| u16::try_from(p).ok())
-            .unwrap_or(DEFAULT_PORT),
-        bind_scope: status["bind_scope"]
-            .as_str()
-            .unwrap_or(super::BIND_SCOPE_ALL)
-            .to_string(),
-        relay_mode_enabled: status["relay_mode_enabled"].as_bool().unwrap_or(true),
-        ..WebRemoteConfig::default()
-    })
+    Ok(lock)
 }
 
 /// `codemux connect status`.

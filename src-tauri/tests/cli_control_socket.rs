@@ -312,6 +312,28 @@ fn connect_refuses_a_running_backend_before_account_login() {
     assert!(app.requests().is_empty(), "the refusal needs no socket Admin call");
 }
 
+#[test]
+fn connect_refuses_a_layout_owner_without_a_control_socket_before_account_login() {
+    let root = tempfile::tempdir().unwrap();
+    let lock_path = layout_path(root.path()).with_extension("lock");
+    std::fs::create_dir_all(lock_path.parent().unwrap()).unwrap();
+    let lock = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&lock_path)
+        .unwrap();
+    lock.try_lock().unwrap();
+
+    let output = cli_in(root.path(), &["connect"]);
+    assert_eq!(exit_code(&output), 1, "{}", String::from_utf8_lossy(&output.stderr));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("desktop Settings"), "{stderr}");
+    assert!(!stderr.contains("For an account with no password"), "login must not run: {stderr}");
+    assert!(!root.path().join("run").join(SOCKET).exists(), "the fixture has no control endpoint");
+}
+
 // ── Without an app ────────────────────────────────────────────────────────
 
 #[test]
