@@ -368,7 +368,7 @@ fn browser_action_access(action: &Value) -> Access {
     let kind = action.get("kind").and_then(Value::as_str).unwrap_or("open_url");
     let reads = matches!(
         kind,
-        "snapshot" | "accessibility_snapshot" | "screenshot" | "console" | "console_logs" | "get_styles"
+        "snapshot" | "accessibility_snapshot" | "screenshot" | "viewport_status" | "console" | "console_logs" | "get_styles"
             | "wait" | "get_text" | "get_box"
     ) || (kind == "eval"
         && action.get("script").and_then(Value::as_str) == Some(crate::agent_browser::DOM_SNAPSHOT_SCRIPT));
@@ -653,7 +653,7 @@ mod tests {
     #[test]
     fn browser_automation_class_follows_the_action() {
         let access = |action: Value| command_access("browser_automation", &json!({ "action": action }));
-        for kind in ["snapshot", "screenshot", "console", "get_styles", "wait"] {
+        for kind in ["snapshot", "screenshot", "viewport_status", "console", "get_styles", "wait"] {
             assert_eq!(access(json!({ "kind": kind })), Access::Read, "{kind}");
         }
         let dom = json!({ "kind": "eval", "script": crate::agent_browser::DOM_SNAPSHOT_SCRIPT });
