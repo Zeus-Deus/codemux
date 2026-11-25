@@ -716,7 +716,8 @@ pub async fn workspace_push_to_host<R: tauri::Runtime>(
         // workspace runs (the host once this succeeds), resuming its
         // conversation. Every outcome releases the gate.
         let migration =
-            crate::commands::agent_chat::begin_workspace_migration(&app, &workspace_id).await;
+            crate::commands::agent_chat::begin_workspace_migration(&workspace_id).await;
+        crate::commands::agent_chat::stop_workspace_chat_sessions(&app, &workspace_id).await;
         let target_matches = || {
             db.list_hosts().into_iter().any(|current| {
                 current.id == host_id && current.ssh_target == host.ssh_target
@@ -917,11 +918,11 @@ pub async fn workspace_push_to_host<R: tauri::Runtime>(
                 }
 
                 // Restart panes after the remote history and daemon are ready.
+                drop(migration);
                 crate::terminal::spawn_missing_ptys_for_workspace(
                     app.clone(),
                     &workspace_id,
                 );
-                drop(migration);
                 WorkspacePushOutcome {
                     ok: true,
                     message: match tunnel_error {
@@ -1006,7 +1007,7 @@ pub async fn workspace_pull_back_impl<R: tauri::Runtime>(
     // A transfer queued behind another move must use the committed placement.
     #[cfg(unix)]
     let migration =
-        crate::commands::agent_chat::begin_workspace_migration(&app, &workspace_id).await;
+        crate::commands::agent_chat::begin_workspace_migration(&workspace_id).await;
 
     // Resolve State guards in a tight pre-await scope and capture
     // owned values so the State guards drop before any `.await`
@@ -1116,6 +1117,18 @@ pub async fn workspace_pull_back_impl<R: tauri::Runtime>(
         }
         // De-dup while preserving order (uid-keyed == basename when no uid).
         candidate_sources.dedup();
+
+        // The move lock prevents another push or pull from changing the
+        // source. A device can still be edited while its chats shut down.
+        crate::commands::agent_chat::stop_workspace_chat_sessions(&app, &workspace_id).await;
+        if !app
+            .state::<DatabaseStore>()
+            .list_hosts()
+            .iter()
+            .any(|current| current.id == host.id && current.ssh_target == host.ssh_target)
+        {
+            return Err("The saved SSH source changed before the copy.".into());
+        }
 
         // Try each candidate; only a "remote path missing" outcome is
         // worth retrying the next one — success / rsync error / host
@@ -1269,11 +1282,11 @@ pub async fn workspace_pull_back_impl<R: tauri::Runtime>(
                     &workspace_id,
                     "Returning to this device…",
                 );
+                drop(migration);
                 crate::terminal::spawn_missing_ptys_for_workspace(
                     app.clone(),
                     &workspace_id,
                 );
-                drop(migration);
                 WorkspacePullOutcome {
                     ok: true,
                     message: format!("Workspace pulled back from {}", host.name),

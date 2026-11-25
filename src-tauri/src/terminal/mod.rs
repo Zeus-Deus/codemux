@@ -2033,6 +2033,23 @@ fn workspace_pty_env_from_fields(
     vars
 }
 
+#[cfg(unix)]
+async fn terminal_hydration_placement<R: Runtime>(
+    app: &AppHandle<R>,
+    session_id: &str,
+) -> Option<(tokio::sync::OwnedRwLockReadGuard<()>, crate::state::PtyHydrationPlan)> {
+    let state: State<'_, AppStateStore> = app.state();
+    loop {
+        let workspace_id = state.workspace_id_for_terminal_session(session_id)?;
+        let placement =
+            crate::commands::agent_chat::wait_for_workspace_placement(Some(&workspace_id)).await?;
+        let plan = state.pty_hydration_plan_for_session(session_id)?;
+        if plan.workspace.workspace_id == workspace_id {
+            return Some((placement, plan));
+        }
+    }
+}
+
 pub fn spawn_pty_for_session<R: Runtime>(app: AppHandle<R>, session_id: String) {
     // Persistent path: every shell goes through the long-lived
     // `codemux pty-daemon` so closing the app doesn't kill it. The
@@ -2048,24 +2065,17 @@ pub fn spawn_pty_for_session<R: Runtime>(app: AppHandle<R>, session_id: String) 
     #[cfg(unix)]
     {
         if daemon_path_viable() {
-            let app_clone = app.clone();
-            let session_id_clone = session_id.clone();
-            let is_remote = {
-                let state: State<'_, AppStateStore> = app.state();
-                state
-                    .pty_hydration_plan_for_session(&session_id)
-                    .and_then(|plan| plan.workspace.host_id)
-                    .is_some()
-            };
             tauri::async_runtime::spawn(async move {
-                if let Err(error) = daemon_backed::spawn_pty_for_session_via_daemon(
-                    app_clone.clone(),
-                    session_id_clone.clone(),
-                )
-                .await
+                let Some((_placement, plan)) =
+                    terminal_hydration_placement(&app, &session_id).await
+                else {
+                    return;
+                };
+                let is_remote = plan.workspace.host_id.is_some();
+                if let Err(error) =
+                    daemon_backed::spawn_pty_for_session_via_daemon(app.clone(), plan).await
                 {
-                    handle_daemon_spawn_failure(app_clone, session_id_clone, error, is_remote)
-                        .await;
+                    handle_daemon_spawn_failure(app, session_id, error, is_remote).await;
                 }
             });
             return;
@@ -2747,13 +2757,31 @@ fn collect_workspace_session_ids(
 /// `try_reserve_session_spawn`, so re-calling this for an already-active
 /// workspace is a cheap no-op.
 pub fn spawn_missing_ptys_for_workspace<R: Runtime>(app: AppHandle<R>, workspace_id: &str) {
+    #[cfg(unix)]
+    if daemon_path_viable() {
+        let workspace_id = workspace_id.to_string();
+        tauri::async_runtime::spawn(async move {
+            hydrate_workspace_terminals(app, &workspace_id).await;
+        });
+        return;
+    }
+
+    if let Some(plan) = workspace_pty_hydration_plan(&app, workspace_id) {
+        for session in plan.sessions {
+            spawn_pty_for_session(app.clone(), session.session_id);
+        }
+    }
+}
+
+fn workspace_pty_hydration_plan<R: Runtime>(
+    app: &AppHandle<R>,
+    workspace_id: &str,
+) -> Option<crate::state::PtyHydrationPlan> {
     let read_started = std::time::Instant::now();
     let app_state: State<'_, AppStateStore> = app.state();
     let plan = app_state.pty_hydration_plan_for_workspace(workspace_id);
     crate::diagnostics::record_perf_timing("pty.hydration-state-read", read_started.elapsed());
-    let Some(mut plan) = plan else {
-        return;
-    };
+    let mut plan = plan?;
 
     if plan.sessions.len() > MAX_STARTUP_SESSIONS {
         eprintln!(
@@ -2764,46 +2792,43 @@ pub fn spawn_missing_ptys_for_workspace<R: Runtime>(app: AppHandle<R>, workspace
         );
         plan.sessions.truncate(MAX_STARTUP_SESSIONS);
     }
+    Some(plan)
+}
 
-    #[cfg(unix)]
-    if daemon_path_viable() {
-        let is_remote = plan.workspace.host_id.is_some();
-        let pty_state: State<'_, PtyState> = app.state();
-        let missing_session_ids: Vec<String> = plan
-            .sessions
-            .iter()
-            .filter(|session| !is_session_spawn_active(&pty_state.sessions, &session.session_id))
-            .map(|session| session.session_id.clone())
-            .collect();
-        tauri::async_runtime::spawn(async move {
-            use futures_util::StreamExt as _;
-            let failures =
-                match daemon_backed::hydrate_workspace_via_daemon(app.clone(), plan, None).await {
-                    Ok(outcome) => outcome.failures,
-                    // The workspace-level error arrives pre-classified: a
-                    // List timeout against a stalled-but-alive daemon stays
-                    // retry-only for every missing session, while a daemon
-                    // that provably isn't running still falls back locally.
-                    Err(error) => missing_session_ids
-                        .into_iter()
-                        .map(|session_id| (session_id, error.clone()))
-                        .collect(),
-                };
-            futures_util::stream::iter(failures)
-                .for_each_concurrent(4, |(session_id, error)| {
-                    let app = app.clone();
-                    async move {
-                        handle_daemon_spawn_failure(app, session_id, error, is_remote).await;
-                    }
-                })
-                .await;
-        });
+#[cfg(unix)]
+async fn hydrate_workspace_terminals<R: Runtime>(app: AppHandle<R>, workspace_id: &str) {
+    use futures_util::StreamExt as _;
+
+    let _placement =
+        crate::commands::agent_chat::wait_for_workspace_placement(Some(workspace_id)).await;
+    let Some(plan) = workspace_pty_hydration_plan(&app, workspace_id) else {
         return;
-    }
-
-    for session in plan.sessions {
-        spawn_pty_for_session(app.clone(), session.session_id);
-    }
+    };
+    let is_remote = plan.workspace.host_id.is_some();
+    let pty_state: State<'_, PtyState> = app.state();
+    let missing_session_ids: Vec<String> = plan
+        .sessions
+        .iter()
+        .filter(|session| !is_session_spawn_active(&pty_state.sessions, &session.session_id))
+        .map(|session| session.session_id.clone())
+        .collect();
+    let failures = match daemon_backed::hydrate_workspace_via_daemon(app.clone(), plan, None).await {
+        Ok(outcome) => outcome.failures,
+        // A List timeout against a stalled-but-alive daemon stays retry-only
+        // for every missing session. A daemon that is absent permits local fallback.
+        Err(error) => missing_session_ids
+            .into_iter()
+            .map(|session_id| (session_id, error.clone()))
+            .collect(),
+    };
+    futures_util::stream::iter(failures)
+        .for_each_concurrent(4, |(session_id, error)| {
+            let app = app.clone();
+            async move {
+                handle_daemon_spawn_failure(app, session_id, error, is_remote).await;
+            }
+        })
+        .await;
 }
 
 /// Emit a transient `Migrating` lifecycle status for every terminal session in
@@ -3523,6 +3548,11 @@ pub async fn restart_terminal_session<R: Runtime>(
         .map_err(|_| "Invalid terminal restart token".to_string())?;
     // Keep the daemon route even if closing the pane removes its layout entry
     // while the old connection is still handling Close.
+    #[cfg(unix)]
+    let Some((placement, plan)) = terminal_hydration_placement(&app, &session_id).await else {
+        return Ok(false);
+    };
+    #[cfg(not(unix))]
     let Some(plan) = app.state::<AppStateStore>().pty_hydration_plan_for_session(&session_id) else {
         return Ok(false);
     };
@@ -3649,6 +3679,7 @@ pub async fn restart_terminal_session<R: Runtime>(
         let is_remote = plan.workspace.host_id.is_some();
         let sessions = terminal_state.sessions.clone();
         let hydrate = async move {
+            let _placement = placement;
             let result = daemon_backed::hydrate_workspace_via_daemon(app.clone(), plan, Some(reservation)).await;
             let error = match result {
                 Ok(outcome) if outcome.restarted_locally => return true,
@@ -4557,6 +4588,46 @@ fn daemon_path_viable() -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn workspace_activation_waits_for_push_terminal_cleanup() {
+        let app = tauri::test::mock_app();
+        let state = AppStateStore::default();
+        let workspace_id = state.active_workspace_id();
+        let session_id = state.active_terminal_session_id().unwrap().0;
+        // An unconfigured host exercises the remote route without a connection.
+        state.set_workspace_host_id(&workspace_id, Some(1)).unwrap();
+        app.manage(state);
+        app.manage(PtyState::default());
+        app.manage(crate::database::DatabaseStore::new_in_memory());
+        let handle = app.handle();
+        let sessions = &app.state::<PtyState>().inner().sessions;
+        let status = || {
+            with_existing_session_runtime(sessions, &session_id, |runtime| {
+                runtime.last_status.clone()
+            })
+            .unwrap()
+        };
+
+        let migration = crate::commands::agent_chat::begin_workspace_migration(&workspace_id).await;
+        emit_migrating_for_workspace(handle, &workspace_id, "Switching to the device");
+        let mut activation =
+            std::pin::pin!(hydrate_workspace_terminals(handle.clone(), &workspace_id));
+
+        assert!(futures_util::poll!(activation.as_mut()).is_pending());
+        assert!(matches!(status().state, TerminalLifecycleState::Migrating));
+
+        handle
+            .state::<AppStateStore>()
+            .set_workspace_host_id(&workspace_id, Some(2))
+            .unwrap();
+        drop(migration);
+        activation.await;
+        let status = status();
+        assert!(matches!(status.state, TerminalLifecycleState::Failed));
+        assert!(status.message.unwrap().contains("host 2"));
+    }
 
     #[test]
     fn user_terminals_never_carry_an_agent_identity() {
@@ -8379,8 +8450,12 @@ mod tests {
             })
         };
         tokio::time::timeout(Duration::from_secs(3), busy.recv()).await.unwrap().unwrap();
+        let startup_plan = app
+            .state::<AppStateStore>()
+            .pty_hydration_plan_for_session(&startup_session)
+            .unwrap();
         let spawning = tokio::spawn(daemon_backed::spawn_pty_for_session_via_daemon(
-            app.handle().clone(), startup_session,
+            app.handle().clone(), startup_plan,
         ));
         tokio::time::timeout(Duration::from_secs(5), ownership.recv()).await
             .expect("the unrelated spawn should reach its ownership write").unwrap();

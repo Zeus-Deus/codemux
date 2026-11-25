@@ -2781,17 +2781,16 @@ fn record_native_worker_mode<R: Runtime>(
     }
 }
 
-/// Per-workspace gate between push / pull and chat session starts.
+/// Per-workspace gate between push / pull and session starts.
 ///
 /// A move stops the workspace's chats before copying it, but a send or a new
 /// pane during the copy would otherwise place its session from the
 /// still-current `host_id`, start it on the machine being left, and keep
 /// editing there after the move succeeds. Push / pull hold the gate for
-/// writing from before they stop the chats until the destination is
-/// committed ([`begin_workspace_migration`]); every session start holds it
-/// for reading from resolving its placement until the provider has started
-/// ([`wait_for_workspace_placement`]), so it waits out a move and then starts
-/// where the workspace runs.
+/// writing from before they stop the chats until the destination has been
+/// committed and its terminals cleaned up ([`begin_workspace_migration`]).
+/// Chat startup and daemon PTY hydration hold it for reading while resolving
+/// placement and starting or attaching to their session.
 ///
 /// Lock order: this gate, then a thread's [`resume_lock_for`] lock. A move
 /// takes resume locks while it holds the gate, so waiting for the gate with
@@ -2812,7 +2811,7 @@ fn migration_gate_for(workspace_id: &str) -> Arc<tokio::sync::RwLock<()>> {
 /// Wait out any push / pull of `workspace_id`, then keep the next one from
 /// starting until the guard drops. `None` (a thread with no workspace) has
 /// nothing to wait for.
-async fn wait_for_workspace_placement(
+pub(crate) async fn wait_for_workspace_placement(
     workspace_id: Option<&str>,
 ) -> Option<tokio::sync::OwnedRwLockReadGuard<()>> {
     Some(migration_gate_for(workspace_id?).read_owned().await)
@@ -2910,21 +2909,12 @@ async fn stop_moved_session<R: Runtime>(
     Ok(())
 }
 
-/// Start moving a workspace to another machine (push / pull): close its
-/// migration gate ([`migration_gate_for`]), then stop its live chats.
-///
-/// Until the returned guard drops no chat session in the workspace starts,
-/// so none can begin on the machine being left. Hold it until the new
-/// `host_id` is committed and the conversations have travelled with the
-/// files; dropping it on failure lets chats start where the workspace still
-/// runs.
-pub async fn begin_workspace_migration<R: Runtime>(
-    app: &AppHandle<R>,
+/// Reserve a workspace move before reading its current placement.
+#[cfg(any(unix, test))]
+pub(crate) async fn begin_workspace_migration(
     workspace_id: &str,
 ) -> tokio::sync::OwnedRwLockWriteGuard<()> {
-    let gate = migration_gate_for(workspace_id).write_owned().await;
-    stop_workspace_chat_sessions(app, workspace_id).await;
-    gate
+    migration_gate_for(workspace_id).write_owned().await
 }
 
 /// Stop every live chat session in a workspace that push / pull is about to
@@ -2935,7 +2925,11 @@ pub async fn begin_workspace_migration<R: Runtime>(
 /// the provider can. Runs under the migration gate, so no thread starts
 /// meanwhile; the moved check in [`ensure_live_session`] still catches a
 /// session that outlives a move.
-async fn stop_workspace_chat_sessions<R: Runtime>(app: &AppHandle<R>, workspace_id: &str) {
+#[cfg(any(unix, test))]
+pub(crate) async fn stop_workspace_chat_sessions<R: Runtime>(
+    app: &AppHandle<R>,
+    workspace_id: &str,
+) {
     let threads = app
         .try_state::<AppStateStore>()
         .and_then(|state| state.find_workspace(workspace_id))
@@ -14179,7 +14173,8 @@ mod tests {
         provider.live.lock().unwrap().insert(thread.to_string());
         record_session_host(thread, None);
 
-        let migration = begin_workspace_migration(&handle, &workspace).await;
+        let migration = begin_workspace_migration(&workspace).await;
+        stop_workspace_chat_sessions(&handle, &workspace).await;
         assert_eq!(*provider.stopped.lock().unwrap(), vec![thread.to_string()]);
         let send = tokio::spawn({
             let handle = handle.clone();
@@ -14213,7 +14208,8 @@ mod tests {
         provider.live.lock().unwrap().insert(thread.to_string());
         record_session_host(thread, Some(host_id));
 
-        let migration = begin_workspace_migration(&handle, &workspace).await;
+        let migration = begin_workspace_migration(&workspace).await;
+        stop_workspace_chat_sessions(&handle, &workspace).await;
         assert_eq!(*provider.stopped.lock().unwrap(), vec![thread.to_string()]);
         let send = tokio::spawn({
             let handle = handle.clone();
@@ -14234,6 +14230,25 @@ mod tests {
         assert_eq!(*provider.started_on.lock().unwrap(), vec![None]);
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn stale_pull_leaves_the_local_chat_running() {
+        let thread = "stale-pull-local-chat";
+        let provider = Arc::new(PlacementProvider::default());
+        let (app, workspace) = placement_app(thread, None, provider.clone()).await;
+        provider.live.lock().unwrap().insert(thread.to_string());
+
+        let error = super::super::hosts::workspace_pull_back_impl(
+            app.handle().clone(),
+            workspace,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error, "Workspace is already local.");
+        assert!(provider.stopped.lock().unwrap().is_empty());
+        assert!(provider.has_session(&ThreadId(thread.to_string())).await);
+    }
+
     /// A failed move leaves the workspace where it was, and a send waiting
     /// on it starts the chat there.
     #[tokio::test]
@@ -14243,7 +14258,8 @@ mod tests {
         let (app, workspace) = placement_app(thread, None, provider.clone()).await;
         let handle = app.handle().clone();
 
-        let migration = begin_workspace_migration(&handle, &workspace).await;
+        let migration = begin_workspace_migration(&workspace).await;
+        stop_workspace_chat_sessions(&handle, &workspace).await;
         let send = tokio::spawn({
             let handle = handle.clone();
             async move {
@@ -14280,7 +14296,8 @@ mod tests {
         }))
         .unwrap();
 
-        let migration = begin_workspace_migration(&handle, &workspace).await;
+        let migration = begin_workspace_migration(&workspace).await;
+        stop_workspace_chat_sessions(&handle, &workspace).await;
         let start = tokio::spawn({
             let handle = handle.clone();
             async move { agent_chat_start_session(handle, pane, ProviderKind::Codex, input, None).await }
