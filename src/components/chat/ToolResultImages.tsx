@@ -36,23 +36,41 @@ function needsRemoteConfirmation(image: ToolResultImage): boolean {
  * image-only data-URL fallback when hosted clients cannot reach that asset
  * URL. Its binary Blob cache is bounded by bytes, entries and idle time.
  */
-export function ToolResultImages({ images, onImageError }: {
+interface LazyImageIdentity {
+  stub: LazyToolResultStub;
+  pointer: string;
+}
+
+export function ToolResultImages({ images, onImageError, lazyImageIdentity }: {
   images: ToolResultImage[];
   onImageError?: () => void;
+  lazyImageIdentity?: LazyImageIdentity;
 }) {
-  const [lightboxSelection, setLightboxSelection] = useState<{ index: number; src: string } | null>(null);
+  const [lightboxSelection, setLightboxSelection] = useState<{
+    index: number;
+    src: string;
+    localIdentity?: LazyImageIdentity;
+  } | null>(null);
   const [approvedRemoteSources, setApprovedRemoteSources] = useState<Record<number, string>>({});
   const selectedImage = lightboxSelection ? images[lightboxSelection.index] : undefined;
   const selectedSrc = selectedImage?.src;
-  const lightboxImage = lightboxSelection && selectedImage && selectedSrc === lightboxSelection.src && (
+  const selectedSourceMatches = Boolean(lightboxSelection && selectedImage && (
+    selectedSrc === lightboxSelection.src || (
+      lightboxSelection.localIdentity && lazyImageIdentity &&
+      lightboxSelection.localIdentity.stub === lazyImageIdentity.stub &&
+      lightboxSelection.localIdentity.pointer === lazyImageIdentity.pointer &&
+      selectedSrc?.startsWith("blob:")
+    )
+  ));
+  const lightboxImage = lightboxSelection && selectedImage && selectedSourceMatches && (
     !needsRemoteConfirmation(selectedImage) || approvedRemoteSources[lightboxSelection.index] === selectedSrc
   ) ? selectedImage : undefined;
 
   useEffect(() => {
-    if (lightboxSelection && selectedSrc !== lightboxSelection.src) {
+    if (lightboxSelection && !selectedSourceMatches) {
       setLightboxSelection(null);
     }
-  }, [lightboxSelection, selectedSrc]);
+  }, [lightboxSelection, selectedSourceMatches]);
 
   if (images.length === 0) return null;
 
@@ -64,7 +82,11 @@ export function ToolResultImages({ images, onImageError }: {
           image={image}
           approved={!needsRemoteConfirmation(image) || approvedRemoteSources[i] === image.src}
           onConfirm={() => setApprovedRemoteSources((current) => ({ ...current, [i]: image.src }))}
-          onOpen={() => setLightboxSelection({ index: i, src: image.src })}
+          onOpen={() => setLightboxSelection({
+            index: i,
+            src: image.src,
+            localIdentity: image.trustedLocal ? lazyImageIdentity : undefined,
+          })}
           onImageError={onImageError}
         />
       ))}
@@ -374,6 +396,7 @@ function LazyToolResultImage({ stub, pointer }: { stub: LazyToolResultStub; poin
       src: source.local ? convertFileSrc(source.src) : source.src,
       trustedLocal: source.local,
     }]}
+      lazyImageIdentity={{ stub, pointer }}
       onImageError={source.local ? readFallback : undefined} />;
   }
   return (

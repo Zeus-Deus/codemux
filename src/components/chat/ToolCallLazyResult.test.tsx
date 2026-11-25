@@ -1,6 +1,6 @@
 /// <reference types="@testing-library/jest-dom/vitest" />
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 
 import { LAZY_TOOL_RESULT_KEY } from "@/lib/agent-chat/lazy-tool-result";
@@ -168,7 +168,7 @@ describe("lazy tool-result body", () => {
     expect(screen.getByRole("img")).toHaveAttribute("src", url);
   });
 
-  it("reuses a bounded binary cache across hosted remounts and revokes idle URLs", async () => {
+  it("keeps the lightbox open through Blob fallback and reuses the bounded cache", async () => {
     vi.mocked(agentChatGetToolResultImage)
       .mockResolvedValueOnce({ src: "/managed/tool.png", local: true })
       .mockResolvedValueOnce({ src: "data:image/png;base64,AQID", local: false });
@@ -179,10 +179,9 @@ describe("lazy tool-result body", () => {
     const item = imageStub();
     const view = render(<ToolCallBody item={item} />);
     await waitFor(() => expect(screen.getByRole("img")).toHaveAttribute("src", "asset:/managed/tool.png"));
-    fireEvent.error(screen.getByRole("img"));
-    await waitFor(() => expect(screen.getByRole("img")).toHaveAttribute("src", "blob:tool-image"));
     await userEvent.click(screen.getByRole("button", { name: "Open image" }));
-    expect(screen.getByRole("dialog").querySelector("img")).toHaveAttribute("src", "blob:tool-image");
+    fireEvent.error(within(screen.getByRole("dialog")).getByRole("img"));
+    await waitFor(() => expect(within(screen.getByRole("dialog")).getByRole("img")).toHaveAttribute("src", "blob:tool-image"));
     expect(agentChatGetToolResultImage).toHaveBeenLastCalledWith(ROW_ID, "/1", true);
     expect(fetchMock).toHaveBeenCalledWith("data:image/png;base64,AQID");
     expect(agentChatGetToolResult).not.toHaveBeenCalled();
