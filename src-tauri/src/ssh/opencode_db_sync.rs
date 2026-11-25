@@ -50,6 +50,7 @@
 //! PATH (only login shells source `~/.profile` / `~/.bashrc`). So every
 //! remote `opencode` invocation runs through a login shell. Each transfer
 //! uses a private scratch directory created and removed by that shell.
+//! A remote deadline bounds the transfer even if the SSH client disconnects.
 //! The bundle travels over SSH on stdin for imports and stdout for exports.
 //!
 //! Everything here is best-effort: a failure only loses conversation
@@ -122,43 +123,70 @@ fn remote_export_bundle(stdout: &[u8]) -> Result<Option<(&str, &[u8])>, String> 
     Ok(Some((session_id, &bundle[1..])))
 }
 
-// Allocate and clean up the private directory in the shell that uses it.
-const REMOTE_SCRATCH: &str = r#"umask 077
+const REMOTE_TRANSFER_TIMEOUT_SECS: u64 = 60;
+
+// Keep cleanup in the parent shell. The supervisor can kill the entire
+// transfer process group without killing the shell that removes the bundle.
+const REMOTE_TRANSFER: &str = r#"run_transfer() {
+    seconds=$1
+    shift
+    if command timeout --version >/dev/null 2>&1; then
+        command timeout -s KILL "$seconds" "$@"
+    else
+        # macOS provides Perl but may not have the GNU timeout executable.
+        command perl -e '
+            getpgrp() == $$ || setpgrp(0, 0) or die "setpgrp: $!";
+            $SIG{ALRM} = $SIG{HUP} = $SIG{TERM} = sub { kill "KILL", -$$ };
+            alarm shift @ARGV;
+            my $status = system { $ARGV[0] } @ARGV;
+            exit($status == -1 ? 127 : ($status & 127) ? 128 + ($status & 127) : $status >> 8);
+        ' "$seconds" "$@"
+    fi
+}
+umask 077
 scratch=$(mktemp -d /tmp/codemux-opencode.XXXXXXXX) || exit 1
 bundle="$scratch/session.json"
 trap 'rm -f "$bundle"; rmdir "$scratch"' EXIT
-trap 'exit 1' HUP INT TERM
+trap 'exit 1' HUP INT TERM PIPE
 "#;
+
+fn remote_transfer_script(body: &str, argument: &str, timeout_secs: u64) -> String {
+    format!(
+        "{REMOTE_TRANSFER}run_transfer {timeout_secs} bash -c {} codemux-opencode \"$bundle\" {}\n",
+        shell_sq(body),
+        shell_sq(argument)
+    )
+}
 
 fn remote_import_script(remote_cwd: &str) -> String {
     // `mkdir -p` defends against the rare case where the workspace dir
     // isn't there yet (the push rsync normally creates it first); `cd` is
     // load-bearing because `opencode import` derives the session directory
     // from the process cwd.
-    format!(
-        "mkdir -p {cwd} && cd {cwd} || exit 3\n\
-         {REMOTE_SCRATCH}\
-         cat > \"$bundle\" || exit 1\n\
-         opencode import \"$bundle\"\n",
-        cwd = shell_sq(remote_cwd),
+    remote_transfer_script(
+        r#"mkdir -p "$2" && cd "$2" || exit 3
+cat > "$1" || exit 1
+opencode import "$1""#,
+        remote_cwd,
+        REMOTE_TRANSFER_TIMEOUT_SECS,
     )
 }
 
 /// Find the newest root session and emit its ID and export in a single
 /// frame. An empty successful response means there was no session.
-fn remote_extract_script(remote_cwd: &str) -> String {
+fn remote_extract_script(remote_cwd: &str, timeout_secs: u64) -> String {
     // Build the query with the shared SQL helper (which SQL-escapes the
     // directory) and pass it as a single shell-quoted argument. Splicing the
     // path through a `$dir` shell variable into the SQL literal would break
     // the query for any path containing an apostrophe (e.g. /Users/O'Brien/…),
     // silently yielding "nothing to pull".
-    format!(
-        "sid=$(opencode db {sql} 2>/dev/null | grep -m1 '^ses_') || exit 0\n\
-         {REMOTE_SCRATCH}\
-         opencode export \"$sid\" > \"$bundle\" || exit $?\n\
-         printf '\\000CMX_OC_SID=%s\\n' \"$sid\"\n\
-         cat \"$bundle\" && printf '\\000'\n",
-        sql = shell_sq(&newest_session_sql(remote_cwd)),
+    remote_transfer_script(
+        r#"sid=$(opencode db "$2" 2>/dev/null | grep -m1 '^ses_') || exit 0
+opencode export "$sid" > "$1" || exit $?
+printf '\000CMX_OC_SID=%s\n' "$sid"
+cat "$1" && printf '\000'"#,
+        &newest_session_sql(remote_cwd),
+        timeout_secs,
     )
 }
 
@@ -237,7 +265,7 @@ pub async fn pull_opencode_session(
         return Ok(None);
     };
 
-    let script = remote_extract_script(&remote_cwd.to_string_lossy());
+    let script = remote_extract_script(&remote_cwd.to_string_lossy(), REMOTE_TRANSFER_TIMEOUT_SECS);
     let result = run_remote_login_script(ssh_target, &script, None).await?;
     if !result.status.success() {
         return Err(format!(
@@ -345,6 +373,9 @@ async fn run_remote_login_script(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::process::Stdio;
+    use std::time::Duration;
+    use tokio::io::{AsyncBufReadExt as _, BufReader};
 
     #[test]
     fn sql_quote_doubles_single_quotes() {
@@ -400,7 +431,7 @@ mod tests {
         assert_eq!(shell_sq("a'b"), "'a'\\''b'");
     }
 
-    async fn run_transfer_fixture(script: &str, opencode: &str, input: Option<&[u8]>) -> Output {
+    fn transfer_fixture(script: &str, opencode: &str) -> Command {
         let mut command = Command::new("bash");
         let fixture = format!(
             r#"mktemp() {{
@@ -412,9 +443,15 @@ mod tests {
 opencode() {{
 {opencode}
 }}
+export -f opencode
 {script}"#
         );
         command.args(["--noprofile", "--norc", "-c", &fixture]);
+        command
+    }
+
+    async fn run_transfer_fixture(script: &str, opencode: &str, input: Option<&[u8]>) -> Output {
+        let mut command = transfer_fixture(script, opencode);
         output(&mut command, input).await.unwrap()
     }
 
@@ -452,7 +489,7 @@ return 17
 
     #[tokio::test]
     async fn remote_export_sends_bundle_and_cleans_up_private_scratch() {
-        let script = remote_extract_script("/home/me/ws");
+        let script = remote_extract_script("/home/me/ws", REMOTE_TRANSFER_TIMEOUT_SECS);
         // The query is built by the shared SQL helper and passed as one
         // shell-quoted argument (no raw $dir splice into the SQL literal).
         assert!(script.contains(&shell_sq(&newest_session_sql("/home/me/ws"))));
@@ -471,13 +508,75 @@ esac
         assert_private_scratch_removed(&result);
     }
 
+    #[tokio::test]
+    async fn remote_export_cleans_up_after_disconnect_during_stall() {
+        let export = remote_extract_script("/home/me/ws", 2);
+        for use_perl in [false, true] {
+            let mut script = String::new();
+            if use_perl {
+                // Exercise the macOS fallback even on a host with GNU timeout.
+                script.push_str(
+                    "command() { if [ \"$1\" = timeout ]; then return 1; fi; builtin command \"$@\"; }\n",
+                );
+            }
+            script.push_str(&export);
+            let fake_opencode = r#"
+case "$1" in
+    db) printf 'id\nses_fixture\n' ;;
+    export)
+        printf 'partial export\n'
+        printf 'export started\n' >&2
+        sleep 30
+        ;;
+    *) return 3 ;;
+esac
+"#;
+            let mut child = transfer_fixture(&script, fake_opencode)
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .kill_on_drop(true)
+                .spawn()
+                .unwrap();
+            let mut diagnostics = BufReader::new(child.stderr.take().unwrap()).lines();
+            let directory = tokio::time::timeout(Duration::from_secs(5), async {
+                let directory = PathBuf::from(diagnostics.next_line().await.unwrap().unwrap());
+                assert!(diagnostics
+                    .next_line()
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .starts_with("drwx------"));
+                assert_eq!(
+                    diagnostics.next_line().await.unwrap().unwrap(),
+                    "export started"
+                );
+                directory
+            })
+            .await
+            .expect("export started before disconnect");
+            assert!(directory.join("session.json").is_file());
+
+            // A disconnected SSH client can close the pipe without signaling
+            // the waiting shell. Leave stderr open to observe worker exit.
+            drop(child.stdout.take().unwrap());
+            tokio::time::timeout(Duration::from_secs(5), async {
+                assert!(!child.wait().await.unwrap().success());
+                while diagnostics.next_line().await.unwrap().is_some() {}
+            })
+            .await
+            .expect("the remote transfer and its children exited");
+            assert!(!directory.exists(), "scratch remains at {directory:?}");
+        }
+    }
+
     #[test]
     fn remote_extract_script_sql_escapes_apostrophe_paths() {
         // A path with an apostrophe must be SQL-escaped into the query (the
         // apostrophe doubled), exactly like the local-side newest_session_sql —
         // never spliced raw via a shell variable, which breaks the SQL literal.
         let cwd = "/Users/O'Brien/ws";
-        let s = remote_extract_script(cwd);
+        let s = remote_extract_script(cwd, REMOTE_TRANSFER_TIMEOUT_SECS);
         assert!(
             s.contains(&shell_sq(&newest_session_sql(cwd))),
             "must embed the SQL-escaped query; got:\n{s}"
