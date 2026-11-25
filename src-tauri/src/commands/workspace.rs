@@ -1074,11 +1074,10 @@ pub(crate) async fn create_worktree_checked<R: tauri::Runtime>(
                     // using a longer settle time for agent TUI initialization.
                     if needs_pty_injection {
                         if let Some(ref prompt) = initial_prompt {
-                            super::presets::write_command_when_ready(
+                            super::presets::write_prompt_when_agent_ready(
                                 sessions_arc.clone(),
                                 session_id,
-                                prompt.clone(),
-                                1500,
+                                prompt,
                             );
                         }
                     }

@@ -433,11 +433,10 @@ pub fn apply_preset<R: tauri::Runtime>(
                     write_command_when_ready(sessions_arc.clone(), session_id.clone(), cmd, 120);
                     if needs_pty_injection {
                         if let Some(ref prompt) = initial_prompt {
-                            write_command_when_ready(
+                            write_prompt_when_agent_ready(
                                 sessions_arc.clone(),
                                 session_id.clone(),
-                                prompt.clone(),
-                                1500,
+                                prompt,
                             );
                         }
                     }
@@ -730,6 +729,34 @@ fn wait_and_write_command(
     wait_and_write(sessions, session_id, command, settle_ms, PTY_COMMAND_TERMINATOR);
 }
 
+/// Type an agent's initial prompt into its TUI once the agent has started.
+///
+/// The prompt can hold untrusted text (PR comments, CI logs, issue bodies), so
+/// control characters are stripped first. Nothing is written if the shell is
+/// still in the foreground when the agent should be running: the agent exited
+/// or never started, and every prompt line would run as a shell command.
+pub(crate) fn write_prompt_when_agent_ready(
+    sessions: Arc<std::sync::Mutex<std::collections::HashMap<String, terminal::SessionRuntime>>>,
+    session_id: String,
+    prompt: &str,
+) {
+    let prompt = crate::branch_name::sanitize_prompt_for_pty(prompt);
+    std::thread::spawn(move || {
+        wait_and_write_guarded(
+            &sessions,
+            &session_id,
+            &prompt,
+            AGENT_PROMPT_SETTLE_MS,
+            PTY_COMMAND_TERMINATOR,
+            true,
+        );
+    });
+}
+
+/// Quiet period before typing a prompt into an agent TUI, long enough for the
+/// agent to finish initializing.
+const AGENT_PROMPT_SETTLE_MS: u64 = 1500;
+
 /// `wait_and_write_command` with the byte(s) written after the command as a
 /// parameter: an empty `terminator` leaves the command typed but not run.
 fn wait_and_write(
@@ -738,6 +765,19 @@ fn wait_and_write(
     command: &str,
     settle_ms: u64,
     terminator: &[u8],
+) {
+    wait_and_write_guarded(sessions, session_id, command, settle_ms, terminator, false);
+}
+
+/// `wait_and_write`; with `needs_foreground_job`, skips the write when the
+/// shell itself is verifiably at its prompt (see `write_prompt_when_agent_ready`).
+fn wait_and_write_guarded(
+    sessions: &Arc<std::sync::Mutex<std::collections::HashMap<String, terminal::SessionRuntime>>>,
+    session_id: &str,
+    command: &str,
+    settle_ms: u64,
+    terminator: &[u8],
+    needs_foreground_job: bool,
 ) {
     // Phase 1: poll until the PTY writer is available (shell process spawned).
     //
@@ -882,6 +922,14 @@ fn wait_and_write(
         quiet_phase_start.elapsed(),
         writer_poll_start.elapsed()
     );
+
+    if needs_foreground_job && terminal::session_shell_owns_terminal(sessions, session_id) {
+        eprintln!(
+            "[codemux::presets] not typing the prompt into {session_id}: \
+             the shell is at its prompt, so the agent is not running"
+        );
+        return;
+    }
 
     // Write the plain command text followed by the PTY command
     // terminator in a SINGLE `write_all` call. See

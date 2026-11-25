@@ -4068,6 +4068,46 @@ fn read_foreground_job(shell_pid: u32) -> Option<String> {
     }
 }
 
+/// True only when `session_id`'s shell provably owns its terminal, i.e. it is
+/// sitting at its prompt with no foreground job. False whenever that can't be
+/// known: remote panes (their pid lives on another machine), non-Linux hosts,
+/// missing sessions and unreadable pids.
+pub(crate) fn session_shell_owns_terminal(
+    sessions: &Arc<Mutex<HashMap<String, SessionRuntime>>>,
+    session_id: &str,
+) -> bool {
+    let pid = {
+        let guard = sessions.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(runtime) = guard.get(session_id) else {
+            return false;
+        };
+        #[cfg(unix)]
+        if runtime
+            .daemon_client
+            .as_ref()
+            .is_some_and(|client| client.ssh_target().is_some())
+        {
+            return false;
+        }
+        runtime.child_pid
+    };
+    let Some(pid) = pid else {
+        return false;
+    };
+    #[cfg(target_os = "linux")]
+    {
+        std::fs::read_to_string(format!("/proc/{pid}/stat"))
+            .ok()
+            .and_then(|stat| parse_stat_pgrp_tpgid(&stat))
+            .is_some_and(|(pgrp, tpgid)| tpgid > 0 && tpgid == pgrp)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = pid;
+        false
+    }
+}
+
 /// Resume one subscriber's view of a session's PTY output. `None` resumes every
 /// subscriber for the session. See `pause_pty_output`. Idempotent.
 #[tauri::command]
@@ -9846,6 +9886,52 @@ mod tests {
             wait_child_gone(&mut shell, Duration::from_secs(2));
 
             assert_eq!(job.as_deref(), Some("sleep"));
+        }
+
+        /// Agent prompts are only withheld when the shell is provably at its
+        /// prompt; a running job or an unknown pid never blocks them.
+        #[test]
+        #[serial]
+        #[cfg(target_os = "linux")]
+        fn session_shell_owns_terminal_only_when_idle() {
+            let sessions: Arc<Mutex<HashMap<String, SessionRuntime>>> = Arc::default();
+            let insert = |id: &str, pid: Option<u32>| {
+                let mut runtime = SessionRuntime::new(id);
+                runtime.child_pid = pid;
+                sessions.lock().unwrap().insert(id.into(), runtime);
+            };
+
+            let (mut idle, idle_pid) = spawn_on_pty(CommandBuilder::new("cat"));
+            std::thread::sleep(Duration::from_millis(100));
+            insert("idle", Some(idle_pid));
+            insert("no-pid", None);
+            assert!(session_shell_owns_terminal(&sessions, "idle"));
+            assert!(!session_shell_owns_terminal(&sessions, "no-pid"));
+            assert!(!session_shell_owns_terminal(&sessions, "missing"));
+            kill_session_tree(idle_pid);
+            wait_child_gone(&mut idle, Duration::from_secs(2));
+
+            let mut cmd = CommandBuilder::new("sh");
+            cmd.arg("-c");
+            cmd.arg("set -m; sleep 3600");
+            let (mut shell, shell_pid) = spawn_on_pty(cmd);
+            insert("busy", Some(shell_pid));
+            let start = Instant::now();
+            while read_foreground_job(shell_pid).is_none()
+                && start.elapsed() < Duration::from_secs(5)
+            {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            let owns = session_shell_owns_terminal(&sessions, "busy");
+            let stat = std::fs::read_to_string(format!("/proc/{shell_pid}/stat")).ok();
+            if let Some((_, tpgid)) = stat.as_deref().and_then(parse_stat_pgrp_tpgid) {
+                if tpgid > 1 {
+                    kill_session_tree(tpgid as u32);
+                }
+            }
+            kill_session_tree(shell_pid);
+            wait_child_gone(&mut shell, Duration::from_secs(2));
+            assert!(!owns);
         }
 
         /// SIGTERM→200ms→SIGKILL should clear a simple long-sleeping child.

