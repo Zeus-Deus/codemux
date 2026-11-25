@@ -290,6 +290,65 @@ pub fn api_base_url() -> Result<String, String> {
     }
 }
 
+enum ApiTransport {
+    Https,
+    LoopbackIp,
+    Localhost,
+}
+
+fn localhost_loopback_addrs() -> [std::net::SocketAddr; 2] {
+    [
+        std::net::SocketAddr::from(([127, 0, 0, 1], 0)),
+        std::net::SocketAddr::from(([0, 0, 0, 0, 0, 0, 0, 1], 0)),
+    ]
+}
+
+fn api_transport(base: &str) -> Result<ApiTransport, String> {
+    let validated = validate_api_base_url(base)?;
+    let url = url::Url::parse(&validated)
+        .map_err(|_| "CODEMUX_API_URL must be a valid URL".to_string())?;
+    if url.scheme() == "https" {
+        Ok(ApiTransport::Https)
+    } else if url.host_str() == Some("localhost") {
+        Ok(ApiTransport::Localhost)
+    } else {
+        Ok(ApiTransport::LoopbackIp)
+    }
+}
+
+/// Build a client for account credentials and bearer tokens. Loopback HTTP
+/// must connect directly: an inherited proxy could otherwise see the secret.
+/// Pin `localhost` to loopback addresses so name resolution cannot change that.
+/// Redirects are disabled because a later hop has not passed the URL policy.
+pub(crate) fn api_client(base: &str) -> Result<reqwest::Client, String> {
+    let mut builder = reqwest::Client::builder().redirect(reqwest::redirect::Policy::none());
+    match api_transport(base)? {
+        ApiTransport::Https => {}
+        ApiTransport::LoopbackIp => builder = builder.no_proxy(),
+        ApiTransport::Localhost => {
+            builder = builder
+                .no_proxy()
+                .resolve_to_addrs("localhost", &localhost_loopback_addrs());
+        }
+    }
+    builder.build().map_err(|e| format!("HTTP client: {e}"))
+}
+
+fn blocking_api_client(base: &str) -> Result<reqwest::blocking::Client, String> {
+    let mut builder =
+        reqwest::blocking::Client::builder().redirect(reqwest::redirect::Policy::none());
+    match api_transport(base)? {
+        ApiTransport::Https => {}
+        ApiTransport::LoopbackIp => builder = builder.no_proxy(),
+        ApiTransport::Localhost => {
+            builder = builder
+                .no_proxy()
+                .resolve_to_addrs("localhost", &localhost_loopback_addrs());
+        }
+    }
+    builder.build().map_err(|e| format!("HTTP client: {e}"))
+}
+
 // ── Encrypted token storage ──────────────────────────────────────
 
 const SALT_LEN: usize = 16;
@@ -719,13 +778,11 @@ fn emit_auth_state<R: tauri::Runtime>(
     let outcome = match api_base_url() {
         Ok(base) => {
             let url = format!("{base}/api/auth/desktop/verify");
-            match reqwest::blocking::Client::builder()
-                .timeout(std::time::Duration::from_secs(5))
-                .build()
-            {
+            match blocking_api_client(&base) {
                 Ok(client) => match client
                     .get(&url)
                     .header("Authorization", format!("Bearer {token}"))
+                    .timeout(std::time::Duration::from_secs(5))
                     .send()
                 {
                     Ok(response) => {
@@ -866,6 +923,161 @@ mod tests {
         ] {
             assert!(validate_api_base_url(url).is_err(), "accepted {url:?}");
         }
+    }
+
+    #[test]
+    fn api_client_sends_loopback_credentials_directly() {
+        const TEST: &str = "auth::tests::api_client_sends_loopback_credentials_directly";
+        if crate::test_isolation::isolated(TEST) {
+            return;
+        }
+
+        let mut server = mockito::Server::new();
+        let mock = server
+            .mock("POST", "/signin")
+            .match_header("authorization", "Bearer private-test-token")
+            .match_body("derived-secret")
+            .with_status(204)
+            .expect(2)
+            .create();
+        let proxy = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let proxy_url = format!("http://{}", proxy.local_addr().unwrap());
+        for key in ["HTTP_PROXY", "http_proxy", "ALL_PROXY", "all_proxy"] {
+            std::env::set_var(key, &proxy_url);
+        }
+        for key in ["NO_PROXY", "no_proxy"] {
+            std::env::set_var(key, "");
+        }
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let numeric_url = server.url();
+        let localhost_url = numeric_url.replace("127.0.0.1", "localhost");
+        assert_ne!(numeric_url, localhost_url);
+        for base in [&numeric_url, &localhost_url] {
+            let response = runtime
+                .block_on(async {
+                    api_client(base)
+                        .unwrap()
+                        .post(format!("{base}/signin"))
+                        .bearer_auth("private-test-token")
+                        .body("derived-secret")
+                        .timeout(std::time::Duration::from_secs(2))
+                        .send()
+                        .await
+                })
+                .unwrap();
+            assert_eq!(response.status(), reqwest::StatusCode::NO_CONTENT);
+        }
+        mock.assert();
+        proxy.set_nonblocking(true).unwrap();
+        assert_eq!(
+            proxy.accept().unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+    }
+
+    #[test]
+    fn api_client_does_not_follow_credential_redirects() {
+        const TEST: &str = "auth::tests::api_client_does_not_follow_credential_redirects";
+        if crate::test_isolation::isolated(TEST) {
+            return;
+        }
+
+        let mut destination = mockito::Server::new();
+        let no_leak = destination.mock("POST", "/leak").expect(0).create();
+        let mut server = mockito::Server::new();
+        let redirect = server
+            .mock("POST", "/signin")
+            .match_body("derived-secret")
+            .with_status(307)
+            .with_header("location", &format!("{}/leak", destination.url()))
+            .create();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let response = runtime
+            .block_on(async {
+                api_client(&server.url())
+                    .unwrap()
+                    .post(format!("{}/signin", server.url()))
+                    .body("derived-secret")
+                    .send()
+                    .await
+            })
+            .unwrap();
+        assert_eq!(response.status(), reqwest::StatusCode::TEMPORARY_REDIRECT);
+        redirect.assert();
+        no_leak.assert();
+    }
+
+    #[test]
+    fn api_client_keeps_https_proxy_support() {
+        const TEST: &str = "auth::tests::api_client_keeps_https_proxy_support";
+        if crate::test_isolation::isolated(TEST) {
+            return;
+        }
+
+        let proxy = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let proxy_url = format!("http://{}", proxy.local_addr().unwrap());
+        for key in ["HTTPS_PROXY", "https_proxy"] {
+            std::env::set_var(key, &proxy_url);
+        }
+        for key in ["NO_PROXY", "no_proxy"] {
+            std::env::set_var(key, "");
+        }
+        proxy.set_nonblocking(true).unwrap();
+        let capture = std::thread::spawn(move || {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+            loop {
+                match proxy.accept() {
+                    Ok((mut stream, _)) => {
+                        use std::io::{Read, Write};
+                        stream
+                            .set_read_timeout(Some(std::time::Duration::from_secs(2)))
+                            .unwrap();
+                        let mut bytes = [0; 512];
+                        let size = stream.read(&mut bytes).unwrap();
+                        stream
+                            .write_all(b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\n\r\n")
+                            .unwrap();
+                        return Some(String::from_utf8_lossy(&bytes[..size]).into_owned());
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        if std::time::Instant::now() >= deadline {
+                            return None;
+                        }
+                        std::thread::sleep(std::time::Duration::from_millis(10));
+                    }
+                    Err(error) => panic!("proxy accept failed: {error}"),
+                }
+            }
+        });
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let _ = runtime.block_on(async {
+            api_client("https://example.invalid")
+                .unwrap()
+                .get("https://example.invalid/secret")
+                .bearer_auth("private-test-token")
+                .timeout(std::time::Duration::from_secs(2))
+                .send()
+                .await
+        });
+        let connect = capture
+            .join()
+            .unwrap()
+            .expect("HTTPS request used the proxy");
+        assert!(
+            connect.starts_with("CONNECT example.invalid:443 HTTP/1.1"),
+            "{connect}"
+        );
+        assert!(!connect.contains("private-test-token"), "{connect}");
     }
 
     fn test_db() -> DatabaseStore {

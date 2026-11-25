@@ -458,7 +458,7 @@ struct GrantIdentity {
 /// the same `CODEMUX_API_URL` base every other API call reads.
 async fn verify_grant(base: &str, grant: &str) -> Result<GrantVerifyResponse, String> {
     let url = format!("{base}/api/devices/grant/verify");
-    let resp = reqwest::Client::new()
+    let resp = crate::auth::api_client(base)?
         .post(&url)
         .json(&json!({ "grant": grant }))
         .send()

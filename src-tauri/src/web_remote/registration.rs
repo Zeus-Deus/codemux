@@ -212,7 +212,7 @@ async fn post_registration(
     reg: &DeviceRegistration,
 ) -> Result<(), String> {
     let url = format!("{base}/api/devices");
-    let resp = reqwest::Client::new()
+    let resp = crate::auth::api_client(base)?
         .post(&url)
         .header("Authorization", format!("Bearer {bearer}"))
         .json(reg)

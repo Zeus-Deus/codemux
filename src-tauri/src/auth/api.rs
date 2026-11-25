@@ -17,7 +17,7 @@
 
 use serde::Deserialize;
 
-use crate::auth::{api_base_url, AuthSecret};
+use crate::auth::{api_base_url, api_client, AuthSecret};
 
 // ── Wire types ───────────────────────────────────────────────────
 //
@@ -70,15 +70,6 @@ pub(crate) fn build_signup_body(email: &str, secret: &AuthSecret, name: &str) ->
 
 // ── Public API ───────────────────────────────────────────────────
 
-// Credential-bearing POST bodies must never be replayed to a redirect target.
-// reqwest otherwise follows 307/308 and resends the AuthSecret JSON body.
-fn auth_client() -> Result<reqwest::Client, String> {
-    reqwest::Client::builder()
-        .redirect(reqwest::redirect::Policy::none())
-        .build()
-        .map_err(|e| format!("Create authentication client: {e}"))
-}
-
 /// POST `/api/auth/desktop/signin` with `{email, password: auth_secret}`.
 /// The `secret` parameter is an `AuthSecret` — the compiler guarantees
 /// the callsite has already run `derive_auth_secret(password, email)`
@@ -90,7 +81,7 @@ pub(crate) async fn login_email_api(
     let base = api_base_url()?;
     let url = format!("{base}/api/auth/desktop/signin");
 
-    let resp = auth_client()?
+    let resp = api_client(&base)?
         .post(&url)
         .json(&build_signin_body(email, secret))
         .send()
@@ -123,7 +114,7 @@ pub(crate) async fn signup_email_api(
     let base = api_base_url()?;
     let url = format!("{base}/api/auth/desktop/signup");
 
-    let resp = auth_client()?
+    let resp = api_client(&base)?
         .post(&url)
         .json(&build_signup_body(email, secret, name))
         .send()

@@ -382,7 +382,7 @@ async fn push_linked(request: &SyncRequest<'_>, db: &DatabaseStore) -> Result<()
 
 async fn push_unlinked(token: &str, db: &DatabaseStore) -> Result<(), String> {
     let base = api_base_url()?;
-    let client = reqwest::Client::new();
+    let client = crate::auth::api_client(&base)?;
     let dirty = db.list_dirty_workspaces_sync();
     let mut any_failed = false;
 
