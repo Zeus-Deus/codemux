@@ -156,7 +156,7 @@ function verdictWording(verdict: string): { verb: string; tone: DotTone } {
   }
 }
 
-/** What the agent was sent to do, in the run card's voice. */
+/** What older agent run records report having done. */
 function runVerb(kind: AgentRunRecord["kind"]): string {
   if (kind === "review-thread") return "addressed this thread";
   if (kind === "failing-check") return "fixed a failing check";
@@ -329,13 +329,18 @@ function AgentEntry({
   return (
     <Row tone="ember" emberRail last={last} testId="timeline-entry-agent">
       <Line>
-        <span className="font-semibold text-accent-ember">Agent run</span> ·{" "}
-        {runVerb(run.kind)}
+        <span className="font-semibold text-accent-ember">{run.promptNotSent ? "Agent opened" : "Agent run"}</span> ·{" "}
+        {run.promptNotSent ? "task not sent" : runVerb(run.kind)}
       </Line>
       <div className="flex max-w-[760px] flex-col gap-1.5 rounded-md bg-accent-ember/[0.07] px-3 py-2">
         <span className={cn("leading-relaxed text-foreground/80", tzBody)}>
           {run.summary}
         </span>
+        {run.promptNotSent && (
+          <span className={cn("text-muted-foreground", tzMeta)}>
+            Copy the prepared prompt from Drafts to start this task.
+          </span>
+        )}
         <div className="flex items-center gap-1.5">
           {/* Omitted rather than guessed — see `AgentRunRecord`. */}
           {stats && (

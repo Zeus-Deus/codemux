@@ -214,6 +214,16 @@ describe("Composer", () => {
     expect(getByRole("status")).not.toHaveTextContent("Press Enter to retry");
   });
 
+  it("offers a copy action with manual-entry guidance", () => {
+    const onClick = vi.fn();
+    const { getByRole } = renderComposer({
+      noticeMessage: "Agent opened without this prompt.",
+      noticeAction: { label: "Copy prompt", onClick },
+    });
+    fireEvent.click(getByRole("button", { name: "Copy prompt" }));
+    expect(onClick).toHaveBeenCalledOnce();
+  });
+
   describe("showStopButton (§6.5)", () => {
     it("hides the Stop button while streaming when showStopButton=false", () => {
       const { container } = renderComposer({

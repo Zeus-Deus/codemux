@@ -5,6 +5,7 @@ import { NewWorkspaceDialog, branchNameError } from "./new-workspace-dialog";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import { useAppStore } from "@/stores/app-store";
 import { useUIStore } from "@/stores/ui-store";
+import { useChatDraftStore } from "@/stores/chat-draft-store";
 import type {
   AppStateSnapshot,
   ProviderChatCapabilities,
@@ -35,6 +36,7 @@ vi.mock("@/tauri/commands", () => ({
         is_builtin: true,
         auto_run_on_workspace: false,
         auto_run_on_new_tab: false,
+        kind: "cli",
       },
     ],
   }),
@@ -304,6 +306,7 @@ beforeEach(() => {
     lastSelectedAgentId: null,
     lastModelSelections: {},
   });
+  useChatDraftStore.setState({ draftsById: {}, activeDraftId: null });
 });
 
 describe("NewWorkspaceDialog", () => {
@@ -601,12 +604,8 @@ describe("Submit flow", () => {
         null,
         "builtin-claude",
         null,
-        // 9th arg = launch-time model selection. This mock's preset
-        // omits `kind`, so it's filtered from the cli-preset list and
-        // no family is detected — the model picker stays absent and
-        // the selection is null. The picker's own behaviour is covered
-        // by launch-model-picker.test.tsx.
-        null,
+        // 9th arg = launch-time model selection at the agent defaults.
+        { model: null, reasoning: null, context: null },
       );
     });
 
@@ -698,9 +697,11 @@ describe("Submit flow", () => {
     expect(createWorktreeWorkspaceResult).not.toHaveBeenCalled();
     // The dedup must not be silent — that's what made re-linking an issue
     // look like "nothing happened" and quietly dropped the typed message.
-    expect(toast.info).toHaveBeenCalledWith(
-      expect.stringContaining("already has a workspace"),
+    expect(toast.success).toHaveBeenCalledWith(
+      expect.stringContaining("prompt. It is saved"),
+      expect.objectContaining({ action: expect.objectContaining({ label: "Copy prompt" }) }),
     );
+    expect(Object.values(useChatDraftStore.getState().draftsById)[0].inputDraft).toBe("Fix the login bug");
   });
 
   it("surfaces an 'Open it' notice before submit when the branch already has a workspace", async () => {
@@ -761,9 +762,13 @@ describe("Submit flow", () => {
     await waitFor(() => {
       expect(activateWorkspace).toHaveBeenCalledWith("ws-existing");
     });
-    expect(toast.info).toHaveBeenCalledWith(
-      expect.stringContaining("prompt wasn't sent"),
+    expect(toast.success).toHaveBeenCalledWith(
+      expect.stringContaining("without sending this prompt"),
+      expect.objectContaining({ action: expect.objectContaining({ label: "Copy prompt" }) }),
     );
+    const saved = Object.values(useChatDraftStore.getState().draftsById)[0];
+    expect(saved.inputDraft).toBe("Fix the login bug");
+    expect(saved.manualPromptRequired).toBe(false);
   });
 
   it("does not rename an adopted workspace to the typed name", async () => {
@@ -1446,10 +1451,13 @@ describe("Failure recovery", () => {
 
     fireEvent.click(within(dialog).getByRole("button", { name: /Create/i }));
     await waitFor(() => expect(createWorktreeWorkspaceResult).toHaveBeenCalled());
-    const sentPrompt = (createWorktreeWorkspaceResult as Mock).mock.calls[0][5];
-    expect(sentPrompt).toContain("Look at this");
-    expect(sentPrompt).toContain("Attached files:\n- /tmp/shot.png");
-    expect(sentPrompt).toContain("#92");
+    expect((createWorktreeWorkspaceResult as Mock).mock.calls[0][5]).toBeNull();
+    await waitFor(() => expect(Object.values(useChatDraftStore.getState().draftsById)).toHaveLength(1));
+    const savedPrompt = Object.values(useChatDraftStore.getState().draftsById)[0].inputDraft;
+    expect(savedPrompt).toContain("Look at this");
+    expect(savedPrompt).toContain("Attached files:\n- /tmp/shot.png");
+    expect(savedPrompt).toContain("#92");
+    expect(savedPrompt).toContain("Implement the backend endpoints.");
     // The retry replaced the failed row.
     await waitFor(() =>
       expect(
@@ -1704,10 +1712,11 @@ describe("Non-git project", () => {
         "ws-new",
         "builtin-claude",
         "current_terminal",
-        "Tidy the notes",
         null,
+        { model: null, reasoning: null, context: null },
       );
     });
+    expect(Object.values(useChatDraftStore.getState().draftsById)[0].inputDraft).toBe("Tidy the notes");
     expect(createWorkspace).toHaveBeenCalledWith("/path/to/project");
     expect(createWorktreeWorkspaceResult).not.toHaveBeenCalled();
     expect(generateBranchName).not.toHaveBeenCalled();
@@ -1755,7 +1764,7 @@ describe("Detected default branch routing", () => {
         null,
         "builtin-claude",
         null,
-        null,
+        { model: null, reasoning: null, context: null },
       );
     });
     expect(createWorkspace).not.toHaveBeenCalled();

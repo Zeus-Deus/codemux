@@ -66,6 +66,7 @@ import { randomUUID } from "@/lib/uuid";
 import { autoNameWorkspace } from "@/lib/agent-chat/materialize";
 import { utilitySelectionFromStores } from "@/lib/utility-agent";
 import { toast, errorMessage } from "@/lib/toast";
+import { saveWorkspacePrompt } from "@/lib/workspace-prompt-handoff";
 import { Eyebrow } from "@/components/ui/eyebrow";
 import { PresetIcon } from "@/components/icons/preset-icon";
 
@@ -345,22 +346,29 @@ export function ProjectOnboarding({ projectDir, tempWorkspaceId, onComplete, onC
             : await generateRandomBranchName(projectDir);
         }
 
-        // The task is the agent's first prompt, so the workspace opens with
-        // the agent already working on what the user just described.
-        const prompt = selectedAgentId ? task.trim() || null : null;
+        // The task is kept locally for manual entry after the terminal opens.
+        const prompt = task.trim();
         const created = await createWorktreeWorkspaceResult(
           projectDir,
           branch,
           true, // new branch
           "single",
           baseBranch || null,
-          prompt,
+          null,
           selectedAgentId,
         );
-        // The backend reused a live workspace for this worktree and dropped
-        // the prompt rather than type into a running session; say so.
-        if (created.adopted && prompt) {
-          toast.info(`"${branch}" already has a live workspace — switched to it. Your task wasn't sent.`);
+        if (prompt) {
+          const agentOpened =
+            !created.adopted &&
+            !!selectedAgent?.commands.some((command) => command.trim());
+          saveWorkspacePrompt(
+            created.workspaceId,
+            prompt,
+            agentOpened,
+            agentOpened
+              ? `${selectedAgent?.name ?? "Agent"} opened without this task. Copy the prompt to start it.`
+              : "Workspace opened without sending this task. It is saved for later.",
+          );
         }
         // Title the new workspace from the task, separately from its branch.
         if (!created.adopted && task.trim()) {
@@ -397,6 +405,7 @@ export function ProjectOnboarding({ projectDir, tempWorkspaceId, onComplete, onC
       generatedBranch,
       baseBranch,
       selectedAgentId,
+      selectedAgent,
       projectDir,
       setupMode,
       actions,

@@ -75,6 +75,7 @@ import {
   selectRunsForPr,
   usePrAgentRunsStore,
 } from "@/stores/pr-agent-runs-store";
+import { useChatDraftStore } from "@/stores/chat-draft-store";
 
 const PR = {
   number: 285,
@@ -115,6 +116,7 @@ beforeEach(() => {
   mockGetCheckLogExcerpt.mockResolvedValue("");
   workspaces = [];
   lastSelectedAgentId = null;
+  useChatDraftStore.setState({ draftsById: {}, activeDraftId: null });
 });
 
 // ── Prompt composition ────────────────────────────────────────────────
@@ -226,7 +228,7 @@ describe("buildHandoffPrompt — conflicts", () => {
 
 describe("pickAgentPreset", () => {
   const p = (over: Record<string, unknown>) =>
-    ({ id: "x", name: "x", pinned: true, kind: "cli", ...over }) as never;
+    ({ id: "x", name: "x", pinned: true, kind: "cli", commands: ["agent"], ...over }) as never;
 
   it("prefers the agent the user last launched", () => {
     const presets = [p({ id: "builtin-claude" }), p({ id: "builtin-codex" })];
@@ -244,6 +246,7 @@ describe("pickAgentPreset", () => {
     // unpinned one is one the user took off their own launcher.
     expect(pickAgentPreset([p({ id: "a", kind: "chat_agent" })], "a")).toBeNull();
     expect(pickAgentPreset([p({ id: "a", pinned: false })], "a")).toBeNull();
+    expect(pickAgentPreset([p({ id: "builtin-shell", commands: [] })], "builtin-shell")).toBeNull();
   });
 });
 
@@ -265,13 +268,17 @@ describe("handOffToAgent — routes", () => {
     const [wsId, presetId, mode, prompt] = mockApplyPreset.mock.calls[0];
     expect(wsId).toBe("ws-here");
     expect(presetId).toBe("builtin-claude");
-    // The only apply_preset mode that carries an initial prompt.
     expect(mode).toBe("current_terminal");
-    expect(prompt).toContain("rust (ubuntu-latest)");
+    expect(prompt).toBeNull();
     expect(mockCreateWorktree).not.toHaveBeenCalled();
     expect(mockToastSuccess).toHaveBeenCalledWith(
-      expect.stringContaining("in this workspace"),
+      expect.stringContaining("without the PR task"),
+      expect.objectContaining({ action: expect.objectContaining({ label: "Copy prompt" }) }),
     );
+    const saved = Object.values(useChatDraftStore.getState().draftsById)[0];
+    expect(saved.target).toEqual({ kind: "existing_workspace", workspaceId: "ws-here" });
+    expect(saved.inputDraft).toBe(out.prompt);
+    expect(saved.manualPromptRequired).toBe(true);
   });
 
   it("(b) another workspace has the branch: activates it, then opens a thread", async () => {
@@ -286,6 +293,31 @@ describe("handOffToAgent — routes", () => {
     expect(mockCreateTab).toHaveBeenCalledWith("ws-other", "terminal");
     expect(mockApplyPreset.mock.calls[0][0]).toBe("ws-other");
     expect(mockCreateWorktree).not.toHaveBeenCalled();
+  });
+
+  it("preserves a review comment verbatim on existing and new-worktree routes", async () => {
+    const task: HandoffTask = {
+      kind: "review-thread",
+      reviewer: "mario",
+      body: "Please keep `$(date)` literal in the prompt.",
+      path: "src/app.ts",
+      line: 12,
+    };
+    workspaces = [ws({ workspace_id: "ws-other", git_branch: PR.head_branch })];
+    const existing = await handOffToAgent(req(task));
+    const first = Object.values(useChatDraftStore.getState().draftsById)[0];
+    expect(first.target).toEqual({ kind: "existing_workspace", workspaceId: "ws-other" });
+    expect(first.inputDraft).toBe(existing.prompt);
+    expect(first.inputDraft).toContain(task.body);
+
+    workspaces = [];
+    const worktree = await handOffToAgent(req(task));
+    const second = Object.values(useChatDraftStore.getState().draftsById).find(
+      (draft) => draft.target.kind === "existing_workspace" && draft.target.workspaceId === "ws-new",
+    );
+    expect(second?.inputDraft).toBe(worktree.prompt);
+    expect(second?.inputDraft).toContain(task.body);
+    expect(mockCreateWorktree.mock.calls[mockCreateWorktree.mock.calls.length - 1]?.[5]).toBeNull();
   });
 
   it("ignores a same-branch workspace belonging to another project", async () => {
@@ -303,7 +335,7 @@ describe("handOffToAgent — routes", () => {
     expect(mockActivate).not.toHaveBeenCalled();
   });
 
-  it("(c) nowhere to land: cuts a worktree carrying the prompt", async () => {
+  it("(c) nowhere to land: cuts a worktree and retains the prompt", async () => {
     const out = await handOffToAgent(req(CHECK_TASK));
 
     expect(out.route).toBe("worktree");
@@ -313,14 +345,15 @@ describe("handOffToAgent — routes", () => {
     expect(args[1]).toBe("fix-windows-shutdown");
     expect(args[2]).toBe(false);
     expect(args[3]).toBe("single");
-    expect(args[5]).toContain("rust (ubuntu-latest)"); // initialPrompt
+    expect(args[5]).toBeNull(); // no prompt in the terminal launch
     expect(args[6]).toBe("builtin-claude"); // agentPresetId
     expect(args[7]).toBe(285); // prNumber
-    // Nothing to apply on top — the backend launched it with the prompt.
+    expect(Object.values(useChatDraftStore.getState().draftsById)[0].inputDraft).toBe(out.prompt);
+    // Nothing to apply on top — the backend launched the preset.
     expect(mockApplyPreset).not.toHaveBeenCalled();
   });
 
-  it("(c') an adopted workspace still gets the prompt", async () => {
+  it("(c') an adopted workspace opens the preset and saves the prompt", async () => {
     mockCreateWorktree.mockResolvedValue({ workspaceId: "ws-adopted", adopted: true });
 
     const out = await handOffToAgent(req(CHECK_TASK));
@@ -332,8 +365,8 @@ describe("handOffToAgent — routes", () => {
     const [wsId, , mode, prompt] = mockApplyPreset.mock.calls[0];
     expect(wsId).toBe("ws-adopted");
     expect(mode).toBe("current_terminal");
-    expect(prompt).toContain("rust (ubuntu-latest)");
-    expect(prompt).toBe(out.prompt);
+    expect(prompt).toBeNull();
+    expect(Object.values(useChatDraftStore.getState().draftsById)[0].inputDraft).toBe(out.prompt);
   });
 
   it("fetches a missing log excerpt rather than sending a thin prompt", async () => {
@@ -382,6 +415,7 @@ describe("handOffToAgent — the run it records", () => {
       kind: "failing-check",
       // The check name is what the card shows.
       summary: "rust (ubuntu-latest)",
+      promptNotSent: true,
       workspaceId: "ws-here",
       threadTabId: "tab-1",
       prNumber: 285,

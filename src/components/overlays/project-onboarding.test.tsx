@@ -48,6 +48,7 @@ import {
 } from "@/tauri/commands";
 import { toast } from "@/lib/toast";
 import { useUIStore } from "@/stores/ui-store";
+import { useChatDraftStore } from "@/stores/chat-draft-store";
 import type { TerminalPreset, WorktreeInfo } from "@/tauri/types";
 
 const mockCloseWorkspace = vi.mocked(closeWorkspace);
@@ -106,6 +107,7 @@ beforeEach(() => {
   cleanup();
   vi.clearAllMocks();
   useUIStore.setState({ lastSelectedAgentId: null });
+  useChatDraftStore.setState({ draftsById: {}, activeDraftId: null });
 });
 
 async function goToSetupStep(task = "Add dark mode") {
@@ -127,7 +129,7 @@ describe("ProjectOnboarding — task and agent", () => {
     });
   });
 
-  it("sends the task as the first prompt to the selected agent", async () => {
+  it("keeps the task for manual entry after opening the selected agent", async () => {
     const { onComplete } = renderOnboarding();
     await flushMountEffects();
     await goToSetupStep("  Add dark mode  ");
@@ -141,8 +143,16 @@ describe("ProjectOnboarding — task and agent", () => {
       true,
       "single",
       "main",
-      "Add dark mode",
+      null,
       "builtin-claude",
+    );
+    const saved = Object.values(useChatDraftStore.getState().draftsById)[0];
+    expect(saved.target).toEqual({ kind: "existing_workspace", workspaceId: "ws-new" });
+    expect(saved.inputDraft).toBe("Add dark mode");
+    expect(saved.manualPromptRequired).toBe(true);
+    expect(vi.mocked(toast.success)).toHaveBeenCalledWith(
+      expect.stringContaining("opened without this task"),
+      expect.objectContaining({ action: expect.objectContaining({ label: "Copy prompt" }) }),
     );
     expect(onComplete).toHaveBeenCalledTimes(1);
   });
@@ -171,7 +181,7 @@ describe("ProjectOnboarding — task and agent", () => {
     );
   });
 
-  it("says so when the backend adopts a live workspace and drops the task", async () => {
+  it("saves the task without claiming an agent opened when a workspace is adopted", async () => {
     mockCreate.mockResolvedValueOnce({ workspaceId: "ws-live", cwd: null, adopted: true });
     const { onComplete } = renderOnboarding();
     await flushMountEffects();
@@ -180,9 +190,13 @@ describe("ProjectOnboarding — task and agent", () => {
     fireEvent.click(screen.getByRole("button", { name: /create & start/i }));
     await flushMountEffects();
 
-    expect(vi.mocked(toast.info)).toHaveBeenCalledWith(
-      expect.stringContaining("Your task wasn't sent"),
+    expect(vi.mocked(toast.success)).toHaveBeenCalledWith(
+      expect.stringContaining("without sending this task"),
+      expect.objectContaining({ action: expect.objectContaining({ label: "Copy prompt" }) }),
     );
+    const saved = Object.values(useChatDraftStore.getState().draftsById)[0];
+    expect(saved.inputDraft).toBe("Add dark mode");
+    expect(saved.manualPromptRequired).toBe(false);
     expect(mockActivate).toHaveBeenCalledWith("ws-live");
     expect(onComplete).toHaveBeenCalledTimes(1);
   });

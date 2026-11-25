@@ -270,6 +270,19 @@ describe("the Timeline tab", () => {
 });
 
 describe("agent runs on the rail", () => {
+  it("labels a manual PR handoff as opened without the task", async () => {
+    const user = userEvent.setup();
+    seedRun();
+    const run = usePrAgentRunsStore.getState().runs[0];
+    usePrAgentRunsStore.getState().record({ ...run, promptNotSent: true });
+    renderDetail();
+    await openTimeline(user);
+
+    const row = screen.getByTestId("timeline-entry-agent");
+    expect(row).toHaveTextContent("Agent opened · task not sent");
+    expect(row).toHaveTextContent("Copy the prepared prompt from Drafts");
+  });
+
   it("interleaves a local run between the host events it happened between", async () => {
     const user = userEvent.setup();
     seedRun();

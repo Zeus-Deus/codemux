@@ -65,6 +65,7 @@ export async function launchDraftWithPreset(
       markPromoted: state.markPromoted,
       markSendFailed: state.markSendFailed,
       markManualPromptRequired: state.markManualPromptRequired,
+      markPromptRetained: state.markPromptRetained,
       ensureThread: chat.ensureThread,
       appendUserMessage: chat.appendUserMessage,
       removeUserMessageByNonce: chat.removeUserMessageByNonce,
@@ -90,7 +91,7 @@ export async function launchDraftWithPreset(
 
   if (result.success) {
     state.setActiveDraft(null);
-    if (!result.manualPromptRequired) {
+    if (!result.manualPromptRequired && !result.retainedDraft) {
       const draftIdToClear = draft.draftId;
       setTimeout(
         () => useChatDraftStore.getState().clearDraft(draftIdToClear),

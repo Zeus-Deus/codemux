@@ -51,6 +51,7 @@ import { basename } from "@/lib/path";
 import { metadataFromSessionContext } from "@/lib/agent-chat/session-handoff";
 import { utilitySelectionFromStores } from "@/lib/utility-agent";
 import { toast } from "@/lib/toast";
+import { COPY_FAILED_MESSAGE, copyToClipboard } from "@/lib/clipboard";
 import { markPaneReady } from "@/lib/perf/interaction-trace";
 import { useAgentChatStore, type Attachment } from "@/stores/agent-chat-store";
 import { selectActiveWorkspaceId, useAppStore } from "@/stores/app-store";
@@ -829,6 +830,7 @@ function DraftChatSurfaceInner({
           markPromoted: state.markPromoted,
           markSendFailed: state.markSendFailed,
           markManualPromptRequired: state.markManualPromptRequired,
+          markPromptRetained: state.markPromptRetained,
           ensureThread: chat.ensureThread,
           appendUserMessage: chat.appendUserMessage,
           removeUserMessageByNonce: chat.removeUserMessageByNonce,
@@ -1480,6 +1482,15 @@ function DraftChatSurfaceInner({
       noticeMessage={draft.manualPromptRequired
         ? "Agent opened without this prompt. Copy it into the terminal agent. Sending here starts a separate chat."
         : null}
+      noticeAction={draft.manualPromptRequired ? {
+        label: "Copy prompt",
+        onClick: () => {
+          void copyToClipboard(draft.inputDraft).then((copied) => {
+            if (copied) toast.success("Prompt copied");
+            else toast.error(COPY_FAILED_MESSAGE);
+          });
+        },
+      } : undefined}
       // Thread Scope redesign — the headline names the project and the
       // strip below the composer carries the rest of the scope; `null`
       // hides Composer's own zone-1 slot rather than falling back to a

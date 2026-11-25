@@ -37,6 +37,7 @@ import {
   GitBranch,
 } from "lucide-react";
 import { toast } from "@/lib/toast";
+import { saveWorkspacePrompt } from "@/lib/workspace-prompt-handoff";
 import { selectActiveWorkspaceId, useAppStore } from "@/stores/app-store";
 import { useUIStore } from "@/stores/ui-store";
 import { PresetIcon } from "@/components/icons/preset-icon";
@@ -976,12 +977,21 @@ export function NewWorkspaceDialog({ open, onOpenChange }: Props) {
       if (branchMode === "open_existing" && openExistingBranch) {
         const existingWsId = branchWorkspaceMap.get(openExistingBranch);
         if (existingWsId) {
-          toast.info(
-            linkedIssue
-              ? `Issue #${linkedIssue.number} already has a workspace — switched to it.`
-              : `"${openExistingBranch}" already has a workspace — switched to it.`,
-          );
           await activateWorkspaceInteraction(existingWsId);
+          if (fullPrompt) {
+            saveWorkspacePrompt(
+              existingWsId,
+              fullPrompt,
+              false,
+              "Workspace opened without sending this prompt. It is saved for later.",
+            );
+          } else {
+            toast.info(
+              linkedIssue
+                ? `Issue #${linkedIssue.number} already has a workspace — switched to it.`
+                : `"${openExistingBranch}" already has a workspace — switched to it.`,
+            );
+          }
           return null;
         }
 
@@ -1015,7 +1025,7 @@ export function NewWorkspaceDialog({ open, onOpenChange }: Props) {
           false,
           "single",
           null,
-          fullPrompt || null,
+          null,
           selectedAgentId,
           null,
           launchSelection,
@@ -1025,12 +1035,8 @@ export function NewWorkspaceDialog({ open, onOpenChange }: Props) {
         // dropped (injecting into an in-flight session is worse). Silence
         // here would read as "nothing happened" and quietly lose the
         // typed message, so say so.
-        if (created.adopted) {
-          toast.info(
-            fullPrompt
-              ? `"${openExistingBranch}" already has a live workspace — switched to it. Your prompt wasn't sent.`
-              : `"${openExistingBranch}" already has a live workspace — switched to it.`,
-          );
+        if (created.adopted && !fullPrompt) {
+          toast.info(`"${openExistingBranch}" already has a live workspace — switched to it.`);
         }
         return { wsId: created.workspaceId, agentHandled: true, adopted: created.adopted };
       }
@@ -1065,12 +1071,21 @@ export function NewWorkspaceDialog({ open, onOpenChange }: Props) {
       // and quietly drops the message they just typed.
       const existingWsId = branchWorkspaceMap.get(resolvedBranch);
       if (existingWsId) {
-        toast.info(
-          linkedIssue
-            ? `Issue #${linkedIssue.number} already has a workspace — switched to it.`
-            : `"${resolvedBranch}" already has a workspace — switched to it.`,
-        );
         await activateWorkspaceInteraction(existingWsId);
+        if (fullPrompt) {
+          saveWorkspacePrompt(
+            existingWsId,
+            fullPrompt,
+            false,
+            "Workspace opened without sending this prompt. It is saved for later.",
+          );
+        } else {
+          toast.info(
+            linkedIssue
+              ? `Issue #${linkedIssue.number} already has a workspace — switched to it.`
+              : `"${resolvedBranch}" already has a workspace — switched to it.`,
+          );
+        }
         return null;
       }
 
@@ -1109,7 +1124,7 @@ export function NewWorkspaceDialog({ open, onOpenChange }: Props) {
         isNewBranch,
         "single",
         isNewBranch ? baseBranch || null : null,
-        fullPrompt || null,
+        null,
         selectedAgentId,
         null,
         launchSelection,
@@ -1118,12 +1133,8 @@ export function NewWorkspaceDialog({ open, onOpenChange }: Props) {
       // the backend focused it and dropped the prompt/preset instead of
       // typing into its in-flight session. Surface that — otherwise the
       // user's prompt disappears silently.
-      if (created.adopted) {
-        toast.info(
-          fullPrompt
-            ? `"${resolvedBranch}" already has a live workspace — switched to it. Your prompt wasn't sent.`
-            : `"${resolvedBranch}" already has a live workspace — switched to it.`,
-        );
+      if (created.adopted && !fullPrompt) {
+        toast.info(`"${resolvedBranch}" already has a live workspace — switched to it.`);
       }
       return { wsId: created.workspaceId, agentHandled: true, adopted: created.adopted };
     };
@@ -1144,13 +1155,28 @@ export function NewWorkspaceDialog({ open, onOpenChange }: Props) {
       }
 
       // Launch agent for paths that don't handle it internally
-      if (!agentHandled && selectedAgentId && fullPrompt) {
+      if (!agentHandled && !adopted && selectedAgentId && fullPrompt) {
         await applyPreset(
           wsId,
           selectedAgentId,
           "current_terminal",
-          fullPrompt,
+          null,
           launchSelection,
+        );
+      }
+
+      if (fullPrompt) {
+        const agentOpened =
+          !adopted &&
+          !!selectedAgentId &&
+          !!selectedAgent?.commands.some((command) => command.trim());
+        saveWorkspacePrompt(
+          wsId,
+          fullPrompt,
+          agentOpened,
+          agentOpened
+            ? `${selectedAgent?.name ?? "Agent"} opened without this task. Copy the prompt to start it.`
+            : "Workspace opened without sending this prompt. It is saved for later.",
         );
       }
 

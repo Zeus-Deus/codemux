@@ -64,6 +64,8 @@ export interface MaterializeActions {
   markSendFailed: (id: DraftId, error: string) => void;
   /** Keeps a successfully launched terminal preset's unsent prompt for manual entry. */
   markManualPromptRequired: (id: DraftId) => void;
+  /** Keeps an unsent prompt after opening a commandless shell. */
+  markPromptRetained: (id: DraftId) => void;
   /** Idempotent — ensures a slice exists on the agent-chat store for
    *  the pre-minted `thread_id` so the optimistic user message has a
    *  home before the live pane mounts. */
@@ -125,6 +127,8 @@ export type MaterializeResult =
       threadId: string;
       /** Terminal preset launched, but its prompt is still in the draft. */
       manualPromptRequired?: boolean;
+      /** A commandless shell opened; the draft remains without agent guidance. */
+      retainedDraft?: boolean;
     }
   | { success: false; error: string };
 
@@ -489,7 +493,7 @@ export async function materializeAndSend(
  *
  * This is the commit-on-preset-click path: when the user clicks a
  * preset tile while a draft is active, the draft's composer text
- * carries over as the preset's initial prompt, the draft's target
+ * remains available for manual entry, the draft's target
  * (home / project / existing) turns into a real workspace, and the
  * preset takes over that workspace's active surface.
  *
@@ -734,7 +738,7 @@ export async function materializeWithPreset(
       workspaceId,
       preset.id,
       "current_terminal",
-      prompt.length > 0 ? prompt : null,
+      null,
     );
   } catch (err) {
     const message = errorMessage(err);
@@ -746,13 +750,15 @@ export async function materializeWithPreset(
   // foreground shell may change before the write arrives. Keep the draft
   // visible in the sidebar with its original text for the user to copy.
   if (prompt.length > 0) {
-    actions.markManualPromptRequired(draft.draftId);
+    const agentOpened = preset.commands.some((command) => command.trim());
+    if (agentOpened) actions.markManualPromptRequired(draft.draftId);
+    else actions.markPromptRetained(draft.draftId);
     return {
       success: true,
       workspaceId,
       paneId: "cli-preset",
       threadId: draft.threadId,
-      manualPromptRequired: true,
+      ...(agentOpened ? { manualPromptRequired: true } : { retainedDraft: true }),
     };
   }
 

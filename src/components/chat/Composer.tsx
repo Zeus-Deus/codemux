@@ -247,6 +247,7 @@ interface Props {
   errorMessage?: string | null;
   /** Informational draft notice without failure or retry wording. */
   noticeMessage?: string | null;
+  noticeAction?: { label: string; onClick: () => void };
   /** When false, hides the Stop button even while streaming. The draft
    *  surface uses this during materialise because there is no live
    *  session to interrupt. Defaults to true. */
@@ -540,6 +541,7 @@ export function Composer({
   mode,
   errorMessage = null,
   noticeMessage = null,
+  noticeAction,
   showStopButton = true,
   zone1Override,
   belowComposerSlot,
@@ -3508,6 +3510,11 @@ export function Composer({
               {noticeMessage && (
                 <div role="status" className="px-5 pt-2 text-label text-muted-foreground leading-tight">
                   {noticeMessage}
+                  {noticeAction && (
+                    <button type="button" onClick={noticeAction.onClick} className="ml-2 font-medium text-foreground underline underline-offset-2 hover:text-primary">
+                      {noticeAction.label}
+                    </button>
+                  )}
                 </div>
               )}
               {unsupportedAcpImages && <p role="alert" className="px-5 pt-2 text-body-sm text-muted-foreground">This custom agent does not advertise image support. Remove image attachments to send a text prompt.</p>}

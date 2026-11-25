@@ -48,16 +48,16 @@ export interface AgentRunRecord {
   projectRoot: string;
   prNumber: number;
   kind: AgentRunKind;
-  /** What the agent was pointed at: a check name, `path:line`, or the
-   *  base branch for a conflict. Rendered as the card's first line. */
+  /** The prepared task's check name, `path:line`, or base branch. */
   summary: string;
+  /** The terminal opened, but the prepared task was saved for manual entry. */
+  promptNotSent?: boolean;
   /** Where the thread landed. */
   workspaceId: string;
   workspaceTitle: string;
   /** The tab the thread opened in, when the handoff created one — so
    *  "Open thread" lands on the conversation rather than the workspace.
-   *  Null when the worktree route carried the prompt at creation time and
-   *  no tab was created here. */
+   *  Null when the worktree route created no tab here. */
   threadTabId: string | null;
   /** Epoch ms. Sorted against host events by this. */
   createdAt: number;

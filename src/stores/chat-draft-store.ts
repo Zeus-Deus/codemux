@@ -163,6 +163,8 @@ export interface ChatDraftStore {
    *  effect have already kicked in. */
   getOrCreateHomeDraft: (opts?: { lockedToHome?: boolean }) => ChatDraft;
   getOrCreateProjectDraft: (projectPath: string) => ChatDraft;
+  /** Keep a terminal launch's exact unsent prompt beside its workspace. */
+  saveWorkspacePrompt: (workspaceId: string, prompt: string, agentOpened: boolean) => DraftId;
 
   // Active-draft selection
   setActiveDraft: (draftId: DraftId | null) => void;
@@ -211,6 +213,7 @@ export interface ChatDraftStore {
   ) => void;
   markSendFailed: (draftId: DraftId, error: string) => void;
   markManualPromptRequired: (draftId: DraftId) => void;
+  markPromptRetained: (draftId: DraftId) => void;
   clearSendError: (draftId: DraftId) => void;
 
   // Removal
@@ -539,6 +542,18 @@ export const useChatDraftStore = create<ChatDraftStore>()(
         return draft;
       },
 
+      saveWorkspacePrompt: (workspaceId, prompt, agentOpened) => {
+        const draft: ChatDraft = {
+          ...makeDraft({ kind: "existing_workspace", workspaceId }),
+          inputDraft: prompt,
+          manualPromptRequired: agentOpened,
+        };
+        set((state) => ({
+          draftsById: { ...state.draftsById, [draft.draftId]: draft },
+        }));
+        return draft.draftId;
+      },
+
       setActiveDraft: (draftId) => set({ activeDraftId: draftId }),
 
       updateDraftTarget: (draftId, target) =>
@@ -698,6 +713,23 @@ export const useChatDraftStore = create<ChatDraftStore>()(
                 promoting: false,
                 lastSendError: null,
                 manualPromptRequired: true,
+              },
+            },
+          };
+        }),
+
+      markPromptRetained: (draftId) =>
+        set((s) => {
+          const existing = s.draftsById[draftId];
+          if (!existing) return s;
+          return {
+            draftsById: {
+              ...s.draftsById,
+              [draftId]: {
+                ...existing,
+                promoting: false,
+                lastSendError: null,
+                manualPromptRequired: false,
               },
             },
           };

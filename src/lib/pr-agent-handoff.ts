@@ -8,9 +8,8 @@
  *
  * The prompts are deliberately verbose. The agent lands in a fresh
  * thread knowing nothing: not the pull request, not the failure, not
- * which branch it is standing on. Everything it would otherwise have to
- * go and fetch is in the first message, quoted from data this panel
- * already has.
+ * which branch it is standing on. The prepared first message is saved
+ * as a draft for the user to copy after the terminal opens.
  */
 
 import {
@@ -25,7 +24,7 @@ import { activateWorkspaceInteraction } from "@/lib/perf/instrumented-activate";
 import { useAppStore } from "@/stores/app-store";
 import { useUIStore } from "@/stores/ui-store";
 import { usePrAgentRunsStore } from "@/stores/pr-agent-runs-store";
-import { toast } from "@/lib/toast";
+import { saveWorkspacePrompt } from "@/lib/workspace-prompt-handoff";
 
 // ── Task shapes ───────────────────────────────────────────────────────
 
@@ -114,7 +113,9 @@ export function pickAgentPreset(
   presets: TerminalPreset[],
   lastSelectedAgentId: string | null,
 ): TerminalPreset | null {
-  const candidates = presets.filter((p) => p.pinned && p.kind === "cli");
+  const candidates = presets.filter(
+    (p) => p.pinned && p.kind === "cli" && p.commands.some((command) => command.trim()),
+  );
   const remembered = lastSelectedAgentId
     ? candidates.find((p) => p.id === lastSelectedAgentId)
     : undefined;
@@ -286,13 +287,6 @@ export function buildHandoffPrompt(req: HandoffRequest, excerpt?: string | null)
   return parts.filter(Boolean).join("\n\n");
 }
 
-/** The half-sentence a toast uses to say what was handed over. */
-export function taskLabel(task: HandoffTask, pr: HandoffPr): string {
-  if (task.kind === "failing-check") return `fixing ${task.checkName}`;
-  if (task.kind === "review-thread") return `addressing ${task.reviewer}'s comment`;
-  return `resolving conflicts with ${pr.base_branch ?? "the base branch"}`;
-}
-
 // ── Routing ───────────────────────────────────────────────────────────
 
 function workspaceById(id: string): WorkspaceSnapshot | null {
@@ -316,22 +310,18 @@ export function findWorkspaceForBranch(
 /**
  * Start the preset in a *fresh* tab of an existing workspace.
  *
- * `apply_preset` only carries an initial prompt on its `current_terminal`
- * path — the `new_tab` branch spawns the agent with no prompt at all. So
- * the tab is created first (which makes it the active one) and the
- * preset is then applied to it. That also means we never type into the
- * terminal the user was already working in.
+ * A fresh tab keeps the user's current terminal untouched. The task is
+ * saved separately for manual entry after the preset launches.
  */
 async function startThreadIn(
   workspaceId: string,
   presetId: string,
-  prompt: string,
   modelSelection: ModelSelection | null,
 ): Promise<string | null> {
   // The id is kept so the timeline's "Open thread" can land on this
   // conversation rather than merely on the workspace containing it.
   const tabId = await createTab(workspaceId, "terminal");
-  await applyPreset(workspaceId, presetId, "current_terminal", prompt, modelSelection);
+  await applyPreset(workspaceId, presetId, "current_terminal", null, modelSelection);
   return tabId ?? null;
 }
 
@@ -377,6 +367,7 @@ export async function handOffToAgent(req: HandoffRequest): Promise<HandoffOutcom
       prNumber: pr.number,
       kind: task.kind,
       summary: runSummary(task, pr),
+      promptNotSent: true,
       workspaceId,
       workspaceTitle,
       threadTabId,
@@ -410,14 +401,19 @@ export async function handOffToAgent(req: HandoffRequest): Promise<HandoffOutcom
           ? `in a new worktree for ${pr.head_branch}`
           : `in ${title}`;
     remember(workspaceId, title, threadTabId);
-    toast.success(`${presetName} is ${taskLabel(task, pr)} — new thread ${where}`);
+    saveWorkspacePrompt(
+      workspaceId,
+      prompt,
+      true,
+      `${presetName} opened ${where} without the PR task. Copy the prompt to start it.`,
+    );
     return { route, workspaceId, workspaceTitle: title, presetName, prompt };
   };
 
   // (a) You are standing in the branch: the worktree already exists and
   // it is the one on screen.
   if (currentWorkspaceId) {
-    const tabId = await startThreadIn(currentWorkspaceId, presetId, prompt, modelSelection);
+    const tabId = await startThreadIn(currentWorkspaceId, presetId, modelSelection);
     return finish("current", currentWorkspaceId, tabId);
   }
 
@@ -430,33 +426,30 @@ export async function handOffToAgent(req: HandoffRequest): Promise<HandoffOutcom
   const existing = findWorkspaceForBranch(projectRoot, pr.head_branch);
   if (existing) {
     await activateWorkspaceInteraction(existing.workspace_id);
-    const tabId = await startThreadIn(existing.workspace_id, presetId, prompt, modelSelection);
+    const tabId = await startThreadIn(existing.workspace_id, presetId, modelSelection);
     return finish("existing", existing.workspace_id, tabId);
   }
 
-  // (c) Nowhere to land: cut the worktree, with the prompt attached.
+  // (c) Nowhere to land: cut the worktree and save its task separately.
   const result = await createWorktreeWorkspaceResult(
     projectRoot,
     pr.head_branch,
     false,
     "single",
     null,
-    prompt,
+    null,
     presetId,
     pr.number,
     modelSelection,
   );
 
-  // An adopted workspace is one the backend attached to instead of
-  // creating, and adoption drops the prompt and the preset. Rather than
-  // telling the user their instruction went nowhere, start the thread
-  // the second way.
+  // Adoption skips the preset. Start it in a new tab and retain the task.
   if (result.adopted) {
-    const tabId = await startThreadIn(result.workspaceId, presetId, prompt, modelSelection);
+    const tabId = await startThreadIn(result.workspaceId, presetId, modelSelection);
     return finish("adopted", result.workspaceId, tabId);
   }
 
-  // The worktree route carried the prompt at creation time, so no tab was
-  // created here and there is no id to point "Open thread" at.
+  // The backend created the worktree and launched the preset. It does not
+  // return a tab id for the timeline's "Open thread" action.
   return finish("worktree", result.workspaceId, null);
 }

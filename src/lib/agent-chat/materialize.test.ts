@@ -95,6 +95,7 @@ function makeActions(): SpyActions {
     markPromoted: vi.fn(),
     markSendFailed: vi.fn(),
     markManualPromptRequired: vi.fn(),
+    markPromptRetained: vi.fn(),
     ensureThread: vi.fn(),
     appendUserMessage: vi.fn(),
     removeUserMessageByNonce: vi.fn(),
@@ -1586,7 +1587,7 @@ describe("materializeWithPreset", () => {
         "ws-project",
         "builtin-claude",
         "current_terminal",
-        "ship it",
+        null,
       );
       // CLI path does not mint its own chat pane / session / turn.
       expect(agentChatCreatePane).not.toHaveBeenCalled();
@@ -1595,6 +1596,25 @@ describe("materializeWithPreset", () => {
       expect(actions.markPromoted).not.toHaveBeenCalled();
       expect(actions.markManualPromptRequired).toHaveBeenCalledWith(draft.draftId);
       expect(actions.markSendFailed).not.toHaveBeenCalled();
+    });
+
+    it("keeps a commandless Shell prompt without claiming an agent opened", async () => {
+      const actions = makeActions();
+      const draft = makeDraft({ target: { kind: "project", projectPath: "/projects/foo" } });
+
+      const result = await materializeWithPreset(
+        draft,
+        makePreset({ id: "builtin-shell", name: "Shell", commands: [] }),
+        "inspect this branch",
+        actions,
+      );
+
+      expect(result).toMatchObject({ success: true, retainedDraft: true });
+      expect(result).not.toHaveProperty("manualPromptRequired");
+      expect(actions.markPromptRetained).toHaveBeenCalledWith(draft.draftId);
+      expect(actions.markManualPromptRequired).not.toHaveBeenCalled();
+      expect(actions.markPromoted).not.toHaveBeenCalled();
+      expect(applyPreset).toHaveBeenCalledWith("ws-project", "builtin-shell", "current_terminal", null);
     });
 
     it("empty/whitespace prompt becomes null when delegated to applyPreset", async () => {

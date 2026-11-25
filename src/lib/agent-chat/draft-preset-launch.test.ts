@@ -82,3 +82,38 @@ it("keeps a withheld CLI prompt available after showing the agent workspace", as
   expect(preserved?.promotedTo).toBeNull();
   expect(preserved?.materializedTo).toBeNull();
 });
+
+it("keeps a Shell draft without manual agent guidance", async () => {
+  vi.mocked(materializeWithPreset).mockResolvedValueOnce({
+    success: true,
+    workspaceId: "ws",
+    paneId: "cli-preset",
+    threadId: "thread",
+    retainedDraft: true,
+  });
+  const store = useChatDraftStore.getState();
+  const draft = store.getOrCreateHomeDraft();
+  store.updateDraftInput(draft.draftId, "inspect this branch");
+  store.setActiveDraft(draft.draftId);
+
+  const shellPreset: TerminalPreset = {
+    id: "builtin-shell",
+    name: "Shell",
+    description: null,
+    commands: [],
+    working_directory: null,
+    launch_mode: "new_tab",
+    icon: null,
+    pinned: true,
+    is_builtin: true,
+    auto_run_on_workspace: false,
+    auto_run_on_new_tab: false,
+    kind: "cli",
+  };
+  await launchDraftWithPreset(draft.draftId, shellPreset);
+
+  const preserved = useChatDraftStore.getState().draftsById[draft.draftId];
+  expect(preserved?.inputDraft).toBe("inspect this branch");
+  expect(preserved?.manualPromptRequired).not.toBe(true);
+  expect(preserved?.promotedTo).toBeNull();
+});
