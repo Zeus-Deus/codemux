@@ -584,6 +584,7 @@ mod tests {
             "dev_agent_chat_spawn_test_pane",
             "quit_app",
             "delete_archived_workspace",
+            "archive_workspace_without_teardown",
             "remove_worktree",
             "git_discard_file",
             "get_auth_token",

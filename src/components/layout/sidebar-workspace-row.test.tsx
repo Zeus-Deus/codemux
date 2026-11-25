@@ -15,6 +15,7 @@ import type {
 // reference must be created via `vi.hoisted` to survive that hoist.
 const {
   mockArchiveWorkspace,
+  mockArchiveWorkspaceWithoutTeardown,
   mockUnarchiveWorkspace,
   mockCheckoutDefault,
   mockCloseWorkspace,
@@ -26,6 +27,7 @@ const {
   mockToast,
 } = vi.hoisted(() => ({
   mockArchiveWorkspace: vi.fn(),
+  mockArchiveWorkspaceWithoutTeardown: vi.fn(),
   mockUnarchiveWorkspace: vi.fn(),
   mockCheckoutDefault: vi.fn(),
   mockCloseWorkspace: vi.fn(),
@@ -46,6 +48,8 @@ const {
 vi.mock("@/tauri/commands", () => ({
   activateWorkspace: vi.fn().mockResolvedValue(undefined),
   archiveWorkspace: (...args: unknown[]) => mockArchiveWorkspace(...args),
+  archiveWorkspaceWithoutTeardown: (...args: unknown[]) =>
+    mockArchiveWorkspaceWithoutTeardown(...args),
   unarchiveWorkspace: (...args: unknown[]) =>
     mockUnarchiveWorkspace(...args),
   checkoutDefaultBranchInWorkspace: (...args: unknown[]) =>
@@ -257,6 +261,7 @@ beforeEach(() => {
   });
   mockArchiveWorkspace.mockReset();
   mockArchiveWorkspace.mockResolvedValue("archive-1");
+  mockArchiveWorkspaceWithoutTeardown.mockReset();
   mockUnarchiveWorkspace.mockReset();
   mockUnarchiveWorkspace.mockResolvedValue("ws-1");
   mockCheckoutDefault.mockReset();
@@ -731,6 +736,7 @@ describe("Archive context-menu items", () => {
 });
 
 describe("Hover-reveal archive button", () => {
+  const teardownError = "The workspace is still open because teardown could not be verified. Missing checkout binding.";
   const renderRow = (ws: WorkspaceSnapshot) =>
     render(
       <TooltipProvider>
@@ -777,8 +783,53 @@ describe("Hover-reveal archive button", () => {
       screen.getByRole("button", { name: /Archive workspace/i }),
     );
 
-    await waitFor(() => expect(mockToast.error).toHaveBeenCalledTimes(1));
+    await waitFor(() => expect(mockToast.error).toHaveBeenCalledWith("Archive failed", {
+      description: "This workspace is attached in place on its host — close it instead of archiving.",
+    }));
     expect(mockToast.undoable).not.toHaveBeenCalled();
+    expect(mockArchiveWorkspaceWithoutTeardown).not.toHaveBeenCalled();
+  });
+
+  it("offers explicit archive recovery for unverified teardown and retains Undo", async () => {
+    mockArchiveWorkspace.mockRejectedValueOnce(teardownError);
+    mockArchiveWorkspaceWithoutTeardown.mockResolvedValueOnce("archive-recovered");
+    renderRow(makeWorkspace({
+      workspace_id: "ws-recovered",
+      worktree_path: "/home/user/.codemux/worktrees/myapp/feature-x",
+    }));
+
+    await userEvent.click(screen.getByRole("button", { name: /Archive workspace/i }));
+
+    await waitFor(() => expect(mockToast.error).toHaveBeenCalledWith(
+      "Archive failed",
+      expect.objectContaining({
+        description: teardownError,
+        action: expect.objectContaining({ label: "Archive without running teardown" }),
+      }),
+    ));
+    expect(mockArchiveWorkspaceWithoutTeardown).not.toHaveBeenCalled();
+    expect(mockToast.undoable).not.toHaveBeenCalled();
+    await mockToast.error.mock.calls[0][1].action.onClick();
+
+    expect(mockArchiveWorkspaceWithoutTeardown).toHaveBeenCalledWith("ws-recovered");
+    expect(mockCloseWorkspaceWithWorktree).not.toHaveBeenCalled();
+    await mockToast.undoable.mock.calls[0][0].onUndo();
+    expect(mockUnarchiveWorkspace).toHaveBeenCalledWith("archive-recovered", { select: false });
+  });
+
+  it("keeps archive teardown recovery off the web client", async () => {
+    remote.value = true;
+    mockArchiveWorkspace.mockRejectedValueOnce(teardownError);
+    renderRow(makeWorkspace({
+      worktree_path: "/home/user/.codemux/worktrees/myapp/feature-x",
+    }));
+
+    await userEvent.click(screen.getByRole("button", { name: /Archive workspace/i }));
+
+    await waitFor(() => expect(mockToast.error).toHaveBeenCalledWith("Archive failed", {
+      description: teardownError,
+    }));
+    expect(mockArchiveWorkspaceWithoutTeardown).not.toHaveBeenCalled();
   });
 
   it("shift-click on a deletable worktree opens the delete dialog instead of archiving", async () => {

@@ -8673,6 +8673,7 @@ const handlers: Record<string, Handler> = {
     emitAppState();
     return archiveId;
   },
+  archive_workspace_without_teardown: (a) => handlers.archive_workspace(a),
   unarchive_workspace: (a) => {
     const entries = appState.archived_workspaces ?? [];
     const entry = entries.find((e) => e.archive_id === a.archiveId);

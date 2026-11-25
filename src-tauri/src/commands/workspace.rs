@@ -1364,8 +1364,12 @@ enum CloseRoute<'a> {
     Plain,
     /// The close dialog and the MCP / control-socket close.
     Tracked,
-    /// Tracked teardown plus the archive entry recorded with layout removal.
-    Archive(&'a crate::state::ArchivedWorkspaceSnapshot),
+    /// Archive entry recorded with layout removal. Skipping teardown is a
+    /// separate desktop action that keeps the worktree and branch.
+    Archive {
+        entry: &'a crate::state::ArchivedWorkspaceSnapshot,
+        skip_teardown: bool,
+    },
 }
 
 /// The folder a closing workspace's teardown scripts run in. A plain close
@@ -1379,7 +1383,8 @@ fn teardown_folder(ws: &crate::state::WorkspaceSnapshot, route: CloseRoute<'_>) 
     }
     match route {
         CloseRoute::Plain => (!ws.is_local_import_snapshot_only()).then(|| ws.cwd.clone()),
-        CloseRoute::Tracked | CloseRoute::Archive(_) => ws.worktree_path.clone(),
+        CloseRoute::Archive { skip_teardown: true, .. } => None,
+        CloseRoute::Tracked | CloseRoute::Archive { .. } => ws.worktree_path.clone(),
     }
 }
 
@@ -1522,7 +1527,7 @@ fn detach_workspace<R: tauri::Runtime>(
     let claim = closing.as_ref().map(crate::checkout_claims::claim_checkout);
     let closed = crate::state::with_terminal_close_layout_lock(|| {
         let intent = match route {
-            CloseRoute::Archive(entry) => LayoutCloseIntent::archive(entry.clone()),
+            CloseRoute::Archive { entry, .. } => LayoutCloseIntent::archive(entry.clone()),
             _ => LayoutCloseIntent::Workspace(workspace_id.to_owned()),
         };
         let (_scope, terminal_close) = commit_closed_terminals(app, state, intent, checkpoint)?;
@@ -1990,7 +1995,7 @@ async fn close_workspace_tracked<R: tauri::Runtime>(
     torn_down.map_err(|e| format!("Teardown failed: {e}\nUse force delete to skip teardown."))?;
 
     let archive = match route {
-        CloseRoute::Archive(entry) => Some(entry.clone()),
+        CloseRoute::Archive { entry, skip_teardown } => Some((entry.clone(), skip_teardown)),
         _ => None,
     };
     let ordinary_route = if matches!(route, CloseRoute::Plain) { CloseRoute::Plain } else { CloseRoute::Tracked };
@@ -1999,7 +2004,9 @@ async fn close_workspace_tracked<R: tauri::Runtime>(
     let detach_checkpoint = checkpoint.clone();
     let closing = attempt.clone();
     let detached = tauri::async_runtime::spawn_blocking(move || {
-        let route = archive.as_ref().map(CloseRoute::Archive).unwrap_or(ordinary_route);
+        let route = archive.as_ref().map_or(ordinary_route, |(entry, skip_teardown)| {
+            CloseRoute::Archive { entry, skip_teardown: *skip_teardown }
+        });
         let detached = detach_workspace(
             &detach_app, &detach_app.state(), &detach_app.state(), &detach_id, route, &detach_checkpoint,
         )?;
@@ -2318,6 +2325,17 @@ pub(crate) async fn archive_workspace_checked<R: tauri::Runtime>(
     workspace_id: String,
     checkpoint: &Checkpoint,
 ) -> Result<String, String> {
+    archive_workspace_with_teardown_choice(app, state, db, workspace_id, checkpoint, false).await
+}
+
+async fn archive_workspace_with_teardown_choice<R: tauri::Runtime>(
+    app: tauri::AppHandle<R>,
+    state: &AppStateStore,
+    db: &crate::database::DatabaseStore,
+    workspace_id: String,
+    checkpoint: &Checkpoint,
+    skip_teardown: bool,
+) -> Result<String, String> {
     let ws = state
         .find_workspace(&workspace_id)
         .ok_or_else(|| format!("No workspace found for {workspace_id}"))?;
@@ -2325,18 +2343,21 @@ pub(crate) async fn archive_workspace_checked<R: tauri::Runtime>(
     if let Some(reason) = archive_refusal_reason(&ws) {
         return Err(reason);
     }
+    if skip_teardown && (ws.worktree_path.is_none() || ws.is_chat_child() || ws.is_remote_only()) {
+        return Err("Archiving without teardown is available for local worktrees.".into());
+    }
 
     let entry = crate::state::build_archive_entry(&ws);
     let archive_id = entry.archive_id.clone();
 
-    // remove_worktree=false + force_delete=None: teardown scripts run
-    // and their failure aborts the archive; files/branch are untouched.
+    // Archiving always retains the worktree and branch. The standard route
+    // runs verified teardown first and aborts the archive on failure.
     close_workspace_tracked(
         app.clone(),
         state,
         db,
         workspace_id,
-        CloseRoute::Archive(&entry),
+        CloseRoute::Archive { entry: &entry, skip_teardown },
         false,
         None,
         None,
@@ -2747,6 +2768,19 @@ pub async fn archive_workspace<R: tauri::Runtime>(
     workspace_id: String,
 ) -> Result<String, String> {
     archive_workspace_impl(app, &state, &db, workspace_id).await
+}
+
+/// Explicit desktop recovery when teardown cannot be verified. This command
+/// is deliberately absent from the paired browser and agent command lists.
+#[tauri::command]
+pub async fn archive_workspace_without_teardown<R: tauri::Runtime>(
+    app: tauri::AppHandle<R>,
+    state: State<'_, AppStateStore>,
+    db: State<'_, crate::database::DatabaseStore>,
+    workspace_id: String,
+) -> Result<String, String> {
+    archive_workspace_with_teardown_choice(app, &state, &db, workspace_id, &Checkpoint::default(), true)
+        .await
 }
 
 // `async fn` for the same reason as `create_worktree_workspace`: the
@@ -5128,6 +5162,19 @@ mod archive_guard_tests {
         (project, checkout)
     }
 
+    fn restore_worktree_before_bindings(base: &Path) -> (AppStateStore, String, PathBuf, PathBuf) {
+        let (root, worktree) = linked_teardown_fixture(base);
+        let before_upgrade = AppStateStore::default();
+        let id = before_upgrade.create_empty_workspace_at_path(worktree.clone()).0;
+        before_upgrade.set_workspace_worktree(&id, worktree.display().to_string(), "feature".into());
+        before_upgrade.set_workspace_project_root(&id, root.display().to_string());
+        crate::state::flush_persisted_state(&before_upgrade).unwrap();
+
+        let restored = AppStateStore::default();
+        restored.replace_snapshot(crate::state::load_persisted_state().unwrap());
+        (restored, id, root, worktree)
+    }
+
     /// A chat child workspace borrows its parent's folder: closing it, by
     /// any route, never runs the folder's teardown scripts.
     #[tokio::test]
@@ -5284,15 +5331,7 @@ mod archive_guard_tests {
         use tauri::Manager;
 
         let fixture = tempfile::tempdir().unwrap();
-        let (root, worktree) = linked_teardown_fixture(fixture.path());
-        let before_upgrade = AppStateStore::default();
-        let id = before_upgrade.create_empty_workspace_at_path(worktree.clone()).0;
-        before_upgrade.set_workspace_worktree(&id, worktree.display().to_string(), "feature".into());
-        before_upgrade.set_workspace_project_root(&id, root.display().to_string());
-        crate::state::flush_persisted_state(&before_upgrade).unwrap();
-
-        let restored = AppStateStore::default();
-        restored.replace_snapshot(crate::state::load_persisted_state().unwrap());
+        let (restored, id, root, worktree) = restore_worktree_before_bindings(fixture.path());
         let app = close_test_app(restored);
         let state = app.state::<AppStateStore>();
         let db = app.state::<crate::database::DatabaseStore>();
@@ -5315,6 +5354,61 @@ mod archive_guard_tests {
         delete(true).await.unwrap();
         assert!(state.find_workspace(&id).is_none());
         assert!(!worktree.exists());
+    }
+
+    #[tokio::test]
+    async fn restored_worktree_can_be_archived_without_running_unverified_teardown() {
+        if crate::state::run_with_isolated_layout(
+            "commands::workspace::archive_guard_tests::restored_worktree_can_be_archived_without_running_unverified_teardown",
+        ) {
+            return;
+        }
+        use tauri::Manager;
+
+        let fixture = tempfile::tempdir().unwrap();
+        let (restored, id, root, worktree) = restore_worktree_before_bindings(fixture.path());
+        std::fs::write(worktree.join("local-notes"), "keep these changes").unwrap();
+        let app = close_test_app(restored);
+        let state = app.state::<AppStateStore>();
+        let db = app.state::<crate::database::DatabaseStore>();
+        save_teardown(&db, &root, "touch teardown-ran; exit 43");
+        assert!(db.lifecycle_worktree_id(&id).unwrap().is_none());
+
+        let error = archive_workspace_impl(app.handle().clone(), &state, &db, id.clone())
+            .await
+            .unwrap_err();
+        assert!(error.contains("teardown could not be verified"), "{error}");
+        assert!(state.find_workspace(&id).is_some());
+        assert!(state.snapshot().archived_workspaces.is_empty());
+        assert!(db.pending_layout_closes().unwrap().is_empty());
+
+        let archive_id = archive_workspace_without_teardown(
+            app.handle().clone(),
+            app.state(),
+            app.state(),
+            id.clone(),
+        )
+        .await
+        .unwrap();
+        let archive = state.find_archived_workspace(&archive_id).unwrap();
+        assert_eq!(archive.worktree_path.as_deref(), worktree.to_str());
+        assert!(state.find_workspace(&id).is_none());
+        assert_eq!(std::fs::read_to_string(worktree.join("local-notes")).unwrap(), "keep these changes");
+        assert!(worktree.join(".git").is_file());
+        assert!(!worktree.join("teardown-ran").exists());
+        let branch = crate::git::git_command()
+            .current_dir(&worktree)
+            .args(["symbolic-ref", "--short", "HEAD"])
+            .output()
+            .unwrap();
+        assert!(branch.status.success(), "{branch:?}");
+        assert_eq!(String::from_utf8_lossy(&branch.stdout).trim(), "feature");
+        let branch_ref = crate::git::git_command()
+            .current_dir(&root)
+            .args(["show-ref", "--verify", "refs/heads/feature"])
+            .output()
+            .unwrap();
+        assert!(branch_ref.status.success(), "{branch_ref:?}");
     }
 
     /// From a deletion's final check through the delete, nothing opens in

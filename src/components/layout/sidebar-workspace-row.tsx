@@ -73,6 +73,7 @@ import { openExternalUrl } from "@/lib/open-url";
 import { PrStatusIcon, humanizePrState } from "@/components/github/pr-status-icon";
 import {
   archiveWorkspace,
+  archiveWorkspaceWithoutTeardown,
   checkoutDefaultBranchInWorkspace,
   closeWorkspace,
   closeWorkspaceWithWorktree,
@@ -231,11 +232,14 @@ function focusWorkspaceRow(
  * reopens the workspace if it was the one on screen, so undoing never pulls
  * the user away from what they were reading.
  */
-export async function archiveWorkspaceWithUndo(workspace: WorkspaceSnapshot): Promise<void> {
+async function archiveAndOfferUndo(
+  workspace: WorkspaceSnapshot,
+  archive: (workspaceId: string) => Promise<string>,
+): Promise<void> {
   const workspaceId = workspace.workspace_id;
   const wasActive = selectActiveWorkspaceId(useAppStore.getState()) === workspaceId;
   const neighbour = neighbourWorkspaceId(workspaceId);
-  const archiveId = await archiveWorkspace(workspaceId);
+  const archiveId = await archive(workspaceId);
   if (neighbour) focusWorkspaceRow(neighbour, { leaving: workspaceId });
   toast.undoable({
     message: `Archived "${workspace.title}"`,
@@ -245,6 +249,41 @@ export async function archiveWorkspaceWithUndo(workspace: WorkspaceSnapshot): Pr
       focusWorkspaceRow(restoredId, { holdThroughToasts: true });
     },
   });
+}
+
+export async function archiveWorkspaceWithUndo(workspace: WorkspaceSnapshot): Promise<void> {
+  try {
+    await archiveAndOfferUndo(workspace, archiveWorkspace);
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    if (
+      !isRemoteClient() &&
+      workspace.worktree_path &&
+      !isAttachOrRemoteWorkspace(workspace) &&
+      message.startsWith("The workspace is still open because teardown could not be verified.")
+    ) {
+      toast.error("Archive failed", {
+        id: `archive-teardown-${workspace.workspace_id}`,
+        className: "cn-toast-archive-recovery",
+        description: message,
+        duration: Infinity,
+        action: {
+          label: "Archive without running teardown",
+          onClick: async () => {
+            try {
+              await archiveAndOfferUndo(workspace, archiveWorkspaceWithoutTeardown);
+            } catch (err) {
+              toast.error("Archive failed", {
+                description: err instanceof Error ? err.message : String(err),
+              });
+            }
+          },
+        },
+      });
+    } else {
+      toast.error("Archive failed", { description: message });
+    }
+  }
 }
 
 export function DeleteWorktreeDialog({
@@ -1114,16 +1153,7 @@ export function SidebarWorkspaceRow({ workspace, isActive, projectChip }: Props)
     activateWorkspaceInteraction(workspace.workspace_id).catch(console.error);
   };
 
-  // Archive: same 10s Undo escape hatch as push/pull (see
-  // `archiveWorkspaceWithUndo`).
-  const handleArchive = async () => {
-    try {
-      await archiveWorkspaceWithUndo(workspace);
-    } catch (err) {
-      const message = err instanceof Error ? err.message : String(err);
-      toast.error("Archive failed", { description: message });
-    }
-  };
+  const handleArchive = () => archiveWorkspaceWithUndo(workspace);
 
   // Non-destructive close for attach-in-place / remote rows: the backend
   // refuses to archive them, so their removal affordance is the old

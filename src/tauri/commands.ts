@@ -727,6 +727,15 @@ export const archiveWorkspace = (workspaceId: string) => {
   return invoke<string>("archive_workspace", { workspaceId });
 };
 
+/** Archive on the desktop after the user explicitly chooses to skip teardown. */
+export const archiveWorkspaceWithoutTeardown = (workspaceId: string) => {
+  if (isRemoteClient()) {
+    return Promise.reject(new Error("Archiving without teardown requires the desktop app."));
+  }
+  noteLocalActivationFallback();
+  return invoke<string>("archive_workspace_without_teardown", { workspaceId });
+};
+
 /** Restore an archived workspace. Resolves with the restored workspace id;
  *  the backend also activates it unless `select` is false (an Undo of an
  *  archive the user wasn't looking at). Rejects (entry kept) when nothing is

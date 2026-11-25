@@ -2948,6 +2948,7 @@ fn build_core_app<R: tauri::Runtime>(
             commands::close_workspace_with_worktree,
             commands::workspaces_worktree_sizes,
             commands::archive_workspace,
+            commands::archive_workspace_without_teardown,
             commands::unarchive_workspace,
             commands::delete_archived_workspace,
             commands::generate_branch_name,
