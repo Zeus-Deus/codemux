@@ -953,7 +953,9 @@ function DraftChatSurfaceInner({
             metadata: {
               label: filename,
               lineCount: info.lineCount,
+              lineCountLowerBound: info.lineCountLowerBound,
               bytes: info.bytes,
+              isTruncated: info.truncated,
               isLoading: false,
               fetchedAt: Date.now(),
             },

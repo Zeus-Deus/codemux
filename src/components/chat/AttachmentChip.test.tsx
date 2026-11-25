@@ -417,7 +417,7 @@ describe("AttachmentChip", () => {
   // ──────────────── Stage 7 polish ────────────────
 
   describe("Stage 7 — truncation indicator", () => {
-    it("renders 'first 50/N L' when metadata.isTruncated is true", () => {
+    it("renders a preview label when metadata.isTruncated is true", () => {
       const { getByTestId, queryByText } = render(
         <AttachmentChip
           attachment={makeAttachment({
@@ -431,11 +431,30 @@ describe("AttachmentChip", () => {
         />,
       );
       expect(getByTestId("attachment-chip-truncation").textContent).toBe(
-        "first 50/3000L",
+        "preview/3000L",
       );
       // The plain "3000L" line-count slot is suppressed when truncated
       // so we don't double-render the line count.
       expect(queryByText("3000L")).toBeNull();
+    });
+
+    it("shows a lower bound when the backend stopped scanning a large file", () => {
+      const { getByTestId } = render(
+        <AttachmentChip
+          attachment={makeAttachment({
+            metadata: {
+              label: "huge.ts",
+              lineCount: 3000,
+              lineCountLowerBound: true,
+              isTruncated: true,
+            },
+          })}
+          onRemove={vi.fn()}
+        />,
+      );
+      expect(getByTestId("attachment-chip-truncation").textContent).toBe(
+        "preview/≥3000L",
+      );
     });
 
     it("renders the plain line-count slot when not truncated", () => {

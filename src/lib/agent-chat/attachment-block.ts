@@ -35,14 +35,17 @@ function renderFullFile(info: FileAttachmentInfo): string {
 function renderTruncatedFile(info: FileAttachmentInfo): string {
   const lang = info.language ?? "";
   const previewLines = info.content.split("\n").slice(0, 50).join("\n");
+  const total = info.lineCountLowerBound
+    ? `at least ${info.lineCount}`
+    : `${info.lineCount}`;
   const lines: string[] = [
-    `First 50 of ${info.lineCount} lines:`,
+    `Preview (up to 50 lines) of ${total} total lines:`,
     "```" + lang,
     previewLines,
     "```",
   ];
   if (info.outline && info.outline.length > 0) {
-    lines.push(`\nOutline (${info.outline.length} declarations):`);
+    lines.push(`\nOutline preview (${info.outline.length} declarations shown):`);
     for (const entry of info.outline) {
       lines.push(`- ${entry.kind} ${entry.name} (line ${entry.line})`);
     }
@@ -77,8 +80,11 @@ export function buildFileResolvedContent(info: FileAttachmentInfo): string {
  * footgun that bloats prompts when a folder has dozens of files.
  */
 export function buildFolderResolvedContent(info: FolderAttachmentInfo): string {
+  const count = info.itemCountLowerBound
+    ? `at least ${info.itemCount}`
+    : `${info.itemCount}`;
   return [
-    `Tree (depth-bounded, ${info.itemCount} item${info.itemCount === 1 ? "" : "s"}):`,
+    `Tree (depth-bounded, ${count} item${info.itemCount === 1 ? "" : "s"}):`,
     "```",
     info.tree,
     "```",
@@ -91,7 +97,9 @@ function formatFileAttachment(att: Attachment): string {
   const header: string[] = [`## File: ${att.metadata.label}`];
   header.push(`Full path: ${att.ref}`);
   if (typeof att.metadata.lineCount === "number") {
-    header.push(`Lines: ${att.metadata.lineCount}`);
+    header.push(
+      `Lines: ${att.metadata.lineCountLowerBound ? "at least " : ""}${att.metadata.lineCount}`,
+    );
   }
   return [...header, "", att.resolvedContent ?? ""].join("\n");
 }

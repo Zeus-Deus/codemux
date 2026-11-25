@@ -14,6 +14,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, LazyLock, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
+use ignore::gitignore::{Gitignore, GitignoreBuilder};
 use ignore::WalkBuilder;
 use nucleo_matcher::pattern::{CaseMatching, Normalization, Pattern};
 use nucleo_matcher::{Config, Matcher};
@@ -22,18 +23,25 @@ use serde::{Deserialize, Serialize};
 
 /// Step 8 Stage 2 — content tier thresholds. Mirrors the locked
 /// research decision: full inline for files ≤200KB AND ≤1500 lines;
-/// first-50 + outline for anything larger.
+/// bounded first-50 preview + outline for anything larger.
 const FULL_CONTENT_BYTES_LIMIT: u64 = 200 * 1024;
 const FULL_CONTENT_LINE_LIMIT: usize = 1500;
 const TRUNCATED_PREVIEW_LINES: usize = 50;
 const BINARY_SNIFF_BYTES: usize = 8 * 1024;
+/// A workspace file can be much larger than the attachment preview. Stop
+/// scanning after this many text bytes instead of loading the whole file.
+const MAX_ATTACHMENT_TEXT_BYTES: usize = 8 * 1024 * 1024;
+const MAX_ATTACHMENT_PREVIEW_BYTES: usize = 32 * 1024;
+const MAX_ATTACHMENT_OUTLINE_ENTRIES: usize = 200;
 
 /// Step 8 Stage 3 — folder-tree rendering caps. Walking is bounded by
-/// the caller's `max_depth`; truncation kicks in at this many entries
-/// to keep injected blocks budget-friendly. The walker itself
-/// continues so `item_count` reflects the true total — only the
-/// rendered tree is cut.
+/// depth and visits; the rendered tree uses at most this many entries.
 const FOLDER_TREE_MAX_ENTRIES: usize = 100;
+const FOLDER_WALK_MAX_VISITS: usize = 10_000;
+const FOLDER_WALK_MAX_DEPTH: usize = 8;
+const MAX_ATTACHMENT_IGNORE_FILE_BYTES: u64 = 1024 * 1024;
+const MAX_ATTACHMENT_IGNORE_TOTAL_BYTES: u64 = 4 * 1024 * 1024;
+const MAX_ATTACHMENT_IGNORE_RULE_LINES: usize = 10_000;
 
 /// Convert a `Path` (or path string) to a forward-slash-separated string
 /// for the frontend. On Linux/macOS this is a no-op. On Windows the
@@ -415,18 +423,499 @@ fn list_project_folders_blocking(
 pub struct FolderAttachmentInfo {
     pub absolute_path: String,
     pub relative_path: Option<String>,
-    /// Pre-rendered unicode tree, depth-bounded by the caller's
-    /// `max_depth`. Truncated at FOLDER_TREE_MAX_ENTRIES with a
-    /// trailing "… N more entries" marker; `item_count` reports the
-    /// true total before truncation.
+    /// Pre-rendered unicode tree, bounded by the caller's `max_depth` and
+    /// the hard depth cap. Truncated at FOLDER_TREE_MAX_ENTRIES with a
+    /// trailing marker. `item_count` is a lower bound when the walk stops
+    /// early or encounters an error.
     pub tree: String,
     pub item_count: usize,
+    pub item_count_lower_bound: bool,
 }
 
-/// Read a folder for attachment. Walks the directory depth-bounded
-/// (caller-supplied `max_depth`), respects `.gitignore` via the same
-/// `ignore` walker as the file list, renders a unicode-tree preview,
-/// and reports the true item count even when the tree is truncated.
+fn open_bounded_file(path: &Path, allow_symlinks: bool) -> std::io::Result<std::fs::File> {
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        let flags = libc::O_NONBLOCK | if allow_symlinks { 0 } else { libc::O_NOFOLLOW };
+        options.custom_flags(flags);
+    }
+    #[cfg(windows)]
+    if !allow_symlinks {
+        use std::os::windows::fs::OpenOptionsExt;
+        // Open the reparse point itself so a replaced symlink cannot
+        // redirect the bounded read to another file.
+        const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+        options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+    }
+    options.open(path)
+}
+
+#[derive(Default)]
+struct FolderRuleSet {
+    ignore: Option<Gitignore>,
+    gitignore: Option<Gitignore>,
+    git_exclude: Option<Gitignore>,
+    has_git: bool,
+}
+
+#[derive(Clone, Copy)]
+enum FolderRuleSource {
+    Ignore,
+    Gitignore,
+    GitExclude,
+}
+
+enum RuleReadError {
+    Io(String),
+    NonRegular(String),
+    Rejected(String),
+}
+
+impl RuleReadError {
+    fn into_message(self) -> String {
+        match self {
+            Self::Io(message) | Self::NonRegular(message) | Self::Rejected(message) => message,
+        }
+    }
+}
+
+struct FolderWalkFilter {
+    rules: HashMap<PathBuf, FolderRuleSet>,
+    global_rules: Option<Gitignore>,
+    global_rules_checked: bool,
+    raw_visits: usize,
+    exhausted: bool,
+    had_error: bool,
+    fatal_error: Option<String>,
+    checked_rule_dirs: HashSet<PathBuf>,
+    rule_bytes: u64,
+    rule_lines: usize,
+}
+
+impl FolderWalkFilter {
+    fn check_global_rule_files(&mut self) -> Result<(), String> {
+        if !self.global_rules_checked {
+            self.global_rules =
+                Self::load_global_rule_files(&mut self.rule_bytes, &mut self.rule_lines)?;
+            self.global_rules_checked = true;
+        }
+        Ok(())
+    }
+
+    fn load_global_rule_files(
+        rule_bytes: &mut u64,
+        rule_lines: &mut usize,
+    ) -> Result<Option<Gitignore>, String> {
+        #[allow(deprecated)]
+        let home = std::env::home_dir();
+        let xdg = std::env::var_os("XDG_CONFIG_HOME")
+            .filter(|value| !value.is_empty())
+            .map(PathBuf::from)
+            .or_else(|| home.as_ref().map(|path| path.join(".config")));
+        let global_config = std::env::var_os("GIT_CONFIG_GLOBAL")
+            .filter(|value| !value.is_empty())
+            .map(PathBuf::from);
+        let system_config = std::env::var_os("GIT_CONFIG_SYSTEM")
+            .filter(|value| !value.is_empty())
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("/etc/gitconfig"));
+        let mut exclude = None;
+        for file in [
+            global_config,
+            home.as_ref().map(|path| path.join(".gitconfig")),
+            xdg.as_ref().map(|path| path.join("git/config")),
+            Some(system_config),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            // Git treats unreadable and nonregular optional config sources as
+            // unavailable. Byte budgets still reject the preview.
+            let bytes = match Self::read_bounded_file(&file, rule_bytes, true) {
+                Ok(Some(bytes)) => bytes,
+                Ok(None) | Err(RuleReadError::Io(_) | RuleReadError::NonRegular(_)) => continue,
+                Err(RuleReadError::Rejected(message)) => return Err(message),
+            };
+            if let Some(path) = Self::config_exclude_path(&bytes, home.as_deref()) {
+                exclude = Some(path);
+                break;
+            }
+        }
+        let cwd = std::env::current_dir()
+            .map_err(|error| format!("cannot resolve folder preview working directory: {error}"))?;
+        let Some(file) = exclude.or_else(|| xdg.map(|xdg| xdg.join("git/ignore"))) else {
+            return Ok(None);
+        };
+        let bytes = match Self::read_bounded_file(&file, rule_bytes, true) {
+            Ok(Some(bytes)) => bytes,
+            Ok(None) | Err(RuleReadError::Io(_) | RuleReadError::NonRegular(_)) => return Ok(None),
+            Err(RuleReadError::Rejected(message)) => return Err(message),
+        };
+        Self::compile_rule_bytes(&cwd, &file, &bytes, rule_lines).map(Some)
+    }
+
+    fn config_exclude_path(bytes: &[u8], home: Option<&Path>) -> Option<PathBuf> {
+        use std::sync::OnceLock;
+
+        // Match the file picker's `ignore` parser on the bounded snapshot.
+        // Its byte matcher ignores unrelated non-UTF-8 text and falls through
+        // to lower-priority sources when the selected path cannot be decoded.
+        static EXCLUDES_FILE: OnceLock<regex::bytes::Regex> = OnceLock::new();
+        let matcher = EXCLUDES_FILE.get_or_init(|| {
+            regex::bytes::Regex::new(r#"(?im-u)^\s*excludesfile\s*=\s*"?\s*(\S+?)\s*"?\s*$"#)
+                .expect("valid Git excludesFile pattern")
+        });
+        let captures = matcher.captures(bytes)?;
+        let value = std::str::from_utf8(captures.get(1)?.as_bytes()).ok()?;
+        Some(if let Some(rest) = value.strip_prefix('~') {
+            if rest.is_empty() || rest.starts_with(std::path::is_separator) {
+                home.map(|home| home.join(rest.trim_start_matches(std::path::is_separator)))
+                    .unwrap_or_else(|| PathBuf::from(value))
+            } else {
+                PathBuf::from(value)
+            }
+        } else {
+            PathBuf::from(value)
+        })
+    }
+
+    fn has_repository_marker(dir: &Path) -> bool {
+        dir.join(".git").metadata().is_ok() || dir.join(".jj").exists()
+    }
+
+    fn check_rule_files(&mut self, dir: &Path, load_git_rules: bool) -> Result<(), String> {
+        if !self.checked_rule_dirs.insert(dir.to_path_buf()) {
+            return Ok(());
+        }
+        let ignore = self.load_rule_file(dir, &dir.join(".ignore"))?;
+        let gitignore = if load_git_rules {
+            self.load_rule_file(dir, &dir.join(".gitignore"))?
+        } else {
+            None
+        };
+        let (has_git, git_exclude) = if load_git_rules {
+            self.load_git_exclude(dir)?
+        } else {
+            (false, None)
+        };
+        self.rules.insert(
+            dir.to_path_buf(),
+            FolderRuleSet {
+                ignore,
+                gitignore,
+                git_exclude,
+                has_git,
+            },
+        );
+        Ok(())
+    }
+
+    fn load_git_exclude(&mut self, dir: &Path) -> Result<(bool, Option<Gitignore>), String> {
+        let dot_git = dir.join(".git");
+        let dot_git_metadata = match std::fs::metadata(&dot_git) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok((dir.join(".jj").exists(), None));
+            }
+            Err(error) => {
+                return Err(format!(
+                    "cannot inspect attachment ignore rules at {}: {error}",
+                    dot_git.display()
+                ));
+            }
+        };
+        if dot_git_metadata.is_dir() {
+            let exclude = self.load_rule_file(dir, &dot_git.join("info/exclude"))?;
+            return Ok((true, exclude));
+        }
+        // Linked worktrees store their Git directory in a `.git` file and
+        // may keep `info/exclude` outside the attached folder.
+        if !dot_git_metadata.is_file() {
+            return Err(format!(
+                "attachment ignore rules are not a regular file: {}",
+                dot_git.display()
+            ));
+        }
+        // The picker follows linked-worktree pointer symlinks. This read is
+        // still capped and validates the opened handle as a regular file.
+        let bytes = Self::read_bounded_file(&dot_git, &mut self.rule_bytes, true)
+            .map_err(RuleReadError::into_message)?
+            .ok_or_else(|| format!("missing attachment Git directory: {}", dot_git.display()))?;
+        let git_dir_line = Self::rule_line(&bytes)?
+            .ok_or_else(|| format!("invalid attachment Git directory: {}", dot_git.display()))?;
+        let Some(git_dir) = git_dir_line.strip_prefix("gitdir: ") else {
+            return Err(format!("invalid attachment Git directory: {}", dot_git.display()));
+        };
+        if git_dir.is_empty() {
+            return Err(format!(
+                "invalid attachment Git directory: {}",
+                dot_git.display()
+            ));
+        }
+        let git_dir = PathBuf::from(git_dir);
+        let git_dir = if git_dir.is_absolute() {
+            git_dir
+        } else {
+            dir.join(git_dir)
+        };
+        let commondir_file = git_dir.join("commondir");
+        // Worktree metadata pointers may be symlinks; the bounded reader
+        // follows them while validating the opened handle and byte count.
+        let commondir_bytes = Self::read_bounded_file(
+            &commondir_file,
+            &mut self.rule_bytes,
+            true,
+        )
+        .map_err(RuleReadError::into_message)?;
+        let common_dir = if let Some(commondir_bytes) = commondir_bytes {
+            let commondir_line = Self::rule_line(&commondir_bytes)?.ok_or_else(|| {
+                format!(
+                    "invalid attachment Git common directory: {}",
+                    commondir_file.display()
+                )
+            })?;
+            if commondir_line.is_empty() {
+                return Err(format!(
+                    "invalid attachment Git common directory: {}",
+                    commondir_file.display()
+                ));
+            }
+            let common_dir = PathBuf::from(commondir_line);
+            if common_dir.is_absolute() {
+                common_dir
+            } else {
+                git_dir.join(common_dir)
+            }
+        } else {
+            git_dir
+        };
+        let exclude = self.load_rule_file(dir, &common_dir.join("info/exclude"))?;
+        Ok((true, exclude))
+    }
+
+    fn load_rule_file(&mut self, dir: &Path, file: &Path) -> Result<Option<Gitignore>, String> {
+        let bytes = Self::read_bounded_file(file, &mut self.rule_bytes, false)
+            .map_err(RuleReadError::into_message)?;
+        let Some(bytes) = bytes else {
+            return Ok(None);
+        };
+        let matcher = Self::compile_rule_bytes(dir, file, &bytes, &mut self.rule_lines)?;
+        Ok(Some(matcher))
+    }
+
+    fn compile_rule_bytes(
+        dir: &Path,
+        file: &Path,
+        bytes: &[u8],
+        rule_lines: &mut usize,
+    ) -> Result<Gitignore, String> {
+        let mut builder = GitignoreBuilder::new(dir);
+        let mut rejected_lines = 0;
+        let mut first_rejected_line = None;
+        for (index, line) in bytes.split_inclusive(|byte| *byte == b'\n').enumerate() {
+            *rule_lines += 1;
+            if *rule_lines > MAX_ATTACHMENT_IGNORE_RULE_LINES {
+                return Err("attachment ignore rules exceed 10,000 lines".to_string());
+            }
+            let line = line.strip_suffix(b"\n").unwrap_or(line);
+            let Ok(line) = std::str::from_utf8(line) else {
+                rejected_lines += 1;
+                first_rejected_line.get_or_insert(index + 1);
+                continue;
+            };
+            let line = line.trim_end_matches('\r');
+            let line = if index == 0 {
+                line.trim_start_matches('\u{feff}')
+            } else {
+                line
+            };
+            if builder.add_line(None, line).is_err() {
+                rejected_lines += 1;
+                first_rejected_line.get_or_insert(index + 1);
+            }
+        }
+        if rejected_lines > 0 {
+            log::warn!(
+                "Skipped {rejected_lines} malformed attachment ignore rules in {} (first at line {})",
+                file.display(),
+                first_rejected_line.expect("a rejected line was counted")
+            );
+        }
+        let matcher = builder.build().map_err(|error| {
+            format!("invalid attachment ignore rules at {}: {error}", file.display())
+        })?;
+        Ok(matcher)
+    }
+
+    fn is_ignored(&mut self, path: &Path, is_dir: bool) -> Result<bool, String> {
+        if let Some(ignored) = self.match_source(path, is_dir, FolderRuleSource::Ignore, None) {
+            return Ok(ignored);
+        }
+        let git_root = path.parent().and_then(|parent| {
+            parent.ancestors().find(|directory| {
+                self.rules
+                    .get(*directory)
+                    .is_some_and(|rules| rules.has_git)
+            })
+        });
+        let Some(git_root) = git_root else {
+            return Ok(false);
+        };
+        for source in [FolderRuleSource::Gitignore, FolderRuleSource::GitExclude] {
+            if let Some(ignored) = self.match_source(path, is_dir, source, Some(git_root)) {
+                return Ok(ignored);
+            }
+        }
+        self.check_global_rule_files()?;
+        Ok(self
+            .global_rules
+            .as_ref()
+            .is_some_and(|rules| rules.matched(path, is_dir).is_ignore()))
+    }
+
+    fn match_source(
+        &self,
+        path: &Path,
+        is_dir: bool,
+        source: FolderRuleSource,
+        git_root: Option<&Path>,
+    ) -> Option<bool> {
+        for directory in path.parent()?.ancestors() {
+            if git_root.is_some_and(|root| !directory.starts_with(root)) {
+                break;
+            }
+            let Some(rules) = self.rules.get(directory) else {
+                continue;
+            };
+            let matcher = match source {
+                FolderRuleSource::Ignore => rules.ignore.as_ref(),
+                FolderRuleSource::Gitignore => rules.gitignore.as_ref(),
+                FolderRuleSource::GitExclude => rules.git_exclude.as_ref(),
+            };
+            let Some(matcher) = matcher else {
+                continue;
+            };
+            let matched = matcher.matched(path, is_dir);
+            if matched.is_ignore() {
+                return Some(true);
+            }
+            if matched.is_whitelist() {
+                return Some(false);
+            }
+        }
+        None
+    }
+
+    fn read_bounded_file(
+        file: &Path,
+        rule_bytes: &mut u64,
+        allow_symlinks: bool,
+    ) -> Result<Option<Vec<u8>>, RuleReadError> {
+        #[cfg(unix)]
+        if allow_symlinks && file == Path::new("/dev/null") {
+            return Ok(None);
+        }
+        #[cfg(windows)]
+        if allow_symlinks && file.to_string_lossy().eq_ignore_ascii_case("NUL") {
+            return Ok(None);
+        }
+        let metadata = match if allow_symlinks {
+            std::fs::metadata(file)
+        } else {
+            std::fs::symlink_metadata(file)
+        } {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => {
+                return Err(RuleReadError::Io(format!(
+                    "cannot inspect attachment ignore rules at {}: {error}",
+                    file.display()
+                )));
+            }
+        };
+        if !metadata.is_file() {
+            return Err(RuleReadError::NonRegular(format!(
+                "attachment ignore rules are not a regular file: {}",
+                file.display()
+            )));
+        }
+        if metadata.len() > MAX_ATTACHMENT_IGNORE_FILE_BYTES {
+            return Err(RuleReadError::Rejected(format!(
+                "attachment ignore rule file exceeds 1 MiB: {}",
+                file.display()
+            )));
+        }
+        let reader = open_bounded_file(file, allow_symlinks).map_err(|error| {
+            RuleReadError::Io(format!(
+                "cannot read attachment ignore rules at {}: {error}",
+                file.display()
+            ))
+        })?;
+        let opened_metadata = reader.metadata().map_err(|error| {
+            RuleReadError::Io(format!(
+                "cannot inspect attachment ignore rules at {}: {error}",
+                file.display()
+            ))
+        })?;
+        if !opened_metadata.is_file()
+            || (!allow_symlinks && opened_metadata.file_type().is_symlink())
+        {
+            return Err(RuleReadError::NonRegular(format!(
+                "attachment ignore rules are not a regular file: {}",
+                file.display()
+            )));
+        }
+        if opened_metadata.len() > MAX_ATTACHMENT_IGNORE_FILE_BYTES {
+            return Err(RuleReadError::Rejected(format!(
+                "attachment ignore rule file exceeds 1 MiB: {}",
+                file.display()
+            )));
+        }
+        let mut bytes = Vec::new();
+        reader
+            .take(MAX_ATTACHMENT_IGNORE_FILE_BYTES + 1)
+            .read_to_end(&mut bytes)
+            .map_err(|error| {
+                RuleReadError::Io(format!(
+                    "cannot read attachment ignore rules at {}: {error}",
+                    file.display()
+                ))
+            })?;
+        if bytes.len() as u64 > MAX_ATTACHMENT_IGNORE_FILE_BYTES {
+            return Err(RuleReadError::Rejected(format!(
+                "attachment ignore rule file exceeds 1 MiB: {}",
+                file.display()
+            )));
+        }
+        *rule_bytes = rule_bytes.saturating_add(
+            metadata.len().max(opened_metadata.len()).max(bytes.len() as u64),
+        );
+        if *rule_bytes > MAX_ATTACHMENT_IGNORE_TOTAL_BYTES {
+            return Err(RuleReadError::Rejected(
+                "attachment ignore rules exceed 4 MiB in total".to_string(),
+            ));
+        }
+        Ok(Some(bytes))
+    }
+
+    fn rule_line(bytes: &[u8]) -> Result<Option<&str>, String> {
+        let Some(line) = bytes.split(|byte| *byte == b'\n').next() else {
+            return Ok(None);
+        };
+        if line.is_empty() && bytes.is_empty() {
+            return Ok(None);
+        }
+        let line = std::str::from_utf8(line)
+            .map_err(|_| "invalid attachment Git metadata".to_string())?;
+        Ok(Some(line.trim_end_matches('\r')))
+    }
+}
+
+/// Read a folder for attachment. Walks the directory with depth and raw-entry
+/// caps, applies the same ignore rules as the file list, renders a unicode
+/// tree preview, and reports the item count seen before the walk stops.
 #[tauri::command]
 pub async fn read_folder_for_attachment(
     absolute_path: String,
@@ -445,25 +934,128 @@ fn read_folder_for_attachment_blocking(
     cwd: Option<String>,
     max_depth: usize,
 ) -> Result<FolderAttachmentInfo, String> {
-    let path = Path::new(&absolute_path);
-    if !path.is_dir() {
+    read_folder_for_attachment_with_limit(absolute_path, cwd, max_depth, FOLDER_WALK_MAX_VISITS)
+}
+
+fn read_folder_for_attachment_with_limit(
+    absolute_path: String,
+    cwd: Option<String>,
+    max_depth: usize,
+    max_visits: usize,
+) -> Result<FolderAttachmentInfo, String> {
+    let supplied_path = Path::new(&absolute_path);
+    if !supplied_path.is_dir() {
         return Err(format!("not a directory: {absolute_path}"));
     }
-    let depth = max_depth.max(1);
+    let canonical_path = supplied_path
+        .canonicalize()
+        .map_err(|error| format!("cannot resolve attachment folder: {error}"))?;
+    let path = canonical_path.as_path();
+    let depth = max_depth.clamp(1, FOLDER_WALK_MAX_DEPTH);
 
-    let mut entries: Vec<(PathBuf, bool)> = Vec::new();
-    let walker = WalkBuilder::new(path)
+    // The raw walker charges every candidate before filtering it. Rules are
+    // compiled only from bounded bytes captured by the filter.
+    let mut filter_state = FolderWalkFilter {
+        rules: HashMap::new(),
+        global_rules: None,
+        global_rules_checked: false,
+        raw_visits: 0,
+        exhausted: false,
+        had_error: false,
+        fatal_error: None,
+        checked_rule_dirs: HashSet::new(),
+        rule_bytes: 0,
+        rule_lines: 0,
+    };
+    // The canonical root is shared by the rules and the raw walk so symlinked
+    // entry paths cannot select a different set of parent rule files.
+    let git_root = path
+        .ancestors()
+        .find(|ancestor| FolderWalkFilter::has_repository_marker(ancestor));
+    for ancestor in path.ancestors() {
+        let load_git_rules = git_root.is_some_and(|root| ancestor.starts_with(root));
+        filter_state.check_rule_files(ancestor, load_git_rules)?;
+    }
+    let filter = Arc::new(Mutex::new(filter_state));
+    let filter_for_walk = Arc::clone(&filter);
+    let root_for_filter = path.to_path_buf();
+    let root_has_git = git_root.is_some();
+    // Keep filesystem iteration order here: sorting before the visit cap
+    // would materialize every entry in a wide directory.
+    let mut raw_walker = WalkBuilder::new(path);
+    raw_walker
         .hidden(false)
-        .git_ignore(true)
-        .git_exclude(true)
-        .git_global(true)
-        .ignore(true)
-        .parents(true)
+        .git_ignore(false)
+        .git_exclude(false)
+        .git_global(false)
+        .ignore(false)
+        .parents(false)
         .follow_links(false)
         .max_depth(Some(depth))
-        .build();
-    for result in walker {
-        let Ok(entry) = result else { continue };
+        .filter_entry(move |entry| {
+            let mut state = filter_for_walk.lock().expect("folder walk filter lock");
+            if state.raw_visits >= max_visits {
+                // Yield one sentinel entry so the caller can stop the walk
+                // without scanning the rest of this directory.
+                state.exhausted = true;
+                return true;
+            }
+            state.raw_visits += 1;
+            let Ok(relative) = entry.path().strip_prefix(&root_for_filter) else {
+                state.had_error = true;
+                return false;
+            };
+            if relative.components().any(|component| {
+                matches!(component, std::path::Component::Normal(name) if name == ".git")
+            }) {
+                return false;
+            }
+            if let Some(parent) = entry.path().parent() {
+                let load_git_rules = root_has_git
+                    || parent.ancestors().any(|ancestor| {
+                        state.rules.get(ancestor).is_some_and(|rules| rules.has_git)
+                    })
+                    || FolderWalkFilter::has_repository_marker(parent);
+                if let Err(error) = state.check_rule_files(parent, load_git_rules) {
+                    state.fatal_error = Some(error);
+                    return true;
+                }
+            }
+            if entry.depth() == 0 {
+                return true;
+            }
+            let is_dir = entry.file_type().map(|kind| kind.is_dir()).unwrap_or(false);
+            match state.is_ignored(entry.path(), is_dir) {
+                Ok(ignored) => !ignored,
+                Err(error) => {
+                    state.fatal_error = Some(error);
+                    true
+                }
+            }
+        });
+
+    let mut entries: Vec<(PathBuf, bool)> = Vec::new();
+    let mut item_count_lower_bound = false;
+    for result in raw_walker.build() {
+        let state = filter.lock().expect("folder walk filter lock");
+        if let Some(error) = &state.fatal_error {
+            return Err(error.clone());
+        }
+        if state.exhausted {
+            item_count_lower_bound = true;
+            break;
+        }
+        drop(state);
+        let Ok(entry) = result else {
+            let mut state = filter.lock().expect("folder walk filter lock");
+            if state.raw_visits >= max_visits {
+                item_count_lower_bound = true;
+                break;
+            }
+            state.raw_visits += 1;
+            item_count_lower_bound = true;
+            continue;
+        };
         // The walker emits the root itself first — skip it; we only
         // want descendants.
         if entry.depth() == 0 {
@@ -471,16 +1063,9 @@ fn read_folder_for_attachment_blocking(
         }
         let is_dir = entry.file_type().map(|ft| ft.is_dir()).unwrap_or(false);
         let p = entry.path().to_path_buf();
-        // Skip nested .git contents defensively (gitignore catches the
-        // top-level case, but not always the inner objects on bare repos).
-        let rel = p.strip_prefix(path).unwrap_or(&p);
-        if rel.components().any(|c| {
-            matches!(c, std::path::Component::Normal(s) if s == ".git")
-        }) {
-            continue;
-        }
         entries.push((p, is_dir));
     }
+    item_count_lower_bound |= filter.lock().expect("folder walk filter lock").had_error;
 
     // Sort: directories first, then files; alphabetical within each
     // group at every depth level.
@@ -508,7 +1093,13 @@ fn read_folder_for_attachment_blocking(
     });
 
     let item_count = entries.len();
-    let tree = render_tree(path, &entries, FOLDER_TREE_MAX_ENTRIES);
+    let tree = render_tree(
+        path,
+        supplied_path,
+        &entries,
+        FOLDER_TREE_MAX_ENTRIES,
+        item_count_lower_bound,
+    );
 
     let relative_path = cwd
         .as_deref()
@@ -528,15 +1119,26 @@ fn read_folder_for_attachment_blocking(
         relative_path,
         tree,
         item_count,
+        item_count_lower_bound,
     })
 }
 
 /// Render a sorted entry list as a unicode tree. Each line carries
 /// the appropriate `├──`, `└──`, or `│   ` prefix based on its
 /// relationship to siblings at the same depth.
-fn render_tree(root: &Path, entries: &[(PathBuf, bool)], cap: usize) -> String {
+fn render_tree(
+    root: &Path,
+    display_root: &Path,
+    entries: &[(PathBuf, bool)],
+    cap: usize,
+    count_lower_bound: bool,
+) -> String {
     if entries.is_empty() {
-        return "(empty)".to_string();
+        return if count_lower_bound {
+            "(no scanned entries; additional entries may be omitted)".to_string()
+        } else {
+            "(empty)".to_string()
+        };
     }
 
     // For a tree renderer to compute the right prefix at each depth,
@@ -544,8 +1146,8 @@ fn render_tree(root: &Path, entries: &[(PathBuf, bool)], cap: usize) -> String {
     // child group. Walk the sorted list and, for each entry, find
     // whether the next entry shares the same parent — if not, this
     // entry is the last sibling.
-    let mut last_at_depth: Vec<bool> = Vec::with_capacity(entries.len());
-    for i in 0..entries.len() {
+    let mut last_at_depth: Vec<bool> = Vec::with_capacity(entries.len().min(cap));
+    for i in 0..entries.len().min(cap) {
         let (cur, _) = &entries[i];
         let cur_parent = cur.parent();
         let mut is_last = true;
@@ -572,9 +1174,9 @@ fn render_tree(root: &Path, entries: &[(PathBuf, bool)], cap: usize) -> String {
 
     let mut out = Vec::with_capacity(visible.len() + 2);
     out.push(
-        root.file_name()
+        display_root.file_name()
             .map(|n| n.to_string_lossy().to_string())
-            .unwrap_or_else(|| root.display().to_string()),
+            .unwrap_or_else(|| display_root.display().to_string()),
     );
 
     // Track the "is this depth's lineage last?" stack so we know when
@@ -623,7 +1225,13 @@ fn render_tree(root: &Path, entries: &[(PathBuf, bool)], cap: usize) -> String {
 
     if truncated {
         let more = entries.len() - cap;
-        out.push(format!("… {more} more entries"));
+        out.push(if count_lower_bound {
+            format!("… {more} more scanned entries; additional entries may be omitted")
+        } else {
+            format!("… {more} more entries")
+        });
+    } else if count_lower_bound {
+        out.push("… additional entries may be omitted".to_string());
     }
 
     out.join("\n")
@@ -642,6 +1250,9 @@ pub struct FileAttachmentInfo {
     pub absolute_path: String,
     pub relative_path: Option<String>,
     pub line_count: usize,
+    /// True when scanning stopped at the text-byte limit; `line_count`
+    /// then counts only the scanned prefix.
+    pub line_count_lower_bound: bool,
     pub bytes: u64,
     pub language: Option<String>,
     pub is_text: bool,
@@ -651,7 +1262,7 @@ pub struct FileAttachmentInfo {
 }
 
 /// Read a file for attachment. Full content for small files
-/// (≤200KB AND ≤1500 lines); first-50 + outline for larger files.
+/// (≤200KB AND ≤1500 lines); bounded preview + outline for larger files.
 /// Binary files return `is_text: false` with empty content. Errors
 /// only on actual I/O failures (missing path, permission denied) —
 /// not on "file too large" or "binary" since both are normal cases
@@ -675,13 +1286,16 @@ fn read_file_for_attachment_blocking(
         return Err(format!("not a file: {absolute_path}"));
     }
 
-    let metadata = std::fs::metadata(path)
-        .map_err(|e| format!("metadata read failed for {absolute_path}: {e}"))?;
-    let bytes = metadata.len();
-
-    let file = std::fs::File::open(path)
+    let file = open_bounded_file(path, true)
         .map_err(|e| format!("read failed for {absolute_path}: {e}"))?;
-    let raw = read_attachment_bytes(file)
+    let metadata = file
+        .metadata()
+        .map_err(|e| format!("metadata read failed for {absolute_path}: {e}"))?;
+    if !metadata.is_file() {
+        return Err(format!("not a file: {absolute_path}"));
+    }
+    let bytes = metadata.len();
+    let (raw, line_count_lower_bound) = read_attachment_bytes(file)
         .map_err(|e| format!("read failed for {absolute_path}: {e}"))?;
 
     let language = path
@@ -707,6 +1321,7 @@ fn read_file_for_attachment_blocking(
             absolute_path,
             relative_path,
             line_count: 0,
+            line_count_lower_bound: false,
             bytes,
             language,
             is_text: false,
@@ -721,14 +1336,17 @@ fn read_file_for_attachment_blocking(
     let content = String::from_utf8_lossy(&raw).into_owned();
     let line_count = content.lines().count();
 
-    let fits_inline =
-        bytes <= FULL_CONTENT_BYTES_LIMIT && line_count <= FULL_CONTENT_LINE_LIMIT;
+    let fits_inline = !line_count_lower_bound
+        && bytes <= FULL_CONTENT_BYTES_LIMIT
+        && content.len() <= FULL_CONTENT_BYTES_LIMIT as usize
+        && line_count <= FULL_CONTENT_LINE_LIMIT;
 
     if fits_inline {
         return Ok(FileAttachmentInfo {
             absolute_path,
             relative_path,
             line_count,
+            line_count_lower_bound: false,
             bytes,
             language: language.clone(),
             is_text: true,
@@ -739,17 +1357,14 @@ fn read_file_for_attachment_blocking(
     }
 
     // Truncated path — preview + outline.
-    let preview: String = content
-        .lines()
-        .take(TRUNCATED_PREVIEW_LINES)
-        .collect::<Vec<_>>()
-        .join("\n");
+    let preview = bounded_preview(&content);
     let outline = extract_outline(&content, language.as_deref());
 
     Ok(FileAttachmentInfo {
         absolute_path,
         relative_path,
         line_count,
+        line_count_lower_bound,
         bytes,
         language,
         is_text: true,
@@ -759,18 +1374,49 @@ fn read_file_for_attachment_blocking(
     })
 }
 
-fn read_attachment_bytes(mut reader: impl Read) -> std::io::Result<Vec<u8>> {
+fn read_attachment_bytes(mut reader: impl Read) -> std::io::Result<(Vec<u8>, bool)> {
     let mut raw = Vec::new();
     reader
         .by_ref()
         .take(BINARY_SNIFF_BYTES as u64)
         .read_to_end(&mut raw)?;
-    // Binary attachments only expose metadata. Text still needs a full
-    // read for exact line counts and outlines beyond the preview.
-    if !is_binary(&raw) {
-        reader.read_to_end(&mut raw)?;
+    // Binary attachments only expose metadata. Text reads at most one byte
+    // beyond the cap so a growing file is bounded even if metadata is stale.
+    if is_binary(&raw) {
+        return Ok((raw, false));
     }
-    Ok(raw)
+    reader
+        .take((MAX_ATTACHMENT_TEXT_BYTES + 1 - raw.len()) as u64)
+        .read_to_end(&mut raw)?;
+    let lower_bound = raw.len() > MAX_ATTACHMENT_TEXT_BYTES;
+    raw.truncate(MAX_ATTACHMENT_TEXT_BYTES);
+    Ok((raw, lower_bound))
+}
+
+fn bounded_preview(content: &str) -> String {
+    let mut preview = String::new();
+    let mut first = true;
+    for line in content.lines().take(TRUNCATED_PREVIEW_LINES) {
+        let separator = usize::from(!first);
+        let room = MAX_ATTACHMENT_PREVIEW_BYTES.saturating_sub(preview.len() + separator);
+        if room == 0 {
+            break;
+        }
+        if separator != 0 {
+            preview.push('\n');
+        }
+        first = false;
+        if line.len() > room {
+            let mut end = room;
+            while !line.is_char_boundary(end) {
+                end -= 1;
+            }
+            preview.push_str(&line[..end]);
+            break;
+        }
+        preview.push_str(line);
+    }
+    preview
 }
 
 fn is_binary(bytes: &[u8]) -> bool {
@@ -856,27 +1502,13 @@ fn extract_outline(content: &str, language: Option<&str>) -> Vec<OutlineEntry> {
     let Some(spec) = select_outline(language) else {
         return Vec::new();
     };
-    // Pre-compute byte-offset → line-number map by walking the content
-    // once. Outline regex matches give us byte offsets via `caps.get(0)
-    // .start()`; converting through this map keeps line lookup O(1)
-    // per match instead of re-scanning the prefix per match.
-    let line_starts: Vec<usize> = std::iter::once(0)
-        .chain(
-            content
-                .char_indices()
-                .filter_map(|(i, c)| if c == '\n' { Some(i + 1) } else { None }),
-        )
-        .collect();
-
-    let line_for_offset = |offset: usize| -> usize {
-        match line_starts.binary_search(&offset) {
-            Ok(idx) => idx + 1,
-            Err(idx) => idx, // first index strictly greater → that's our 1-indexed line
-        }
-    };
-
     let mut out = Vec::new();
+    let mut scanned_to = 0;
+    let mut line = 1;
     for caps in spec.re.captures_iter(content) {
+        if out.len() >= MAX_ATTACHMENT_OUTLINE_ENTRIES {
+            break;
+        }
         let Some(name_match) = caps.get(spec.name_capture) else {
             continue;
         };
@@ -892,15 +1524,17 @@ fn extract_outline(content: &str, language: Option<&str>) -> Vec<OutlineEntry> {
         if kind.is_empty() {
             continue;
         }
-        let name = name_match.as_str().trim().to_string();
+        let name: String = name_match.as_str().trim().chars().take(160).collect();
         if name.is_empty() {
             continue;
         }
         let offset = caps.get(0).map(|m| m.start()).unwrap_or(0);
+        line += content[scanned_to..offset].bytes().filter(|b| *b == b'\n').count();
+        scanned_to = offset;
         out.push(OutlineEntry {
             kind,
             name,
-            line: line_for_offset(offset),
+            line,
         });
     }
     out
@@ -1368,8 +2002,9 @@ mod tests {
         let mut prefix = vec![b'x'; BINARY_SNIFF_BYTES];
         prefix[BINARY_SNIFF_BYTES - 1] = 0;
         let header = std::io::Cursor::new(&prefix);
-        let raw = read_attachment_bytes(header.chain(UnreadableTail)).unwrap();
+        let (raw, lower_bound) = read_attachment_bytes(header.chain(UnreadableTail)).unwrap();
         assert_eq!(raw, prefix);
+        assert!(!lower_bound);
         assert!(is_binary(&raw));
     }
 
@@ -1379,9 +2014,38 @@ mod tests {
         // Preserve the existing boundary: a NUL immediately after the
         // sniff window does not classify an attachment as binary.
         content[BINARY_SNIFF_BYTES] = 0;
-        let raw = read_attachment_bytes(std::io::Cursor::new(&content)).unwrap();
+        let (raw, lower_bound) = read_attachment_bytes(std::io::Cursor::new(&content)).unwrap();
         assert_eq!(raw, content);
+        assert!(!lower_bound);
         assert!(!is_binary(&raw));
+    }
+
+    #[test]
+    fn attachment_text_stops_reading_an_unbounded_source() {
+        let (raw, lower_bound) = read_attachment_bytes(std::io::repeat(b'x')).unwrap();
+        assert_eq!(raw.len(), MAX_ATTACHMENT_TEXT_BYTES);
+        assert!(lower_bound);
+        assert!(bounded_preview(&String::from_utf8(raw).unwrap()).len() <= MAX_ATTACHMENT_PREVIEW_BYTES);
+    }
+
+    #[test]
+    fn attachment_outline_limits_declarations_without_losing_line_numbers() {
+        let content = (0..500)
+            .map(|n| format!("fn item_{n}() {{}}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let outline = extract_outline(&content, Some("rs"));
+        assert_eq!(outline.len(), MAX_ATTACHMENT_OUTLINE_ENTRIES);
+        assert_eq!(outline.last().unwrap().line, MAX_ATTACHMENT_OUTLINE_ENTRIES);
+    }
+
+    #[test]
+    fn attachment_preview_preserves_blank_lines_and_utf8_at_the_byte_limit() {
+        let content = format!("\n\n{}", "é".repeat(MAX_ATTACHMENT_PREVIEW_BYTES));
+        let preview = bounded_preview(&content);
+        assert!(preview.starts_with("\n\n"));
+        assert!(preview.len() <= MAX_ATTACHMENT_PREVIEW_BYTES);
+        assert!(preview.is_char_boundary(preview.len()));
     }
 
     #[tokio::test]
@@ -1527,6 +2191,20 @@ mod tests {
         assert_eq!(info.line_count, 0);
         assert_eq!(info.bytes, 0);
         assert_eq!(info.content, "");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn read_file_allows_regular_file_symlinks() {
+        let dir = tempdir().unwrap();
+        let target = dir.path().join("target.txt");
+        fs::write(&target, "hello\n").unwrap();
+        let link = dir.path().join("linked.txt");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        let info = read_file_for_attachment_blocking(link.to_string_lossy().into_owned(), None)
+            .unwrap();
+        assert_eq!(info.content, "hello\n");
+        assert_eq!(info.bytes, 6);
     }
 
     #[tokio::test]
@@ -1869,6 +2547,7 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(info.item_count, 150);
+        assert!(!info.item_count_lower_bound);
         assert!(
             info.tree.contains("more entries"),
             "truncation marker missing: tree starts with {}",
@@ -1876,6 +2555,1059 @@ mod tests {
         );
         // The "more" line wraps the truncated count.
         assert!(info.tree.contains("50 more"));
+    }
+
+    #[test]
+    fn read_folder_bounds_walks_before_sorting_or_rendering() {
+        let dir = tempdir().unwrap();
+        for i in 0..20 {
+            fs::write(dir.path().join(format!("file_{i:03}.txt")), "x").unwrap();
+        }
+        let info = read_folder_for_attachment_with_limit(
+            dir.path().to_string_lossy().into_owned(),
+            None,
+            1,
+            4,
+        ).unwrap();
+        assert!(info.item_count_lower_bound);
+        assert!(info.item_count <= 4);
+        assert!(info.tree.contains("additional entries may be omitted"));
+    }
+
+    #[test]
+    fn ignored_files_still_consume_the_folder_visit_budget() {
+        let dir = tempdir().unwrap();
+        fs::create_dir(dir.path().join(".git")).unwrap();
+        fs::write(dir.path().join(".gitignore"), "*.tmp\n").unwrap();
+        for i in 0..20 {
+            fs::write(dir.path().join(format!("ignored_{i:03}.tmp")), "x").unwrap();
+        }
+        fs::write(dir.path().join("visible.txt"), "x").unwrap();
+        let info = read_folder_for_attachment_with_limit(
+            dir.path().to_string_lossy().into_owned(),
+            None,
+            1,
+            5,
+        )
+        .unwrap();
+        assert!(info.item_count_lower_bound);
+        assert!(info.item_count <= 5);
+        assert!(!info.tree.contains("ignored_"));
+        assert!(info.tree.contains("additional entries may be omitted"));
+    }
+
+    #[test]
+    fn oversized_ignore_rules_are_rejected_before_parsing() {
+        let dir = tempdir().unwrap();
+        fs::create_dir(dir.path().join(".git")).unwrap();
+        fs::write(
+            dir.path().join(".gitignore"),
+            vec![b'x'; MAX_ATTACHMENT_IGNORE_FILE_BYTES as usize + 1],
+        )
+        .unwrap();
+        fs::write(dir.path().join("visible.txt"), "x").unwrap();
+        let error = read_folder_for_attachment_blocking(
+            dir.path().to_string_lossy().into_owned(),
+            None,
+            1,
+        )
+        .unwrap_err();
+        assert!(error.contains("ignore rule file exceeds 1 MiB"));
+    }
+
+    #[test]
+    fn excessive_ignore_patterns_are_rejected_before_compiling() {
+        let dir = tempdir().unwrap();
+        fs::write(
+            dir.path().join(".ignore"),
+            "x\n".repeat(MAX_ATTACHMENT_IGNORE_RULE_LINES + 1),
+        )
+        .unwrap();
+        let error = read_folder_for_attachment_blocking(
+            dir.path().to_string_lossy().into_owned(),
+            None,
+            1,
+        )
+        .unwrap_err();
+        assert!(error.contains("exceed 10,000 lines"));
+    }
+
+    #[test]
+    fn ignore_rule_line_budget_counts_only_present_lines() {
+        let dir = tempdir().unwrap();
+        let file = dir.path().join(".ignore");
+        let rules = "# rule\n".repeat(MAX_ATTACHMENT_IGNORE_RULE_LINES);
+        let mut lines = 0;
+        FolderWalkFilter::compile_rule_bytes(dir.path(), &file, rules.as_bytes(), &mut lines)
+            .unwrap();
+        assert_eq!(lines, MAX_ATTACHMENT_IGNORE_RULE_LINES);
+
+        let mut lines = 0;
+        let too_many = "# rule\n".repeat(MAX_ATTACHMENT_IGNORE_RULE_LINES + 1);
+        let error = FolderWalkFilter::compile_rule_bytes(
+            dir.path(),
+            &file,
+            too_many.as_bytes(),
+            &mut lines,
+        )
+        .err()
+        .expect("10,001 lines must exceed the limit");
+        assert!(error.contains("exceed 10,000 lines"));
+
+        let mut lines = 0;
+        FolderWalkFilter::compile_rule_bytes(dir.path(), &file, b"", &mut lines).unwrap();
+        assert_eq!(lines, 0);
+    }
+
+    #[test]
+    fn malformed_ignore_line_keeps_valid_exclusions() {
+        let dir = tempdir().unwrap();
+        fs::create_dir(dir.path().join(".git")).unwrap();
+        let mut builder = GitignoreBuilder::new(dir.path());
+        assert!(builder.add_line(None, "{broken").is_err());
+        fs::write(dir.path().join(".gitignore"), b"{broken\n\xff\n*.secret\n").unwrap();
+        fs::write(dir.path().join("hidden.secret"), "x").unwrap();
+        fs::write(dir.path().join("visible.txt"), "x").unwrap();
+        let info = read_folder_for_attachment_blocking(
+            dir.path().to_string_lossy().into_owned(),
+            None,
+            1,
+        )
+        .unwrap();
+        assert!(info.tree.contains("visible.txt"));
+        assert!(!info.tree.contains("hidden.secret"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlinked_ignore_rules_are_rejected_before_parsing() {
+        let dir = tempdir().unwrap();
+        fs::create_dir(dir.path().join(".git")).unwrap();
+        fs::write(dir.path().join("rules"), "*.txt\n").unwrap();
+        std::os::unix::fs::symlink("rules", dir.path().join(".gitignore")).unwrap();
+        let error = read_folder_for_attachment_blocking(
+            dir.path().to_string_lossy().into_owned(),
+            None,
+            1,
+        )
+        .unwrap_err();
+        assert!(error.contains("ignore rules are not a regular file"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn opened_rule_sources_cannot_block_on_fifo_or_follow_symlink() {
+        use std::os::unix::ffi::OsStrExt;
+
+        let dir = tempdir().unwrap();
+        let fifo = dir.path().join("rules.fifo");
+        let fifo_path = std::ffi::CString::new(fifo.as_os_str().as_bytes()).unwrap();
+        assert_eq!(
+            unsafe { libc::mkfifo(fifo_path.as_ptr(), 0o600) },
+            0,
+            "{}",
+            std::io::Error::last_os_error()
+        );
+        let reader = open_bounded_file(&fifo, false).unwrap();
+        assert!(!reader.metadata().unwrap().is_file());
+        let reader = open_bounded_file(&fifo, true).unwrap();
+        assert!(!reader.metadata().unwrap().is_file());
+
+        let fifo_link = dir.path().join("fifo.link");
+        std::os::unix::fs::symlink(&fifo, &fifo_link).unwrap();
+        let reader = open_bounded_file(&fifo_link, true).unwrap();
+        assert!(!reader.metadata().unwrap().is_file());
+
+        let target = dir.path().join("target");
+        fs::write(&target, "*.secret\n").unwrap();
+        let symlink = dir.path().join("rules.link");
+        std::os::unix::fs::symlink(&target, &symlink).unwrap();
+        assert!(open_bounded_file(&symlink, false).is_err());
+    }
+
+    #[test]
+    fn worktree_git_file_does_not_block_folder_attachment() {
+        let dir = tempdir().unwrap();
+        fs::write(dir.path().join(".git"), "gitdir: /tmp/example\n").unwrap();
+        fs::write(dir.path().join("visible.txt"), "x").unwrap();
+        let info = read_folder_for_attachment_blocking(
+            dir.path().to_string_lossy().into_owned(),
+            None,
+            1,
+        )
+        .unwrap();
+        assert!(info.tree.contains("visible.txt"));
+    }
+
+    #[test]
+    fn oversized_worktree_git_file_is_rejected_before_parsing() {
+        let dir = tempdir().unwrap();
+        fs::write(
+            dir.path().join(".git"),
+            vec![b'x'; MAX_ATTACHMENT_IGNORE_FILE_BYTES as usize + 1],
+        )
+        .unwrap();
+        let error = read_folder_for_attachment_blocking(
+            dir.path().to_string_lossy().into_owned(),
+            None,
+            1,
+        )
+        .unwrap_err();
+        assert!(error.contains("ignore rule file exceeds 1 MiB"));
+    }
+
+    #[test]
+    fn linked_worktree_exclude_is_bounded_outside_attached_folder() {
+        let dir = tempdir().unwrap();
+        let worktree = dir.path().join("worktree");
+        let git_dir = dir.path().join("gitdir");
+        let common_dir = dir.path().join("common");
+        fs::create_dir(&worktree).unwrap();
+        fs::create_dir(&git_dir).unwrap();
+        fs::create_dir_all(common_dir.join("info")).unwrap();
+        fs::write(worktree.join(".git"), format!("gitdir: {}\n", git_dir.display())).unwrap();
+        fs::write(git_dir.join("commondir"), format!("{}\n", common_dir.display())).unwrap();
+        fs::write(
+            common_dir.join("info/exclude"),
+            vec![b'x'; MAX_ATTACHMENT_IGNORE_FILE_BYTES as usize + 1],
+        )
+        .unwrap();
+        let error = read_folder_for_attachment_blocking(
+            worktree.to_string_lossy().into_owned(),
+            None,
+            1,
+        )
+        .unwrap_err();
+        assert!(error.contains("ignore rule file exceeds 1 MiB"));
+    }
+
+    #[test]
+    fn relative_git_directory_exclude_is_applied() {
+        let dir = tempdir().unwrap();
+        let worktree = dir.path().join("worktree");
+        let git_dir = dir.path().join("gitdir");
+        fs::create_dir(&worktree).unwrap();
+        fs::create_dir_all(git_dir.join("info")).unwrap();
+        fs::write(worktree.join(".git"), "gitdir: ../gitdir\n").unwrap();
+        fs::write(git_dir.join("info/exclude"), "*.secret\n").unwrap();
+        fs::write(worktree.join("hidden.secret"), "x").unwrap();
+        fs::write(worktree.join("visible.txt"), "x").unwrap();
+        let info = read_folder_for_attachment_blocking(
+            worktree.to_string_lossy().into_owned(),
+            None,
+            1,
+        )
+        .unwrap();
+        assert!(info.tree.contains("visible.txt"));
+        assert!(!info.tree.contains("hidden.secret"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlinked_folder_checks_canonical_parent_rules() {
+        let dir = tempdir().unwrap();
+        let real_parent = dir.path().join("real");
+        let attached = real_parent.join("attached");
+        fs::create_dir_all(&attached).unwrap();
+        fs::write(
+            real_parent.join(".ignore"),
+            vec![b'x'; MAX_ATTACHMENT_IGNORE_FILE_BYTES as usize + 1],
+        )
+        .unwrap();
+        let link = dir.path().join("linked");
+        std::os::unix::fs::symlink(&attached, &link).unwrap();
+        let error = read_folder_for_attachment_blocking(
+            link.to_string_lossy().into_owned(),
+            None,
+            1,
+        )
+        .unwrap_err();
+        assert!(error.contains("ignore rule file exceeds 1 MiB"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlinked_folder_keeps_supplied_name_in_preview() {
+        let dir = tempdir().unwrap();
+        let attached = dir.path().join("real");
+        fs::create_dir(&attached).unwrap();
+        fs::write(attached.join("visible.txt"), "x").unwrap();
+        let link = dir.path().join("linked");
+        std::os::unix::fs::symlink(&attached, &link).unwrap();
+        let info = read_folder_for_attachment_blocking(
+            link.to_string_lossy().into_owned(),
+            None,
+            1,
+        )
+        .unwrap();
+        assert_eq!(info.tree.lines().next(), Some("linked"));
+        assert!(info.tree.contains("visible.txt"));
+    }
+
+    #[test]
+    fn ignore_matcher_uses_bounded_snapshot_after_file_changes() {
+        let dir = tempdir().unwrap();
+        let rules = dir.path().join(".ignore");
+        fs::write(&rules, "ignored.txt\n").unwrap();
+        let mut state = FolderWalkFilter {
+            rules: HashMap::new(),
+            global_rules: None,
+            global_rules_checked: false,
+            raw_visits: 0,
+            exhausted: false,
+            had_error: false,
+            fatal_error: None,
+            checked_rule_dirs: HashSet::new(),
+            rule_bytes: 0,
+            rule_lines: 0,
+        };
+        state.check_rule_files(dir.path(), true).unwrap();
+        fs::write(&rules, vec![b'x'; MAX_ATTACHMENT_IGNORE_FILE_BYTES as usize + 1]).unwrap();
+        assert!(state.is_ignored(&dir.path().join("ignored.txt"), false).unwrap());
+        assert!(!state.is_ignored(&dir.path().join("visible.txt"), false).unwrap());
+    }
+
+    #[test]
+    fn folder_preview_keeps_git_exclude_and_parent_ignore_rules() {
+        let dir = tempdir().unwrap();
+        let project = dir.path().join("project");
+        fs::create_dir_all(project.join(".git/info")).unwrap();
+        fs::write(dir.path().join(".ignore"), "*.tmp\n").unwrap();
+        fs::write(project.join(".git/info/exclude"), "*.secret\n").unwrap();
+        fs::write(project.join("scratch.tmp"), "x").unwrap();
+        fs::write(project.join("local.secret"), "x").unwrap();
+        fs::write(project.join("visible.txt"), "x").unwrap();
+        let info = read_folder_for_attachment_blocking(
+            project.to_string_lossy().into_owned(),
+            None,
+            1,
+        )
+        .unwrap();
+        assert!(info.tree.contains("visible.txt"));
+        assert!(!info.tree.contains("scratch.tmp"));
+        assert!(!info.tree.contains("local.secret"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlinked_git_directory_excludes_files_in_attached_subfolder() {
+        let dir = tempdir().unwrap();
+        let git_dir = dir.path().join("git-metadata");
+        fs::create_dir_all(git_dir.join("info")).unwrap();
+        fs::write(git_dir.join("info/exclude"), "*.secret\n").unwrap();
+        let project = dir.path().join("project");
+        let child = project.join("child");
+        fs::create_dir_all(&child).unwrap();
+        std::os::unix::fs::symlink(&git_dir, project.join(".git")).unwrap();
+        fs::write(child.join("hidden.secret"), "x").unwrap();
+        fs::write(child.join("visible.txt"), "x").unwrap();
+
+        let picked = walk_project(&child);
+        assert!(picked.paths.iter().any(|path| path == "visible.txt"));
+        assert!(!picked.paths.iter().any(|path| path == "hidden.secret"));
+        let info = read_folder_for_attachment_blocking(
+            child.to_string_lossy().into_owned(),
+            None,
+            1,
+        )
+        .unwrap();
+        assert!(info.tree.contains("visible.txt"));
+        assert!(!info.tree.contains("hidden.secret"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlinked_worktree_metadata_excludes_files_in_attached_subfolder() {
+        let dir = tempdir().unwrap();
+        let common = dir.path().join("common-git");
+        fs::create_dir_all(common.join("info")).unwrap();
+        fs::write(common.join("info/exclude"), "*.secret\n").unwrap();
+        let worktree_git = dir.path().join("worktree-git");
+        fs::create_dir(&worktree_git).unwrap();
+        let commondir_target = dir.path().join("commondir-target");
+        fs::write(&commondir_target, common.to_string_lossy().as_bytes()).unwrap();
+        std::os::unix::fs::symlink(&commondir_target, worktree_git.join("commondir")).unwrap();
+        let pointer = dir.path().join("git-pointer");
+        fs::write(&pointer, format!("gitdir: {}\n", worktree_git.display())).unwrap();
+
+        let project = dir.path().join("project");
+        let child = project.join("child");
+        fs::create_dir_all(&child).unwrap();
+        std::os::unix::fs::symlink(&pointer, project.join(".git")).unwrap();
+        fs::write(child.join("hidden.secret"), "x").unwrap();
+        fs::write(child.join("visible.txt"), "x").unwrap();
+
+        let picked = walk_project(&child);
+        assert!(picked.paths.iter().any(|path| path == "visible.txt"));
+        assert!(!picked.paths.iter().any(|path| path == "hidden.secret"));
+        let info = read_folder_for_attachment_blocking(
+            child.to_string_lossy().into_owned(),
+            None,
+            1,
+        )
+        .unwrap();
+        assert!(info.tree.contains("visible.txt"));
+        assert!(!info.tree.contains("hidden.secret"));
+    }
+
+    #[test]
+    fn child_gitignore_negation_overrides_parent() {
+        let dir = tempdir().unwrap();
+        fs::create_dir(dir.path().join(".git")).unwrap();
+        fs::write(dir.path().join(".gitignore"), "*.log\n").unwrap();
+        let child = dir.path().join("child");
+        fs::create_dir(&child).unwrap();
+        fs::write(child.join(".gitignore"), "!keep.log\n").unwrap();
+        fs::write(child.join("keep.log"), "x").unwrap();
+        fs::write(child.join("hidden.log"), "x").unwrap();
+        let info = read_folder_for_attachment_blocking(
+            dir.path().to_string_lossy().into_owned(),
+            None,
+            2,
+        )
+        .unwrap();
+        assert!(info.tree.contains("keep.log"));
+        assert!(!info.tree.contains("hidden.log"));
+    }
+
+    #[test]
+    fn gitignore_negation_overrides_git_exclude() {
+        let dir = tempdir().unwrap();
+        fs::create_dir_all(dir.path().join(".git/info")).unwrap();
+        fs::write(dir.path().join(".git/info/exclude"), "*.log\n").unwrap();
+        fs::write(dir.path().join(".gitignore"), "!keep.log\n").unwrap();
+        fs::write(dir.path().join("keep.log"), "x").unwrap();
+        fs::write(dir.path().join("hidden.log"), "x").unwrap();
+        let info = read_folder_for_attachment_blocking(
+            dir.path().to_string_lossy().into_owned(),
+            None,
+            1,
+        )
+        .unwrap();
+        assert!(info.tree.contains("keep.log"));
+        assert!(!info.tree.contains("hidden.log"));
+    }
+
+    #[test]
+    fn nested_git_repository_stops_parent_gitignore_rules() {
+        let dir = tempdir().unwrap();
+        fs::create_dir(dir.path().join(".git")).unwrap();
+        fs::write(dir.path().join(".gitignore"), "*.log\n").unwrap();
+        let nested = dir.path().join("nested");
+        fs::create_dir_all(nested.join(".git")).unwrap();
+        fs::write(nested.join("visible.log"), "x").unwrap();
+        let info = read_folder_for_attachment_blocking(
+            dir.path().to_string_lossy().into_owned(),
+            None,
+            2,
+        )
+        .unwrap();
+        assert!(info.tree.contains("visible.log"));
+    }
+
+    #[test]
+    fn attaching_nested_repository_skips_oversized_outer_gitignore() {
+        let dir = tempdir().unwrap();
+        fs::create_dir(dir.path().join(".git")).unwrap();
+        fs::write(
+            dir.path().join(".gitignore"),
+            vec![b'x'; MAX_ATTACHMENT_IGNORE_FILE_BYTES as usize + 1],
+        )
+        .unwrap();
+        fs::write(dir.path().join(".ignore"), "*.tmp\n").unwrap();
+        let nested = dir.path().join("nested");
+        let child = nested.join("child");
+        fs::create_dir_all(nested.join(".git")).unwrap();
+        fs::create_dir(&child).unwrap();
+        fs::write(child.join("hidden.tmp"), "x").unwrap();
+        fs::write(child.join("visible.txt"), "x").unwrap();
+
+        let picked = walk_project(&child);
+        assert!(picked.paths.iter().any(|path| path == "visible.txt"));
+        assert!(!picked.paths.iter().any(|path| path == "hidden.tmp"));
+        let info = read_folder_for_attachment_blocking(
+            child.to_string_lossy().into_owned(),
+            None,
+            1,
+        )
+        .unwrap();
+        assert!(info.tree.contains("visible.txt"));
+        assert!(!info.tree.contains("hidden.tmp"));
+    }
+
+    #[test]
+    fn jujutsu_workspace_applies_gitignore_rules() {
+        let dir = tempdir().unwrap();
+        fs::create_dir(dir.path().join(".jj")).unwrap();
+        fs::write(dir.path().join(".gitignore"), "*.secret\n").unwrap();
+        fs::write(dir.path().join("hidden.secret"), "x").unwrap();
+        fs::write(dir.path().join("visible.txt"), "x").unwrap();
+        let info = read_folder_for_attachment_blocking(
+            dir.path().to_string_lossy().into_owned(),
+            None,
+            1,
+        )
+        .unwrap();
+        assert!(info.tree.contains("visible.txt"));
+        assert!(!info.tree.contains("hidden.secret"));
+    }
+
+    #[test]
+    fn oversized_global_git_config_is_rejected_before_matching() {
+        let dir = tempdir().unwrap();
+        let config = dir.path().join("global-git-config");
+        fs::write(&config, vec![b'x'; MAX_ATTACHMENT_IGNORE_FILE_BYTES as usize + 1]).unwrap();
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "commands::project_files::tests::global_config_preflight_child",
+                "--nocapture",
+            ])
+            .env("CODEMUX_ATTACHMENT_GLOBAL_CONFIG_CHILD", "1")
+            .env("GIT_CONFIG_GLOBAL", config)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "stdout: {}\nstderr: {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[test]
+    fn global_config_preflight_child() {
+        if std::env::var_os("CODEMUX_ATTACHMENT_GLOBAL_CONFIG_CHILD").is_none() {
+            return;
+        }
+        let dir = tempdir().unwrap();
+        fs::create_dir(dir.path().join(".git")).unwrap();
+        fs::write(dir.path().join("visible.txt"), "x").unwrap();
+        let error = read_folder_for_attachment_blocking(
+            dir.path().to_string_lossy().into_owned(),
+            None,
+            1,
+        )
+        .unwrap_err();
+        assert!(error.contains("ignore rule file exceeds 1 MiB"));
+    }
+
+    #[test]
+    fn oversized_global_exclude_is_loaded_only_for_visited_repositories() {
+        let dir = tempdir().unwrap();
+        let config = dir.path().join("global-git-config");
+        let global_ignore = dir.path().join("global-ignore");
+        let system_config = dir.path().join("system-git-config");
+        let xdg = dir.path().join("xdg");
+        fs::create_dir(&xdg).unwrap();
+        fs::write(&global_ignore, vec![b'x'; MAX_ATTACHMENT_IGNORE_FILE_BYTES as usize + 1])
+            .unwrap();
+        fs::write(
+            &config,
+            format!("[core]\nexcludesFile = {}\n", global_ignore.display()),
+        )
+        .unwrap();
+        fs::write(&system_config, "").unwrap();
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "commands::project_files::tests::global_exclude_scope_child",
+                "--nocapture",
+            ])
+            .env("CODEMUX_ATTACHMENT_GLOBAL_EXCLUDE_SCOPE_CHILD", "1")
+            .env("GIT_CONFIG_GLOBAL", config)
+            .env("GIT_CONFIG_SYSTEM", system_config)
+            .env("XDG_CONFIG_HOME", xdg)
+            .env("HOME", dir.path())
+            .env("USERPROFILE", dir.path())
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "stdout: {}\nstderr: {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[test]
+    fn global_exclude_scope_child() {
+        if std::env::var_os("CODEMUX_ATTACHMENT_GLOBAL_EXCLUDE_SCOPE_CHILD").is_none() {
+            return;
+        }
+        let dir = tempdir().unwrap();
+        fs::write(dir.path().join("visible.txt"), "x").unwrap();
+        let standalone = read_folder_for_attachment_blocking(
+            dir.path().to_string_lossy().into_owned(),
+            None,
+            2,
+        )
+        .unwrap();
+        assert!(standalone.tree.contains("visible.txt"));
+
+        let nested = dir.path().join("nested");
+        fs::create_dir_all(nested.join(".git")).unwrap();
+        fs::write(nested.join("repo.txt"), "x").unwrap();
+        let error = read_folder_for_attachment_blocking(
+            dir.path().to_string_lossy().into_owned(),
+            None,
+            2,
+        )
+        .unwrap_err();
+        assert!(error.contains("ignore rule file exceeds 1 MiB"));
+
+        let empty = dir.path().join("empty");
+        fs::create_dir_all(empty.join(".git")).unwrap();
+        let info = read_folder_for_attachment_blocking(
+            empty.to_string_lossy().into_owned(),
+            None,
+            1,
+        )
+        .unwrap();
+        assert_eq!(info.item_count, 0);
+        fs::write(empty.join("entry.txt"), "x").unwrap();
+        let error = read_folder_for_attachment_blocking(
+            empty.to_string_lossy().into_owned(),
+            None,
+            1,
+        )
+        .unwrap_err();
+        assert!(error.contains("ignore rule file exceeds 1 MiB"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unreadable_optional_git_config_uses_picker_fallback() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempdir().unwrap();
+        let xdg = dir.path().join("xdg");
+        fs::create_dir_all(xdg.join("git")).unwrap();
+        fs::write(xdg.join("git/ignore"), "*.secret\n").unwrap();
+        let system_config = dir.path().join("unreadable-system-config");
+        fs::write(&system_config, "[core]\n").unwrap();
+        fs::set_permissions(&system_config, fs::Permissions::from_mode(0o000)).unwrap();
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "commands::project_files::tests::optional_config_fallback_child",
+                "--nocapture",
+            ])
+            .env("CODEMUX_ATTACHMENT_OPTIONAL_CONFIG_CHILD", "1")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_SYSTEM", system_config)
+            .env("XDG_CONFIG_HOME", xdg)
+            .env("HOME", dir.path())
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "stdout: {}\nstderr: {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn directory_optional_git_config_uses_picker_fallback() {
+        let dir = tempdir().unwrap();
+        let xdg = dir.path().join("xdg");
+        fs::create_dir_all(xdg.join("git")).unwrap();
+        fs::write(xdg.join("git/ignore"), "*.secret\n").unwrap();
+        let system_config = dir.path().join("directory-system-config");
+        fs::create_dir(&system_config).unwrap();
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "commands::project_files::tests::optional_config_fallback_child",
+                "--nocapture",
+            ])
+            .env("CODEMUX_ATTACHMENT_OPTIONAL_CONFIG_CHILD", "1")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_SYSTEM", system_config)
+            .env("XDG_CONFIG_HOME", xdg)
+            .env("HOME", dir.path())
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "stdout: {}\nstderr: {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn optional_config_fallback_child() {
+        if std::env::var_os("CODEMUX_ATTACHMENT_OPTIONAL_CONFIG_CHILD").is_none() {
+            return;
+        }
+        let dir = tempdir().unwrap();
+        fs::create_dir(dir.path().join(".git")).unwrap();
+        fs::write(dir.path().join("hidden.secret"), "x").unwrap();
+        fs::write(dir.path().join("visible.txt"), "x").unwrap();
+        let picked = walk_project(dir.path());
+        assert!(picked.paths.iter().any(|path| path == "visible.txt"));
+        assert!(!picked.paths.iter().any(|path| path == "hidden.secret"));
+        let info = read_folder_for_attachment_blocking(
+            dir.path().to_string_lossy().into_owned(),
+            None,
+            1,
+        )
+        .unwrap();
+        assert!(info.tree.contains("visible.txt"));
+        assert!(!info.tree.contains("hidden.secret"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn nonregular_global_ignore_matches_picker() {
+        let dir = tempdir().unwrap();
+        let xdg = dir.path().join("xdg");
+        fs::create_dir_all(xdg.join("git")).unwrap();
+        std::os::unix::fs::symlink("/dev/null", xdg.join("git/ignore")).unwrap();
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "commands::project_files::tests::nonregular_global_ignore_child",
+                "--nocapture",
+            ])
+            .env("CODEMUX_ATTACHMENT_NONREGULAR_IGNORE_CHILD", "1")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_SYSTEM", "/dev/null")
+            .env("XDG_CONFIG_HOME", xdg)
+            .env("HOME", dir.path())
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "stdout: {}\nstderr: {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn nonregular_global_ignore_child() {
+        if std::env::var_os("CODEMUX_ATTACHMENT_NONREGULAR_IGNORE_CHILD").is_none() {
+            return;
+        }
+        let dir = tempdir().unwrap();
+        fs::create_dir(dir.path().join(".git")).unwrap();
+        fs::write(dir.path().join("visible.secret"), "x").unwrap();
+        let picked = walk_project(dir.path());
+        assert!(picked.paths.iter().any(|path| path == "visible.secret"));
+        let info = read_folder_for_attachment_blocking(
+            dir.path().to_string_lossy().into_owned(),
+            None,
+            1,
+        )
+        .unwrap();
+        assert!(info.tree.contains("visible.secret"));
+    }
+
+    #[test]
+    fn non_utf8_global_config_comment_keeps_valid_ignore_rules() {
+        let dir = tempdir().unwrap();
+        let config = dir.path().join("global-git-config");
+        let global_ignore = dir.path().join("global-ignore");
+        fs::write(&global_ignore, "*.secret\n").unwrap();
+        let mut config_bytes = b"[core]\n# unrelated ".to_vec();
+        config_bytes.extend_from_slice(&[0xff, b'\n']);
+        config_bytes.extend_from_slice(format!("excludesFile = {}\n", global_ignore.display()).as_bytes());
+        fs::write(&config, config_bytes).unwrap();
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "commands::project_files::tests::configured_global_ignore_child",
+                "--nocapture",
+            ])
+            .env("CODEMUX_ATTACHMENT_CONFIGURED_IGNORE_CHILD", "1")
+            .env("GIT_CONFIG_GLOBAL", config)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "stdout: {}\nstderr: {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[test]
+    fn configured_global_ignore_child() {
+        if std::env::var_os("CODEMUX_ATTACHMENT_CONFIGURED_IGNORE_CHILD").is_none() {
+            return;
+        }
+        let dir = tempdir().unwrap();
+        fs::create_dir(dir.path().join(".git")).unwrap();
+        fs::write(dir.path().join("local.secret"), "x").unwrap();
+        fs::write(dir.path().join("visible.txt"), "x").unwrap();
+        let info = read_folder_for_attachment_blocking(
+            dir.path().to_string_lossy().into_owned(),
+            None,
+            1,
+        )
+        .unwrap();
+        assert!(info.tree.contains("visible.txt"));
+        assert!(!info.tree.contains("local.secret"));
+    }
+
+    #[test]
+    fn invalid_global_excludes_values_use_picker_fallback() {
+        let dir = tempdir().unwrap();
+        let xdg = dir.path().join("xdg");
+        fs::create_dir_all(xdg.join("git")).unwrap();
+        fs::write(xdg.join("git/ignore"), "*.secret\n").unwrap();
+        let system_config = dir.path().join("system-git-config");
+        fs::write(&system_config, "").unwrap();
+
+        let mut undecodable = b"[core]\nexcludesFile = /invalid/".to_vec();
+        undecodable.extend_from_slice(&[0xff, b'\n']);
+        for (name, contents) in [
+            ("inline-comment", b"[core]\nexcludesFile = /invalid/ignore # comment\n".to_vec()),
+            ("undecodable", undecodable),
+        ] {
+            let config = dir.path().join(name);
+            fs::write(&config, contents).unwrap();
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "commands::project_files::tests::invalid_global_excludes_fallback_child",
+                    "--nocapture",
+                ])
+                .env("CODEMUX_ATTACHMENT_INVALID_GLOBAL_CHILD", "1")
+                .env("GIT_CONFIG_GLOBAL", config)
+                .env("GIT_CONFIG_SYSTEM", &system_config)
+                .env("XDG_CONFIG_HOME", &xdg)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{name}: stdout: {}\nstderr: {}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+    }
+
+    #[test]
+    fn invalid_global_excludes_fallback_child() {
+        if std::env::var_os("CODEMUX_ATTACHMENT_INVALID_GLOBAL_CHILD").is_none() {
+            return;
+        }
+        let dir = tempdir().unwrap();
+        fs::create_dir(dir.path().join(".git")).unwrap();
+        fs::write(dir.path().join("hidden.secret"), "x").unwrap();
+        fs::write(dir.path().join("visible.txt"), "x").unwrap();
+        let picked = walk_project(dir.path());
+        assert!(picked.paths.iter().any(|path| path == "visible.txt"));
+        assert!(!picked.paths.iter().any(|path| path == "hidden.secret"));
+        let info = read_folder_for_attachment_blocking(
+            dir.path().to_string_lossy().into_owned(),
+            None,
+            1,
+        )
+        .unwrap();
+        assert!(info.tree.contains("visible.txt"));
+        assert!(!info.tree.contains("hidden.secret"));
+    }
+
+    #[test]
+    fn empty_global_override_falls_through_to_xdg_config() {
+        let dir = tempdir().unwrap();
+        let override_config = dir.path().join("empty-override");
+        fs::write(&override_config, "").unwrap();
+        let xdg = dir.path().join("xdg");
+        fs::create_dir_all(xdg.join("git")).unwrap();
+        let selected_ignore = dir.path().join("selected-ignore");
+        fs::write(&selected_ignore, "*.secret\n").unwrap();
+        fs::write(
+            xdg.join("git/config"),
+            format!("[core]\nexcludesFile = {}\n", selected_ignore.display()),
+        )
+        .unwrap();
+        fs::write(xdg.join("git/ignore"), "*.default\n").unwrap();
+        let system_config = dir.path().join("system-git-config");
+        fs::write(&system_config, "").unwrap();
+
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "commands::project_files::tests::empty_global_override_fallback_child",
+                "--nocapture",
+            ])
+            .env("CODEMUX_ATTACHMENT_EMPTY_OVERRIDE_CHILD", "1")
+            .env("GIT_CONFIG_GLOBAL", override_config)
+            .env("GIT_CONFIG_SYSTEM", system_config)
+            .env("XDG_CONFIG_HOME", xdg)
+            .env("HOME", dir.path())
+            .env("USERPROFILE", dir.path())
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "stdout: {}\nstderr: {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[test]
+    fn empty_global_override_fallback_child() {
+        if std::env::var_os("CODEMUX_ATTACHMENT_EMPTY_OVERRIDE_CHILD").is_none() {
+            return;
+        }
+        let dir = tempdir().unwrap();
+        fs::create_dir(dir.path().join(".git")).unwrap();
+        fs::write(dir.path().join("hidden.secret"), "x").unwrap();
+        fs::write(dir.path().join("visible.default"), "x").unwrap();
+        let picked = walk_project(dir.path());
+        assert!(!picked.paths.iter().any(|path| path == "hidden.secret"));
+        assert!(picked.paths.iter().any(|path| path == "visible.default"));
+        let info = read_folder_for_attachment_blocking(
+            dir.path().to_string_lossy().into_owned(),
+            None,
+            1,
+        )
+        .unwrap();
+        assert!(!info.tree.contains("hidden.secret"));
+        assert!(info.tree.contains("visible.default"));
+    }
+
+    #[test]
+    fn explicit_global_ignore_replaces_xdg_fallback() {
+        let dir = tempdir().unwrap();
+        let config = dir.path().join("global-git-config");
+        let global_ignore = dir.path().join("global-ignore");
+        let system_config = dir.path().join("system-git-config");
+        let xdg = dir.path().join("xdg");
+        fs::create_dir_all(xdg.join("git")).unwrap();
+        fs::write(&global_ignore, "*.secret\n").unwrap();
+        fs::write(&system_config, vec![b'x'; MAX_ATTACHMENT_IGNORE_FILE_BYTES as usize + 1])
+            .unwrap();
+        fs::write(xdg.join("git/ignore"), "*.txt\n").unwrap();
+        fs::write(
+            &config,
+            format!("[core]\nexcludesFile = {}\n", global_ignore.display()),
+        )
+        .unwrap();
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "commands::project_files::tests::explicit_global_ignore_child",
+                "--nocapture",
+            ])
+            .env("CODEMUX_ATTACHMENT_EXPLICIT_IGNORE_CHILD", "1")
+            .env("GIT_CONFIG_GLOBAL", config)
+            .env("GIT_CONFIG_SYSTEM", system_config)
+            .env("XDG_CONFIG_HOME", xdg)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "stdout: {}\nstderr: {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[test]
+    fn explicit_global_ignore_child() {
+        if std::env::var_os("CODEMUX_ATTACHMENT_EXPLICIT_IGNORE_CHILD").is_none() {
+            return;
+        }
+        let dir = tempdir().unwrap();
+        fs::create_dir(dir.path().join(".git")).unwrap();
+        fs::write(dir.path().join("hidden.secret"), "x").unwrap();
+        fs::write(dir.path().join("visible.txt"), "x").unwrap();
+        let info = read_folder_for_attachment_blocking(
+            dir.path().to_string_lossy().into_owned(),
+            None,
+            1,
+        )
+        .unwrap();
+        assert!(info.tree.contains("visible.txt"));
+        assert!(!info.tree.contains("hidden.secret"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn null_global_git_config_allows_folder_preview() {
+        let dir = tempdir().unwrap();
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "commands::project_files::tests::null_global_config_child",
+                "--nocapture",
+            ])
+            .env("CODEMUX_ATTACHMENT_NULL_CONFIG_CHILD", "1")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_SYSTEM", "/dev/null")
+            .env("XDG_CONFIG_HOME", dir.path())
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "stdout: {}\nstderr: {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn null_global_config_child() {
+        if std::env::var_os("CODEMUX_ATTACHMENT_NULL_CONFIG_CHILD").is_none() {
+            return;
+        }
+        let dir = tempdir().unwrap();
+        fs::create_dir(dir.path().join(".git")).unwrap();
+        fs::write(dir.path().join("visible.txt"), "x").unwrap();
+        let info = read_folder_for_attachment_blocking(
+            dir.path().to_string_lossy().into_owned(),
+            None,
+            1,
+        )
+        .unwrap();
+        assert!(info.tree.contains("visible.txt"));
+    }
+
+    #[test]
+    fn bounded_folder_with_no_scanned_entries_is_not_reported_empty() {
+        let dir = tempdir().unwrap();
+        fs::write(dir.path().join("file.txt"), "x").unwrap();
+        let info = read_folder_for_attachment_with_limit(
+            dir.path().to_string_lossy().into_owned(),
+            None,
+            1,
+            0,
+        )
+        .unwrap();
+        assert_eq!(info.item_count, 0);
+        assert!(info.item_count_lower_bound);
+        assert!(info.tree.contains("additional entries may be omitted"));
+    }
+
+    #[test]
+    fn read_folder_clamps_untrusted_depth() {
+        let dir = tempdir().unwrap();
+        let mut nested = dir.path().to_path_buf();
+        for depth in 1..=FOLDER_WALK_MAX_DEPTH + 1 {
+            nested.push(format!("level_{depth}"));
+            fs::create_dir(&nested).unwrap();
+        }
+        let info = read_folder_for_attachment_blocking(
+            dir.path().to_string_lossy().into_owned(),
+            None,
+            usize::MAX,
+        )
+        .unwrap();
+        assert_eq!(info.item_count, FOLDER_WALK_MAX_DEPTH);
+        assert!(!info.tree.contains(&format!("level_{}", FOLDER_WALK_MAX_DEPTH + 1)));
     }
 
     #[tokio::test]

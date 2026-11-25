@@ -60,6 +60,8 @@ export interface AttachmentMetadata {
   label: string;
   /** File-only: line count for the chip's secondary metric ("421L"). */
   lineCount?: number;
+  /** The backend stopped counting at its text-byte limit. */
+  lineCountLowerBound?: boolean;
   /** File / image: byte size for the chip tooltip and 5MB warning. */
   bytes?: number;
   /** Issue / PR state — drives chip color. PRs add `draft` (in-progress

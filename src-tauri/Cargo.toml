@@ -98,7 +98,7 @@ async-trait = "0.1"
 futures-core = "0.3"
 serde_yaml = "0.9"
 glob = "0.3"
-ignore = "0.4"
+ignore = "0.4.35"
 nucleo-matcher = "0.3"
 # PNG encoder for the clipboard-paste flow. The OS clipboard hands
 # us raw RGBA pixels via tauri-plugin-clipboard-manager; we encode

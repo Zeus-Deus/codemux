@@ -164,6 +164,13 @@ describe("buildAttachmentBlock", () => {
     expect(block!).not.toContain("Lines: ");
     expect(block!).toContain("## File: Composer.tsx");
   });
+
+  it("labels a bounded file scan as a lower bound in the prompt header", () => {
+    const att = makeFileAttachment({
+      metadata: { label: "large.txt", lineCount: 240, lineCountLowerBound: true },
+    });
+    expect(buildAttachmentBlock([att])).toContain("Lines: at least 240");
+  });
 });
 
 describe("buildFileResolvedContent", () => {
@@ -175,8 +182,8 @@ describe("buildFileResolvedContent", () => {
     expect(out).toContain("// alpha");
     expect(out).toContain("// beta");
     // Truncated-only artifacts MUST NOT appear in the full path.
-    expect(out).not.toContain("First 50 of");
-    expect(out).not.toContain("Outline (");
+    expect(out).not.toContain("Preview (up to 50 lines)");
+    expect(out).not.toContain("Outline preview");
     expect(out).not.toContain("Use the Read tool");
   });
 
@@ -192,13 +199,13 @@ describe("buildFileResolvedContent", () => {
       ],
     });
     const out = buildFileResolvedContent(info);
-    expect(out).toContain("First 50 of 1800 lines:");
+    expect(out).toContain("Preview (up to 50 lines) of 1800 total lines:");
     expect(out).toContain("```tsx");
     // Only the first 50 preview lines should appear in the body.
     expect(out).toContain("// line 1\n");
     expect(out).toContain("// line 50");
     expect(out).not.toContain("// line 51");
-    expect(out).toContain("Outline (2 declarations):");
+    expect(out).toContain("Outline preview (2 declarations shown):");
     expect(out).toContain("- function alpha (line 12)");
     expect(out).toContain("- class Beta (line 80)");
     expect(out).toContain('Use the Read tool with path "/abs/Composer.tsx"');
@@ -216,8 +223,16 @@ describe("buildFileResolvedContent", () => {
       outline: [],
     });
     const out = buildFileResolvedContent(info);
-    expect(out).not.toContain("Outline (");
-    expect(out).toContain("First 50 of");
+    expect(out).not.toContain("Outline preview");
+    expect(out).toContain("Preview (up to 50 lines)");
+  });
+
+  it("does not claim an exact line total after the backend scan limit", () => {
+    const out = buildFileResolvedContent(
+      makeInfo({ lineCount: 240, lineCountLowerBound: true, truncated: true }),
+    );
+    expect(out).toContain("of at least 240 total lines:");
+    expect(out).not.toContain("of 240 total lines:");
   });
 
   it("uses an empty language fence when language is null", () => {
@@ -255,6 +270,17 @@ describe("buildFolderResolvedContent (Step 8 Stage 3)", () => {
     });
     expect(out).toContain("1 item):");
     expect(out).not.toContain("1 items");
+  });
+
+  it("labels a bounded folder walk as a lower bound", () => {
+    const out = buildFolderResolvedContent({
+      absolutePath: "/repo/large",
+      relativePath: "large",
+      tree: "large\n… additional entries may be omitted",
+      itemCount: 10_000,
+      itemCountLowerBound: true,
+    });
+    expect(out).toContain("at least 10000 items");
   });
 });
 
