@@ -432,6 +432,26 @@ pub struct FolderAttachmentInfo {
     pub item_count_lower_bound: bool,
 }
 
+fn open_bounded_file(path: &Path, allow_symlinks: bool) -> std::io::Result<std::fs::File> {
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        let flags = libc::O_NONBLOCK | if allow_symlinks { 0 } else { libc::O_NOFOLLOW };
+        options.custom_flags(flags);
+    }
+    #[cfg(windows)]
+    if !allow_symlinks {
+        use std::os::windows::fs::OpenOptionsExt;
+        // Open the reparse point itself so a replaced symlink cannot
+        // redirect the bounded read to another file.
+        const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+        options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+    }
+    options.open(path)
+}
+
 #[derive(Default)]
 struct FolderRuleSet {
     ignore: Option<Gitignore>,
@@ -498,8 +518,9 @@ impl FolderWalkFilter {
             let Some(bytes) = Self::read_bounded_file(&file, rule_bytes, true)? else {
                 continue;
             };
-            if exclude.is_none() {
-                exclude = Self::config_exclude_path(&bytes, home.as_deref())?;
+            if let Some(path) = Self::config_exclude_path(&bytes, home.as_deref())? {
+                exclude = Some(path);
+                break;
             }
         }
         let cwd = std::env::current_dir()
@@ -566,7 +587,7 @@ impl FolderWalkFilter {
         let dot_git_metadata = match std::fs::symlink_metadata(&dot_git) {
             Ok(metadata) => metadata,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                return Ok((false, None));
+                return Ok((dir.join(".jj").exists(), None));
             }
             Err(error) => {
                 return Err(format!(
@@ -772,7 +793,7 @@ impl FolderWalkFilter {
                 file.display()
             ));
         }
-        let reader = Self::open_rule_file(file, allow_symlinks).map_err(|error| {
+        let reader = open_bounded_file(file, allow_symlinks).map_err(|error| {
             format!(
                 "cannot read attachment ignore rules at {}: {error}",
                 file.display()
@@ -821,26 +842,6 @@ impl FolderWalkFilter {
             return Err("attachment ignore rules exceed 4 MiB in total".to_string());
         }
         Ok(Some(bytes))
-    }
-
-    fn open_rule_file(file: &Path, allow_symlinks: bool) -> std::io::Result<std::fs::File> {
-        let mut options = std::fs::OpenOptions::new();
-        options.read(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            let flags = libc::O_NONBLOCK | if allow_symlinks { 0 } else { libc::O_NOFOLLOW };
-            options.custom_flags(flags);
-        }
-        #[cfg(windows)]
-        if !allow_symlinks {
-            use std::os::windows::fs::OpenOptionsExt;
-            // Open the reparse point itself so a replaced symlink cannot
-            // redirect the bounded read to another file.
-            const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
-            options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
-        }
-        options.open(file)
     }
 
     fn rule_line(bytes: &[u8]) -> Result<Option<&str>, String> {
@@ -1216,12 +1217,15 @@ fn read_file_for_attachment_blocking(
         return Err(format!("not a file: {absolute_path}"));
     }
 
-    let metadata = std::fs::metadata(path)
-        .map_err(|e| format!("metadata read failed for {absolute_path}: {e}"))?;
-    let bytes = metadata.len();
-
-    let file = std::fs::File::open(path)
+    let file = open_bounded_file(path, true)
         .map_err(|e| format!("read failed for {absolute_path}: {e}"))?;
+    let metadata = file
+        .metadata()
+        .map_err(|e| format!("metadata read failed for {absolute_path}: {e}"))?;
+    if !metadata.is_file() {
+        return Err(format!("not a file: {absolute_path}"));
+    }
+    let bytes = metadata.len();
     let (raw, line_count_lower_bound) = read_attachment_bytes(file)
         .map_err(|e| format!("read failed for {absolute_path}: {e}"))?;
 
@@ -2120,6 +2124,20 @@ mod tests {
         assert_eq!(info.content, "");
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn read_file_allows_regular_file_symlinks() {
+        let dir = tempdir().unwrap();
+        let target = dir.path().join("target.txt");
+        fs::write(&target, "hello\n").unwrap();
+        let link = dir.path().join("linked.txt");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        let info = read_file_for_attachment_blocking(link.to_string_lossy().into_owned(), None)
+            .unwrap();
+        assert_eq!(info.content, "hello\n");
+        assert_eq!(info.bytes, 6);
+    }
+
     #[tokio::test]
     async fn read_file_errors_on_missing_path() {
         let err = read_file_for_attachment(
@@ -2574,14 +2592,21 @@ mod tests {
             "{}",
             std::io::Error::last_os_error()
         );
-        let reader = FolderWalkFilter::open_rule_file(&fifo, false).unwrap();
+        let reader = open_bounded_file(&fifo, false).unwrap();
+        assert!(!reader.metadata().unwrap().is_file());
+        let reader = open_bounded_file(&fifo, true).unwrap();
+        assert!(!reader.metadata().unwrap().is_file());
+
+        let fifo_link = dir.path().join("fifo.link");
+        std::os::unix::fs::symlink(&fifo, &fifo_link).unwrap();
+        let reader = open_bounded_file(&fifo_link, true).unwrap();
         assert!(!reader.metadata().unwrap().is_file());
 
         let target = dir.path().join("target");
         fs::write(&target, "*.secret\n").unwrap();
         let symlink = dir.path().join("rules.link");
         std::os::unix::fs::symlink(&target, &symlink).unwrap();
-        assert!(FolderWalkFilter::open_rule_file(&symlink, false).is_err());
+        assert!(open_bounded_file(&symlink, false).is_err());
     }
 
     #[test]
@@ -2802,6 +2827,23 @@ mod tests {
     }
 
     #[test]
+    fn jujutsu_workspace_applies_gitignore_rules() {
+        let dir = tempdir().unwrap();
+        fs::create_dir(dir.path().join(".jj")).unwrap();
+        fs::write(dir.path().join(".gitignore"), "*.secret\n").unwrap();
+        fs::write(dir.path().join("hidden.secret"), "x").unwrap();
+        fs::write(dir.path().join("visible.txt"), "x").unwrap();
+        let info = read_folder_for_attachment_blocking(
+            dir.path().to_string_lossy().into_owned(),
+            None,
+            1,
+        )
+        .unwrap();
+        assert!(info.tree.contains("visible.txt"));
+        assert!(!info.tree.contains("hidden.secret"));
+    }
+
+    #[test]
     fn oversized_global_git_config_is_rejected_before_matching() {
         let dir = tempdir().unwrap();
         let config = dir.path().join("global-git-config");
@@ -2892,9 +2934,12 @@ mod tests {
         let dir = tempdir().unwrap();
         let config = dir.path().join("global-git-config");
         let global_ignore = dir.path().join("global-ignore");
+        let system_config = dir.path().join("system-git-config");
         let xdg = dir.path().join("xdg");
         fs::create_dir_all(xdg.join("git")).unwrap();
         fs::write(&global_ignore, "*.secret\n").unwrap();
+        fs::write(&system_config, vec![b'x'; MAX_ATTACHMENT_IGNORE_FILE_BYTES as usize + 1])
+            .unwrap();
         fs::write(xdg.join("git/ignore"), "*.txt\n").unwrap();
         fs::write(
             &config,
@@ -2909,6 +2954,7 @@ mod tests {
             ])
             .env("CODEMUX_ATTACHMENT_EXPLICIT_IGNORE_CHILD", "1")
             .env("GIT_CONFIG_GLOBAL", config)
+            .env("GIT_CONFIG_SYSTEM", system_config)
             .env("XDG_CONFIG_HOME", xdg)
             .output()
             .unwrap();
