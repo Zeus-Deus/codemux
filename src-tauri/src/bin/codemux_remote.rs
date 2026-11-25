@@ -1119,7 +1119,14 @@ fn run_worktree_create(
         Ok(None) => create_worktree_in_process(&state_dir, &args),
         Err(e) => Err(e),
     };
-    match data.and_then(|data| checkout::worktree_create_output(&data)) {
+    match data.and_then(|data| {
+        let output = checkout::worktree_create_output(&data)?;
+        let skipped = &data["setup"]["includes_skipped_nested"];
+        if skipped.as_array().is_some_and(|paths| !paths.is_empty()) {
+            eprintln!("[codemux-remote] Automatic setup skipped nested worktree includes: {skipped}");
+        }
+        Ok(output)
+    }) {
         Ok(output) => {
             println!("{output}");
             ExitCode::SUCCESS

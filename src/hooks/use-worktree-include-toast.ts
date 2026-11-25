@@ -6,8 +6,7 @@ import { basename } from "@/lib/path";
 import { toast } from "@/lib/toast";
 
 /**
- * Shows a one-time info toast when worktree includes are applied from defaults,
- * so users learn about the feature and how to customize it.
+ * Reports skipped nested files and shows a one-time hint for default copies.
  *
  * Implementation note: do NOT subscribe to `appState` via `useAppStore`
  * here, and do NOT put `appState` in the effect's dependency array.
@@ -31,6 +30,18 @@ import { toast } from "@/lib/toast";
 export function useWorktreeIncludeToast() {
   useEffect(() => {
     const unlisten = onWorktreeIncludesApplied(async (payload) => {
+      const skipped = payload.skipped_nested ?? [];
+      if (skipped.length > 0) {
+        const paths = skipped.slice(0, 3).join(", ");
+        const remaining = skipped.length > 3 ? ` and ${skipped.length - 3} more` : "";
+        toast.warning("Nested worktree files skipped", {
+          description: `Skipped ${paths}${remaining}. Use Re-run setup to copy nested files.`,
+          classNames: { description: "line-clamp-3 break-words" },
+          duration: 8000,
+        });
+        return;
+      }
+
       // Only show hint for defaults — if user configured a file or setting, they already know
       if (payload.source !== "defaults" || payload.copied.length === 0) {
         return;

@@ -2838,7 +2838,7 @@ export function SettingsView() {
               <FormField
                 label="Worktree includes"
                 status={savedNote("includes")}
-                helper="Files matching these patterns are copied from the main project into new worktrees. One pattern per line."
+                helper="New worktrees copy matching top-level files. Use Re-run setup to include nested files. One pattern per line."
                 caption={
                   <>
                     Create a <code className="font-mono text-label bg-muted/60 border border-border/40 px-1.5 py-0.5 rounded-sm">.codemuxinclude</code> file

@@ -93,6 +93,7 @@ pub enum IncludeSource {
 #[derive(Debug, Clone, Serialize)]
 pub struct IncludeResult {
     pub copied: Vec<String>,
+    pub skipped_nested: Vec<String>,
     pub source: IncludeSource,
 }
 
@@ -126,6 +127,7 @@ fn process_registered_worktree_includes(
     }
     Ok(IncludeResult {
         copied: Vec::new(),
+        skipped_nested: Vec::new(),
         source: IncludeSource::Defaults,
     })
 }
@@ -314,7 +316,8 @@ fn copy_worktree_includes(
         root.path.display()
     );
 
-    let copied = copy_matching_files(root, destination, patterns.path(), include_nested)?;
+    let (copied, skipped_nested) =
+        copy_matching_files(root, destination, patterns.path(), include_nested)?;
 
     if !copied.is_empty() {
         eprintln!(
@@ -324,7 +327,11 @@ fn copy_worktree_includes(
         );
     }
 
-    Ok(IncludeResult { copied, source })
+    Ok(IncludeResult {
+        copied,
+        skipped_nested,
+        source,
+    })
 }
 
 fn write_include_patterns<'a>(
@@ -338,13 +345,13 @@ fn write_include_patterns<'a>(
 }
 
 /// Use `git ls-files` to find gitignored files matching the exclude patterns,
-/// then copy them from `root_path` to `worktree_path`.
+/// then return the copied paths and any nested paths skipped during automatic setup.
 fn copy_matching_files(
     root: &IncludeSourceDir,
     destination: &Dir,
     exclude_file: &Path,
     include_nested: bool,
-) -> Result<Vec<String>, String> {
+) -> Result<(Vec<String>, Vec<String>), String> {
     let output = root
         .git_command()
         .map_err(|error| format!("Pin Git working directory: {error}"))?
@@ -369,6 +376,7 @@ fn copy_matching_files(
     }
 
     let mut copied = Vec::new();
+    let mut skipped_nested = Vec::new();
 
     // NUL records preserve Unicode and embedded newlines without Git's
     // C-style quoting. Unix paths may also contain non-UTF-8 bytes.
@@ -390,6 +398,7 @@ fn copy_matching_files(
         // On Unix an open nested directory can still be moved out of the
         // checkout. Automatic copies stay at the registered checkout root.
         if !include_nested && relative_path.components().count() != 1 {
+            skipped_nested.push(relative_path.to_string_lossy().into_owned());
             continue;
         }
         if copy_confined_include(&root.dir, destination, relative_path).map_err(|error| {
@@ -399,7 +408,7 @@ fn copy_matching_files(
         }
     }
 
-    Ok(copied)
+    Ok((copied, skipped_nested))
 }
 
 fn open_include_parent(root: &Dir, path: &Path, create: bool) -> io::Result<Dir> {
@@ -570,6 +579,7 @@ struct WorktreeIncludesApplied {
     workspace_id: String,
     source: IncludeSource,
     copied: Vec<String>,
+    skipped_nested: Vec<String>,
 }
 
 /// Run the full setup pipeline: worktree includes copy + setup scripts.
@@ -611,6 +621,7 @@ pub fn run_setup_scripts<R: Runtime>(
                     workspace_id: workspace_id.to_string(),
                     source: result.source,
                     copied: result.copied,
+                    skipped_nested: result.skipped_nested,
                 },
             );
         }
@@ -1338,11 +1349,13 @@ mod tests {
             assert_eq!(resolve_root_path(checkout), canonical_root);
             let includes = process_worktree_includes(&root, checkout, &[]).unwrap();
             assert_eq!(includes.copied, [".env"]);
+            assert_eq!(includes.skipped_nested, ["settings/private.env"]);
             assert!(!checkout.join("settings").exists());
             let subdirectory = checkout.join("subdirectory");
             fs::create_dir(&subdirectory).unwrap();
             let includes = process_worktree_includes(&root, &subdirectory, &[]).unwrap();
             assert!(includes.copied.is_empty());
+            assert!(includes.skipped_nested.is_empty());
             assert!(!subdirectory.join(".env").exists());
         }
         for checkout in [fixture.path().join("unregistered"), root.join("nested")] {
@@ -1354,8 +1367,17 @@ mod tests {
             // setup step passed the parent repository directly.
             let includes = process_worktree_includes(&root, &checkout, &[]).unwrap();
             assert!(includes.copied.is_empty());
+            assert!(includes.skipped_nested.is_empty());
             assert!(!checkout.join(".env").exists());
         }
+
+        let includes = process_registered_worktree_includes(&root, &registered, &[], true).unwrap();
+        assert!(includes.copied.iter().any(|path| path == "settings/private.env"));
+        assert!(includes.skipped_nested.is_empty());
+        assert_eq!(
+            fs::read_to_string(registered.join("settings/private.env")).unwrap(),
+            "INCLUDE_FIXTURE=nested"
+        );
         assert_eq!(fs::read_to_string(root.join(".env")).unwrap(), "INCLUDE_FIXTURE=local");
     }
 

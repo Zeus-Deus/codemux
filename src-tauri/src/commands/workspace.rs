@@ -3653,6 +3653,7 @@ fn spawn_setup_scripts<R: tauri::Runtime>(
                         "workspace_id": ws_id,
                         "source": result.source,
                         "copied": result.copied,
+                        "skipped_nested": result.skipped_nested,
                     }),
                 );
             }
