@@ -517,21 +517,34 @@ impl Git {
             Ok(!String::from_utf8_lossy(&out).trim().is_empty())
         };
 
-        // Give the default branch two depth rounds before any unrelated ref.
-        // This lets a common older pin be proven without spending the shared
-        // download budget on a large tag or branch first.
+        // Search the default branch, then release tags, at the first depth
+        // before deepening anything. A pin near a tag should not be starved
+        // by a costly deeper default history. The second default round still
+        // precedes unrelated branches, which can be much larger.
         let default_ref = default_head.as_ref().filter(|head| refs.contains(head));
-        if let Some(default_ref) = default_ref {
-            for depth in depths.iter().take(2) {
-                if search_ref(default_ref, *depth)? {
+        if let Some(first_depth) = depths.first() {
+            if let Some(default_ref) = default_ref {
+                if search_ref(default_ref, *first_depth)? {
                     return Ok(());
                 }
+            }
+            for tag in refs.iter().filter(|name| name.starts_with("refs/tags/")) {
+                if search_ref(tag, *first_depth)? {
+                    return Ok(());
+                }
+            }
+        }
+        if let (Some(default_ref), Some(second_depth)) = (default_ref, depths.get(1)) {
+            if search_ref(default_ref, *second_depth)? {
+                return Ok(());
             }
         }
         let mut searched = 0;
         for (round, depth) in depths.iter().enumerate() {
             for remote_ref in &refs {
-                if round < 2 && default_ref == Some(remote_ref) {
+                if (round < 2 && default_ref == Some(remote_ref))
+                    || (round == 0 && remote_ref.starts_with("refs/tags/"))
+                {
                     continue;
                 }
                 if search_ref(remote_ref, *depth)? {

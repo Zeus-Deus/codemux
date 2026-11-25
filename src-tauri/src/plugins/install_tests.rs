@@ -198,6 +198,22 @@ fn commits(work: &Path, count: usize) -> Vec<String> {
         .collect()
 }
 
+fn large_commit(work: &Path) {
+    let mut seed = 1u64;
+    let alphabet = b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+    let message: String = (0..3_000_000)
+        .map(|_| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            alphabet[(seed as usize) % alphabet.len()] as char
+        })
+        .collect();
+    let message_file = work.parent().unwrap().join("large-message");
+    std::fs::write(&message_file, message).unwrap();
+    git(work, &["commit", "-q", "--allow-empty", "-F", message_file.to_str().unwrap()]);
+}
+
 #[test]
 fn provenance_search_is_bounded_and_says_when_it_gave_up() {
     let f = fixture();
@@ -248,19 +264,7 @@ fn provenance_searches_older_default_pin_before_large_unrelated_refs() {
     // An unrelated branch has a large, hard-to-compress commit object. A
     // wildcard fetch would download it even when main proves the pin.
     git(&work, &["checkout", "-q", "-b", "zlarge"]);
-    let mut seed = 1u64;
-    let alphabet = b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
-    let message: String = (0..3_000_000)
-        .map(|_| {
-            seed ^= seed << 13;
-            seed ^= seed >> 7;
-            seed ^= seed << 17;
-            alphabet[(seed as usize) % alphabet.len()] as char
-        })
-        .collect();
-    let message_file = work.parent().unwrap().join("large-message");
-    std::fs::write(&message_file, message).unwrap();
-    git(&work, &["commit", "-q", "--allow-empty", "-F", message_file.to_str().unwrap()]);
+    large_commit(&work);
     git(&work, &["push", "-q", origin, "zlarge"]);
 
     // The pinned commit is deeper than the first round on main. Searching
@@ -280,6 +284,30 @@ fn provenance_searches_older_default_pin_before_large_unrelated_refs() {
     git(Path::new(origin), &["update-ref", "-d", "refs/heads/stray"]);
     let error = verifier.check_on_branch_or_tag_with_budget(&f.url, &stray, &[1, 2], 1024 * 1024).unwrap_err();
     assert!(error.contains("Could not confirm commit") && error.contains("download exceeded 1 MiB"), "{error}");
+}
+
+#[test]
+fn provenance_checks_release_tags_before_costly_default_history() {
+    let f = fixture();
+    let origin = PathBuf::from(f.url.strip_prefix("file://").unwrap());
+    let work = origin.parent().unwrap().join("work");
+    let origin = origin.to_str().unwrap();
+
+    git(&work, &["checkout", "-q", "-b", "release", &f.first]);
+    commits(&work, 1);
+    git(&work, &["tag", "-a", "v9", "-m", "v9"]);
+    git(&work, &["push", "-q", origin, "refs/tags/v9"]);
+
+    // The default tip is small, but its older history has a large commit
+    // beyond the first depth. A second default fetch would exhaust 1 MiB.
+    git(&work, &["checkout", "-q", "main"]);
+    large_commit(&work);
+    commits(&work, 2);
+    git(&work, &["push", "-q", origin, "main"]);
+
+    test_git()
+        .check_on_branch_or_tag_with_budget(&f.url, &f.first, &[2, 16], 1024 * 1024)
+        .unwrap();
 }
 
 #[test]
