@@ -15,7 +15,9 @@ export function saveWorkspacePrompt(
   if (!prompt) return;
   useChatDraftStore.getState().saveWorkspacePrompt(workspaceId, prompt, commandDelivered);
   toast[tone](message, {
-    description: "The exact prompt is saved in Drafts.",
+    description: commandDelivered
+      ? "The exact prompt is saved in Drafts. Paste it only when the agent's input is visible."
+      : "The exact prompt is saved in Drafts.",
     duration: 10_000,
     action: {
       label: "Copy prompt",

@@ -28,6 +28,7 @@ it("saves and copies the exact prepared prompt", async () => {
 
   const options = vi.mocked(toast.success).mock.calls[0][1];
   expect(options?.action).toMatchObject({ label: "Copy prompt" });
+  expect(options?.description).toContain("Paste it only when the agent's input is visible");
   const action = options?.action;
   if (!action || typeof action !== "object" || !("onClick" in action)) {
     throw new Error("Copy action missing");
@@ -48,6 +49,7 @@ it("warns and retains the prompt when a terminal command was not confirmed", () 
     "Agent could not start",
     expect.objectContaining({ action: expect.objectContaining({ label: "Copy prompt" }) }),
   );
+  expect(vi.mocked(toast.warning).mock.calls[0][1]?.description).toBe("The exact prompt is saved in Drafts.");
   expect(toast.success).not.toHaveBeenCalled();
 });
 
@@ -60,6 +62,7 @@ it("offers to reopen a confirmed terminal after a partial launch", async () => {
   expect(saved.manualPromptRequired).toBe(true);
   const options = vi.mocked(toast.warning).mock.calls[0][1];
   expect(options?.action).toMatchObject({ label: "Copy prompt" });
+  expect(options?.description).toContain("Paste it only when the agent's input is visible");
   expect(options?.cancel).toMatchObject({ label: "Open terminal" });
   const cancel = options?.cancel;
   if (!cancel || typeof cancel !== "object" || !("onClick" in cancel)) {
