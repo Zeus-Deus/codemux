@@ -3663,8 +3663,16 @@ impl AgentBrowserManager {
             let sessions = self.sessions.lock().await;
             sessions.get(browser_id).is_some_and(|s| s.running)
         };
-        if was_running && self.refresh_running_session(browser_id, &session, BrowserActionOutcome::Failed).await {
-            return Ok(());
+        if was_running {
+            let ready = self.refresh_running_session(browser_id, &session, BrowserActionOutcome::Failed).await;
+            let pending = self.sessions.lock().await.get(browser_id)
+                .is_some_and(|entry| entry.running && entry.confirmation_pending);
+            if pending {
+                return Err(format!("Browser confirmation is pending for session {session}"));
+            }
+            if ready {
+                return Ok(());
+            }
         }
 
         // The launch shells out to agent-browser (which forks the daemon) and
@@ -4101,6 +4109,23 @@ impl AgentBrowserManager {
         }
     }
 
+    async fn reconcile_existing_stream_process(
+        &self,
+        browser_id: &str,
+        session: &str,
+        port: u16,
+        expected_pid: u32,
+        record: Option<BrowserPidRecord>,
+        ownership: Option<bool>,
+    ) -> Result<BrowserPidRecord, String> {
+        if record.as_ref().is_some_and(|record| record.pid != expected_pid) {
+            self.clear_stale_running_stream_allocation(browser_id, port).await;
+            return Err(format!("Browser session {session} changed since its last successful open"));
+        }
+        self.reconcile_existing_stream_listener(browser_id, session, port, ownership).await?;
+        record.ok_or_else(|| format!("Could not verify ownership of browser session {session}"))
+    }
+
     async fn start_stream_locked(&self, browser_id: &str) -> Result<String, String> {
         let session = session_name(browser_id).to_string();
 
@@ -4121,18 +4146,10 @@ impl AgentBrowserManager {
                 self.clear_stale_running_stream_allocation(browser_id, port).await;
                 return Err(format!("Could not verify ownership of browser session {session}"));
             }
-            if ready_pid.is_some() {
-                let owned = ready_pid.and_then(|pid| owned_browser_pid(&session, pid));
-                let Some(record) = owned else {
-                    self.clear_stale_running_stream_allocation(browser_id, port).await;
-                    return Err(format!("Could not verify ownership of browser session {session}"));
-                };
-                if ready_pid != Some(record.pid) {
-                    self.clear_stale_running_stream_allocation(browser_id, port).await;
-                    return Err(format!("Browser session {session} changed since its last successful open"));
-                }
-                self.reconcile_existing_stream_listener(
-                    browser_id, &session, port, listener_ownership(port, record.pid),
+            if let Some(pid) = ready_pid {
+                let owned = owned_browser_pid(&session, pid);
+                let record = self.reconcile_existing_stream_process(
+                    browser_id, &session, port, pid, owned, listener_ownership(port, pid),
                 ).await?;
                 if run_dir_for_session(&session)
                     .is_some_and(|dir| browser_daemon_has_protected_stream(&session, &dir))
@@ -6295,6 +6312,14 @@ mod tests {
         assert!(retry.unwrap_err().contains("confirmation is pending"));
         assert!(manager.sessions.lock().await.get(&session).unwrap().confirmation_pending);
 
+        let spawn = manager.spawn(&session).await;
+        assert!(spawn.unwrap_err().contains("confirmation is pending"));
+        assert!(daemon.try_wait().unwrap().is_none());
+        let tracked = manager.sessions.lock().await;
+        assert!(tracked.get(&session).unwrap().confirmation_pending);
+        assert_eq!(tracked.get(&session).unwrap().pid, Some(daemon.id()));
+        drop(tracked);
+
         daemon.kill().unwrap();
         daemon.wait().unwrap();
         let _ = std::fs::remove_file(daemon_pid_path);
@@ -6409,6 +6434,46 @@ mod tests {
         assert!(stream.running);
         assert!(stream.browser_ready);
         assert_eq!(stream.pid, Some(std::process::id()));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn inconclusive_process_lookup_preserves_a_ready_stream_for_retry() {
+        let session = format!("browser-process-lookup-{}", uuid::Uuid::new_v4().simple());
+        let (_temp, mut daemon, record) = browser_identity_fixture(&session, browser_owner_token());
+        let manager = AgentBrowserManager::new();
+        let port = manager.allocate_port(&session).await.unwrap();
+        {
+            let mut sessions = manager.sessions.lock().await;
+            let stream = sessions.get_mut(&session).unwrap();
+            stream.running = true;
+            stream.browser_ready = true;
+            stream.pid = Some(daemon.id());
+        }
+
+        for ownership in [Some(true), None] {
+            let error = manager.reconcile_existing_stream_process(
+                &session, &session, port, daemon.id(), None, ownership,
+            ).await.err().unwrap();
+            assert!(error.contains("Could not verify"));
+            let sessions = manager.sessions.lock().await;
+            let stream = sessions.get(&session).unwrap();
+            assert_eq!(stream.port, port);
+            assert!(stream.running);
+            assert!(stream.browser_ready);
+            assert_eq!(stream.pid, Some(daemon.id()));
+        }
+
+        let verified = manager.reconcile_existing_stream_process(
+            &session, &session, port, daemon.id(), Some(record), Some(true),
+        ).await.unwrap();
+        assert_eq!(verified.pid, daemon.id());
+        assert!(manager.reconcile_existing_stream_attachment(
+            &session, &session, BrowserAttachment::Attached,
+        ).await.unwrap());
+
+        daemon.kill().unwrap();
+        daemon.wait().unwrap();
     }
 
     #[tokio::test]
