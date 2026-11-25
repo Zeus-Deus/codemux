@@ -1124,6 +1124,10 @@ fn run_worktree_create(
         let skipped = &data["setup"]["includes_skipped_nested"];
         if skipped.as_array().is_some_and(|paths| !paths.is_empty()) {
             eprintln!("[codemux-remote] Automatic setup skipped nested worktree includes: {skipped}");
+            let path_bytes = &data["setup"]["includes_skipped_nested_path_bytes"];
+            if path_bytes.as_array().is_some_and(|paths| !paths.is_empty()) {
+                eprintln!("[codemux-remote] Exact Unix path bytes (zero-based indices into the skipped paths): {path_bytes}");
+            }
         }
         let errors = &data["setup"]["includes_errors"];
         if errors.as_array().is_some_and(|errors| !errors.is_empty()) {

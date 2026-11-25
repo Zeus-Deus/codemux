@@ -53,7 +53,14 @@ export function useWorktreeIncludeToast() {
             label: "Copy skipped paths",
             onClick: async (event) => {
               event.preventDefault();
-              const copied = await copyToClipboard(JSON.stringify(skipped, null, 2));
+              const bytesByIndex = new Map<number, string>(
+                payload.skipped_nested_path_bytes?.map(({ index, bytes_hex }) => [index, bytes_hex]),
+              );
+              const paths = skipped.map((path, index) => {
+                const bytes_hex = bytesByIndex.get(index);
+                return bytes_hex === undefined ? path : { path, bytes_hex };
+              });
+              const copied = await copyToClipboard(JSON.stringify(paths, null, 2));
               if (copied) toast.success("Copied skipped paths");
               else toast.error(COPY_FAILED_MESSAGE);
             },

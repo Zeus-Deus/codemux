@@ -95,8 +95,17 @@ pub enum IncludeSource {
 pub struct IncludeResult {
     pub copied: Vec<String>,
     pub skipped_nested: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub skipped_nested_path_bytes: Vec<SkippedNestedPathBytes>,
     pub errors: Vec<String>,
     pub source: IncludeSource,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct SkippedNestedPathBytes {
+    /// Zero-based position in the display list, even if display names match.
+    pub index: usize,
+    pub bytes_hex: String,
 }
 
 impl IncludeResult {
@@ -390,6 +399,13 @@ fn copy_matching_files(
         // An open nested directory can move outside the checkout on Unix.
         // Report its matches for manual copying without opening a nested parent.
         if relative_path.components().count() != 1 {
+            #[cfg(unix)]
+            if relative_path.to_str().is_none() {
+                result.skipped_nested_path_bytes.push(SkippedNestedPathBytes {
+                    index: result.skipped_nested.len(),
+                    bytes_hex: raw_path.iter().map(|byte| format!("{byte:02x}")).collect(),
+                });
+            }
             result.skipped_nested.push(relative_path.to_string_lossy().into_owned());
             continue;
         }
@@ -560,8 +576,8 @@ pub(crate) fn emit_worktree_include_result<R: Runtime>(
     );
 }
 
-/// Run the full setup pipeline: worktree includes copy + setup scripts.
-/// Resolves config from file/DB.
+/// Re-run setup commands using config resolved from the workspace or database.
+/// Worktree includes are copied during provisioning.
 pub fn run_setup_scripts<R: Runtime>(
     workspace_path: &Path,
     workspace_name: &str,
@@ -578,26 +594,11 @@ pub fn run_setup_scripts<R: Runtime>(
 
     let root_path = resolve_root_path(workspace_path);
 
-    // Read config to get worktree_includes setting for fallback
     let config = if let Some(db) = db {
         read_effective_config(workspace_path, db)
     } else {
         read_workspace_config(workspace_path)
     };
-
-    let setting_patterns = config
-        .as_ref()
-        .map(|c| c.worktree_includes.clone())
-        .unwrap_or_default();
-
-    // Step 1: Process worktree includes (copy gitignored files from main worktree)
-    emit_worktree_include_result(
-        app_handle,
-        workspace_id,
-        process_worktree_includes(&root_path, workspace_path, &setting_patterns),
-    );
-
-    // Step 2: Run setup commands
 
     let config = match config {
         Some(c) if !c.setup.is_empty() => c,
@@ -1294,6 +1295,47 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn rerun_setup_uses_manually_restored_includes_and_preserves_worktree_edits() {
+        let fixture = tempfile::tempdir().unwrap();
+        let root = fixture.path().join("project");
+        let checkout = fixture.path().join("linked");
+        include_source_project(&root);
+        fs::write(root.join(".codemuxinclude"), ".env\nsettings/local.env\n").unwrap();
+        fs::create_dir(root.join("settings")).unwrap();
+        fs::write(root.join("settings/local.env"), "NESTED=restored\n").unwrap();
+        register_include_fixture(&root, &checkout);
+
+        let includes = process_worktree_includes(&root, &checkout, &[]).unwrap();
+        assert_eq!(includes.copied, [".env"]);
+        assert_eq!(includes.skipped_nested, ["settings/local.env"]);
+        assert!(includes.errors.is_empty());
+
+        fs::write(checkout.join(".env"), "INCLUDE_FIXTURE=worktree\n").unwrap();
+        fs::create_dir(checkout.join("settings")).unwrap();
+        fs::copy(root.join("settings/local.env"), checkout.join("settings/local.env")).unwrap();
+        fs::create_dir(checkout.join(".codemux")).unwrap();
+        fs::write(
+            checkout.join(".codemux/config.json"),
+            r#"{"setup":["cat .env settings/local.env > setup-result"]}"#,
+        )
+        .unwrap();
+
+        let app = tauri::test::mock_app();
+        run_setup_scripts(&checkout, "linked", "fixture", app.handle(), None, None, None)
+            .unwrap();
+
+        assert_eq!(
+            fs::read_to_string(checkout.join("setup-result")).unwrap(),
+            "INCLUDE_FIXTURE=worktree\nNESTED=restored\n"
+        );
+        assert_eq!(
+            fs::read_to_string(checkout.join(".env")).unwrap(),
+            "INCLUDE_FIXTURE=worktree\n"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn worktree_includes_skip_a_moved_nested_parent_when_the_file_is_missing() {
         let fixture = tempfile::tempdir().unwrap();
         let root = fixture.path().join("project");
@@ -1422,6 +1464,37 @@ mod tests {
             "INCLUDE_FIXTURE=custom"
         );
         assert!(!subdirectory.join(".env").exists());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn worktree_includes_report_exact_bytes_for_ambiguous_skipped_nested_paths() {
+        use std::ffi::OsStr;
+        use std::os::unix::ffi::OsStrExt;
+
+        let fixture = tempfile::tempdir().unwrap();
+        let root = fixture.path().join("project");
+        let checkout = fixture.path().join("linked");
+        include_source_project(&root);
+        fs::create_dir(root.join("settings")).unwrap();
+        for file in [b"private-\xfe.env".as_slice(), b"private-\xff.env", "private-�.env".as_bytes()] {
+            fs::write(root.join("settings").join(OsStr::from_bytes(file)), "include fixture").unwrap();
+        }
+        fs::write(root.join(".codemuxinclude"), "settings/*.env\n").unwrap();
+        register_include_fixture(&root, &checkout);
+
+        let result = process_worktree_includes(&root, &checkout, &[]).unwrap();
+        assert_eq!(result.skipped_nested, ["settings/private-�.env"; 3]);
+        assert!(result.copied.is_empty());
+        assert!(result.errors.is_empty());
+        assert!(!checkout.join("settings").exists());
+        assert_eq!(
+            serde_json::to_value(result.skipped_nested_path_bytes).unwrap(),
+            serde_json::json!([
+                {"index": 1, "bytes_hex": "73657474696e67732f707269766174652dfe2e656e76"},
+                {"index": 2, "bytes_hex": "73657474696e67732f707269766174652dff2e656e76"}
+            ])
+        );
     }
 
     #[cfg(unix)]

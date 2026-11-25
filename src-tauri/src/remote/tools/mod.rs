@@ -440,6 +440,7 @@ fn provision_worktree_workspace(ws: &Workspace, runner: &SetupRunner) -> Value {
         "port": port,
         "includes_copied": includes.copied,
         "includes_skipped_nested": includes.skipped_nested,
+        "includes_skipped_nested_path_bytes": includes.skipped_nested_path_bytes,
         "includes_errors": includes.errors,
         "setup_commands": setup_commands,
         "setup_running": setup_running,
@@ -810,6 +811,9 @@ mod tests {
     #[test]
     #[serial]
     fn worktree_create_runs_setup_scripts_with_env_and_includes() {
+        #[cfg(target_os = "linux")]
+        use std::os::unix::ffi::OsStrExt;
+
         let home = TempDir::new().unwrap();
         let prev_home = std::env::var_os("HOME");
         std::env::set_var("HOME", home.path());
@@ -817,8 +821,8 @@ mod tests {
         let repo = TempDir::new().unwrap();
         init_repo(repo.path());
         // The root include is copied and the nested match is reported.
-        std::fs::write(repo.path().join(".gitignore"), ".env\nblocked.env\nconfig/local.env\nsetup-ran.txt\n").unwrap();
-        std::fs::write(repo.path().join(".codemuxinclude"), ".env\nblocked.env\nconfig/local.env\n").unwrap();
+        std::fs::write(repo.path().join(".gitignore"), ".env\nblocked.env\nconfig/*.env\nsetup-ran.txt\n").unwrap();
+        std::fs::write(repo.path().join(".codemuxinclude"), ".env\nblocked.env\nconfig/*.env\n").unwrap();
         std::fs::write(repo.path().join(".env"), "SECRET=from-root").unwrap();
         #[cfg(unix)]
         let blocked_source = if unsafe { libc::geteuid() } != 0 {
@@ -832,6 +836,10 @@ mod tests {
         };
         std::fs::create_dir(repo.path().join("config")).unwrap();
         std::fs::write(repo.path().join("config/local.env"), "NESTED=fixture").unwrap();
+        #[cfg(target_os = "linux")]
+        let non_utf8 = std::ffi::OsStr::from_bytes(b"config/raw-\xff.env");
+        #[cfg(target_os = "linux")]
+        std::fs::write(repo.path().join(non_utf8), "NESTED=raw fixture").unwrap();
         // Committed setup config: the script records its env into a
         // marker file inside the worktree.
         std::fs::create_dir_all(repo.path().join(".codemux")).unwrap();
@@ -860,7 +868,19 @@ mod tests {
         let port = setup["port"].as_u64().expect("port") as u16;
         assert!((3100..6500).contains(&port), "port {port} out of range");
         assert_eq!(setup["includes_copied"], json!([".env"]));
-        assert_eq!(setup["includes_skipped_nested"], json!(["config/local.env"]));
+        #[cfg(target_os = "linux")]
+        {
+            assert_eq!(setup["includes_skipped_nested"], json!(["config/local.env", "config/raw-�.env"]));
+            assert_eq!(
+                setup["includes_skipped_nested_path_bytes"],
+                json!([{"index": 1, "bytes_hex": "636f6e6669672f7261772dff2e656e76"}])
+            );
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            assert_eq!(setup["includes_skipped_nested"], json!(["config/local.env"]));
+            assert_eq!(setup["includes_skipped_nested_path_bytes"], json!([]));
+        }
         #[cfg(unix)]
         if blocked_source {
             let errors = setup["includes_errors"].as_array().unwrap();
@@ -877,6 +897,8 @@ mod tests {
             "SECRET=from-root"
         );
         assert!(!wt.join("config/local.env").exists());
+        #[cfg(target_os = "linux")]
+        assert!(!wt.join(non_utf8).exists());
 
         // Setup commands run in the background; poll for the marker.
         let marker = wt.join("setup-ran.txt");

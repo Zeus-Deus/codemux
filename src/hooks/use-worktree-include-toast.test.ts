@@ -33,6 +33,16 @@ function listener() {
   return vi.mocked(onWorktreeIncludesApplied).mock.calls[0][0];
 }
 
+async function copySkippedPaths() {
+  const warning = vi.mocked(toast.warning).mock.calls.find(([title]) => title === "Nested worktree files skipped");
+  const action = warning?.[1]?.action;
+  if (!action || typeof action !== "object" || !("onClick" in action)) {
+    throw new Error("Expected a clipboard action");
+  }
+  render(createElement("button", { onClick: action.onClick }, action.label));
+  await userEvent.click(screen.getByRole("button", { name: "Copy skipped paths" }));
+}
+
 beforeEach(() => {
   vi.mocked(copyToClipboard).mockResolvedValue(true);
   vi.mocked(onWorktreeIncludesApplied).mockResolvedValue(vi.fn());
@@ -80,15 +90,34 @@ describe("useWorktreeIncludeToast", () => {
     );
     const warning = vi.mocked(toast.warning).mock.calls.find(([title]) => title === "Nested worktree files skipped");
     expect(warning?.[1]?.description).toContain("config/local.env, config/db.env, test/local.env and 1 more");
-    const action = warning?.[1]?.action;
-    if (!action || typeof action !== "object" || !("onClick" in action)) {
-      throw new Error("Expected a clipboard action");
-    }
-    render(createElement("button", { onClick: action.onClick }, action.label));
-    await userEvent.click(screen.getByRole("button", { name: "Copy skipped paths" }));
+    await copySkippedPaths();
 
     expect(copyToClipboard).toHaveBeenCalledExactlyOnceWith(JSON.stringify(skipped, null, 2));
     await waitFor(() => expect(toast.success).toHaveBeenCalledWith("Copied skipped paths"));
+  });
+
+  it("copies exact bytes alongside display names when skipped paths share a label", async () => {
+    const path = "config/raw-�.env";
+    const first = "636f6e6669672f7261772dfe2e656e76";
+    const second = "636f6e6669672f7261772dff2e656e76";
+    await listener()({
+      workspace_id: "workspace-1",
+      source: "file",
+      copied: [],
+      skipped_nested: [path, path, path],
+      skipped_nested_path_bytes: [
+        { index: 1, bytes_hex: first },
+        { index: 2, bytes_hex: second },
+      ],
+    });
+
+    await copySkippedPaths();
+
+    expect(copyToClipboard).toHaveBeenCalledExactlyOnceWith(JSON.stringify([
+      path,
+      { path, bytes_hex: first },
+      { path, bytes_hex: second },
+    ], null, 2));
   });
 
   it("keeps the default-copy hint for older events", async () => {
