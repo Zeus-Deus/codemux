@@ -139,7 +139,7 @@ impl OpenCodeClient {
         let raw: ProviderListResponse = response
             .json()
             .await
-            .map_err(|err| format!("parse_error: {err}"))?;
+            .map_err(format_json_body_error)?;
         Ok(flatten_provider_list(raw))
     }
 
@@ -360,7 +360,7 @@ impl OpenCodeClient {
         let envelope: V2Data<T> = response
             .json()
             .await
-            .map_err(|error| format!("parse_error: {error}"))?;
+            .map_err(format_json_body_error)?;
         Ok(envelope.data)
     }
 
@@ -779,6 +779,16 @@ pub fn format_request_error(err: reqwest::Error) -> String {
         format!("http_status_{}", status.as_u16())
     } else {
         format!("request_error: {err}")
+    }
+}
+
+// `Response::json` also reads the body. Headers can arrive before a
+// request timeout, so keep that timeout distinct from invalid JSON.
+fn format_json_body_error(err: reqwest::Error) -> String {
+    if err.is_timeout() {
+        format_request_error(err)
+    } else {
+        format!("parse_error: {err}")
     }
 }
 
