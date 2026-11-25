@@ -40,12 +40,19 @@ export function ToolResultImages({ images, onImageError }: {
   images: ToolResultImage[];
   onImageError?: () => void;
 }) {
-  const [lightboxIndex, setLightboxIndex] = useState<number | null>(null);
+  const [lightboxSelection, setLightboxSelection] = useState<{ index: number; src: string } | null>(null);
   const [approvedRemoteSources, setApprovedRemoteSources] = useState<Record<number, string>>({});
-  const selectedImage = lightboxIndex !== null ? images[lightboxIndex] : undefined;
-  const lightboxImage = lightboxIndex !== null && selectedImage && (
-    !needsRemoteConfirmation(selectedImage) || approvedRemoteSources[lightboxIndex] === selectedImage.src
+  const selectedImage = lightboxSelection ? images[lightboxSelection.index] : undefined;
+  const selectedSrc = selectedImage?.src;
+  const lightboxImage = lightboxSelection && selectedImage && selectedSrc === lightboxSelection.src && (
+    !needsRemoteConfirmation(selectedImage) || approvedRemoteSources[lightboxSelection.index] === selectedSrc
   ) ? selectedImage : undefined;
+
+  useEffect(() => {
+    if (lightboxSelection && selectedSrc !== lightboxSelection.src) {
+      setLightboxSelection(null);
+    }
+  }, [lightboxSelection, selectedSrc]);
 
   if (images.length === 0) return null;
 
@@ -57,7 +64,7 @@ export function ToolResultImages({ images, onImageError }: {
           image={image}
           approved={!needsRemoteConfirmation(image) || approvedRemoteSources[i] === image.src}
           onConfirm={() => setApprovedRemoteSources((current) => ({ ...current, [i]: image.src }))}
-          onOpen={() => setLightboxIndex(i)}
+          onOpen={() => setLightboxSelection({ index: i, src: image.src })}
           onImageError={onImageError}
         />
       ))}
@@ -65,11 +72,11 @@ export function ToolResultImages({ images, onImageError }: {
       <ImageLightbox
         open={lightboxImage !== undefined}
         onOpenChange={(open) => {
-          if (!open) setLightboxIndex(null);
+          if (!open) setLightboxSelection(null);
         }}
         title="Tool result image"
       >
-        {lightboxImage ? <LightboxImage key={`${lightboxImage.src}-${lightboxIndex}`} image={lightboxImage} onImageError={onImageError} /> : null}
+        {lightboxImage ? <LightboxImage key={`${lightboxImage.src}-${lightboxSelection?.index}`} image={lightboxImage} onImageError={onImageError} /> : null}
       </ImageLightbox>
     </div>
   );

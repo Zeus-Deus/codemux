@@ -577,6 +577,25 @@ describe("Tool result images", () => {
     expect(screen.queryByRole("button", { name: "Retry image" })).not.toBeInTheDocument();
   });
 
+  it("closes the lightbox when its image URL changes", async () => {
+    const prefix = "https://private.example.test/very-long-screenshot-name-";
+    const item = (url: string) => makeTool({ result_content: [
+      { type: "image_url", image_url: { url } },
+    ] });
+    const view = render(<ToolCallBody item={item(`${prefix}one.png`)} />);
+    fireEvent.click(screen.getByRole("button", { name: "Load remote image" }));
+    fireEvent.click(screen.getByRole("button", { name: "Load image" }));
+    fireEvent.click(screen.getByRole("button", { name: "Open image" }));
+    expect(screen.getByRole("dialog", { name: "Tool result image" })).toBeInTheDocument();
+
+    view.rerender(<ToolCallBody item={item(`${prefix}two.png`)} />);
+    expect(screen.queryByRole("dialog", { name: "Tool result image" })).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Load remote image" }));
+    fireEvent.click(screen.getByRole("button", { name: "Load image" }));
+    await waitFor(() => expect(screen.getByRole("button", { name: "Open image" })).toHaveFocus());
+    expect(screen.queryByRole("dialog", { name: "Tool result image" })).not.toBeInTheDocument();
+  });
+
   it("renders a valid image block as a thumbnail without dumping its base64 payload", () => {
     render(
       <ToolCallBody
