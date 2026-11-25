@@ -634,7 +634,7 @@ fn parse_gh_hosts_yml(text: &str) -> Vec<String> {
 
 /// Whether a GitHub credential may be used for `host`. A remote URL is
 /// repository content, so a host only qualifies by exact match against
-/// github.com, a `*.ghe.com` tenancy, or a host the user configured
+/// github.com (or one of GitHub's own service hosts), a `*.ghe.com` tenancy, or a host the user configured
 /// (`GH_HOST`, `gh auth login`, or a GitHub mapping in Settings → Source
 /// Control). gh hands `GH_ENTERPRISE_TOKEN` to *any* other host, so a
 /// hostname that merely contains "github" must never qualify.
@@ -657,7 +657,7 @@ fn gh_host_trusted_in(
     if host.is_empty() {
         return false;
     }
-    if host == "github.com"
+    if crate::git_provider::detect::github_canonical_host(&host).is_some()
         || host
             .strip_suffix(".ghe.com")
             .is_some_and(|tenant| !tenant.is_empty() && !tenant.contains(':'))
@@ -4059,13 +4059,25 @@ mod tests {
         use crate::git_provider::ProviderKind;
         let none = Vec::new;
         let no_custom = HashMap::new;
-        for host in ["github.com", "GitHub.com", "acme.ghe.com"] {
+        for host in [
+            "github.com",
+            "GitHub.com",
+            "www.github.com",
+            "ssh.github.com",
+            "ssh.github.com:443",
+            "api.github.com",
+            "acme.ghe.com",
+        ] {
             assert!(gh_host_trusted_in(host, None, none, no_custom), "{host}");
         }
         for host in [
             "github-mirror.attacker.example",
             "github.com.attacker.example",
+            "www.github.com.attacker.example",
+            "ssh.github.com.attacker.example",
             "attacker-github.com",
+            "evilgithub.com",
+            "evil.github.com",
             "ghe.com",
             "acme.ghe.com.attacker.example",
             "",
@@ -4242,6 +4254,19 @@ mod tests {
             "gh was called for the mirror:\n{}",
             calls()
         );
+
+        // GitHub's own service hosts resolve to github.com before the gate.
+        for (name, url) in [
+            ("ssh443", "ssh://git@ssh.github.com:443/o/r.git"),
+            ("www", "https://www.github.com/o/r.git"),
+        ] {
+            let repo = repo_with_origin(name, url);
+            assert_eq!(
+                crate::github_budget::host_for_path(&repo).unwrap(),
+                "github.com",
+                "{url}"
+            );
+        }
 
         // A host the user signed in to with gh keeps working.
         let corp = repo_with_origin("corp", "https://ghe.corp.example/o/r.git");
