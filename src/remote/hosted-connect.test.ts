@@ -2,7 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { connectOverIroh } from "./hosted-bootstrap";
 import { DeviceRegistry, type RegisteredDevice } from "./device-registry";
 import { loadIrohDialer } from "./iroh-wasm-loader";
-import type { IrohByteStream } from "./iroh-transport";
+import type { IrohByteStream, IrohDialer } from "./iroh-transport";
 import { encodeFrame, FrameDecoder, KIND_TEXT, type IrohFrame } from "./iroh-codec";
 
 vi.mock("./iroh-wasm-loader", async (importOriginal) => ({
@@ -56,7 +56,7 @@ afterEach(() => {
 
 describe("hosted connection startup", () => {
   it("bounds a stalled WASM load and ignores its late completion", async () => {
-    let finishLoad!: (dialer: { dial: ReturnType<typeof vi.fn> }) => void;
+    let finishLoad!: (dialer: IrohDialer) => void;
     vi.mocked(loadIrohDialer).mockReturnValue(new Promise((resolve) => (finishLoad = resolve)));
     let failure: unknown;
     const pending = connectOverIroh(args()).catch((error: unknown) => { failure = error; });
@@ -258,7 +258,7 @@ describe("hosted connection startup", () => {
   });
 
   it("cancels before WASM loads without installing a late shim", async () => {
-    let finishLoad!: (dialer: { dial: ReturnType<typeof vi.fn> }) => void;
+    let finishLoad!: (dialer: IrohDialer) => void;
     vi.mocked(loadIrohDialer).mockReturnValue(new Promise((resolve) => (finishLoad = resolve)));
     const controller = new AbortController();
     const options = { ...args(), signal: controller.signal };
