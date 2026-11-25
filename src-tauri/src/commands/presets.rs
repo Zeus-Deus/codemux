@@ -400,6 +400,9 @@ pub fn apply_preset<R: tauri::Runtime>(
     };
 
     let sessions_arc = pty_state.sessions.clone();
+    let has_starting_prompt = initial_prompt
+        .as_deref()
+        .is_some_and(|prompt| !prompt.trim().is_empty());
 
     match effective_mode {
         "current_terminal" => {
@@ -408,7 +411,7 @@ pub fn apply_preset<R: tauri::Runtime>(
                 .ok_or_else(|| "No active terminal session in workspace".to_string())?;
 
             if initial_prompt.is_some() {
-                // Agent launch with prompt: rename tab, embed prompt in command
+                // Agent launch with a starting prompt: rename the tab and request manual entry.
                 let snap = state.snapshot();
                 if let Some(ws) = snap
                     .workspaces
@@ -424,15 +427,10 @@ pub fn apply_preset<R: tauri::Runtime>(
                     if command.is_empty() {
                         continue;
                     }
-                    let shell = receiving_shell_for_agent_prompt(
-                        &state, &workspace_id, &session_id, false,
-                    );
                     let (cmd, prompt_requires_manual_entry) =
                         crate::branch_name::prepare_agent_command(
-                            &preset_id,
                             command,
                             initial_prompt.as_deref(),
-                            shell.as_deref(),
                         );
                     state.update_terminal_session_command(&session_id, command.clone());
                     write_command_when_ready(sessions_arc.clone(), session_id.clone(), cmd, 120);
@@ -484,6 +482,9 @@ pub fn apply_preset<R: tauri::Runtime>(
                     let sid = session_id.0.clone();
                     let cmd = command.clone();
                     write_command_when_ready(sessions, sid, cmd, 120);
+                    if has_starting_prompt {
+                        report_prompt_requires_manual_entry(&app, &session_id.0, &preset.name);
+                    }
                 }
             }
         }
@@ -509,7 +510,10 @@ pub fn apply_preset<R: tauri::Runtime>(
                     state.update_terminal_session_command(&sid, combined.clone());
                     let sessions = sessions_arc.clone();
                     let cmd = combined.clone();
-                    write_command_when_ready(sessions, sid, cmd, 120);
+                    write_command_when_ready(sessions, sid.clone(), cmd, 120);
+                    if has_starting_prompt {
+                        report_prompt_requires_manual_entry(&app, &sid, &preset.name);
+                    }
                 }
             }
         }
@@ -532,6 +536,9 @@ pub fn apply_preset<R: tauri::Runtime>(
                         let sid = session_id.0.clone();
                         let cmd = command.clone();
                         write_command_when_ready(sessions, sid, cmd, 120);
+                        if has_starting_prompt {
+                            report_prompt_requires_manual_entry(&app, &session_id.0, &preset.name);
+                        }
                     }
                 }
             }
@@ -726,45 +733,6 @@ fn wait_and_write_command(
     settle_ms: u64,
 ) {
     wait_and_write(sessions, session_id, command, settle_ms, PTY_COMMAND_TERMINATOR);
-}
-
-/// Pick the shell that receives a preset command. Device sessions run Bash
-/// regardless of the desktop's SHELL. A newly created local session uses the
-/// same default-shell selection as PTY spawn. An existing session with no
-/// recorded shell remains unknown, so its prompt cannot be embedded.
-pub(crate) fn receiving_shell_for_agent_prompt(
-    state: &AppStateStore,
-    workspace_id: &str,
-    session_id: &str,
-    newly_spawned: bool,
-) -> Option<String> {
-    let snapshot = state.snapshot();
-    let remote = snapshot
-        .workspaces
-        .iter()
-        .find(|workspace| workspace.workspace_id.0 == workspace_id)?
-        .host_id.is_some();
-    let shell = snapshot
-        .terminal_sessions
-        .iter()
-        .find(|session| session.session_id.0 == session_id)?
-        .shell.as_deref();
-    let local_default = (!remote && newly_spawned).then(terminal::default_shell);
-    choose_agent_launch_shell(remote, shell, local_default.as_deref())
-}
-
-fn choose_agent_launch_shell(
-    remote: bool,
-    recorded_shell: Option<&str>,
-    newly_spawned_local_shell: Option<&str>,
-) -> Option<String> {
-    if remote {
-        Some("bash".to_string())
-    } else {
-        recorded_shell
-            .or(newly_spawned_local_shell)
-            .map(str::to_string)
-    }
 }
 
 /// Tell the user a prompt cannot be delivered safely through this terminal.
@@ -1068,25 +1036,6 @@ mod tests {
     use crate::terminal::SessionRuntime;
     use std::collections::HashMap;
     use std::io::Write;
-
-    #[test]
-    fn agent_prompt_uses_the_receiving_shell() {
-        // Device PTYs launch Bash even when the desktop launches Fish.
-        let remote_shell = choose_agent_launch_shell(true, None, Some("/usr/bin/fish"));
-        assert_eq!(remote_shell.as_deref(), Some("bash"));
-        assert_eq!(
-            crate::branch_name::prepare_agent_command(
-                "builtin-claude", "claude", Some("fix it"), remote_shell.as_deref(),
-            ),
-            ("claude $'fix it'".to_string(), false)
-        );
-        assert_eq!(
-            choose_agent_launch_shell(false, Some("/bin/zsh"), Some("/usr/bin/fish")),
-            Some("/bin/zsh".to_string())
-        );
-        // Existing local sessions without a recorded shell are unknown.
-        assert_eq!(choose_agent_launch_shell(false, None, None), None);
-    }
 
     fn make_sessions() -> Arc<std::sync::Mutex<HashMap<String, SessionRuntime>>> {
         Arc::new(std::sync::Mutex::new(HashMap::new()))

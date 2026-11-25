@@ -763,7 +763,7 @@ pub(crate) fn find_live_workspace_for_worktree_path(
 ///
 /// One atomic operation: git worktree creation, workspace and layout
 /// hydration, PTY spawn, setup scripts, and the
-/// preset launch with an optional starting prompt. A new workspace takes
+/// preset launch with an optional prompt for manual entry. A new workspace takes
 /// `request.reserved_id` when given.
 pub(crate) async fn create_worktree_from_request<R: tauri::Runtime>(
     app: tauri::AppHandle<R>,
@@ -1055,18 +1055,10 @@ pub(crate) async fn create_worktree_checked<R: tauri::Runtime>(
                 let _ = state.set_tab_icon(&workspace_id.0, &tab_id, preset.icon.clone());
 
                 if !session_id.is_empty() && !command.is_empty() {
-                    let shell = super::presets::receiving_shell_for_agent_prompt(
-                        &state,
-                        &workspace_id.0,
-                        &session_id,
-                        true,
-                    );
                     let (cmd, prompt_requires_manual_entry) =
                         crate::branch_name::prepare_agent_command(
-                            &preset.id,
                             command,
                             initial_prompt.as_deref(),
-                            shell.as_deref(),
                         );
 
                     state.update_terminal_session_command(&session_id, command.clone());

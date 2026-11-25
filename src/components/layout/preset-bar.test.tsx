@@ -302,6 +302,33 @@ describe("PresetBar — draft mode dispatch", () => {
     expect(mockAgentChatCreatePane).not.toHaveBeenCalled();
   });
 
+  it("shows where to find a withheld CLI prompt", async () => {
+    const draft = useChatDraftStore.getState().getOrCreateHomeDraft();
+    useChatDraftStore.getState().updateDraftTarget(draft.draftId, {
+      kind: "project",
+      projectPath: "/p",
+    });
+    useChatDraftStore.getState().updateDraftInput(draft.draftId, "review this issue &calc");
+    useChatDraftStore.getState().setActiveDraft(draft.draftId);
+    const cli = makePreset({ id: "builtin-claude", name: "Claude", kind: "cli" });
+    mockGetPresets.mockResolvedValue(makeSnapshot([cli]));
+    mockMaterializeWithPreset.mockResolvedValueOnce({
+      success: true,
+      workspaceId: "ws-new",
+      paneId: "cli-preset",
+      threadId: draft.threadId,
+      manualPromptRequired: true,
+    });
+
+    renderDraftPresetBar({ presets: [cli], draftId: draft.draftId });
+    await flushPromises();
+    await userEvent.click(screen.getByRole("button", { name: /claude/i }));
+    await flushPromises();
+
+    expect(mockToast.info).toHaveBeenCalledWith(expect.stringContaining("open it from the sidebar"));
+    expect(useChatDraftStore.getState().draftsById[draft.draftId]?.inputDraft).toBe("review this issue &calc");
+  });
+
   it("on successful materialize the active draft is cleared", async () => {
     const draft = useChatDraftStore.getState().getOrCreateHomeDraft();
     useChatDraftStore

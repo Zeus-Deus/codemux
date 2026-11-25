@@ -59,3 +59,26 @@ it.each<[DraftTarget, string]>([
     selection, [selected], cwd, "/new-worktree", "claude",
   );
 });
+
+it("keeps a withheld CLI prompt available after showing the agent workspace", async () => {
+  vi.mocked(materializeWithPreset).mockResolvedValueOnce({
+    success: true,
+    workspaceId: "ws",
+    paneId: "cli-preset",
+    threadId: "thread",
+    manualPromptRequired: true,
+  });
+  const store = useChatDraftStore.getState();
+  const draft = store.getOrCreateHomeDraft();
+  store.updateDraftInput(draft.draftId, "review this issue\n&calc");
+  store.setActiveDraft(draft.draftId);
+
+  const result = await launchDraftWithPreset(draft.draftId, { id: "cli" } as TerminalPreset);
+
+  expect(result.success).toBe(true);
+  expect(useChatDraftStore.getState().activeDraftId).toBeNull();
+  const preserved = useChatDraftStore.getState().draftsById[draft.draftId];
+  expect(preserved?.inputDraft).toBe("review this issue\n&calc");
+  expect(preserved?.promotedTo).toBeNull();
+  expect(preserved?.materializedTo).toBeNull();
+});

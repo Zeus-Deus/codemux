@@ -562,6 +562,8 @@ export function DraftAgentLauncher({ draft }: DraftAgentLauncherProps) {
     void launchDraftWithPreset(draft.draftId, preset).then((result) => {
       if (!result.success) {
         toast.error(`${preset.name}: ${result.error ?? "Send failed"}`);
+      } else if (result.manualPromptRequired) {
+        toast.info(`${preset.name} opened. Your prompt is saved in the draft; open it from the sidebar to copy it.`);
       }
     });
   };

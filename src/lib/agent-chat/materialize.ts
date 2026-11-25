@@ -121,6 +121,8 @@ export type MaterializeResult =
       workspaceId: string;
       paneId: string;
       threadId: string;
+      /** Terminal preset launched, but its prompt is still in the draft. */
+      manualPromptRequired?: boolean;
     }
   | { success: false; error: string };
 
@@ -490,9 +492,9 @@ export async function materializeAndSend(
  * preset takes over that workspace's active surface.
  *
  * Dispatch depends on `preset.kind`:
- *   - `cli`      — delegate to the Rust `apply_preset` command,
- *                  which spawns a terminal pane and runs the preset's
- *                  shell commands with `initialPrompt` spliced in.
+ *   - `cli`      — delegate to the Rust `apply_preset` command, which
+ *                  starts the terminal preset and keeps any unsent prompt
+ *                  in the draft for manual entry.
  *   - `chat_agent` — create an `agent_chat` pane, start a session with
  *                  the draft's model/permission/etc., and send the
  *                  first turn. Same sequence `materializeAndSend` uses,
@@ -723,9 +725,8 @@ export async function materializeWithPreset(
 
   // ── CLI dispatch ──
   // Delegate to the existing Rust `apply_preset`, which spawns a
-  // terminal pane and runs the preset's commands. For agent presets
-  // like Claude Code, the CLI reads `initialPrompt` and launches its
-  // own session inside the PTY.
+  // terminal pane and runs the preset's commands. Terminal presets ask
+  // the user to enter `initialPrompt` in the agent after launch.
   try {
     await applyPreset(
       workspaceId,
@@ -739,11 +740,25 @@ export async function materializeWithPreset(
     return { success: false, error: message };
   }
 
-  // CLI presets don't give us a usable paneId / threadId from the
-  // frontend — `apply_preset` spawns the pane server-side. The
-  // promotedTo values are placeholders; the grace-period cleanup
-  // still runs via DraftChatSurface's `setActiveDraft(null)` +
-  // scheduled `clearDraft`.
+  // A PTY command cannot safely carry an untrusted prompt when its
+  // foreground shell may change before the write arrives. Keep the draft
+  // visible in the sidebar with its original text for the user to copy.
+  if (prompt.length > 0) {
+    actions.markSendFailed(
+      draft.draftId,
+      "Agent launched without the starting prompt. Open this draft to copy the prompt into the agent.",
+    );
+    return {
+      success: true,
+      workspaceId,
+      paneId: "cli-preset",
+      threadId: draft.threadId,
+      manualPromptRequired: true,
+    };
+  }
+
+  // Empty-prompt CLI launches can retire the draft normally. CLI presets
+  // do not give us a usable paneId or threadId from the frontend.
   actions.markPromoted(draft.draftId, {
     workspaceId,
     paneId: "cli-preset",

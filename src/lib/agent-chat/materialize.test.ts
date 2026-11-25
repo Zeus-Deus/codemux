@@ -1569,7 +1569,7 @@ describe("materializeWithPreset", () => {
   });
 
   describe("CLI preset dispatch", () => {
-    it("happy path: resolves workspace, activates it, delegates to applyPreset with the prompt", async () => {
+    it("launches the CLI while keeping an unsent prompt in its draft", async () => {
       const actions = makeActions();
       const draft = makeDraft({
         target: { kind: "project", projectPath: "/projects/foo" },
@@ -1578,7 +1578,7 @@ describe("materializeWithPreset", () => {
 
       const result = await materializeWithPreset(draft, preset, "ship it", actions);
 
-      expect(result.success).toBe(true);
+      expect(result).toMatchObject({ success: true, manualPromptRequired: true });
       expect(createEmptyWorkspace).toHaveBeenCalledWith("/projects/foo", undefined);
       expect(activateWorkspace).toHaveBeenCalledWith("ws-project");
       expect(applyPreset).toHaveBeenCalledWith(
@@ -1591,7 +1591,11 @@ describe("materializeWithPreset", () => {
       expect(agentChatCreatePane).not.toHaveBeenCalled();
       expect(agentChatStartSession).not.toHaveBeenCalled();
       expect(agentChatSendTurn).not.toHaveBeenCalled();
-      expect(actions.markPromoted).toHaveBeenCalled();
+      expect(actions.markPromoted).not.toHaveBeenCalled();
+      expect(actions.markSendFailed).toHaveBeenCalledWith(
+        draft.draftId,
+        expect.stringContaining("Open this draft to copy the prompt"),
+      );
     });
 
     it("empty/whitespace prompt becomes null when delegated to applyPreset", async () => {
@@ -1601,7 +1605,7 @@ describe("materializeWithPreset", () => {
       });
       const preset = makePreset({ kind: "cli" });
 
-      await materializeWithPreset(draft, preset, "   ", actions);
+      const result = await materializeWithPreset(draft, preset, "   ", actions);
 
       expect(applyPreset).toHaveBeenCalledWith(
         "ws-project",
@@ -1609,6 +1613,8 @@ describe("materializeWithPreset", () => {
         "current_terminal",
         null,
       );
+      expect(result.success).toBe(true);
+      expect(actions.markPromoted).toHaveBeenCalled();
     });
 
     it("workspace-create failure → markSendFailed, applyPreset not called", async () => {
