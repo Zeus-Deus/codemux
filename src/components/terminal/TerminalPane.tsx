@@ -415,14 +415,23 @@ export const TerminalPane = memo(function TerminalPane({ sessionId, paneId, focu
           if (!isOpenGesture(event)) return;
           const target = terminalHyperlinkTarget(uri);
           if (!target) return;
+          const host = hyperlinkDestination(target);
           void confirm({
             title: "Open terminal link?",
             description: (
               <>
                 Terminal link text can differ from where it goes. Check the address before opening it.
-                <span className="mt-3 block text-left text-foreground">
-                  Opens{" "}
-                  <span className="break-all font-mono font-medium">{hyperlinkDestination(target)}</span>
+                <span
+                  tabIndex={host ? 0 : undefined}
+                  className="mt-3 block max-h-16 overflow-y-auto break-all text-left text-foreground"
+                >
+                  {host ? (
+                    <>
+                      Opens <span className="font-mono font-medium">{host}</span>
+                    </>
+                  ) : (
+                    "Opens your mail app with the address below"
+                  )}
                 </span>
                 <span
                   tabIndex={0}

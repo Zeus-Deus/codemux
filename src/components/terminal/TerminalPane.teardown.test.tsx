@@ -1126,8 +1126,22 @@ describe("TerminalPane OSC 8 hyperlinks", () => {
     const { view, click } = await hyperlink("https://github.com/acme/app/pull/7");
     await click(`https://github.com:${"x".repeat(2000)}@evil.example/oauth`);
     const host = view.getByText("evil.example");
-    expect(host.closest(".overflow-y-auto")).toBeNull();
+    // Its own bounded line, not inside the full-address box.
     expect(host.parentElement?.textContent).toBe("Opens evil.example");
+    expect(host.parentElement?.className).toContain("max-h-16");
+    expect(host.parentElement?.textContent).not.toContain("xxxx");
+  });
+
+  it("shows every mail recipient in the full address, with bounded summaries", async () => {
+    const { view, click } = await hyperlink("Contact us");
+    const recipients = Array.from({ length: 200 }, (_, i) => `r${i}@example.com`).join(",");
+    await click(`mailto:${recipients}?bcc=leak@evil.example`);
+    const dialog = view.getByRole("alertdialog");
+    expect(dialog.textContent).toContain("Opens your mail app with the address below");
+    expect(dialog.textContent).toContain("bcc=leak@evil.example");
+    const summary = view.getByText("Opens your mail app with the address below");
+    expect(summary.className).toContain("max-h-16");
+    expect(view.getByRole("button", { name: "Open link" })).toBeTruthy();
   });
 
   it("keeps a long address inside a scrollable box", async () => {

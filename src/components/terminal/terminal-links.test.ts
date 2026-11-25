@@ -124,7 +124,9 @@ describe("hyperlinkDestination", () => {
     expect(hyperlinkDestination(`https://github.com:${"x".repeat(300)}@evil.example/a`)).toBe("evil.example");
     expect(hyperlinkDestination("https://example.com:8443/a")).toBe("example.com:8443");
     expect(hyperlinkDestination("https://bücher.example/")).toBe("xn--bcher-kva.example");
-    expect(hyperlinkDestination("mailto:dev@example.com")).toBe("dev@example.com");
+    // Mail recipients can hide in to/cc/bcc fields; the dialog shows the
+    // full address for those instead of a one-line summary.
+    expect(hyperlinkDestination("mailto:dev@example.com?bcc=leak@evil.example")).toBeNull();
   });
 });
 

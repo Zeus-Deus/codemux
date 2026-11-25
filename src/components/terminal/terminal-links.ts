@@ -116,17 +116,18 @@ export function terminalHyperlinkTarget(uri: string): string | null {
   }
 }
 
-/** Where a confirmed hyperlink goes, short enough to read at a glance: the
- *  host (port included) for web links, the address for mail links. A long
- *  user-info part (`https://github.com:...@evil.example/`) can push the
- *  host far along the full address, so the dialog shows this on its own.
- *  Internationalized hosts come back in their ASCII (`xn--`) form. */
-export function hyperlinkDestination(target: string): string {
+/** The host (port included) a confirmed web link opens, shown on its own
+ *  line because a long user-info part (`https://github.com:...@evil.example/`)
+ *  can push it far along the full address. Internationalized hosts come back
+ *  in their ASCII (`xn--`) form. Null for mail links: their recipients can
+ *  sit in the path and in `to`/`cc`/`bcc` fields, so only the full address
+ *  shows them all. */
+export function hyperlinkDestination(target: string): string | null {
   try {
     const url = new URL(target);
-    return url.protocol === "mailto:" ? url.pathname : url.host;
+    return url.protocol === "http:" || url.protocol === "https:" ? url.host : null;
   } catch {
-    return target;
+    return null;
   }
 }
 
