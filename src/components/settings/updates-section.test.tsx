@@ -108,6 +108,19 @@ describe("UpdatesSection", () => {
     expect(screen.getByRole("button", { name: "Restart required" })).toBeDisabled();
   });
 
+  it("shows the running version when another helper update is available", async () => {
+    invoke.mockImplementation(async (cmd: string) => {
+      if (cmd === "provider_updates_local") return [];
+      if (cmd === "provider_updates_device") {
+        return { host_id: 2, helper_version: "0.24.0", running_version: "0.23.0", serve_alive: true, app_version: "0.25.0", providers: [], error: null };
+      }
+      throw new Error(`unexpected ${cmd}`);
+    });
+
+    render(<UpdatesSection />);
+    expect(await screen.findByText("v0.24.0 → v0.25.0 · v0.23.0 running · Restart required")).toBeInTheDocument();
+  });
+
   it("refreshes daemon status after updating one device's helper", async () => {
     statusAvailable = false;
     render(<UpdatesSection />);

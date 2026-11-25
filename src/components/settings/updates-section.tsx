@@ -401,7 +401,7 @@ function HelperRow({ machine, state }: { machine: MachineKey; state: MachineStat
     item?.phase === "failed"
       ? { text: item.message ?? "Update failed", tone: "error" as const }
       : outdated
-          ? { text: `v${state.helperVersion} → v${state.appVersion}`, tone: "available" as const }
+          ? { text: `v${state.helperVersion} → v${state.appVersion}${restartRequired ? ` · v${state.runningVersion} running · Restart required` : ""}`, tone: "available" as const }
           : restartRequired
             ? { text: `v${state.helperVersion} installed · v${state.runningVersion} running · Restart required`, tone: "error" as const }
             : state.serveAlive === false

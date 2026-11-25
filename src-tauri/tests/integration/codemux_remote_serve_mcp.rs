@@ -168,6 +168,42 @@ impl ServeFixture {
 }
 
 #[test]
+fn status_without_manifest_does_not_claim_a_service_stopped() {
+    let fx = ServeFixture::start();
+    let login_data = TempDir::new().unwrap();
+    let status = Command::new(binary_path())
+        .args(["serve", "status"])
+        .env("HOME", fx.home.path())
+        .env("XDG_DATA_HOME", login_data.path())
+        .output();
+
+    // The service is live in its own state directory. The login shell's
+    // different XDG_DATA_HOME must not turn absence of that manifest into
+    // evidence that the service has stopped.
+    let service_status = Command::new(binary_path())
+        .args(["serve", "status", "--state-dir"])
+        .arg(fx.state_dir.path())
+        .env("HOME", fx.home.path())
+        .env("XDG_DATA_HOME", login_data.path())
+        .output();
+    fx.stop();
+
+    let status = status.unwrap();
+    assert!(!status.status.success());
+    let report: Value = serde_json::from_slice(&status.stdout).unwrap();
+    assert!(report["alive"].is_null(), "{report}");
+    assert!(report["running_version"].is_null(), "{report}");
+    let service_status = service_status.unwrap();
+    assert!(
+        service_status.status.success(),
+        "{}",
+        String::from_utf8_lossy(&service_status.stderr)
+    );
+    let report: Value = serde_json::from_slice(&service_status.stdout).unwrap();
+    assert_eq!(report["alive"], json!(true));
+}
+
+#[test]
 fn http_health_and_tools_list() {
     let fx = ServeFixture::start();
     let client = reqwest::blocking::Client::new();

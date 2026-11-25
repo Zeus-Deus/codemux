@@ -1131,6 +1131,12 @@ mod tests {
         );
         assert_eq!(stopped.serve_alive, Some(false));
         assert_eq!(stopped.running_version, None);
+        let unknown = parse_device_report(
+            7,
+            "{\"name\":\"codemux-remote\",\"version\":\"0.24.0\"}\n{\"alive\":null,\"running_version\":null}\n{\"providers\":[]}\n",
+        );
+        assert_eq!(unknown.serve_alive, None);
+        assert_eq!(unknown.running_version, None);
         assert!(parse_device_report(7, "").error.unwrap().contains("isn't set up"));
     }
 

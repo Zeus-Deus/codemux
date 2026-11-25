@@ -749,11 +749,13 @@ fn run_serve_status(state_dir_arg: Option<PathBuf>) -> ExitCode {
     match codemux_lib::remote::manifest::read(&manifest_path) {
         Ok(None) => {
             eprintln!(
-                "[codemux-remote] no daemon manifest at {}. Not running.",
+                "[codemux-remote] no daemon manifest at {}. Running status unknown.",
                 manifest_path.display()
             );
             println!("{}", serde_json::json!({
-                "alive": false,
+                // The CLI may resolve a different XDG_DATA_HOME than the
+                // background service, so absence here does not prove it stopped.
+                "alive": null,
                 "live_terminals": null,
                 "running_version": null,
             }));
