@@ -505,7 +505,7 @@ mod tests {
         let mut context = openssl::bn::BigNumContext::new().unwrap();
         let mut expected_public_key = openssl::ec::EcPoint::new(&group).unwrap();
         expected_public_key
-            .mul_generator(&group, &secret, &context)
+            .mul_generator2(&group, &secret, &mut context)
             .unwrap();
         assert_eq!(
             public_key,
