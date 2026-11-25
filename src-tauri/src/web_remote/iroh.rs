@@ -1008,6 +1008,19 @@ fn open_key_dir(parent: &Path, access: KeyDirAccess) -> Result<std::fs::File, St
     let search_meta = search_handle
         .metadata()
         .map_err(|e| format!("inspect iroh key directory: {e}"))?;
+    // Legacy lookup needs only search permission on the app-data root. Keep
+    // the validated descriptor: reopening it for read would reject an owned
+    // 0300 directory even though its private key is accessible by name.
+    if access == KeyDirAccess::AncestorReadOnly {
+        if !search_meta.is_dir()
+            || search_meta.uid() != uid
+            || search_meta.permissions().mode() & 0o022 != 0
+        {
+            return Err("iroh key directory permissions remain unsafe".to_string());
+        }
+        check_key_acl(&search_handle, "iroh key directory", KeyAclScope::Ancestor)?;
+        return Ok(search_handle);
+    }
     let dot = std::ffi::CString::new(".").expect("static directory name has no NUL");
     let fd = unsafe {
         libc::openat(
@@ -1192,7 +1205,49 @@ fn persist_secret_key(path: &Path, key: &SecretKey) -> Result<(), String> {
     persist_secret_key_in(&directory, key)
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
+fn persist_secret_key(path: &Path, key: &SecretKey) -> Result<(), String> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Storage::FileSystem::{
+        MoveFileExW, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH,
+    };
+
+    let parent = path.parent().ok_or("iroh key path has no parent")?;
+    std::fs::create_dir_all(parent).map_err(|e| format!("create iroh key directory: {e}"))?;
+    secure_existing_key_file(path)?;
+    let sealed = crate::auth::encrypt_data(&key.to_bytes())?;
+    let temporary = parent.join(format!(".{KEY_FILE}.{}.tmp", uuid::Uuid::new_v4()));
+    let result = (|| {
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temporary)
+            .map_err(|e| format!("create iroh key temp file: {e}"))?;
+        file.write_all(&sealed).map_err(|e| format!("write iroh key temp file: {e}"))?;
+        file.sync_all().map_err(|e| format!("sync iroh key temp file: {e}"))?;
+        drop(file);
+        let source: Vec<u16> = temporary.as_os_str().encode_wide().chain(Some(0)).collect();
+        let destination: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
+        // Same-directory WRITE_THROUGH keeps a partially written replacement
+        // out of the visible key path and waits for the move to reach disk.
+        if unsafe {
+            MoveFileExW(
+                source.as_ptr(),
+                destination.as_ptr(),
+                MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+            )
+        } == 0 {
+            return Err(format!("publish iroh key file: {}", std::io::Error::last_os_error()));
+        }
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&temporary);
+    }
+    result
+}
+
+#[cfg(all(not(unix), not(windows)))]
 fn persist_secret_key(path: &Path, key: &SecretKey) -> Result<(), String> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).map_err(|e| format!("create iroh key directory: {e}"))?;
@@ -1216,7 +1271,7 @@ fn secure_existing_key_file(path: &Path) -> Result<(), String> {
 /// data directory is an ancestor here: its unrelated permissions stay intact.
 #[cfg(unix)]
 fn migrate_legacy_secret_key(path: &Path, directory: &std::fs::File) -> Result<Option<SecretKey>, String> {
-    use std::os::fd::AsRawFd;
+    use std::os::fd::{AsRawFd, FromRawFd};
     use std::os::unix::fs::MetadataExt;
 
     let Some(legacy) = legacy_key_file_path(path) else {
@@ -1239,6 +1294,39 @@ fn migrate_legacy_secret_key(path: &Path, directory: &std::fs::File) -> Result<O
     };
     persist_secret_key_in(directory, &key)?;
 
+    // A new iroh-identity directory is itself an entry in the app-data root.
+    // Sync that parent before removing the recovery copy. Search-only roots
+    // cannot be opened for directory sync, so keep the private legacy key in
+    // that case; a crash can then recover the same node ID from either copy.
+    let cleanup_dir = (|| -> Result<std::fs::File, String> {
+        let dot = std::ffi::CString::new(".").expect("static directory name has no NUL");
+        let fd = unsafe {
+            libc::openat(
+                legacy_dir.as_raw_fd(),
+                dot.as_ptr(),
+                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            )
+        };
+        if fd < 0 {
+            return Err(format!("open app-data directory for sync: {}", std::io::Error::last_os_error()));
+        }
+        let readable = unsafe { std::fs::File::from_raw_fd(fd) };
+        let expected = legacy_dir.metadata().map_err(|e| format!("inspect app-data directory: {e}"))?;
+        let actual = readable.metadata().map_err(|e| format!("inspect app-data sync handle: {e}"))?;
+        if actual.dev() != expected.dev() || actual.ino() != expected.ino() {
+            return Err("app-data directory changed before sync".to_string());
+        }
+        readable.sync_all().map_err(|e| format!("sync app-data directory: {e}"))?;
+        Ok(readable)
+    })();
+    let cleanup_dir = match cleanup_dir {
+        Ok(dir) => dir,
+        Err(error) => {
+            log::warn!("[codemux::web_remote] keeping private legacy iroh key: {error}");
+            return Ok(Some(key));
+        }
+    };
+
     // Delete only the same entry we validated. A failed cleanup leaves a
     // private legacy copy, while the new key is already safely published.
     let name = std::ffi::CString::new(KEY_FILE).expect("static key filename has no NUL");
@@ -1249,6 +1337,8 @@ fn migrate_legacy_secret_key(path: &Path, directory: &std::fs::File) -> Result<O
     if inspected == 0 && entry.st_dev as u64 == old_meta.dev() && entry.st_ino as u64 == old_meta.ino() {
         if unsafe { libc::unlinkat(legacy_dir.as_raw_fd(), name.as_ptr(), 0) } < 0 {
             log::warn!("[codemux::web_remote] could not remove migrated iroh key: {}", std::io::Error::last_os_error());
+        } else if let Err(error) = cleanup_dir.sync_all() {
+            log::warn!("[codemux::web_remote] could not sync removed legacy iroh key: {error}");
         }
     }
     Ok(Some(key))
@@ -1270,9 +1360,8 @@ fn migrate_legacy_secret_key(path: &Path) -> Result<Option<SecretKey>, String> {
         return Ok(None);
     };
     persist_secret_key(path, &key)?;
-    if let Err(error) = std::fs::remove_file(&legacy) {
-        log::warn!("[codemux::web_remote] could not remove migrated iroh key: {error}");
-    }
+    // Windows cannot confirm that a newly created directory entry survived a
+    // crash before the old name is removed. Keep this private recovery copy.
     Ok(Some(key))
 }
 
@@ -1348,33 +1437,44 @@ pub fn persisted_node_id() -> Option<String> {
 
 fn persisted_node_id_at(path: &Path) -> Option<String> {
     #[cfg(unix)]
-    let sealed = {
+    let current = {
         let private_dir = path.parent()?;
-        let current = match open_key_dir(private_dir, KeyDirAccess::PrivateReadOnly) {
+        match open_key_dir(private_dir, KeyDirAccess::PrivateReadOnly) {
             Ok(directory) => read_private_key_in(&directory, false).ok()?,
             Err(_) if matches!(
                 std::fs::symlink_metadata(private_dir),
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound
             ) => None,
             Err(_) => return None,
-        };
-        if let Some(sealed) = current {
-            sealed
-        } else {
-            let legacy = legacy_key_file_path(path)?;
-            let directory = open_key_dir(legacy.parent()?, KeyDirAccess::AncestorReadOnly).ok()?;
-            read_private_key_in(&directory, false).ok()??
         }
     };
     #[cfg(not(unix))]
+    let current = {
+        match std::fs::symlink_metadata(path) {
+            Ok(_) => {
+                secure_existing_key_file(path).ok()?;
+                Some(std::fs::read(path).ok()?)
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(_) => return None,
+        }
+    };
+    if let Some(key) = current.as_deref().and_then(decode_secret_key) {
+        return Some(key.public().to_string());
+    }
+
+    // A damaged new copy can be restored from a retained legacy key at
+    // startup. Status uses the same fallback without changing either file.
+    let legacy = legacy_key_file_path(path)?;
+    #[cfg(unix)]
     let sealed = {
-        let source = if std::fs::symlink_metadata(path).is_ok() {
-            path.to_path_buf()
-        } else {
-            legacy_key_file_path(path)?
-        };
-        secure_existing_key_file(&source).ok()?;
-        std::fs::read(source).ok()?
+        let directory = open_key_dir(legacy.parent()?, KeyDirAccess::AncestorReadOnly).ok()?;
+        read_private_key_in(&directory, false).ok()??
+    };
+    #[cfg(not(unix))]
+    let sealed = {
+        secure_existing_key_file(&legacy).ok()?;
+        std::fs::read(legacy).ok()?
     };
     Some(decode_secret_key(&sealed)?.public().to_string())
 }
@@ -1943,6 +2043,28 @@ mod tests {
         assert_eq!(load_or_create_secret_key_at(&path).unwrap().public(), key.public());
         assert_eq!(std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777, 0o700);
         assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
+
+        // The app-data root itself may be writable and searchable without
+        // being readable. Status and migration must still find the old key by
+        // name, and migration must preserve its identity and root mode.
+        let private_path = dir.join(KEY_DIR).join(KEY_FILE);
+        let node_id = key.public().to_string();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o300)).unwrap();
+        std::fs::set_permissions(&ancestor, std::fs::Permissions::from_mode(0o111)).unwrap();
+        let status_before = persisted_node_id_at(&private_path);
+        let migrated = load_or_create_secret_key_at(&private_path);
+        let status_after = persisted_node_id_at(&private_path);
+        let mode = std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777;
+        std::fs::set_permissions(&ancestor, std::fs::Permissions::from_mode(0o700)).unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert_eq!(status_before.as_deref(), Some(node_id.as_str()));
+        assert_eq!(migrated.unwrap().public(), key.public());
+        assert_eq!(status_after.as_deref(), Some(node_id.as_str()));
+        assert_eq!(mode, 0o300);
+        assert!(path.exists(), "search-only parent keeps the private recovery copy");
+        std::fs::write(&private_path, b"incomplete replacement").unwrap();
+        assert_eq!(persisted_node_id_at(&private_path).as_deref(), Some(node_id.as_str()));
+        assert_eq!(load_or_create_secret_key_at(&private_path).unwrap().public(), key.public());
     }
 
     #[cfg(unix)]
@@ -2033,6 +2155,29 @@ mod tests {
         assert_eq!(std::fs::metadata(relocated.join(KEY_DIR)).unwrap().permissions().mode() & 0o777, 0o700);
         assert_eq!(std::fs::metadata(relocated.join(KEY_DIR).join(KEY_FILE)).unwrap().permissions().mode() & 0o777, 0o600);
         assert_eq!(std::fs::read(&unrelated).unwrap(), b"keep");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn iroh_identity_key_migration_retains_private_legacy_recovery_copy() {
+        let temp = tempfile::tempdir().unwrap();
+        let app_dir = temp.path().join("codemux");
+        std::fs::create_dir(&app_dir).unwrap();
+        let legacy = app_dir.join(KEY_FILE);
+        let path = app_dir.join(KEY_DIR).join(KEY_FILE);
+        let original = SecretKey::generate();
+        let node_id = original.public().to_string();
+        std::fs::write(&legacy, crate::auth::encrypt_data(&original.to_bytes()).unwrap()).unwrap();
+
+        assert_eq!(load_or_create_secret_key_at(&path).unwrap().public(), original.public());
+        assert!(legacy.exists(), "the old key remains available for crash recovery");
+        assert!(path.exists());
+
+        // Even if the replacement is lost or damaged, startup must recover
+        // the same node ID from the private legacy copy.
+        std::fs::write(&path, b"incomplete replacement").unwrap();
+        assert_eq!(persisted_node_id_at(&path).as_deref(), Some(node_id.as_str()));
+        assert_eq!(load_or_create_secret_key_at(&path).unwrap().public(), original.public());
     }
 
     #[cfg(unix)]
