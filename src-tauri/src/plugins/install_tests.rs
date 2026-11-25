@@ -239,6 +239,44 @@ fn provenance_search_is_bounded_and_says_when_it_gave_up() {
 }
 
 #[test]
+fn provenance_checks_the_default_branch_before_large_unrelated_refs_and_caps_all_packs() {
+    let f = fixture();
+    let origin = PathBuf::from(f.url.strip_prefix("file://").unwrap());
+    let work = origin.parent().unwrap().join("work");
+    let origin = origin.to_str().unwrap();
+
+    // An unrelated branch has a large, hard-to-compress commit object. A
+    // wildcard fetch would download it even when main proves the pin.
+    git(&work, &["checkout", "-q", "-b", "zlarge"]);
+    let mut seed = 1u64;
+    let alphabet = b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+    let message: String = (0..3_000_000)
+        .map(|_| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            alphabet[(seed as usize) % alphabet.len()] as char
+        })
+        .collect();
+    let message_file = work.parent().unwrap().join("large-message");
+    std::fs::write(&message_file, message).unwrap();
+    git(&work, &["commit", "-q", "--allow-empty", "-F", message_file.to_str().unwrap()]);
+    git(&work, &["push", "-q", origin, "zlarge"]);
+
+    let verifier = test_git();
+    verifier.check_on_branch_or_tag_with_budget(&f.url, &f.first, &[2], 1024 * 1024).unwrap();
+
+    // A deleted ref leaves a fetchable object, but no named ref proves it.
+    // The large branch must exhaust the shared disk budget and fail closed.
+    git(&work, &["checkout", "-q", "-b", "stray", "main"]);
+    let stray = commits(&work, 1).pop().unwrap();
+    git(&work, &["push", "-q", origin, "stray"]);
+    git(Path::new(origin), &["update-ref", "-d", "refs/heads/stray"]);
+    let error = verifier.check_on_branch_or_tag_with_budget(&f.url, &stray, &[1, 2], 1024 * 1024).unwrap_err();
+    assert!(error.contains("Could not confirm commit") && error.contains("download exceeded 1 MiB"), "{error}");
+}
+
+#[test]
 fn a_local_or_linked_folder_is_never_replaced() {
     let f = fixture();
     std::fs::create_dir_all(f.root.join("hello")).unwrap();

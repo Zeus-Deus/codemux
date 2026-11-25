@@ -343,11 +343,22 @@ fn blocked_check(catalog: &super::catalog::Catalog, id: &str, sha: &str) -> Resu
     }
 }
 
+/// Adds what the user can do when the commit's origin could not be confirmed
+/// within the search limit; other errors pass through unchanged.
+fn provenance_hint(error: String, hint: &str) -> String {
+    if error.starts_with(install::PROVENANCE_UNCONFIRMED) {
+        format!("{error} {hint}")
+    } else {
+        error
+    }
+}
+
 fn plan_git(root: &std::path::Path, catalog: &super::catalog::Catalog, url: &str, git_ref: Option<&str>) -> Result<Plan, String> {
     let repo = install::parse_repo(url)?;
     let git = install::Git::new()?;
     let tree = if git_ref.is_some() { None } else { repo.tree.as_deref() };
-    let fetched = install::fetch_plugin(&git, &format!("{}.git", repo.repo), tree, git_ref, None)?;
+    let fetched = install::fetch_plugin(&git, &format!("{}.git", repo.repo), tree, git_ref, None)
+        .map_err(|e| provenance_hint(e, "Install a newer commit, or a branch or tag."))?;
     let id = install::folder_id(&fetched.meta, &repo.name)?;
     blocked_check(catalog, &id, &fetched.sha)?;
     finish_plan(root, id, "git", repo.repo, "unverified".into(), None, fetched)
@@ -357,7 +368,13 @@ fn plan_catalog(root: &std::path::Path, catalog: &super::catalog::Catalog, id: &
     let entry = catalog.entry(id).ok_or_else(|| format!("\"{id}\" is not in the plugin catalog"))?;
     blocked_check(catalog, &entry.id, &entry.sha)?;
     let git = install::Git::new()?;
-    let fetched = install::fetch_plugin(&git, &format!("{}.git", entry.repo), None, Some(&entry.sha), entry.subdir.as_deref())?;
+    let fetched = install::fetch_plugin(&git, &format!("{}.git", entry.repo), None, Some(&entry.sha), entry.subdir.as_deref())
+        .map_err(|e| {
+            provenance_hint(
+                e,
+                "The catalog pins this commit. Ask the catalog maintainers to update the entry or retain a release tag at the pin.",
+            )
+        })?;
     if fetched.meta.id.as_deref().is_some_and(|found| found != entry.id) {
         return Err(format!(
             "The plugin at that commit says its id is \"{}\", not \"{}\"",
@@ -457,7 +474,7 @@ fn plan_for(root: &std::path::Path, catalog: &super::catalog::Catalog, source: &
                         None,
                         Some(marker.git_ref.as_deref().unwrap_or("HEAD")),
                         marker.subdir.as_deref(),
-                    )?;
+                    ).map_err(|e| provenance_hint(e, "Install a newer commit, or a branch or tag."))?;
                     blocked_check(catalog, id, &fetched.sha)?;
                     let mut plan = finish_plan(root, id.clone(), "git", repo.repo, marker.tier.clone(), None, fetched)?;
                     plan.marker.git_ref = marker.git_ref.clone();
@@ -553,6 +570,13 @@ pub async fn plugins_remove<R: Runtime>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn provenance_hint_only_extends_the_unconfirmed_error() {
+        let unconfirmed = format!("{} abc is from x within the last 5000 commits.", install::PROVENANCE_UNCONFIRMED);
+        assert_eq!(provenance_hint(unconfirmed.clone(), "Fix it."), format!("{unconfirmed} Fix it."));
+        assert_eq!(provenance_hint("Git took too long".into(), "Fix it."), "Git took too long");
+    }
 
     fn plan(root: &std::path::Path, source: &str, repo: &str) -> Result<Plan, String> {
         finish_plan(
