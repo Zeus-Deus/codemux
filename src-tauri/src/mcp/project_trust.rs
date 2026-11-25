@@ -9,9 +9,12 @@
 //! Approvals live in the local database, never in the repository. Each one
 //! is keyed by a hash of the canonical project root and the server's full
 //! definition, so a change to the command, arguments, environment, working
-//! directory, URL or headers asks again.
+//! directory, URL or headers asks again. The project root of a registered
+//! Git worktree is its main checkout, so every worktree of a project shares
+//! the approvals of identical definitions.
 
 use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
 
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -26,14 +29,40 @@ const SETTING_PREFIX: &str = "mcp.project_approval:";
 /// the project defines.
 const RUNTIME_KEYS: [&str; 2] = ["runtimeGeneration", "pluginRegistrationToken"];
 
+/// The root approvals for servers discovered in `checkout` are keyed by:
+/// the canonical Git root, when `checkout` lies inside it or Git lists
+/// `checkout` as one of that repository's worktrees, else `checkout` itself.
+/// A `.git` file can point anywhere, so a folder only shares a project's
+/// approvals when Git itself registered it there.
+pub fn approval_root(checkout: &Path) -> PathBuf {
+    let canonical = std::fs::canonicalize(checkout).unwrap_or_else(|_| checkout.to_path_buf());
+    let Some(root) = crate::config::workspace_config::find_git_root(&canonical)
+        .and_then(|root| std::fs::canonicalize(root).ok())
+    else {
+        return canonical;
+    };
+    let registered = || {
+        crate::git::git_list_worktrees(&root).is_ok_and(|worktrees| {
+            worktrees.iter().filter(|worktree| !worktree.is_bare).any(|worktree| {
+                std::fs::canonicalize(&worktree.path).ok().as_deref() == Some(canonical.as_path())
+            })
+        })
+    };
+    if canonical.starts_with(&root) || registered() {
+        root
+    } else {
+        canonical
+    }
+}
+
 /// The approval fingerprint for a server that needs one, or `None` when the
 /// definition Codemux would start comes from a user-owned file.
 ///
-/// Dedupe can merge an identical user entry into a project row and the
-/// other way round; the row starts the definition of its primary (first)
-/// source, so that source alone decides.
+/// Dedupe merges only entries whose name, command, arguments, environment,
+/// working directory, transport and headers all match, so a row that any
+/// user-owned file also defines starts exactly what the user wrote there.
 pub fn fingerprint(config: &McpServerConfig) -> Option<String> {
-    if !is_project_source(config.primary_source()) {
+    if config.sources.is_empty() || !config.sources.iter().all(|source| is_project_source(*source)) {
         return None;
     }
     let mut raw = config.raw.clone();
@@ -86,33 +115,42 @@ pub fn record_approval<R: Runtime>(
     db.set_setting(&setting_key(fingerprint), &value.to_string())
 }
 
-/// One line describing what approving starts: the full command line or URL,
-/// plus the environment variables an HTTP server's headers would send.
+/// What approving starts, in full: the command line with its environment
+/// and working directory, or the URL with the environment variables its
+/// headers would send. Shown only on this computer, never to paired devices.
 pub fn summary(config: &McpServerConfig) -> String {
-    let mut line = match config.transport {
-        McpTransport::Stdio => std::iter::once(config.command.as_str())
-            .chain(config.args.iter().map(String::as_str))
-            .map(|part| {
-                if !part.is_empty()
-                    && part
-                        .chars()
-                        .all(|c| c.is_ascii_alphanumeric() || "-_./=:@,+%".contains(c))
-                {
-                    part.to_string()
-                } else {
-                    crate::ssh::exec::sh_quote(part)
-                }
-            })
-            .collect::<Vec<_>>()
-            .join(" "),
-        McpTransport::Http => config.command.clone(),
-    };
+    let mut parts = Vec::new();
+    match config.transport {
+        McpTransport::Stdio => {
+            let line = std::iter::once(config.command.as_str()).chain(config.args.iter().map(String::as_str));
+            parts.push(line.map(quote).collect::<Vec<_>>().join(" "));
+            let env: BTreeMap<&String, &String> = config.env.iter().collect();
+            if !env.is_empty() {
+                let env = env.iter().map(|(name, value)| format!("{}={}", quote(name), quote(value)));
+                parts.push(format!("env {}", env.collect::<Vec<_>>().join(" ")));
+            }
+            if let Some(cwd) = config.raw.get("cwd").and_then(Value::as_str) {
+                parts.push(format!("cwd {}", quote(cwd)));
+            }
+        }
+        McpTransport::Http => parts.push(config.command.clone()),
+    }
     let sent = header_env_names(&config.raw);
     if !sent.is_empty() {
-        line.push_str(" · sends ");
-        line.push_str(&sent.join(", "));
+        parts.push(format!("sends {}", sent.join(", ")));
     }
-    line
+    parts.join(" · ")
+}
+
+/// `part` as a shell word, quoted only when it needs to be.
+fn quote(part: &str) -> String {
+    let plain = !part.is_empty()
+        && part.chars().all(|c| c.is_ascii_alphanumeric() || "-_./=:@,+%".contains(c));
+    if plain {
+        part.to_string()
+    } else {
+        crate::ssh::exec::sh_quote(part)
+    }
 }
 
 /// Environment variables whose values the HTTP client puts in headers.
@@ -193,16 +231,34 @@ mod tests {
         }
     }
 
-    /// The row starts its primary source's definition, so a user entry
-    /// merged into a project row does not make the project's copy trusted.
+    /// A repository copying a server from the user's own files does not
+    /// make that server wait: dedupe only merges identical definitions.
     #[test]
-    fn merged_rows_follow_the_definition_they_start() {
+    fn rows_the_user_also_defines_need_no_approval() {
         let mut project_first = project(McpConfigSource::CodemuxProject);
         project_first.sources.push(McpConfigSource::ClaudeUser);
-        assert!(fingerprint(&project_first).is_some());
+        assert!(fingerprint(&project_first).is_none());
         let mut user_first = project(McpConfigSource::CodemuxUser);
         user_first.sources.push(McpConfigSource::ClaudeProject);
         assert!(fingerprint(&user_first).is_none());
+        let mut two_projects = project(McpConfigSource::CodemuxProject);
+        two_projects.sources.push(McpConfigSource::ClaudeProject);
+        assert!(fingerprint(&two_projects).is_some());
+    }
+
+    /// Dedupe keeps entries that differ only in their working directory
+    /// apart, so a user entry cannot vouch for a project copy run elsewhere.
+    #[test]
+    fn dedupe_keeps_a_different_working_directory_apart() {
+        let user = project(McpConfigSource::ClaudeUser);
+        let mut repo = project(McpConfigSource::ClaudeProject);
+        repo.raw["cwd"] = json!("./tools");
+        let rows = crate::mcp::dedupe_servers(vec![user.clone(), repo]);
+        assert_eq!(rows.len(), 2);
+        assert!(fingerprint(&rows[1]).is_some());
+        let rows = crate::mcp::dedupe_servers(vec![user, project(McpConfigSource::ClaudeProject)]);
+        assert_eq!(rows.len(), 1);
+        assert!(fingerprint(&rows[0]).is_none());
     }
 
     #[test]
@@ -229,9 +285,16 @@ mod tests {
     }
 
     #[test]
-    fn summary_shows_the_command_and_header_secrets() {
-        let stdio = project(McpConfigSource::ClaudeProject);
+    fn summary_shows_the_whole_definition() {
+        let mut stdio = project(McpConfigSource::ClaudeProject);
         assert_eq!(summary(&stdio), "sh -c 'echo hi'");
+        stdio.env.insert("NODE_OPTIONS".into(), "--require ./x.js".into());
+        stdio.env.insert("A".into(), "1".into());
+        stdio.raw["cwd"] = json!("./tools dir");
+        assert_eq!(
+            summary(&stdio),
+            "sh -c 'echo hi' · env A=1 NODE_OPTIONS='--require ./x.js' · cwd './tools dir'"
+        );
         let mut http = project(McpConfigSource::ClaudeProject);
         http.transport = McpTransport::Http;
         http.command = "http://example.test/mcp".into();

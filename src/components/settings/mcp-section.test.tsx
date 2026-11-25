@@ -389,10 +389,37 @@ describe("McpSection", () => {
     const approve = await screen.findByTestId("mcp-row-id-repo-approve");
     expect(screen.getByTestId("mcp-row-id-repo-status")).toHaveAttribute("data-status", "needs-approval");
     expect(screen.getByTestId("mcp-row-id-repo-command")).toHaveTextContent("node scripts/lint-mcp.js --fix");
+    expect(screen.getByTestId("mcp-row-id-repo-command")).not.toHaveClass("truncate");
     fireEvent.click(approve);
     await waitFor(() => {
       expect(commands.approveMcpServer).toHaveBeenCalledWith("id-repo", "fp-1");
     });
+  });
+
+  it("points paired devices to the host instead of offering Approve", async () => {
+    const commands = (await import(
+      "@/tauri/commands"
+    )) as unknown as Record<string, ReturnType<typeof vi.fn>>;
+    commands.getMcpRuntimeStatus.mockResolvedValueOnce([
+      {
+        id: "id-repo",
+        name: "repo-lint",
+        // The host strips the definition and fingerprint for paired devices.
+        status: { kind: "needsApproval" },
+        toolsCount: 0,
+        errorMessage: null,
+        stderrTail: null,
+        startedAtMs: null,
+      },
+    ]);
+    listMcpServersMock.mockResolvedValueOnce([
+      makeServer({ id: "id-repo", name: "repo-lint", sources: ["claudeProject"], command: "node", args: ["…"] }),
+    ]);
+
+    render(<McpSection projectRoot="/home/me/proj" />);
+
+    expect(await screen.findByTestId("mcp-row-id-repo-approve-on-host")).toHaveTextContent("codemux mcp-approve");
+    expect(screen.queryByTestId("mcp-row-id-repo-approve")).toBeNull();
   });
 
   it("reveals View tools on keyboard focus and touch, not only hover", async () => {

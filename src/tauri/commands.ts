@@ -3060,8 +3060,10 @@ export type McpServerStatusKind =
 export type McpServerStatus =
   | { kind: "discovered" }
   /** Defined by the project's own files and not approved for this project,
-   *  or changed since. `summary` is what approving would start. */
-  | { kind: "needsApproval"; fingerprint: string; summary: string }
+   *  or changed since. `summary` is what approving would start. Paired
+   *  devices get neither field: the definition and its approval stay on
+   *  the host. */
+  | { kind: "needsApproval"; fingerprint?: string; summary?: string }
   | { kind: "starting" }
   | { kind: "stopping" }
   | { kind: "running"; toolCount: number }

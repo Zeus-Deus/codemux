@@ -227,7 +227,10 @@ pub fn source_rank(s: McpConfigSource) -> u8 {
 
 /// Merge identical configs across sources into single rows.
 ///
-/// **Dedupe key:** `(name, command, args, env)`. Two entries with the
+/// **Dedupe key:** `(name, command, args, env, transport, headers, cwd)`.
+/// Merged entries start exactly the same thing, so a project row that a
+/// user-owned file also defines needs no approval (see
+/// [`project_trust::fingerprint`]). Two entries with the
 /// same name but different command/args stay as two separate rows so the
 /// UI can show a source disambiguator (e.g. two different versions of
 /// the same MCP).
@@ -250,6 +253,7 @@ pub fn dedupe_servers(servers: Vec<McpServerConfig>) -> Vec<McpServerConfig> {
         Vec<(String, String)>,
         u8,
         Vec<(String, String)>,
+        Option<String>,
     );
     let mut by_key: Map<Key, usize> = Map::new();
     let mut out: Vec<McpServerConfig> = Vec::with_capacity(servers.len());
@@ -298,6 +302,7 @@ pub fn dedupe_servers(servers: Vec<McpServerConfig>) -> Vec<McpServerConfig> {
             env_pairs,
             transport,
             http_headers,
+            srv.raw.get("cwd").and_then(serde_json::Value::as_str).map(str::to_string),
         );
 
         if let Some(&idx) = by_key.get(&key) {

@@ -2200,6 +2200,22 @@ pub(crate) async fn dispatch_request_as<R: Runtime>(
             crate::web_remote::control_pair(app, name)
                 .and_then(|res| serde_json::to_value(res).map_err(|error| error.to_string()))
         }
+        // Review and approve the MCP servers a project's own files define
+        // (`codemux mcp-approve`). Paired devices cannot approve, so this is
+        // how a headless `serve` host does.
+        "mcp_project_approval" => {
+            #[derive(Deserialize)] #[serde(deny_unknown_fields)]
+            struct Args { path: String, #[serde(default)] fingerprint: Option<String> }
+            match serde_json::from_value::<Args>(request.params.clone()) {
+                Ok(args) => crate::commands::mcp::project_approval(
+                    app,
+                    std::path::Path::new(&args.path),
+                    args.fingerprint.as_deref(),
+                )
+                .await,
+                Err(error) => Err(error.to_string()),
+            }
+        }
         // The live remote-access status (`codemux connect status`): what is
         // actually bound and registered, not just what the config says.
         "web_remote_status" => {

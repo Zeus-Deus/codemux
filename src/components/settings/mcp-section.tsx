@@ -303,6 +303,8 @@ function ServerRow({
   const isCodemuxSelf = server.id === MCP_CODEMUX_SELF_ID;
   const approval =
     runtime?.status.kind === "needsApproval" && !disabled ? runtime.status : null;
+  // Paired devices get no fingerprint: approving happens on the host.
+  const approveFingerprint = approval?.fingerprint ?? null;
 
   const reportFailure = (verb: "start" | "stop" | "restart" | "approve") => (err: unknown) => {
     console.warn(`[mcp] ${verb} ${server.id} failed:`, err);
@@ -386,20 +388,33 @@ function ServerRow({
             </span>
           )}
         </div>
+        {/* While it waits, the whole definition shows, wrapped, so nothing
+            the approval covers hides past the row's edge. */}
         <p
-          className="mt-0.5 truncate font-mono text-label text-muted-foreground"
-          title={approval?.summary}
+          className={cn(
+            "mt-0.5 font-mono text-label text-muted-foreground",
+            approval?.summary ? "whitespace-pre-wrap break-words" : "truncate",
+          )}
           data-testid={`mcp-row-${server.id}-command`}
         >
-          {approval ? approval.summary : commandPreview(server)}
+          {approval?.summary ?? commandPreview(server)}
         </p>
+        {approval && !approveFingerprint && (
+          <p
+            className="mt-0.5 text-caption text-muted-foreground"
+            data-testid={`mcp-row-${server.id}-approve-on-host`}
+          >
+            Approve it on the host computer: in Settings there, or with{" "}
+            <code className="font-mono">codemux mcp-approve</code> in the project folder.
+          </p>
+        )}
       </div>
-      {approval && (
+      {approveFingerprint && (
         <Button
           variant="outline"
           size="sm"
           onClick={() =>
-            void approveMcpServer(server.id, approval.fingerprint).catch(
+            void approveMcpServer(server.id, approveFingerprint).catch(
               reportFailure("approve"),
             )
           }

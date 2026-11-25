@@ -985,6 +985,17 @@ impl McpRegistry {
                 }
             }
         };
+        self.approve_definition(app, config, fingerprint).await
+    }
+
+    /// Approve `config`, a definition the user reviewed as `fingerprint`
+    /// (in Settings or with `codemux mcp-approve` on the host), then start it.
+    pub async fn approve_definition<R: Runtime>(
+        &self,
+        app: &AppHandle<R>,
+        config: McpServerConfig,
+        fingerprint: &str,
+    ) -> Result<McpServerRuntime, String> {
         if super::project_trust::fingerprint(&config).as_deref() != Some(fingerprint) {
             return Err("This server changed. Refresh and review it again.".into());
         }
@@ -1409,15 +1420,14 @@ fn now_ms() -> i64 {
 /// `Vec<McpServerConfig>` suitable for spawning. Identical definitions from
 /// multiple providers are deduplicated before launch so Codemux owns one
 /// child/connection and one stable tool namespace for all adapters.
-/// Project-sourced entries carry the canonical project root their approval
-/// is keyed by.
+/// Project-sourced entries carry the project root their approval is keyed
+/// by (see [`super::project_trust::approval_root`]).
 pub(crate) fn discover_configs(project_root: Option<&std::path::Path>) -> Vec<McpServerConfig> {
     let mut out: Vec<McpServerConfig> = vec![codemux_self_config()];
 
     let project_path: Option<PathBuf> = project_root.map(|p| p.to_path_buf());
-    let canonical_root = project_path
-        .as_deref()
-        .map(|root| std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf()));
+    // Resolved only when the project defines a server: it can ask Git.
+    let approval_root = std::cell::OnceCell::new();
     let scan = enumerate_mcp_paths(project_path.as_deref());
     let own = PathBuf::from(crate::mcp_server::codemux_mcp_command());
 
@@ -1444,7 +1454,9 @@ pub(crate) fn discover_configs(project_root: Option<&std::path::Path>) -> Vec<Mc
                         continue;
                     }
                     if super::is_project_source(source) {
-                        srv.project_root = canonical_root.clone();
+                        srv.project_root = approval_root
+                            .get_or_init(|| project_path.as_deref().map(super::project_trust::approval_root))
+                            .clone();
                     }
                     out.push(srv);
                 }
@@ -2586,6 +2598,126 @@ mod project_trust_tests {
             .await;
         assert!(!matches!(row.status, McpServerStatus::NeedsApproval { .. }), "{row:?}");
         assert!(appears(&marker).await);
+        reg.shutdown_all().await;
+    }
+
+    fn git(dir: &std::path::Path, args: &[&str]) {
+        let status = std::process::Command::new("git")
+            .args(["-c", "user.name=t", "-c", "user.email=t@example.test", "-c", "commit.gpgsign=false"])
+            .args(args)
+            .current_dir(dir)
+            .status()
+            .unwrap();
+        assert!(status.success(), "git {args:?}");
+    }
+
+    /// A worktree workspace primes its own folder, and Settings lists that
+    /// same folder, so its row can be approved there. The approval belongs
+    /// to the project, so the next worktree of it starts the same server,
+    /// while a folder whose `.git` file merely points at the repository
+    /// does not.
+    #[tokio::test]
+    async fn worktrees_share_their_project_approvals() {
+        let (repo, worktrees, scratch) = (
+            tempfile::tempdir().unwrap(),
+            tempfile::tempdir().unwrap(),
+            tempfile::tempdir().unwrap(),
+        );
+        git(repo.path(), &["init", "-q", "-b", "main"]);
+        git(repo.path(), &["commit", "-q", "--allow-empty", "-m", "first"]);
+        let (first, second) = (worktrees.path().join("first"), worktrees.path().join("second"));
+        for (path, branch) in [(&first, "first"), (&second, "second")] {
+            git(repo.path(), &["worktree", "add", "-q", "-b", branch, path.to_str().unwrap()]);
+        }
+        let fake = worktrees.path().join("fake");
+        std::fs::create_dir(&fake).unwrap();
+        std::fs::write(
+            fake.join(".git"),
+            format!("gitdir: {}/.git/worktrees/fake\n", repo.path().display()),
+        )
+        .unwrap();
+        let marker = scratch.path().join("ran");
+        for root in [&first, &second, &fake] {
+            write_project(root, serde_json::json!({ "lint": touch_server(&marker) }));
+        }
+        let app = app();
+        app.manage(McpRegistry::new());
+        let handle = app.handle();
+        let reg = app.state::<McpRegistry>();
+
+        // Chat priming of the first worktree's folder.
+        let in_first = discovered(&first, "lint");
+        let canonical_repo = std::fs::canonicalize(repo.path()).unwrap();
+        assert_eq!(in_first.project_root.as_deref(), Some(canonical_repo.as_path()));
+        let row = reg.ensure_started(Some(handle), in_first.clone()).await;
+        let fingerprint = shown_fingerprint(&row);
+        // Settings' start toggle for the same folder still starts nothing.
+        let row = crate::commands::start_mcp_server_cmd(
+            handle.clone(),
+            app.state(),
+            in_first.id.clone(),
+            Some(first.display().to_string()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(shown_fingerprint(&row), fingerprint);
+        assert!(!appears(&marker).await, "the project command ran before approval");
+
+        crate::commands::approve_mcp_server(handle.clone(), app.state(), in_first.id.clone(), fingerprint)
+            .await
+            .unwrap();
+        assert!(appears(&marker).await, "the approved command did not start");
+        reg.shutdown_all().await;
+        std::fs::remove_file(&marker).unwrap();
+
+        let in_second = discovered(&second, "lint");
+        assert_ne!(in_second.id, in_first.id);
+        let row = reg.ensure_started(Some(handle), in_second).await;
+        assert!(!matches!(row.status, McpServerStatus::NeedsApproval { .. }), "{row:?}");
+        assert!(appears(&marker).await, "the second worktree asked again");
+        reg.shutdown_all().await;
+        std::fs::remove_file(&marker).unwrap();
+
+        let in_fake = discovered(&fake, "lint");
+        assert_eq!(
+            in_fake.project_root.as_deref(),
+            Some(std::fs::canonicalize(&fake).unwrap().as_path())
+        );
+        shown_fingerprint(&reg.ensure_started(Some(handle), in_fake).await);
+        assert!(!appears(&marker).await, "an unregistered folder borrowed the approval");
+    }
+
+    /// An approved server keeps running when its file changes, and the
+    /// changed definition neither replaces it nor starts beside it.
+    #[tokio::test]
+    async fn a_changed_definition_does_not_start_beside_the_approved_one() {
+        let (project, scratch) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let fixture = format!("{}/tests/fixtures/plugin_mcp.py", env!("CARGO_MANIFEST_DIR"));
+        let server = |pid_file: &std::path::Path| {
+            serde_json::json!({
+                "command": "python3",
+                "args": [fixture, "--pid-file", pid_file.display().to_string()],
+            })
+        };
+        let (old_pid, new_pid) = (scratch.path().join("old"), scratch.path().join("new"));
+        write_project(project.path(), serde_json::json!({ "fixture": server(&old_pid) }));
+        let app = app();
+        let reg = McpRegistry::new();
+        let config = discovered(project.path(), "fixture");
+        let row = reg.ensure_started(Some(app.handle()), config.clone()).await;
+        let row = reg
+            .approve_project_server(app.handle(), &config.id, &shown_fingerprint(&row))
+            .await
+            .unwrap();
+        assert!(matches!(row.status, McpServerStatus::Running { .. }), "{row:?}");
+
+        write_project(project.path(), serde_json::json!({ "fixture": server(&new_pid) }));
+        let row = reg
+            .ensure_started(Some(app.handle()), discovered(project.path(), "fixture"))
+            .await;
+        assert!(matches!(row.status, McpServerStatus::Running { .. }), "{row:?}");
+        assert!(old_pid.exists());
+        assert!(!appears(&new_pid).await, "the changed definition started");
         reg.shutdown_all().await;
     }
 }

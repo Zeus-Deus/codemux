@@ -1136,7 +1136,8 @@ const MOCK_MCP_RUNTIMES: McpServerRuntime[] = [
     status: {
       kind: "needsApproval",
       fingerprint: "mock-fingerprint",
-      summary: "node scripts/lint-mcp.js --fix",
+      summary:
+        "node scripts/lint-mcp.js --fix · env LINT_CACHE=.cache/lint · cwd ./tools",
     },
     toolsCount: 0,
     errorMessage: null,

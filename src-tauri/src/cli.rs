@@ -94,6 +94,18 @@ pub enum CommandSet {
         #[arg(long, value_enum, value_name = "LEVEL")]
         access: Option<args::AccessArg>,
     },
+    /// Review the MCP servers a project's own files define (`.mcp.json`,
+    /// `.cursor/mcp.json`, `.codemux/mcp.json`, `opencode.json`) and approve
+    /// one to run on this computer. Lists what waits for approval; with
+    /// `--fingerprint`, approves that exact definition and starts it.
+    /// Settings does the same on the desktop.
+    McpApprove {
+        /// The project folder or worktree (default: the current directory).
+        path: Option<std::path::PathBuf>,
+        /// The fingerprint the list printed for the server to approve.
+        #[arg(long)]
+        fingerprint: Option<String>,
+    },
     /// Send a notification to the user
     Notify { message: String },
     /// Generate a project handoff summary
@@ -511,6 +523,29 @@ where
 /// Print a control reply as the legacy verbs always have, failing the
 /// process when it is not ok. The reply still goes to stdout either way, so
 /// scripts keep reading the error from it.
+/// `codemux mcp-approve` output: each waiting server's full definition and
+/// the command that approves it, or what was approved.
+fn print_mcp_approval(path: &std::path::Path, data: &Value) {
+    if let Some(name) = data.get("approved").and_then(Value::as_str) {
+        let status = data.pointer("/status/kind").and_then(Value::as_str).unwrap_or("unknown");
+        println!("Approved {name} for this project on this computer. Status: {status}.");
+        return;
+    }
+    let pending = data.get("pending").and_then(Value::as_array).cloned().unwrap_or_default();
+    if pending.is_empty() {
+        println!("No MCP servers from {}'s own files wait for approval.", path.display());
+        return;
+    }
+    let quoted = crate::ssh::exec::sh_quote(&path.to_string_lossy());
+    for server in pending {
+        let field = |key: &str| server.get(key).and_then(Value::as_str).unwrap_or_default().to_string();
+        println!("{} waits for approval. Approving runs:", field("name"));
+        println!("  {}", field("summary"));
+        println!("  To approve: codemux mcp-approve {quoted} --fingerprint {}", field("fingerprint"));
+        println!();
+    }
+}
+
 fn print_response(response: &ControlResponse) -> Result<Exit, String> {
     write_response(&mut std::io::stdout().lock(), response)
 }
@@ -535,6 +570,7 @@ impl CommandSet {
             | CommandSet::Connector { .. }
             | CommandSet::Mcp { .. }
             | CommandSet::Notify { .. }
+            | CommandSet::McpApprove { .. }
             | CommandSet::Handoff
             | CommandSet::Memory { .. }
             | CommandSet::Index { .. }
@@ -641,6 +677,30 @@ async fn run_control_cli(cli: Cli) -> Result<Exit, String> {
             })
             .await?;
             print_response(&response)
+        }
+        Some(CommandSet::McpApprove { path, fingerprint }) => {
+            let path = match path {
+                Some(path) => path,
+                None => std::env::current_dir().map_err(|error| error.to_string())?,
+            };
+            let path = std::fs::canonicalize(&path)
+                .map_err(|error| format!("{}: {error}", path.display()))?;
+            let mut params = json!({ "path": path });
+            if let Some(fingerprint) = &fingerprint {
+                params["fingerprint"] = json!(fingerprint);
+            }
+            let response = send_control_request(ControlRequest {
+                command: "mcp_project_approval".into(),
+                params,
+            })
+            .await?;
+            if !response.ok {
+                return Err(response
+                    .error
+                    .unwrap_or_else(|| "Unknown error from control endpoint".to_string()));
+            }
+            print_mcp_approval(&path, &response.data.unwrap_or(json!(null)));
+            Ok(Exit::Done)
         }
         Some(CommandSet::Handoff) => {
             let response = send_control_request(ControlRequest {

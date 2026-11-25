@@ -449,6 +449,19 @@ pub(super) fn plugin_mcp_row(row: &Value) -> bool {
         .is_some_and(|sources| sources.iter().any(|source| source == "plugin"))
 }
 
+/// A runtime row as paired devices see it. A project server waiting for
+/// approval carries its full command line, URL and environment, which stay
+/// on this computer like the redacted server list's; approving happens
+/// there too (Settings, or `codemux mcp-approve` on a headless host).
+pub(super) fn redact_remote_mcp_row(row: &mut Value) {
+    if let Some(status) = row.get_mut("status").and_then(Value::as_object_mut) {
+        if status.get("kind").and_then(Value::as_str) == Some("needsApproval") {
+            status.remove("summary");
+            status.remove("fingerprint");
+        }
+    }
+}
+
 fn remote_mcp_response(command: &str, body: InvokeResponseBody) -> InvokeResponseBody {
     if matches!(
         command,
@@ -457,6 +470,7 @@ fn remote_mcp_response(command: &str, body: InvokeResponseBody) -> InvokeRespons
         if let InvokeResponseBody::Json(ref text) = body {
             if let Ok(mut rows) = serde_json::from_str::<Vec<Value>>(text) {
                 rows.retain(|row| !plugin_mcp_row(row));
+                rows.iter_mut().for_each(redact_remote_mcp_row);
                 return InvokeResponseBody::Json(serde_json::to_string(&rows).unwrap());
             }
         }
@@ -813,6 +827,21 @@ mod plugins_boundary_tests {
             assert_eq!(
                 serde_json::from_str::<Value>(&body).unwrap(),
                 json!([{"id":"user"}])
+            );
+        }
+    }
+    #[test]
+    fn project_server_definitions_stay_on_this_computer() {
+        let waiting = json!({"id":"repo","status":{"kind":"needsApproval","fingerprint":"fp","summary":"node x.js --api-key sk-1 · env TOKEN=t"}});
+        let running = json!({"id":"user","status":{"kind":"running","toolCount":2}});
+        for command in ["get_mcp_runtime_status", "prime_mcp_runtime"] {
+            let body = InvokeResponseBody::Json(json!([waiting, running]).to_string());
+            let InvokeResponseBody::Json(body) = remote_mcp_response(command, body) else {
+                panic!("JSON expected");
+            };
+            assert_eq!(
+                serde_json::from_str::<Value>(&body).unwrap(),
+                json!([{"id":"repo","status":{"kind":"needsApproval"}}, running])
             );
         }
     }

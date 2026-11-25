@@ -1527,6 +1527,10 @@ export function SettingsView() {
     return st?.workspaces.find((w) => w.workspace_id === selectActiveWorkspaceId(s));
   });
   const projectRoot = activeWorkspace?.project_root ?? null;
+  // MCP lists the folder chat sessions prime, which for a worktree is the
+  // worktree itself, so its project servers show up here to approve.
+  const mcpRoot =
+    (activeWorkspace && !activeWorkspace.host_id && activeWorkspace.cwd) || projectRoot;
   // Projects edits any known project, defaulting to the active one, so a
   // Settings visit from Home or another project still has a target.
   const workspaces = useAppStore((s) => s.appState?.workspaces);
@@ -2708,7 +2712,7 @@ export function SettingsView() {
         );
 
       case "mcp":
-        return <McpSection projectRoot={projectRoot} />;
+        return <McpSection projectRoot={mcpRoot} />;
 
       case "archive":
         return (

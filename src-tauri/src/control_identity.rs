@@ -305,6 +305,8 @@ socket_commands! {
         "agent_connector_set_config", "agent_connector_approve", "agent_connector_deny",
         "agent_connector_revoke", "agent_connector_issue", "agent_connector_revoke_all",
         "delegation_authorize", "delegation_revoke", "delegation_respond",
+        // Lets a repository's MCP server definitions run as the person.
+        "mcp_project_approval",
     ],
 }
 
