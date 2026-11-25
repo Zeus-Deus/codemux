@@ -4,10 +4,10 @@ import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 
 const mockOpenExternalUrl = vi.hoisted(() => vi.fn().mockResolvedValue("browser"));
 const mockOpenUrl = vi.hoisted(() => vi.fn().mockResolvedValue(undefined));
-const mockTauri = vi.hoisted(() => ({ enabled: false }));
+const mockTauri = vi.hoisted(() => ({ enabled: false, assetPrefix: "mock-asset:" }));
 
 vi.mock("@tauri-apps/api/core", () => ({
-  convertFileSrc: (path: string) => `mock-asset:${path}`,
+  convertFileSrc: (path: string) => `${mockTauri.assetPrefix}${path}`,
   isTauri: () => mockTauri.enabled,
 }));
 vi.mock("@/lib/open-url", () => ({ openExternalUrl: mockOpenExternalUrl }));
@@ -20,6 +20,7 @@ afterEach(() => {
   mockOpenExternalUrl.mockClear();
   mockOpenUrl.mockClear();
   mockTauri.enabled = false;
+  mockTauri.assetPrefix = "mock-asset:";
 });
 
 describe("MarkdownRendered", () => {
@@ -146,6 +147,33 @@ describe("MarkdownRendered", () => {
     expect(mockOpenExternalUrl).not.toHaveBeenCalled();
   });
 
+  it("does not follow a wrapping link from the image trigger or dialog backdrop", () => {
+    const { getByRole } = render(
+      <MarkdownRendered
+        content="[![Diagram](https://example.com/x.png)](https://example.com/page)"
+        filePath="/repo/README.md"
+      />,
+    );
+    const trigger = getByRole("button", { name: /diagram/i });
+    fireEvent(trigger, new MouseEvent("auxclick", {
+      bubbles: true,
+      cancelable: true,
+      button: 1,
+    }));
+    expect(mockOpenExternalUrl).not.toHaveBeenCalled();
+    fireEvent.click(trigger);
+    const overlay = document.querySelector('[data-slot="alert-dialog-overlay"]');
+    expect(overlay).not.toBeNull();
+    fireEvent(overlay!, new MouseEvent("auxclick", {
+      bubbles: true,
+      cancelable: true,
+      button: 1,
+    }));
+    fireEvent.click(overlay!);
+    expect(mockOpenExternalUrl).not.toHaveBeenCalled();
+    expect(mockOpenUrl).not.toHaveBeenCalled();
+  });
+
   it("leaves data URIs alone", () => {
     const { container } = render(
       <MarkdownRendered
@@ -169,11 +197,24 @@ describe("MarkdownRendered", () => {
 
   it("previews the exact Windows asset host in Tauri", () => {
     mockTauri.enabled = true;
+    mockTauri.assetPrefix = "http://asset.localhost";
     const src = "http://asset.localhost/tmp/screenshot.png";
     const { container } = render(<MarkdownRendered content={`![Local](${src})`} />);
     expect(container.querySelector("img")?.getAttribute("src")).toBe(src);
     expect(mockOpenUrl).not.toHaveBeenCalled();
   });
+
+  it.each(["asset://localhost", "tauri://localhost"])(
+    "keeps the Windows asset URL inert when the native endpoint is %s",
+    (assetPrefix) => {
+      mockTauri.enabled = true;
+      mockTauri.assetPrefix = assetPrefix;
+      const src = "http://asset.localhost/tmp/screenshot.png";
+      const { container } = render(<MarkdownRendered content={`![Local](${src})`} />);
+      expect(container.querySelector("img")).toBeNull();
+      expect(screen.getByRole("button", { name: /local/i })).toBeInTheDocument();
+    },
+  );
 
   it("keeps the Windows asset host inert in a hosted browser", () => {
     const src = "http://asset.localhost/tmp/screenshot.png";
@@ -193,6 +234,7 @@ describe("MarkdownRendered", () => {
     "https://asset.localhost/tmp/screenshot.png",
   ])("keeps asset host lookalikes inert in Tauri: %s", (src) => {
     mockTauri.enabled = true;
+    mockTauri.assetPrefix = "http://asset.localhost";
     const { container } = render(<MarkdownRendered content={`![Remote](${src})`} />);
     expect(container.querySelector("img")).toBeNull();
     expect(screen.getByRole("button", { name: /remote/i })).toBeInTheDocument();

@@ -1,5 +1,5 @@
 import { memo, useCallback, useMemo, useState } from "react";
-import { isTauri } from "@tauri-apps/api/core";
+import { convertFileSrc, isTauri } from "@tauri-apps/api/core";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import { ExternalLink } from "lucide-react";
 import ReactMarkdown, { type Components } from "react-markdown";
@@ -104,9 +104,15 @@ function isRemoteImageSrc(src: string): boolean {
 }
 
 function isLocalAssetImageSrc(src: string): boolean {
-  // Tauri intercepts this exact Windows asset host. In a hosted browser,
-  // even this address could make an ordinary loopback network request.
-  return isTauri() && /^http:\/\/asset\.localhost(?=\/|[?#]|$)/i.test(src);
+  // Only the webview whose registered asset endpoint uses this HTTP origin
+  // may preview it. Other native platforms and hosted browsers would make a
+  // normal network request to this address.
+  if (!isTauri() || !/^http:\/\/asset\.localhost(?=\/|[?#]|$)/i.test(src)) return false;
+  try {
+    return webUrl(convertFileSrc("/__codemux_asset_probe__"))?.origin === "http://asset.localhost";
+  } catch {
+    return false;
+  }
 }
 
 function RemoteImageReference({ src, alt }: { src: string; alt: string }) {
@@ -129,6 +135,10 @@ function RemoteImageReference({ src, alt }: { src: string; alt: string }) {
           event.stopPropagation();
           setConfirmationOpen(true);
         }}
+        onAuxClick={(event) => {
+          event.preventDefault();
+          event.stopPropagation();
+        }}
       >
         <ExternalLink className="size-4 shrink-0" aria-hidden="true" />
         {alt ? `Open remote image: ${alt}` : "Open remote image"}
@@ -136,6 +146,10 @@ function RemoteImageReference({ src, alt }: { src: string; alt: string }) {
       <AlertDialogContent
         onClick={(event) => event.stopPropagation()}
         onAuxClick={(event) => event.stopPropagation()}
+        overlayProps={{
+          onClick: (event) => event.stopPropagation(),
+          onAuxClick: (event) => event.stopPropagation(),
+        }}
       >
         <AlertDialogHeader>
           <AlertDialogTitle>Open remote image?</AlertDialogTitle>
