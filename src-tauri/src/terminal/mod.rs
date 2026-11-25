@@ -1512,7 +1512,7 @@ fn windows_user_local_bin() -> Option<String> {
 }
 
 #[cfg(unix)]
-fn default_shell() -> String {
+pub(crate) fn default_shell() -> String {
     env::var("SHELL")
         .ok()
         .filter(|shell| !shell.trim().is_empty())
@@ -1520,7 +1520,7 @@ fn default_shell() -> String {
 }
 
 #[cfg(windows)]
-fn default_shell() -> String {
+pub(crate) fn default_shell() -> String {
     resolve_windows_shell(
         |cmd| which::which(cmd).ok().map(|p| p.display().to_string()),
         env::var("COMSPEC").ok(),
@@ -1565,8 +1565,9 @@ where
 fn ensure_cli_shims() -> Option<(String, String)> {
     let current_exe = std::env::current_exe().ok()?;
     let current_exe = current_exe.display().to_string();
-    let shim_dir = std::env::temp_dir().join(format!("{}-cli-shims", crate::APP_DIR_NAME));
-    std::fs::create_dir_all(&shim_dir).ok()?;
+    // This directory goes first on PATH, so it must be one only this user
+    // can write: a shared /tmp path could be created first by someone else.
+    let shim_dir = crate::private_dir::user_private_dir("cli-shims").ok()?;
 
     let shim_path = shim_dir.join("codemux");
     let script = format!(
@@ -5004,6 +5005,23 @@ mod tests {
         // even when the pass-through chain is exercised.
         let result = build_child_path("/opt/codemux/shims", "");
         assert_eq!(result, "/opt/codemux/shims");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cli_shim_dir_is_private_and_not_in_shared_temp() {
+        use std::os::unix::fs::PermissionsExt;
+        let (shim_dir, _) = ensure_cli_shims().expect("shim dir");
+        let shim_dir = std::path::PathBuf::from(shim_dir);
+        assert_ne!(
+            shim_dir,
+            std::env::temp_dir().join(format!("{}-cli-shims", crate::APP_DIR_NAME)),
+        );
+        let mode = |path: &std::path::Path| {
+            std::fs::symlink_metadata(path).unwrap().permissions().mode() & 0o777
+        };
+        assert_eq!(mode(&shim_dir), 0o700);
+        assert_eq!(mode(&shim_dir.join("codemux")), 0o755);
     }
 
     #[cfg(windows)]

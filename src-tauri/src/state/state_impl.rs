@@ -5155,12 +5155,12 @@ impl AppStateStore {
             let session_id = SessionId(next_id("session"));
             let new_pane_id = PaneId(next_id("pane"));
             let split_pane_id = PaneId(next_id("pane"));
-            let cwd = snapshot
-                .workspaces
-                .get(workspace_index)
-                .map(|w| w.cwd.clone())
-                .unwrap_or_else(|| current_project_root().display().to_string());
-            let shell = env::var("SHELL").ok();
+            let cwd = workspace.cwd.clone();
+            let shell = if workspace.host_id.is_some() {
+                Some("bash".to_string())
+            } else {
+                env::var("SHELL").ok()
+            };
             let title = format!("Terminal {}", snapshot.terminal_sessions.len() + 1);
 
             snapshot.terminal_sessions.push(TerminalSessionSnapshot {
@@ -6372,7 +6372,11 @@ impl AppStateStore {
                 let pane_id = PaneId(next_id("pane"));
                 let session_id = SessionId(next_id("session"));
                 let cwd = workspace.cwd.clone();
-                let shell = env::var("SHELL").ok();
+                let shell = if workspace.host_id.is_some() {
+                    Some("bash".to_string())
+                } else {
+                    env::var("SHELL").ok()
+                };
 
                 workspace.surfaces.push(SurfaceSnapshot {
                     surface_id: surface_id.clone(),

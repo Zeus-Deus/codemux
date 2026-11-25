@@ -392,9 +392,7 @@ pub fn apply_preset<R: tauri::Runtime>(
             .commands
             .iter()
             .map(|cmd| {
-                let cmd =
-                    crate::agent_capability::apply_model_selection(cmd, model_selection.as_ref());
-                crate::agent_context::inject_agent_context(&cmd, &workspace_id)
+                crate::agent_capability::apply_model_selection(cmd, model_selection.as_ref())
             })
             .collect()
     };
@@ -424,9 +422,15 @@ pub fn apply_preset<R: tauri::Runtime>(
                     if command.is_empty() {
                         continue;
                     }
+                    let command = render_preset_command_for_session(
+                        &state,
+                        &workspace_id,
+                        &session_id,
+                        command,
+                    );
                     let (cmd, needs_pty_injection) = crate::branch_name::prepare_agent_command(
                         &preset_id,
-                        command,
+                        &command,
                         initial_prompt.as_deref(),
                     );
                     state.update_terminal_session_command(&session_id, command.clone());
@@ -446,7 +450,14 @@ pub fn apply_preset<R: tauri::Runtime>(
                 let combined = commands
                     .iter()
                     .filter(|c| !c.is_empty())
-                    .cloned()
+                    .map(|command| {
+                        render_preset_command_for_session(
+                            &state,
+                            &workspace_id,
+                            &session_id,
+                            command,
+                        )
+                    })
                     .collect::<Vec<_>>()
                     .join(" && ");
 
@@ -481,6 +492,12 @@ pub fn apply_preset<R: tauri::Runtime>(
                 terminal::spawn_pty_for_session(app.clone(), session_id.0.clone());
 
                 if !command.is_empty() {
+                    let command = render_preset_command_for_session(
+                        &state,
+                        &workspace_id,
+                        &session_id.0,
+                        command,
+                    );
                     state.update_terminal_session_command(&session_id.0, command.clone());
                     let sessions = sessions_arc.clone();
                     let sid = session_id.0.clone();
@@ -499,19 +516,20 @@ pub fn apply_preset<R: tauri::Runtime>(
                 .ok_or_else(|| format!("Workspace not found: {workspace_id}"))?;
             let session_ids = crate::state::collect_terminal_sessions(&ws.surfaces);
 
-            let combined = commands
-                .iter()
-                .filter(|c| !c.is_empty())
-                .cloned()
-                .collect::<Vec<_>>()
-                .join(" && ");
+            for sid in session_ids {
+                let combined = commands
+                    .iter()
+                    .filter(|c| !c.is_empty())
+                    .map(|command| {
+                        render_preset_command_for_session(&state, &workspace_id, &sid, command)
+                    })
+                    .collect::<Vec<_>>()
+                    .join(" && ");
 
-            if !combined.is_empty() {
-                for sid in session_ids {
+                if !combined.is_empty() {
                     state.update_terminal_session_command(&sid, combined.clone());
                     let sessions = sessions_arc.clone();
-                    let cmd = combined.clone();
-                    write_command_when_ready(sessions, sid, cmd, 120);
+                    write_command_when_ready(sessions, sid, combined, 120);
                 }
             }
         }
@@ -529,6 +547,12 @@ pub fn apply_preset<R: tauri::Runtime>(
                     terminal::spawn_pty_for_session(app.clone(), session_id.0.clone());
 
                     if !command.is_empty() {
+                        let command = render_preset_command_for_session(
+                            &state,
+                            &workspace_id,
+                            &session_id.0,
+                            command,
+                        );
                         state.update_terminal_session_command(&session_id.0, command.clone());
                         let sessions = sessions_arc.clone();
                         let sid = session_id.0.clone();
@@ -542,6 +566,16 @@ pub fn apply_preset<R: tauri::Runtime>(
 
     crate::state::emit_app_state(&app);
     Ok(())
+}
+
+fn render_preset_command_for_session(
+    state: &AppStateStore,
+    workspace_id: &str,
+    session_id: &str,
+    command: &str,
+) -> String {
+    let shell = crate::agent_context::launch_shell_for_session(state, workspace_id, session_id);
+    crate::agent_context::inject_agent_context(command, workspace_id, &shell)
 }
 
 /// Open a terminal tab in `workspace_id` that runs `provider`'s login
@@ -1013,6 +1047,64 @@ mod tests {
         let mock_writer: Box<dyn Write + Send> = Box::new(Vec::<u8>::new());
         runtime.writer = Some(mock_writer);
         guard.insert(session_id.to_string(), runtime);
+    }
+
+    #[test]
+    fn existing_panes_render_for_each_recorded_shell() {
+        let state = AppStateStore::default();
+        let workspace = state.create_workspace();
+        let snapshot = state.snapshot();
+        let fish_session =
+            crate::state::collect_terminal_sessions(&snapshot.workspaces[0].surfaces)
+                .into_iter()
+                .next()
+                .unwrap();
+        let (_, bash_session) = state
+            .create_tab(&workspace.0, crate::state::TabKind::Terminal)
+            .unwrap();
+        let bash_session = bash_session.unwrap().0;
+        assert!(state.update_terminal_session_shell(&fish_session, "/usr/bin/fish".into(), true));
+        assert!(state.update_terminal_session_shell(&bash_session, "bash".into(), true));
+
+        let fish =
+            render_preset_command_for_session(&state, &workspace.0, &fish_session, "gemini --yolo");
+        let bash =
+            render_preset_command_for_session(&state, &workspace.0, &bash_session, "gemini --yolo");
+        assert!(fish.starts_with("begin\n"), "{fish}");
+        assert!(bash.starts_with("cmx_file=$("), "{bash}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn fresh_remote_tabs_and_splits_render_for_bash_on_a_fish_desktop() {
+        const TEST: &str = "commands::presets::tests::fresh_remote_tabs_and_splits_render_for_bash_on_a_fish_desktop";
+        if crate::test_isolation::isolated(TEST) {
+            return;
+        }
+        std::env::set_var("SHELL", "/usr/bin/fish");
+        let state = AppStateStore::default();
+        let workspace = state.create_remote_attach_workspace(
+            "remote-svc".into(),
+            7,
+            "/srv/agent/work/svc".into(),
+            None,
+            None,
+            None,
+            None,
+        );
+        let (_, tab_session) = state.create_tab(&workspace.0, crate::state::TabKind::Terminal).unwrap();
+        let pane = active_pane_for_workspace(&state, &workspace.0).unwrap();
+        let split_session = state
+            .split_pane_with_selection(&pane, crate::state::SplitDirection::Horizontal, true)
+            .unwrap();
+
+        for session in [tab_session.unwrap().0, split_session.0] {
+            let snapshot = state.snapshot();
+            let shell = snapshot.terminal_sessions.iter().find(|terminal| terminal.session_id.0 == session).unwrap();
+            assert_eq!(shell.shell.as_deref(), Some("bash"));
+            let command = render_preset_command_for_session(&state, &workspace.0, &session, "gemini --yolo");
+            assert!(command.starts_with("cmx_file=$("), "{command}");
+        }
     }
 
     #[test]

@@ -65,6 +65,7 @@ pub mod os_input;
 pub mod plugins;
 pub mod ports;
 pub mod presets;
+pub mod private_dir;
 pub mod provider_accounts;
 pub mod project;
 // The PTY daemon is Unix-only for now. Windows builds get the in-process

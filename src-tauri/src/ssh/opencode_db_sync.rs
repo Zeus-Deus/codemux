@@ -117,56 +117,112 @@ pub(crate) fn parse_sid_marker(stdout: &str) -> Option<String> {
         .map(str::to_string)
 }
 
+/// Owner-only folder on the remote host where bundles wait between the SSH
+/// steps of one transfer. Bundles are whole transcripts, so they never go in
+/// the shared `/tmp`, where other users could read them or plant the name.
+const REMOTE_BUNDLE_DIR: &str = "~/.codemux-opencode-sync";
+
+/// The same ancestor check is run on the remote before creation, reads, and
+/// deletion. Cleanup never creates a directory if the path has changed.
+fn remote_bundle_dir_guard(create: bool) -> String {
+    crate::private_dir::shell_private_dir_guard(&[".codemux-opencode-sync"], create)
+}
+
+/// A shell command that checks the remote directory, then performs a single
+/// operation on one bundle. The filename is restricted to literal shell-safe
+/// characters before it is put into the script.
+fn remote_bundle_command(
+    remote_path: &str,
+    create: bool,
+    operation: &str,
+) -> Result<String, String> {
+    let name = remote_bundle_name(remote_path)
+        .ok_or_else(|| format!("not an OpenCode sync bundle: {remote_path}"))?;
+    let script = format!(
+        "{}cmx_file=\"$cmx_dir/{name}\"\n{operation}\n",
+        remote_bundle_dir_guard(create),
+    );
+    Ok(format!("sh -c {}", shell_sq(&script)))
+}
+
+fn remote_bundle_cleanup_command(remote_path: &str) -> Result<String, String> {
+    remote_bundle_command(remote_path, false, "rm -f \"$cmx_file\"")
+}
+
 /// Login-shell script (fed to `bash -ls` over stdin) that imports a
 /// transferred bundle so the session associates with `remote_cwd`, then
 /// removes the bundle. Exits with `opencode import`'s status so the caller
 /// can tell success from failure.
 pub(crate) fn remote_import_script(remote_cwd: &str, remote_bundle: &str) -> String {
-    // `mkdir -p` defends against the rare case where the workspace dir
-    // isn't there yet (the push rsync normally creates it first); `cd` is
-    // load-bearing because `opencode import` derives the session directory
-    // from the process cwd.
+    // The exit trap checks the directory again before removing the bundle,
+    // including after the early `exit 3`. `mkdir -p` defends against the rare case where the
+    // workspace dir isn't there yet (the push rsync normally creates it
+    // first); `cd` is load-bearing because `opencode import` derives the
+    // session directory from the process cwd.
+    let cleanup =
+        remote_bundle_cleanup_command(remote_bundle).expect("bundle path is generated locally");
+    let import = remote_bundle_command(
+        remote_bundle,
+        false,
+        "[ -f \"$cmx_file\" ] && [ ! -L \"$cmx_file\" ] || exit 4\nopencode import \"$cmx_file\" 2>&1",
+    )
+    .expect("bundle path is generated locally");
     format!(
-        "mkdir -p {cwd} && cd {cwd} || exit 3\n\
-         opencode import {bundle} 2>&1\n\
+        "codemux_cleanup() {{ {cleanup} || :; }}\n\
+         trap codemux_cleanup EXIT\n\
+         mkdir -p {cwd} && cd {cwd} || exit 3\n\
+         {import}\n\
          rc=$?\n\
-         rm -f {bundle}\n\
          exit $rc\n",
         cwd = shell_sq(remote_cwd),
-        bundle = shell_sq(remote_bundle),
     )
 }
 
 /// Login-shell script that finds the newest root session for `remote_cwd`
 /// and exports it to `remote_bundle`, echoing `CMX_OC_SID=<id>` so the
-/// caller knows the id and that a bundle was written. Always exits 0 — the
-/// absence of the marker means "nothing to pull" (no session, or opencode
-/// not on the host), not a transport error.
+/// caller knows the id and that a bundle was written. The absence of the
+/// marker means "nothing to pull" (no session or a failed export); an unsafe
+/// bundle directory exits unsuccessfully so the caller can report it.
 pub(crate) fn remote_extract_script(remote_cwd: &str, remote_bundle: &str) -> String {
     // Build the query with the shared SQL helper (which SQL-escapes the
     // directory) and pass it as a single shell-quoted argument. Splicing the
     // path through a `$dir` shell variable into the SQL literal would break
     // the query for any path containing an apostrophe (e.g. /Users/O'Brien/…),
     // silently yielding "nothing to pull".
+    // A failed export removes its partial bundle; a lost SSH connection is
+    // handled by the caller's bounded cleanup attempt.
+    let name = remote_bundle_name(remote_bundle).expect("bundle path is generated locally");
+    let prep = remote_bundle_dir_guard(true);
+    let cleanup =
+        remote_bundle_cleanup_command(remote_bundle).expect("bundle path is generated locally");
     format!(
         "sid=$(opencode db {sql} 2>/dev/null | grep -m1 '^ses_')\n\
          if [ -n \"$sid\" ]; then\n\
-           opencode export \"$sid\" > {bundle} 2>/dev/null && echo \"CMX_OC_SID=$sid\"\n\
+           {prep}cmx_file=\"$cmx_dir/{name}\"\n\
+           set -C\n\
+           if opencode export \"$sid\" > \"$cmx_file\" 2>/dev/null; then echo \"CMX_OC_SID=$sid\"; else {cleanup} || :; fi\n\
          fi\n",
         sql = shell_sq(&newest_session_sql(remote_cwd)),
-        bundle = shell_sq(remote_bundle),
     )
 }
 
-/// Unique `/tmp` path on the remote for one transfer. No `Math.random`
-/// available; the nanosecond clock + pid is plenty unique for a transient
-/// file we delete immediately.
+/// Unique path in [`REMOTE_BUNDLE_DIR`] for one transfer. The nanosecond
+/// clock + pid is plenty unique for a transient file we delete immediately.
 fn unique_remote_bundle() -> String {
-    format!("/tmp/codemux-opencode-{}.json", unique_token())
+    format!(
+        "{REMOTE_BUNDLE_DIR}/codemux-opencode-{}.json",
+        unique_token()
+    )
 }
 
-fn unique_local_bundle() -> PathBuf {
-    std::env::temp_dir().join(format!("codemux-opencode-{}.json", unique_token()))
+/// A new owner-only local bundle with a random name, removed when dropped so
+/// every early return cleans it up.
+fn local_bundle() -> Result<tempfile::NamedTempFile, String> {
+    tempfile::Builder::new()
+        .prefix("codemux-opencode-")
+        .suffix(".json")
+        .tempfile()
+        .map_err(|e| format!("create local bundle: {e}"))
 }
 
 fn unique_token() -> String {
@@ -215,28 +271,37 @@ pub async fn sync_opencode_session(
     let session_id = match local_newest_session_id(&bin, &dir).await? {
         Some(id) => id,
         None => {
-            eprintln!(
-                "[hosts] no local OpenCode session for {dir}; skipping OpenCode sync"
-            );
+            eprintln!("[hosts] no local OpenCode session for {dir}; skipping OpenCode sync");
             return Ok(None);
         }
     };
 
-    let local_bundle = unique_local_bundle();
+    let local_bundle = local_bundle()?;
     export_session_local(&bin, &session_id, &local_bundle).await?;
 
     let remote_bundle = unique_remote_bundle();
-    let upload = upload_file(ssh_target, &local_bundle, &remote_bundle).await;
-    let _ = std::fs::remove_file(&local_bundle);
+    let upload = upload_file(ssh_target, local_bundle.path(), &remote_bundle).await;
+    drop(local_bundle);
+    if upload.is_err() {
+        remove_remote_bundle(ssh_target, &remote_bundle).await;
+    }
     upload?;
 
     let script = remote_import_script(&remote_cwd.to_string_lossy(), &remote_bundle);
-    let (ok, output) = run_remote_login_script(ssh_target, &script).await?;
-    if !ok {
-        return Err(format!(
+    let import = match run_remote_login_script(ssh_target, &script).await {
+        Ok((true, _)) => Ok(()),
+        Ok((false, output)) => Err(format!(
             "remote `opencode import` failed: {}",
             output.trim()
-        ));
+        )),
+        Err(error) => Err(error),
+    };
+    if let Err(error) = import {
+        // A non-zero exit also covers ssh itself failing (say the connection
+        // dropped) before the script's exit trap ran, so try once more and
+        // report the original failure.
+        remove_remote_bundle(ssh_target, &remote_bundle).await;
+        return Err(error);
     }
     eprintln!(
         "[hosts] synced OpenCode session {session_id} → {ssh_target}:{}",
@@ -265,15 +330,25 @@ pub async fn pull_opencode_session(
         return Ok(None);
     };
 
+    // Created before the remote export so a local failure cannot strand the
+    // exported transcript on the host.
+    let local_bundle = local_bundle()?;
     let remote_bundle = unique_remote_bundle();
     let script = remote_extract_script(&remote_cwd.to_string_lossy(), &remote_bundle);
-    let (ok, output) = run_remote_login_script(ssh_target, &script).await?;
-    if !ok {
-        return Err(format!(
-            "remote `opencode export` failed: {}",
-            output.trim()
-        ));
-    }
+    let output = match run_remote_login_script(ssh_target, &script).await {
+        Ok((true, output)) => output,
+        Ok((false, output)) => {
+            remove_remote_bundle(ssh_target, &remote_bundle).await;
+            return Err(format!(
+                "remote `opencode export` failed: {}",
+                output.trim()
+            ));
+        }
+        Err(error) => {
+            remove_remote_bundle(ssh_target, &remote_bundle).await;
+            return Err(error);
+        }
+    };
     let Some(session_id) = parse_sid_marker(&output) else {
         eprintln!(
             "[hosts] no remote OpenCode session at {}; skipping OpenCode pull-back",
@@ -282,14 +357,11 @@ pub async fn pull_opencode_session(
         return Ok(None);
     };
 
-    let local_bundle = unique_local_bundle();
-    let download = download_file(ssh_target, &remote_bundle, &local_bundle).await;
-    let _ = run_remote_rm(ssh_target, &remote_bundle).await;
+    let download = download_file(ssh_target, &remote_bundle, local_bundle.as_file()).await;
+    remove_remote_bundle(ssh_target, &remote_bundle).await;
     download?;
 
-    let import = import_session_local(&bin, local_cwd, &local_bundle).await;
-    let _ = std::fs::remove_file(&local_bundle);
-    import?;
+    import_session_local(&bin, local_cwd, local_bundle.path()).await?;
 
     eprintln!(
         "[hosts] pulled OpenCode session {session_id} back from {ssh_target} → {}",
@@ -300,10 +372,7 @@ pub async fn pull_opencode_session(
 
 // ── Local opencode invocations ─────────────────────────────────────────────
 
-async fn local_newest_session_id(
-    bin: &Path,
-    dir: &str,
-) -> Result<Option<String>, String> {
+async fn local_newest_session_id(bin: &Path, dir: &str) -> Result<Option<String>, String> {
     let out = Command::new(bin)
         .arg("db")
         .arg(newest_session_sql(dir))
@@ -325,10 +394,12 @@ async fn local_newest_session_id(
 async fn export_session_local(
     bin: &Path,
     session_id: &str,
-    out_path: &Path,
+    bundle: &tempfile::NamedTempFile,
 ) -> Result<(), String> {
-    let file = std::fs::File::create(out_path)
-        .map_err(|e| format!("create export bundle {}: {e}", out_path.display()))?;
+    let out_path = bundle.path();
+    let file = bundle
+        .reopen()
+        .map_err(|e| format!("open export bundle {}: {e}", out_path.display()))?;
     let status = Command::new(bin)
         .arg("export")
         .arg(session_id)
@@ -350,11 +421,7 @@ async fn export_session_local(
     }
 }
 
-async fn import_session_local(
-    bin: &Path,
-    cwd: &Path,
-    bundle: &Path,
-) -> Result<(), String> {
+async fn import_session_local(bin: &Path, cwd: &Path, bundle: &Path) -> Result<(), String> {
     // `import` derives the session's directory from the process cwd, so run
     // it from the workspace dir to associate the conversation locally.
     let out = Command::new(bin)
@@ -379,13 +446,10 @@ async fn import_session_local(
 // ── SSH transport helpers ──────────────────────────────────────────────────
 
 /// Upload a local file to `remote_path` via a `cat >` pipeline (same shape
-/// as the binary-bootstrap upload; `cat` is always on PATH and `/tmp` paths
-/// carry no tilde to expand).
-async fn upload_file(
-    ssh_target: &str,
-    local: &Path,
-    remote_path: &str,
-) -> Result<(), String> {
+/// as the binary-bootstrap upload; `cat` is always on PATH and the remote
+/// shell expands the path's `~/`).
+async fn upload_file(ssh_target: &str, local: &Path, remote_path: &str) -> Result<(), String> {
+    let upload = remote_bundle_command(remote_path, true, "set -C\ncat > \"$cmx_file\"")?;
     let data = tokio::fs::read(local)
         .await
         .map_err(|e| format!("read local bundle {}: {e}", local.display()))?;
@@ -395,10 +459,11 @@ async fn upload_file(
         .arg("-o")
         .arg("ConnectTimeout=10")
         .arg(ssh_target)
-        .arg(format!("cat > {}", shell_sq(remote_path)))
+        .arg(upload)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
+        .kill_on_drop(true)
         .spawn()
         .map_err(|e| format!("ssh upload spawn: {e}"))?;
     if let Some(mut stdin) = child.stdin.take() {
@@ -421,19 +486,24 @@ async fn upload_file(
     Ok(())
 }
 
-/// Download `remote_path` to a local file via `cat`.
+/// Download `remote_path` into `local` via `cat`.
 async fn download_file(
     ssh_target: &str,
     remote_path: &str,
-    local: &Path,
+    local: &std::fs::File,
 ) -> Result<(), String> {
+    let download = remote_bundle_command(
+        remote_path,
+        false,
+        "[ -f \"$cmx_file\" ] && [ ! -L \"$cmx_file\" ] && cat \"$cmx_file\"",
+    )?;
     let out = Command::new("ssh")
         .arg("-o")
         .arg("BatchMode=yes")
         .arg("-o")
         .arg("ConnectTimeout=10")
         .arg(ssh_target)
-        .arg(format!("cat {}", shell_sq(remote_path)))
+        .arg(download)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -447,34 +517,72 @@ async fn download_file(
             String::from_utf8_lossy(&out.stderr).trim()
         ));
     }
-    tokio::fs::write(local, &out.stdout)
-        .await
-        .map_err(|e| format!("write local bundle {}: {e}", local.display()))?;
+    std::io::Write::write_all(&mut &*local, &out.stdout)
+        .map_err(|e| format!("write local bundle: {e}"))?;
     Ok(())
 }
 
-/// Best-effort remote `rm -f`.
-async fn run_remote_rm(ssh_target: &str, remote_path: &str) -> Result<(), String> {
-    let _ = Command::new("ssh")
-        .arg("-o")
+/// Ceiling for one cleanup attempt. It runs after a failure, often on a
+/// connection that just dropped, so it must never stall the caller for long:
+/// the SSH connect itself already gets `ConnectTimeout=10`.
+const REMOTE_CLEANUP_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// Whether `path` names one bundle file directly inside [`REMOTE_BUNDLE_DIR`],
+/// the only remote files cleanup may delete.
+fn remote_bundle_name(path: &str) -> Option<&str> {
+    path.strip_prefix(REMOTE_BUNDLE_DIR)
+        .and_then(|rest| rest.strip_prefix('/'))
+        .filter(|name| {
+            !name.is_empty()
+                && !name.contains("..")
+                && name
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+        })
+}
+
+/// Best-effort removal of a remote bundle, bounded by
+/// [`REMOTE_CLEANUP_TIMEOUT`]. Refuses any path outside the bundle folder.
+async fn remove_remote_bundle(ssh_target: &str, remote_path: &str) {
+    let cleanup = match remote_bundle_cleanup_command(remote_path) {
+        Ok(command) => command,
+        Err(error) => {
+            eprintln!("[hosts] refusing to remove {remote_path}: {error}");
+            return;
+        }
+    };
+    let mut cmd = Command::new("ssh");
+    cmd.arg("-o")
         .arg("BatchMode=yes")
         .arg("-o")
         .arg("ConnectTimeout=10")
         .arg(ssh_target)
-        .arg(format!("rm -f {}", shell_sq(remote_path)))
-        .stdin(Stdio::null())
-        .status()
-        .await;
+        .arg(cleanup);
+    if let Err(error) = run_bounded(cmd, REMOTE_CLEANUP_TIMEOUT).await {
+        eprintln!("[hosts] could not remove remote bundle {remote_path}: {error}");
+    }
+}
+
+/// Run `cmd` to completion within `limit`, killing it if it runs over.
+async fn run_bounded(mut cmd: Command, limit: Duration) -> Result<(), String> {
+    cmd.stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .kill_on_drop(true);
+    let status = timeout(limit, cmd.status())
+        .await
+        .map_err(|_| format!("timed out after {}s", limit.as_secs_f32()))?
+        .map_err(|e| format!("spawn: {e}"))?;
+    if !status.success() {
+        return Err(format!("exited {status}"));
+    }
     Ok(())
 }
 
 /// Run a script on the remote via a **login** shell (`bash -ls`) so the
 /// user's PATH (where `opencode` lives) is in scope, feeding the script over
 /// stdin to avoid nested-quoting hazards. Returns `(exit_ok, stdout)`.
-async fn run_remote_login_script(
-    ssh_target: &str,
-    script: &str,
-) -> Result<(bool, String), String> {
+async fn run_remote_login_script(ssh_target: &str, script: &str) -> Result<(bool, String), String> {
     let mut child = Command::new("ssh")
         .arg("-o")
         .arg("BatchMode=yes")
@@ -485,6 +593,7 @@ async fn run_remote_login_script(
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
+        .kill_on_drop(true)
         .spawn()
         .map_err(|e| format!("ssh login-script spawn: {e}"))?;
     if let Some(mut stdin) = child.stdin.take() {
@@ -567,24 +676,255 @@ mod tests {
 
     #[test]
     fn remote_import_script_cds_then_imports_then_cleans_up() {
-        let s = remote_import_script("/home/me/ws", "/tmp/codemux-opencode-1.json");
+        let s = remote_import_script("/home/me/ws", "~/.codemux-opencode-sync/b1.json");
         assert!(s.contains("mkdir -p '/home/me/ws' && cd '/home/me/ws' || exit 3"));
-        assert!(s.contains("opencode import '/tmp/codemux-opencode-1.json'"));
-        assert!(s.contains("rm -f '/tmp/codemux-opencode-1.json'"));
+        assert!(s.contains("opencode import \"$cmx_file\""));
+        assert!(s.contains("rm -f \"$cmx_file\""));
+        assert!(s.contains("cmx_check_ancestor"));
+        // Cleanup is installed before anything can exit early.
+        assert!(s.starts_with("codemux_cleanup() {"), "{s}");
+        assert!(s.find("trap codemux_cleanup EXIT").unwrap() < s.find("|| exit 3").unwrap());
         // Propagates import's exit status so callers can detect failure.
         assert!(s.contains("exit $rc"));
     }
 
     #[test]
+    fn remote_import_script_removes_the_bundle_when_it_exits_early() {
+        let home = tempfile::tempdir().unwrap();
+        let bundle_dir = home.path().join(".codemux-opencode-sync");
+        std::fs::create_dir_all(&bundle_dir).unwrap();
+        std::fs::write(bundle_dir.join("b3.json"), "transcript").unwrap();
+        // A workspace path under a regular file can't be created, so `cd`
+        // fails and the script takes its `exit 3` path.
+        std::fs::write(home.path().join("file"), "").unwrap();
+        let script = remote_import_script(
+            &home.path().join("file/ws").to_string_lossy(),
+            "~/.codemux-opencode-sync/b3.json",
+        );
+        let status = std::process::Command::new("bash")
+            .arg("-c")
+            .arg(&script)
+            .env("HOME", home.path().canonicalize().unwrap())
+            .status()
+            .unwrap();
+        assert_eq!(status.code(), Some(3));
+        assert!(
+            !bundle_dir.join("b3.json").exists(),
+            "the transcript was left behind"
+        );
+    }
+
+    #[test]
+    fn remote_import_uses_verified_bundle_path_with_a_linked_home() {
+        use std::os::unix::fs::PermissionsExt;
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let real_home = root.join("real-home");
+        std::fs::create_dir(&real_home).unwrap();
+        let linked_home = root.join("linked-home");
+        std::os::unix::fs::symlink(&real_home, &linked_home).unwrap();
+        let bundle_dir = real_home.join(".codemux-opencode-sync");
+        std::fs::create_dir(&bundle_dir).unwrap();
+        let bundle = bundle_dir.join("linked.json");
+        std::fs::write(&bundle, "transcript").unwrap();
+        std::fs::set_permissions(&bundle, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let bin = real_home.join("bin");
+        std::fs::create_dir(&bin).unwrap();
+        let opencode = bin.join("opencode");
+        std::fs::write(
+            &opencode,
+            "#!/bin/sh\n[ \"$1\" = import ] || exit 10\n[ \"$2\" = \"$EXPECTED_BUNDLE\" ] || exit 11\n[ \"$(cat \"$2\")\" = transcript ] || exit 12\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&opencode, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let script = remote_import_script(
+            &real_home.join("workspace").to_string_lossy(),
+            "~/.codemux-opencode-sync/linked.json",
+        );
+        let out = std::process::Command::new("bash")
+            .arg("-c")
+            .arg(script)
+            .env("HOME", linked_home)
+            .env("EXPECTED_BUNDLE", &bundle)
+            .env(
+                "PATH",
+                format!("{}:{}", bin.display(), std::env::var("PATH").unwrap()),
+            )
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(!bundle.exists());
+    }
+
+    #[test]
     fn remote_extract_script_queries_then_exports_with_marker() {
-        let s = remote_extract_script("/home/me/ws", "/tmp/codemux-opencode-2.json");
+        let s = remote_extract_script("/home/me/ws", "~/.codemux-opencode-sync/b2.json");
         // The query is built by the shared SQL helper and passed as one
         // shell-quoted argument (no raw $dir splice into the SQL literal).
         assert!(s.contains(&shell_sq(&newest_session_sql("/home/me/ws"))));
         assert!(s.contains("opencode db"));
         assert!(s.contains("parent_id IS NULL"));
-        assert!(s.contains("opencode export \"$sid\" > '/tmp/codemux-opencode-2.json'"));
+        assert!(s.contains("opencode export \"$sid\" > \"$cmx_file\""));
         assert!(s.contains("echo \"CMX_OC_SID=$sid\""));
+        // A failed export leaves no partial transcript behind.
+        assert!(s.contains("rm -f \"$cmx_file\""));
+    }
+
+    #[test]
+    fn remote_extract_removes_a_failed_exports_partial_bundle() {
+        use std::os::unix::fs::PermissionsExt;
+        let home = tempfile::tempdir().unwrap();
+        let bin = home.path().join("bin");
+        std::fs::create_dir(&bin).unwrap();
+        let opencode = bin.join("opencode");
+        std::fs::write(
+            &opencode,
+            "#!/bin/sh\nif [ \"$1\" = db ]; then echo ses_test; else printf partial; exit 1; fi\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&opencode, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let bundle = unique_remote_bundle();
+        let script = remote_extract_script("/home/me/ws", &bundle);
+        let output = std::process::Command::new("bash")
+            .arg("-c")
+            .arg(&script)
+            .env("HOME", home.path().canonicalize().unwrap())
+            .env(
+                "PATH",
+                format!("{}:{}", bin.display(), std::env::var("PATH").unwrap()),
+            )
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(!String::from_utf8_lossy(&output.stdout).contains("CMX_OC_SID="));
+        assert!(!home
+            .path()
+            .join(bundle.strip_prefix("~/").unwrap())
+            .exists());
+    }
+
+    #[test]
+    fn remote_bundles_are_private_and_out_of_shared_tmp() {
+        let bundle = unique_remote_bundle();
+        assert!(bundle.starts_with("~/.codemux-opencode-sync/codemux-opencode-"));
+        // The export checks ancestors before creating the private folder.
+        let s = remote_extract_script("/home/me/ws", &bundle);
+        assert!(s.contains("cmx_check_ancestor"), "{s}");
+        assert!(s.find("cmx_check_ancestor").unwrap() < s.find("mkdir -m 700").unwrap());
+        assert!(s.contains("set -C"));
+        assert!(!s.contains("/tmp"), "{s}");
+    }
+
+    #[test]
+    fn remote_bundle_dir_prep_runs_in_a_shell() {
+        use std::os::unix::fs::PermissionsExt;
+        let home = tempfile::tempdir().unwrap();
+        let elsewhere = tempfile::tempdir().unwrap();
+        std::os::unix::fs::symlink(elsewhere.path(), home.path().join(".cache")).unwrap();
+        std::os::unix::fs::symlink(elsewhere.path(), home.path().join(".codemux")).unwrap();
+        let bundle = unique_remote_bundle();
+        let script =
+            remote_bundle_command(&bundle, true, "set -C\nprintf data > \"$cmx_file\"").unwrap();
+        let status = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(&script)
+            .env("HOME", home.path().canonicalize().unwrap())
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let dir = home.path().join(".codemux-opencode-sync");
+        let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode(&dir), 0o700);
+        let file = home.path().join(bundle.strip_prefix("~/").unwrap());
+        assert_eq!(mode(&file), 0o600);
+        let retry = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(&script)
+            .env("HOME", home.path().canonicalize().unwrap())
+            .status()
+            .unwrap();
+        assert!(
+            !retry.success(),
+            "an existing bundle must not be overwritten"
+        );
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "data");
+        assert_eq!(std::fs::read_dir(elsewhere.path()).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn remote_bundle_dir_prep_refuses_a_symlinked_folder() {
+        use std::os::unix::fs::PermissionsExt;
+        let home = tempfile::tempdir().unwrap();
+        let elsewhere = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(elsewhere.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::os::unix::fs::symlink(elsewhere.path(), home.path().join(".codemux-opencode-sync"))
+            .unwrap();
+        let bundle = unique_remote_bundle();
+        let script =
+            remote_bundle_command(&bundle, true, "set -C\nprintf data > \"$cmx_file\"").unwrap();
+        let status = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(script)
+            .env("HOME", home.path().canonicalize().unwrap())
+            .status()
+            .unwrap();
+        assert!(!status.success());
+        assert_eq!(
+            std::fs::read_dir(elsewhere.path()).unwrap().count(),
+            0,
+            "nothing written through the link"
+        );
+        let mode = std::fs::metadata(elsewhere.path())
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o755, "the link target keeps its mode");
+    }
+
+    #[test]
+    fn remote_bundle_operations_refuse_writable_parent_and_redirected_cleanup() {
+        use std::os::unix::fs::PermissionsExt;
+        let home = tempfile::tempdir().unwrap();
+        let bundle_dir = home.path().join(".codemux-opencode-sync");
+        std::fs::set_permissions(home.path(), std::fs::Permissions::from_mode(0o777)).unwrap();
+        let bundle = unique_remote_bundle();
+        let write =
+            remote_bundle_command(&bundle, true, "set -C\nprintf data > \"$cmx_file\"").unwrap();
+        let run = |script: &str| {
+            std::process::Command::new("sh")
+                .arg("-c")
+                .arg(script)
+                .env("HOME", home.path().canonicalize().unwrap())
+                .status()
+                .unwrap()
+        };
+        assert!(!run(&write).success());
+        assert!(
+            !bundle_dir.exists(),
+            "nothing created below the writable parent"
+        );
+
+        std::fs::set_permissions(home.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(run(&write).success());
+        let file = home.path().join(bundle.strip_prefix("~/").unwrap());
+        std::fs::rename(&bundle_dir, home.path().join("elsewhere")).unwrap();
+        std::os::unix::fs::symlink(home.path().join("elsewhere"), &bundle_dir).unwrap();
+        let cleanup = remote_bundle_cleanup_command(&bundle).unwrap();
+        assert!(!run(&cleanup).success());
+        assert!(home
+            .path()
+            .join("elsewhere")
+            .join(file.file_name().unwrap())
+            .exists());
     }
 
     #[test]
@@ -593,7 +933,7 @@ mod tests {
         // apostrophe doubled), exactly like the local-side newest_session_sql —
         // never spliced raw via a shell variable, which breaks the SQL literal.
         let cwd = "/Users/O'Brien/ws";
-        let s = remote_extract_script(cwd, "/tmp/b.json");
+        let s = remote_extract_script(cwd, "~/.codemux-opencode-sync/b.json");
         assert!(
             s.contains(&shell_sq(&newest_session_sql(cwd))),
             "must embed the SQL-escaped query; got:\n{s}"
@@ -607,9 +947,61 @@ mod tests {
     #[test]
     fn unique_tokens_differ() {
         // Two bundles requested back to back must not collide.
-        let a = unique_local_bundle();
-        let b = unique_local_bundle();
-        assert_ne!(a, b);
-        assert!(a.to_string_lossy().contains("codemux-opencode-"));
+        assert_ne!(unique_remote_bundle(), unique_remote_bundle());
+        let a = local_bundle().unwrap();
+        let b = local_bundle().unwrap();
+        assert_ne!(a.path(), b.path());
+        assert!(a.path().to_string_lossy().contains("codemux-opencode-"));
+    }
+
+    #[test]
+    fn cleanup_only_targets_bundles_inside_the_bundle_folder() {
+        assert!(remote_bundle_name(&unique_remote_bundle()).is_some());
+        assert!(remote_bundle_name("~/.codemux-opencode-sync/b.json").is_some());
+        for path in [
+            "~/.codemux-opencode-sync",
+            "~/.codemux-opencode-sync/",
+            "~/.codemux-opencode-sync/../x.json",
+            "~/.codemux-opencode-sync/a/../../x.json",
+            "~/.codemux-opencode-sync/sub/b.json",
+            "~/.codemux-opencode-syncx/b.json",
+            "/tmp/codemux-opencode-1.json",
+            "~/.ssh/authorized_keys",
+            "~/.codemux-opencode-sync/$(touch bad)",
+            "",
+        ] {
+            assert!(remote_bundle_name(path).is_none(), "{path}");
+        }
+    }
+
+    #[tokio::test]
+    async fn bounded_cleanup_gives_up_on_a_hung_command() {
+        let mut cmd = Command::new("sleep");
+        cmd.arg("30");
+        let started = std::time::Instant::now();
+        let result = run_bounded(cmd, Duration::from_millis(200)).await;
+        assert!(result.unwrap_err().contains("timed out"));
+        assert!(started.elapsed() < Duration::from_secs(5));
+    }
+
+    #[tokio::test]
+    async fn bounded_cleanup_reports_a_failed_command() {
+        assert!(run_bounded(Command::new("false"), Duration::from_secs(5))
+            .await
+            .is_err());
+        assert!(run_bounded(Command::new("true"), Duration::from_secs(5))
+            .await
+            .is_ok());
+    }
+
+    #[test]
+    fn local_bundle_is_owner_only_and_removed_on_drop() {
+        use std::os::unix::fs::PermissionsExt;
+        let bundle = local_bundle().unwrap();
+        let path = bundle.path().to_path_buf();
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+        drop(bundle);
+        assert!(!path.exists());
     }
 }
