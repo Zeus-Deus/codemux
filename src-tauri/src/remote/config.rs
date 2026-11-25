@@ -40,6 +40,25 @@ pub fn ensure_private_dir(dir: &std::path::Path) -> std::io::Result<()> {
     open_private_dir(dir).map(|_| ())
 }
 
+/// Verify an existing state directory without creating one. Commands that
+/// inspect an existing daemon use this before trusting a manifest from disk.
+pub fn private_dir_exists(dir: &std::path::Path) -> std::io::Result<bool> {
+    use std::io::{Error, ErrorKind};
+
+    if dir.as_os_str().is_empty() {
+        return Err(Error::new(
+            ErrorKind::InvalidInput,
+            "state directory cannot be empty",
+        ));
+    }
+
+    match std::fs::symlink_metadata(dir) {
+        Ok(_) => verify_private_dir_with_default(dir, &default_state_dir()).map(|_| true),
+        Err(e) if e.kind() == ErrorKind::NotFound => Ok(false),
+        Err(e) => Err(e),
+    }
+}
+
 /// Return the verified directory handle for operations that must stay inside
 /// the checked state directory even if its pathname changes afterward.
 pub(crate) fn open_private_dir(dir: &std::path::Path) -> std::io::Result<cap_std::fs::Dir> {
@@ -58,9 +77,8 @@ fn open_private_dir_with_default(
     dir: &std::path::Path,
     default: &std::path::Path,
 ) -> std::io::Result<cap_std::fs::Dir> {
-    use cap_fs_ext::DirExt;
     use std::io::{Error, ErrorKind};
-    use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
+    use std::os::unix::fs::DirBuilderExt;
 
     if dir.as_os_str().is_empty() {
         return Err(Error::new(
@@ -79,6 +97,17 @@ fn open_private_dir_with_default(
         }
         Err(e) => return Err(e),
     }
+
+    verify_private_dir_with_default(dir, default)
+}
+
+fn verify_private_dir_with_default(
+    dir: &std::path::Path,
+    default: &std::path::Path,
+) -> std::io::Result<cap_std::fs::Dir> {
+    use cap_fs_ext::DirExt;
+    use std::io::{Error, ErrorKind};
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
 
     // SQLite opens the registry and its WAL by pathname. A private leaf is
     // insufficient if another user can replace an ancestor between this
@@ -125,7 +154,7 @@ fn open_private_dir_with_default(
         // so it needs user inspection before any automatic migration.
         if meta.permissions().mode() & 0o022 != 0 {
             return Err(Error::new(ErrorKind::PermissionDenied, format!(
-                "default state directory {} was writable by other users; do not reuse it. Stop the remote service, isolate the old directory, and start with a fresh private state directory. Migrate only trusted workspace records; see https://github.com/Zeus-Deus/codemux/blob/main/docs/security/remote-state-recovery.md",
+                "default state directory {} was writable by other users; do not reuse it. Stop the remote service through its service manager, isolate the old directory, and start with a fresh private state directory. Migrate only trusted workspace records; see https://github.com/Zeus-Deus/codemux/blob/main/docs/security/remote-state-recovery.md",
                 dir.display()
             )));
         }
@@ -247,6 +276,22 @@ mod tests {
 
     fn mode(path: &std::path::Path) -> u32 {
         std::fs::metadata(path).unwrap().permissions().mode() & 0o777
+    }
+
+    #[test]
+    fn checking_existing_state_does_not_create_or_trust_shared_roots() {
+        let temp = private_test_dir();
+        let state = temp.path().join("state");
+        assert!(!private_dir_exists(&state).unwrap());
+        assert!(!state.exists());
+
+        std::fs::create_dir(&state).unwrap();
+        std::fs::set_permissions(&state, std::fs::Permissions::from_mode(0o777)).unwrap();
+        assert!(private_dir_exists(&state).is_err());
+        assert_eq!(mode(&state), 0o777);
+
+        std::fs::set_permissions(&state, std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(private_dir_exists(&state).unwrap());
     }
 
     #[test]

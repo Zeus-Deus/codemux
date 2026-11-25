@@ -826,6 +826,83 @@ fn serve_status_reports_absent_when_no_manifest() {
 }
 
 #[test]
+fn unsafe_state_manifest_cannot_block_start_or_signal_a_process() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let temp = private_tempdir();
+    let state = temp.path().join("unsafe-state");
+    std::fs::create_dir(&state).unwrap();
+    std::fs::set_permissions(&state, std::fs::Permissions::from_mode(0o777)).unwrap();
+    let manifest_path = state.join("manifest.json");
+    let manifest = |pid| {
+        json!({
+            "endpoint": "http://127.0.0.1:1",
+            "secret": "untrusted",
+            "pid": pid,
+            "started_at": "2026-01-01T00:00:00Z",
+            "host_id": "test"
+        })
+    };
+    std::fs::write(
+        &manifest_path,
+        serde_json::to_vec(&manifest(std::process::id())).unwrap(),
+    )
+    .unwrap();
+
+    let bin = binary_path();
+    for args in [vec!["serve"], vec!["serve", "status"]] {
+        let output = Command::new(&bin)
+            .args(args)
+            .arg("--state-dir")
+            .arg(&state)
+            .output()
+            .unwrap();
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            !output.status.success(),
+            "untrusted manifest was accepted: {stderr}"
+        );
+        assert!(stderr.contains("state directory"), "{stderr}");
+        assert!(stderr.contains("service manager"), "{stderr}");
+        assert!(!stderr.contains("already running"), "{stderr}");
+    }
+
+    let mut target = Command::new("sleep")
+        .arg("30")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    std::fs::write(
+        &manifest_path,
+        serde_json::to_vec(&manifest(target.id())).unwrap(),
+    )
+    .unwrap();
+    let stop = Command::new(&bin)
+        .args(["serve", "stop", "--state-dir"])
+        .arg(&state)
+        .output()
+        .unwrap();
+    let target_alive = target.try_wait().unwrap().is_none();
+    let _ = target.kill();
+    let _ = target.wait();
+    let stderr = String::from_utf8_lossy(&stop.stderr);
+    assert!(
+        !stop.status.success(),
+        "untrusted manifest was accepted: {stderr}"
+    );
+    assert!(stderr.contains("service manager"), "{stderr}");
+    assert!(
+        target_alive,
+        "serve stop signaled the PID in an untrusted manifest"
+    );
+    assert_eq!(
+        std::fs::metadata(&state).unwrap().permissions().mode() & 0o777,
+        0o777
+    );
+}
+
+#[test]
 fn second_serve_refuses_when_first_is_running() {
     let fx = ServeFixture::start();
     let bin = binary_path();
