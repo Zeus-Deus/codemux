@@ -96,7 +96,8 @@ const ACTIVE_POLL_INTERVAL: Duration = Duration::from_millis(500);
 /// talks to the default host, because a systemd unit inherits nothing from the
 /// shell that installed it.
 fn unit_exec_path(path: &str) -> Result<String, String> {
-    if !std::path::Path::new(path).is_absolute()
+    // A systemd path is Unix-style even when this generator is tested on Windows.
+    if !path.starts_with('/')
         || path.chars().any(char::is_control)
         || path.contains('\\')
         || path.contains('"')
