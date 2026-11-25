@@ -163,7 +163,7 @@ index aad976c..14643dc 100644
          state.active_provider_connection = true;
          let target = state
 diff --git a/cli/src/native/browser.rs b/cli/src/native/browser.rs
-index 27ef4d1..c0e646c 100644
+index 27ef4d1..4c17ed2 100644
 --- a/cli/src/native/browser.rs
 +++ b/cli/src/native/browser.rs
 @@ -1,7 +1,7 @@
@@ -311,7 +311,15 @@ index 27ef4d1..c0e646c 100644
              let mut manager = Self {
                  client,
                  browser_process: Some(process),
-@@ -4531,7 +4585,7 @@ mod tests {
+@@ -1906,6 +1960,7 @@ impl BrowserManager {
+             // Only send Browser.close when we launched the browser ourselves.
+             // For external connections (--auto-connect, --cdp) we just disconnect
+             // without shutting down the user's browser.
++            self.client.expect_pipe_shutdown();
+             let close = self.client.send_command_no_params("Browser.close", None);
+             if let Some(timeout) = browser_close_timeout {
+                 let _ = tokio::time::timeout(timeout, close).await;
+@@ -4531,7 +4586,7 @@ mod tests {
          let executable = dir.path().join("chrome");
          let port = url::Url::parse(url).unwrap().port().unwrap();
          std::fs::write(&executable, format!(
@@ -320,7 +328,7 @@ index 27ef4d1..c0e646c 100644
              dir.path().display()
          )).unwrap();
          std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
-@@ -4570,23 +4624,24 @@ mod tests {
+@@ -4570,23 +4625,24 @@ mod tests {
  
      #[cfg(unix)]
      #[tokio::test]
@@ -362,7 +370,7 @@ index 27ef4d1..c0e646c 100644
      }
  
      #[cfg(unix)]
-@@ -4600,7 +4655,10 @@ mod tests {
+@@ -4600,7 +4656,10 @@ mod tests {
              .unwrap();
          let mut manager = tokio::time::timeout(
              Duration::from_secs(4),
@@ -941,7 +949,7 @@ index bf572f9..729e346 100644
                  temp_nss_home: None,
                  #[cfg(unix)]
 diff --git a/cli/src/native/cdp/client.rs b/cli/src/native/cdp/client.rs
-index f06379b..bc29603 100644
+index f06379b..4fd2b0e 100644
 --- a/cli/src/native/cdp/client.rs
 +++ b/cli/src/native/cdp/client.rs
 @@ -1,4 +1,5 @@
@@ -1140,7 +1148,7 @@ index f06379b..bc29603 100644
  
  /// Sessions whose events go to one private receiver instead of the broadcast.
  type PrivateSessions = Arc<std::sync::Mutex<HashMap<String, mpsc::Sender<CdpEvent>>>>;
-@@ -336,8 +493,9 @@ async fn release_detached_session(
+@@ -336,8 +493,10 @@ async fn release_detached_session(
  }
  
  pub struct CdpClient {
@@ -1148,11 +1156,12 @@ index f06379b..bc29603 100644
 -    socket: socket2::Socket,
 +    transport_tx: TransportTx,
 +    pipe_failure_handler: Option<PipeFailureHandler>,
++    pipe_close_expected: Arc<AtomicBool>,
 +    socket: Option<socket2::Socket>,
      closed: Arc<AtomicBool>,
      close_complete: AtomicBool,
      close_lock: Mutex<()>,
-@@ -439,14 +597,50 @@ impl CdpClient {
+@@ -439,18 +598,55 @@ impl CdpClient {
              .try_clone()
              .map_err(|error| format!("Failed to duplicate CDP socket: {}", error))?;
  
@@ -1206,11 +1215,17 @@ index f06379b..bc29603 100644
  
          let private_sessions: PrivateSessions = Arc::new(std::sync::Mutex::new(HashMap::new()));
          let method_taps: MethodTaps = Arc::new(std::sync::Mutex::new(Vec::new()));
-@@ -460,42 +654,14 @@ impl CdpClient {
+         let detached_sessions: DetachedSessionSet = Arc::default();
++        let pipe_close_expected = Arc::new(AtomicBool::new(false));
+ 
+         let pending_clone = pending.clone();
+         let raw_pending_clone = raw_pending.clone();
+@@ -460,42 +656,15 @@ impl CdpClient {
          let private_clone = private_sessions.clone();
          let taps_clone = method_taps.clone();
          let detached_clone = detached_sessions.clone();
 +        let reader_pipe_failure_handler = pipe_failure_handler.clone();
++        let reader_close_expected = pipe_close_expected.clone();
  
          // Notify used to stop the keepalive task when the reader loop exits.
          let (cancel_tx, mut cancel_rx) = tokio::sync::watch::channel(false);
@@ -1251,7 +1266,7 @@ index f06379b..bc29603 100644
                  // Broadcast raw message for inspect proxy subscribers before typed parse,
                  // so messages with negative IDs (used by the inspect proxy) are still delivered.
                  if raw_tx_clone.receiver_count() > 0 {
-@@ -630,39 +796,47 @@ impl CdpClient {
+@@ -630,39 +799,48 @@ impl CdpClient {
              // Reader loop exited (connection closed or error). Drop all pending
              // command senders so callers get an immediate channel-closed error
              // instead of waiting for the 30-second timeout.
@@ -1262,7 +1277,7 @@ index f06379b..bc29603 100644
  
              // Stop the keepalive task because the connection is gone.
              let _ = reader_cancel_tx.send(true);
-+            if !already_closed {
++            if !already_closed && !reader_close_expected.load(Ordering::SeqCst) {
 +                if let Some(handler) = reader_pipe_failure_handler {
 +                    let _ = tokio::task::spawn_blocking(move || handler()).await;
 +                }
@@ -1314,10 +1329,11 @@ index f06379b..bc29603 100644
 +        Self {
 +            transport_tx,
 +            pipe_failure_handler,
++            pipe_close_expected,
              socket,
              closed,
              close_complete: AtomicBool::new(false),
-@@ -674,11 +848,11 @@ impl CdpClient {
+@@ -674,11 +852,11 @@ impl CdpClient {
              event_tx,
              raw_tx,
              reader_handle: Mutex::new(Some(reader_handle)),
@@ -1331,10 +1347,14 @@ index f06379b..bc29603 100644
      }
  
      /// Refuse a command to a session Chrome already reported detached.
-@@ -716,6 +890,19 @@ impl CdpClient {
+@@ -716,6 +894,23 @@ impl CdpClient {
          }
      }
  
++    pub fn expect_pipe_shutdown(&self) {
++        self.pipe_close_expected.store(true, Ordering::SeqCst);
++    }
++
 +    async fn mark_transport_failed(&self) {
 +        let already_closed = self.closed.swap(true, Ordering::SeqCst);
 +        self.pending.lock().await.clear();
@@ -1351,7 +1371,7 @@ index f06379b..bc29603 100644
      async fn abort_task(handle: &Mutex<Option<JoinHandle<()>>>) {
          let Some(task) = handle.lock().await.take() else {
              return;
-@@ -735,12 +922,14 @@ impl CdpClient {
+@@ -735,12 +930,14 @@ impl CdpClient {
          Self::abort_task(&self.keepalive_handle).await;
  
          let _ = tokio::time::timeout(TRANSPORT_CLOSE_TIMEOUT, async {
@@ -1369,7 +1389,7 @@ index f06379b..bc29603 100644
          Self::abort_task(&self.reader_handle).await;
          self.pending.lock().await.clear();
          self.raw_pending.lock().await.clear();
-@@ -776,7 +965,7 @@ impl CdpClient {
+@@ -776,7 +973,7 @@ impl CdpClient {
          };
  
          {
@@ -1378,7 +1398,7 @@ index f06379b..bc29603 100644
              self.ensure_open()?;
              let mut pending = self.pending.lock().await;
              if let Err(error) = self.ensure_session_attached(method, cmd.session_id.as_deref()) {
-@@ -791,8 +980,8 @@ impl CdpClient {
+@@ -791,8 +988,8 @@ impl CdpClient {
                  },
              );
              drop(pending);
@@ -1389,7 +1409,7 @@ index f06379b..bc29603 100644
                  guard.done = true;
                  return Err(format!("Failed to send CDP command: {}", error));
              }
-@@ -872,7 +1061,7 @@ impl CdpClient {
+@@ -872,7 +1069,7 @@ impl CdpClient {
      /// Contains only what's needed to forward messages bidirectionally.
      pub fn inspect_handle(&self) -> InspectProxyHandle {
          InspectProxyHandle {
@@ -1398,7 +1418,7 @@ index f06379b..bc29603 100644
              raw_tx: self.raw_tx.clone(),
              closed: self.closed.clone(),
          }
-@@ -936,7 +1125,7 @@ impl CdpClient {
+@@ -936,7 +1133,7 @@ impl CdpClient {
          };
  
          {
@@ -1407,7 +1427,7 @@ index f06379b..bc29603 100644
              self.ensure_open()?;
              let mut raw_pending = self.raw_pending.lock().await;
              if let Err(error) = self.ensure_session_attached(method, cmd.session_id.as_deref()) {
-@@ -951,8 +1140,8 @@ impl CdpClient {
+@@ -951,8 +1148,8 @@ impl CdpClient {
                  },
              );
              drop(raw_pending);
@@ -1418,7 +1438,7 @@ index f06379b..bc29603 100644
                  guard.done = true;
                  return Err(format!("Failed to send CDP command: {}", error));
              }
-@@ -1018,23 +1207,25 @@ impl CdpClient {
+@@ -1018,23 +1215,25 @@ impl CdpClient {
          let json = serde_json::to_string(&cmd)
              .map_err(|e| format!("Failed to serialize CDP command: {}", e))?;
  
@@ -1454,7 +1474,7 @@ index f06379b..bc29603 100644
      }
  
      /// Test-only: count of in-flight commands still awaiting a response, so a
-@@ -1055,19 +1246,19 @@ impl CdpClient {
+@@ -1055,19 +1254,19 @@ impl CdpClient {
  /// Lightweight handle for the inspect WebSocket proxy, holding only
  /// the cloneable parts of CdpClient needed for bidirectional message forwarding.
  pub struct InspectProxyHandle {
@@ -1478,7 +1498,7 @@ index f06379b..bc29603 100644
              .await
              .map_err(|e| format!("Failed to send raw CDP message: {}", e))
      }
-@@ -1123,6 +1314,165 @@ mod tests {
+@@ -1123,6 +1322,193 @@ mod tests {
      const TEST_CERT_DER: &str = "MIIBPDCB46ADAgECAgkA9xwXmIhbzQIwCgYIKoZIzj0EAwIwFDESMBAGA1UEAwwJbG9jYWxob3N0MB4XDTI2MDgzMDA1NTU0NFoXDTM2MDgyNzA1NTU0NFowFDESMBAGA1UEAwwJbG9jYWxob3N0MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEQdmPO0sXXFRmVn7+8MViXGom2rYy8aV3Oc0pNZhUmFGaPl4MRFzc1G0yaV/WRBPF/BUh2LGsXCvUsn7NqaYkFaMeMBwwGgYDVR0RBBMwEYIJbG9jYWxob3N0hwR/AAABMAoGCCqGSM49BAMCA0gAMEUCIQC32oureGNAupABEmonQPAQBD7OdJjXmUxoVQNr0UB+6AIgb23GMwxTjwHyLG4tZcJST7r3cCW8K/Y+1h618j2f+Uw=";
      const TEST_KEY_DER: &str = "MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgIVZST8Vhc5f3OW+4kF78f8o1nQCRwjW/Yo8CXQ35Y9uhRANCAARB2Y87SxdcVGZWfv7wxWJcaibatjLxpXc5zSk1mFSYUZo+XgxEXNzUbTJpX9ZEE8X8FSHYsaxcK9Syfs2ppiQV";
  
@@ -1531,6 +1551,34 @@ index f06379b..bc29603 100644
 +        })
 +        .await
 +        .expect("reader EOF must stop Chrome");
++        client.close().await;
++    }
++
++    #[cfg(unix)]
++    #[tokio::test]
++    async fn expected_pipe_shutdown_does_not_force_kill() {
++        use std::os::fd::{FromRawFd, IntoRawFd};
++        use std::os::unix::net::UnixStream;
++
++        let (_child_reader, parent_writer) = UnixStream::pair().unwrap();
++        let (parent_reader, child_writer) = UnixStream::pair().unwrap();
++        let reader = unsafe { File::from_raw_fd(parent_reader.into_raw_fd()) };
++        let writer = unsafe { File::from_raw_fd(parent_writer.into_raw_fd()) };
++        let failed = Arc::new(AtomicBool::new(false));
++        let failed_callback = failed.clone();
++        let callback: PipeFailureHandler = Arc::new(move || {
++            failed_callback.store(true, Ordering::SeqCst);
++        });
++        let client = CdpClient::connect_pipe(reader, writer, Some(callback));
++        client.expect_pipe_shutdown();
++        drop(child_writer);
++
++        let reader_task = client.reader_handle.lock().await.take().unwrap();
++        tokio::time::timeout(Duration::from_secs(2), reader_task)
++            .await
++            .expect("expected pipe close must settle")
++            .unwrap();
++        assert!(!failed.load(Ordering::SeqCst));
 +        client.close().await;
 +    }
 +
@@ -1644,7 +1692,7 @@ index f06379b..bc29603 100644
      #[test]
      fn repairs_only_unpaired_surrogate_escapes() {
          let msg = r#"{"id":1,"result":{"high":"\ud800","low":"\udfff","pair":"\ud83d\ude00","escaped":"\\ud800","text":"café 中文"}}"#;
-@@ -1888,7 +2238,7 @@ mod tests {
+@@ -1888,7 +2274,7 @@ mod tests {
  
          let client = Arc::new(CdpClient::connect(&url).await.unwrap());
          accepted_rx.await.unwrap();
