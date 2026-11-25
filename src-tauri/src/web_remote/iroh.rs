@@ -84,8 +84,9 @@ use crate::web_remote::auth::{self, AuthedSession};
 /// wasm client's ALPN. Versioned so a future incompatible framing can bump it.
 pub const IROH_ALPN: &[u8] = b"codemux/web-remote/0";
 
-/// File (under the app data dir) holding the machine-guarded iroh identity key.
+/// File (under a private app-data subdirectory) holding the machine-guarded iroh identity key.
 const KEY_FILE: &str = "web-remote-iroh.key";
+const KEY_DIR: &str = "iroh-identity";
 
 // ── Kind-tagged, length-delimited codec ─────────────────────────────
 
@@ -599,7 +600,15 @@ fn welcome_frame_bytes(session_id: &str) -> Vec<u8> {
 fn key_file_path() -> PathBuf {
     let data_dir = dirs::data_dir()
         .unwrap_or_else(|| dirs::home_dir().unwrap_or_default().join(".local/share"));
-    data_dir.join(crate::APP_DIR_NAME).join(KEY_FILE)
+    data_dir.join(crate::APP_DIR_NAME).join(KEY_DIR).join(KEY_FILE)
+}
+
+fn legacy_key_file_path(path: &Path) -> Option<PathBuf> {
+    let private_dir = path.parent()?;
+    if private_dir.file_name()? != KEY_DIR {
+        return None;
+    }
+    Some(private_dir.parent()?.join(KEY_FILE))
 }
 
 #[cfg(unix)]
@@ -608,6 +617,14 @@ enum KeyAclScope {
     Ancestor,
     PrivateDirectory,
     KeyFile,
+}
+
+#[cfg(unix)]
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum KeyDirAccess {
+    PrivateCreate,
+    PrivateReadOnly,
+    AncestorReadOnly,
 }
 
 #[cfg(any(target_os = "macos", all(unix, test)))]
@@ -810,6 +827,11 @@ fn check_symlink_key_acl(
 /// another user cannot replace or modify.
 #[cfg(unix)]
 fn open_private_key_dir(parent: &Path) -> Result<std::fs::File, String> {
+    open_key_dir(parent, KeyDirAccess::PrivateCreate)
+}
+
+#[cfg(unix)]
+fn open_key_dir(parent: &Path, access: KeyDirAccess) -> Result<std::fs::File, String> {
     use std::collections::VecDeque;
     use std::ffi::{CString, OsString};
     use std::os::fd::{AsRawFd, FromRawFd};
@@ -898,7 +920,10 @@ fn open_private_key_dir(parent: &Path) -> Result<std::fs::File, String> {
                 libc::AT_SYMLINK_NOFOLLOW,
             )
         };
-        if result < 0 && std::io::Error::last_os_error().kind() == std::io::ErrorKind::NotFound {
+        if result < 0
+            && access == KeyDirAccess::PrivateCreate
+            && std::io::Error::last_os_error().kind() == std::io::ErrorKind::NotFound
+        {
             result = unsafe { libc::mkdirat(directory.as_raw_fd(), name.as_ptr(), 0o700) };
             if result < 0 && std::io::Error::last_os_error().kind() != std::io::ErrorKind::AlreadyExists {
                 return Err(format!("create iroh key directory: {}", std::io::Error::last_os_error()));
@@ -1005,8 +1030,13 @@ fn open_private_key_dir(parent: &Path) -> Result<std::fs::File, String> {
     if !meta.is_dir() || meta.uid() != uid {
         return Err("iroh key directory is not an owned directory".to_string());
     }
-    check_key_acl(&directory, "iroh key directory", KeyAclScope::PrivateDirectory)?;
-    if meta.permissions().mode() & 0o777 != 0o700 {
+    let scope = if access == KeyDirAccess::AncestorReadOnly {
+        KeyAclScope::Ancestor
+    } else {
+        KeyAclScope::PrivateDirectory
+    };
+    check_key_acl(&directory, "iroh key directory", scope)?;
+    if access == KeyDirAccess::PrivateCreate && meta.permissions().mode() & 0o777 != 0o700 {
         directory
             .set_permissions(std::fs::Permissions::from_mode(0o700))
             .map_err(|e| format!("secure iroh key directory: {e}"))?;
@@ -1017,17 +1047,23 @@ fn open_private_key_dir(parent: &Path) -> Result<std::fs::File, String> {
     let secured = directory
         .metadata()
         .map_err(|e| format!("recheck iroh key directory permissions: {e}"))?;
-    if !secured.is_dir() || secured.uid() != uid || secured.permissions().mode() & 0o777 != 0o700 {
+    let mode = secured.permissions().mode();
+    let safe_mode = if access == KeyDirAccess::AncestorReadOnly {
+        mode & 0o022 == 0
+    } else {
+        mode & 0o777 == 0o700
+    };
+    if !secured.is_dir() || secured.uid() != uid || !safe_mode {
         return Err("iroh key directory permissions remain unsafe".to_string());
     }
-    check_key_acl(&directory, "iroh key directory", KeyAclScope::PrivateDirectory)?;
+    check_key_acl(&directory, "iroh key directory", scope)?;
     Ok(directory)
 }
 
-/// Open only the key entry under the validated directory. The descriptor is
-/// checked and tightened before any read or truncation, including old files.
+/// Open only the key entry under the validated directory. Startup may tighten
+/// an old mode; status reads only accept a file already private.
 #[cfg(unix)]
-fn open_private_key_file(directory: &std::fs::File) -> Result<Option<std::fs::File>, String> {
+fn open_private_key_file(directory: &std::fs::File, tighten: bool) -> Result<Option<std::fs::File>, String> {
     use std::os::fd::{AsRawFd, FromRawFd};
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
 
@@ -1058,7 +1094,7 @@ fn open_private_key_file(directory: &std::fs::File) -> Result<Option<std::fs::Fi
         return Err("iroh key path is not a singly linked owned regular file".to_string());
     }
     check_key_acl(&file, "iroh key file", KeyAclScope::KeyFile)?;
-    if meta.permissions().mode() & 0o777 != 0o600 {
+    if tighten && meta.permissions().mode() & 0o777 != 0o600 {
         file.set_permissions(std::fs::Permissions::from_mode(0o600))
             .map_err(|e| format!("secure iroh key file: {e}"))?;
     }
@@ -1077,8 +1113,8 @@ fn open_private_key_file(directory: &std::fs::File) -> Result<Option<std::fs::Fi
 }
 
 #[cfg(unix)]
-fn read_private_key_in(directory: &std::fs::File) -> Result<Option<Vec<u8>>, String> {
-    let Some(mut file) = open_private_key_file(directory)? else {
+fn read_private_key_in(directory: &std::fs::File, tighten: bool) -> Result<Option<Vec<u8>>, String> {
+    let Some(mut file) = open_private_key_file(directory, tighten)? else {
         return Ok(None);
     };
     let mut sealed = Vec::new();
@@ -1093,7 +1129,7 @@ fn persist_secret_key_in(directory: &std::fs::File, key: &SecretKey) -> Result<(
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
 
     // Refuse hardlinked or symlinked legacy entries before replacing them.
-    drop(open_private_key_file(directory)?);
+    drop(open_private_key_file(directory, true)?);
     let sealed = crate::auth::encrypt_data(&key.to_bytes())?;
     let key_name = std::ffi::CString::new(KEY_FILE).expect("static key filename has no NUL");
     let temp_name = std::ffi::CString::new(format!(".{KEY_FILE}.{}.tmp", uuid::Uuid::new_v4()))
@@ -1139,6 +1175,7 @@ fn persist_secret_key_in(directory: &std::fs::File, key: &SecretKey) -> Result<(
         if renamed < 0 {
             return Err(format!("publish iroh key file: {}", std::io::Error::last_os_error()));
         }
+        directory.sync_all().map_err(|e| format!("sync iroh key directory: {e}"))?;
         Ok(())
     })();
     if result.is_err() {
@@ -1175,6 +1212,70 @@ fn secure_existing_key_file(path: &Path) -> Result<(), String> {
     }
 }
 
+/// Copy an existing root-level key only after validating its inode. The app
+/// data directory is an ancestor here: its unrelated permissions stay intact.
+#[cfg(unix)]
+fn migrate_legacy_secret_key(path: &Path, directory: &std::fs::File) -> Result<Option<SecretKey>, String> {
+    use std::os::fd::AsRawFd;
+    use std::os::unix::fs::MetadataExt;
+
+    let Some(legacy) = legacy_key_file_path(path) else {
+        return Ok(None);
+    };
+    let legacy_dir = open_key_dir(
+        legacy.parent().ok_or("legacy iroh key has no parent")?,
+        KeyDirAccess::AncestorReadOnly,
+    )?;
+    let Some(mut file) = open_private_key_file(&legacy_dir, true)? else {
+        return Ok(None);
+    };
+    let old_meta = file.metadata().map_err(|e| format!("inspect legacy iroh key: {e}"))?;
+    let mut sealed = Vec::new();
+    file.read_to_end(&mut sealed)
+        .map_err(|e| format!("read legacy iroh key: {e}"))?;
+    let Some(key) = decode_secret_key(&sealed) else {
+        log::warn!("[codemux::web_remote] legacy iroh identity key is unreadable; regenerating");
+        return Ok(None);
+    };
+    persist_secret_key_in(directory, &key)?;
+
+    // Delete only the same entry we validated. A failed cleanup leaves a
+    // private legacy copy, while the new key is already safely published.
+    let name = std::ffi::CString::new(KEY_FILE).expect("static key filename has no NUL");
+    let mut entry: libc::stat = unsafe { std::mem::zeroed() };
+    let inspected = unsafe {
+        libc::fstatat(legacy_dir.as_raw_fd(), name.as_ptr(), &mut entry, libc::AT_SYMLINK_NOFOLLOW)
+    };
+    if inspected == 0 && entry.st_dev as u64 == old_meta.dev() && entry.st_ino as u64 == old_meta.ino() {
+        if unsafe { libc::unlinkat(legacy_dir.as_raw_fd(), name.as_ptr(), 0) } < 0 {
+            log::warn!("[codemux::web_remote] could not remove migrated iroh key: {}", std::io::Error::last_os_error());
+        }
+    }
+    Ok(Some(key))
+}
+
+#[cfg(not(unix))]
+fn migrate_legacy_secret_key(path: &Path) -> Result<Option<SecretKey>, String> {
+    let Some(legacy) = legacy_key_file_path(path) else {
+        return Ok(None);
+    };
+    secure_existing_key_file(&legacy)?;
+    let sealed = match std::fs::read(&legacy) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(format!("read legacy iroh key: {error}")),
+    };
+    let Some(key) = decode_secret_key(&sealed) else {
+        log::warn!("[codemux::web_remote] legacy iroh identity key is unreadable; regenerating");
+        return Ok(None);
+    };
+    persist_secret_key(path, &key)?;
+    if let Err(error) = std::fs::remove_file(&legacy) {
+        log::warn!("[codemux::web_remote] could not remove migrated iroh key: {error}");
+    }
+    Ok(Some(key))
+}
+
 /// Load the persisted iroh identity, or generate + persist a fresh one. A
 /// corrupt/short blob is treated as absent and regenerated (the endpoint still
 /// comes up, with a new `node_id`).
@@ -1188,7 +1289,7 @@ fn load_or_create_secret_key_at(path: &Path) -> Result<SecretKey, String> {
     #[cfg(unix)]
     let directory = open_private_key_dir(parent)?;
     #[cfg(unix)]
-    let sealed = read_private_key_in(&directory)?;
+    let sealed = read_private_key_in(&directory, true)?;
     #[cfg(not(unix))]
     let sealed = {
         std::fs::create_dir_all(parent).map_err(|e| format!("create iroh key directory: {e}"))?;
@@ -1200,15 +1301,21 @@ fn load_or_create_secret_key_at(path: &Path) -> Result<SecretKey, String> {
         }
     };
     if let Some(sealed) = sealed {
-        if let Ok(bytes) = crate::auth::decrypt_data(&sealed) {
-            if let Some(arr) = to_key_array(&bytes) {
-                return Ok(SecretKey::from_bytes(&arr));
-            }
+        if let Some(key) = decode_secret_key(&sealed) {
+            return Ok(key);
         }
         log::warn!(
             "[codemux::web_remote] iroh identity key at {} unreadable; regenerating",
             path.display()
         );
+    }
+    #[cfg(unix)]
+    if let Some(key) = migrate_legacy_secret_key(path, &directory)? {
+        return Ok(key);
+    }
+    #[cfg(not(unix))]
+    if let Some(key) = migrate_legacy_secret_key(path)? {
+        return Ok(key);
     }
     let key = SecretKey::generate();
     #[cfg(unix)]
@@ -1227,25 +1334,49 @@ fn to_key_array(bytes: &[u8]) -> Option<[u8; 32]> {
     Some(arr)
 }
 
+fn decode_secret_key(sealed: &[u8]) -> Option<SecretKey> {
+    let bytes = crate::auth::decrypt_data(sealed).ok()?;
+    Some(SecretKey::from_bytes(&to_key_array(&bytes)?))
+}
+
 /// The device's stable `node_id` (endpoint id) computed from the persisted
 /// identity key **without** binding an endpoint. `None` when relay mode has
 /// never been enabled (no key persisted yet).
 pub fn persisted_node_id() -> Option<String> {
-    let path = key_file_path();
-    std::fs::symlink_metadata(&path).ok()?;
+    persisted_node_id_at(&key_file_path())
+}
+
+fn persisted_node_id_at(path: &Path) -> Option<String> {
     #[cfg(unix)]
     let sealed = {
-        let directory = open_private_key_dir(path.parent()?).ok()?;
-        read_private_key_in(&directory).ok()??
+        let private_dir = path.parent()?;
+        let current = match open_key_dir(private_dir, KeyDirAccess::PrivateReadOnly) {
+            Ok(directory) => read_private_key_in(&directory, false).ok()?,
+            Err(_) if matches!(
+                std::fs::symlink_metadata(private_dir),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound
+            ) => None,
+            Err(_) => return None,
+        };
+        if let Some(sealed) = current {
+            sealed
+        } else {
+            let legacy = legacy_key_file_path(path)?;
+            let directory = open_key_dir(legacy.parent()?, KeyDirAccess::AncestorReadOnly).ok()?;
+            read_private_key_in(&directory, false).ok()??
+        }
     };
     #[cfg(not(unix))]
     let sealed = {
-        secure_existing_key_file(&path).ok()?;
-        std::fs::read(path).ok()?
+        let source = if std::fs::symlink_metadata(path).is_ok() {
+            path.to_path_buf()
+        } else {
+            legacy_key_file_path(path)?
+        };
+        secure_existing_key_file(&source).ok()?;
+        std::fs::read(source).ok()?
     };
-    let bytes = crate::auth::decrypt_data(&sealed).ok()?;
-    let arr = to_key_array(&bytes)?;
-    Some(SecretKey::from_bytes(&arr).public().to_string())
+    Some(decode_secret_key(&sealed)?.public().to_string())
 }
 
 // ── Endpoint lifecycle manager ──────────────────────────────────────
@@ -1863,6 +1994,77 @@ mod tests {
             replacement.public()
         );
         assert!(!second.join(KEY_FILE).exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn iroh_identity_key_migrates_without_changing_relocated_app_directory() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        let data = temp.path().join("data");
+        let relocated = temp.path().join("relocated-app-data");
+        std::fs::create_dir(&data).unwrap();
+        std::fs::create_dir(&relocated).unwrap();
+        std::fs::set_permissions(&relocated, std::fs::Permissions::from_mode(0o750)).unwrap();
+        let app_dir = data.join("codemux");
+        std::os::unix::fs::symlink(&relocated, &app_dir).unwrap();
+        let unrelated = relocated.join("unrelated.txt");
+        std::fs::write(&unrelated, b"keep").unwrap();
+        std::fs::set_permissions(&unrelated, std::fs::Permissions::from_mode(0o640)).unwrap();
+
+        let path = app_dir.join(KEY_DIR).join(KEY_FILE);
+        assert!(persisted_node_id_at(&path).is_none());
+        assert!(!relocated.join(KEY_DIR).exists());
+        let original = SecretKey::generate();
+        let node_id = original.public().to_string();
+        let legacy = relocated.join(KEY_FILE);
+        std::fs::write(&legacy, crate::auth::encrypt_data(&original.to_bytes()).unwrap()).unwrap();
+        std::fs::set_permissions(&legacy, std::fs::Permissions::from_mode(0o600)).unwrap();
+        assert_eq!(persisted_node_id_at(&path).as_deref(), Some(node_id.as_str()));
+        assert!(!relocated.join(KEY_DIR).exists());
+
+        let loaded = load_or_create_secret_key_at(&path).unwrap();
+        assert_eq!(loaded.public(), original.public());
+        assert_eq!(persisted_node_id_at(&path).as_deref(), Some(node_id.as_str()));
+        assert!(!legacy.exists());
+        assert_eq!(std::fs::metadata(&relocated).unwrap().permissions().mode() & 0o777, 0o750);
+        assert_eq!(std::fs::metadata(&unrelated).unwrap().permissions().mode() & 0o777, 0o640);
+        assert_eq!(std::fs::metadata(relocated.join(KEY_DIR)).unwrap().permissions().mode() & 0o777, 0o700);
+        assert_eq!(std::fs::metadata(relocated.join(KEY_DIR).join(KEY_FILE)).unwrap().permissions().mode() & 0o777, 0o600);
+        assert_eq!(std::fs::read(&unrelated).unwrap(), b"keep");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn iroh_status_lookup_never_tightens_unsafe_key_modes() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        let app_dir = temp.path().join("codemux");
+        std::fs::create_dir(&app_dir).unwrap();
+        std::fs::set_permissions(&app_dir, std::fs::Permissions::from_mode(0o750)).unwrap();
+        let path = app_dir.join(KEY_DIR).join(KEY_FILE);
+        let original = SecretKey::generate();
+        let legacy = app_dir.join(KEY_FILE);
+        std::fs::write(&legacy, crate::auth::encrypt_data(&original.to_bytes()).unwrap()).unwrap();
+        std::fs::set_permissions(&legacy, std::fs::Permissions::from_mode(0o640)).unwrap();
+
+        assert!(persisted_node_id_at(&path).is_none());
+        assert!(!app_dir.join(KEY_DIR).exists());
+        assert_eq!(std::fs::metadata(&app_dir).unwrap().permissions().mode() & 0o777, 0o750);
+        assert_eq!(std::fs::metadata(&legacy).unwrap().permissions().mode() & 0o777, 0o640);
+
+        std::fs::create_dir(app_dir.join(KEY_DIR)).unwrap();
+        std::fs::set_permissions(app_dir.join(KEY_DIR), std::fs::Permissions::from_mode(0o750)).unwrap();
+        assert!(persisted_node_id_at(&path).is_none());
+        assert_eq!(std::fs::metadata(app_dir.join(KEY_DIR)).unwrap().permissions().mode() & 0o777, 0o750);
+
+        let loaded = load_or_create_secret_key_at(&path).unwrap();
+        assert_eq!(loaded.public(), original.public());
+        assert_eq!(std::fs::metadata(&app_dir).unwrap().permissions().mode() & 0o777, 0o750);
+        assert_eq!(std::fs::metadata(app_dir.join(KEY_DIR)).unwrap().permissions().mode() & 0o777, 0o700);
+        assert!(!legacy.exists());
     }
 
     #[cfg(unix)]
