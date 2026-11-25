@@ -61,7 +61,8 @@
 //! concern it defends against cannot arise without ambient cookies; see the
 //! design doc §1.3). Every subsequent frame rides that approved session.
 
-use std::io::Write;
+#[cfg(unix)]
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
@@ -601,75 +602,132 @@ fn key_file_path() -> PathBuf {
     data_dir.join(crate::APP_DIR_NAME).join(KEY_FILE)
 }
 
-fn ensure_private_key_dir(parent: &Path) -> Result<(), String> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
-        std::fs::DirBuilder::new()
-            .recursive(true)
-            .mode(0o700)
-            .create(parent)
-            .map_err(|e| format!("create iroh key directory: {e}"))?;
-        let meta = std::fs::symlink_metadata(parent)
-            .map_err(|e| format!("inspect iroh key directory: {e}"))?;
-        if !meta.file_type().is_dir() {
-            return Err("iroh key directory is not a regular directory".to_string());
-        }
-        if meta.permissions().mode() & 0o777 != 0o700 {
-            std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700))
-                .map_err(|e| format!("secure iroh key directory: {e}"))?;
-        }
+/// Follow an existing user-owned relocation, then keep the opened directory
+/// handle for every key operation. A changed path cannot redirect later I/O.
+#[cfg(unix)]
+fn open_private_key_dir(parent: &Path) -> Result<std::fs::File, String> {
+    use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
+
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(parent)
+        .map_err(|e| format!("create iroh key directory: {e}"))?;
+    let directory = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_CLOEXEC)
+        .open(parent)
+        .map_err(|e| format!("open iroh key directory: {e}"))?;
+    let meta = directory
+        .metadata()
+        .map_err(|e| format!("inspect iroh key directory: {e}"))?;
+    // The descriptor, not the pathname, identifies the directory we tighten.
+    if !meta.is_dir() || meta.uid() != unsafe { libc::geteuid() } {
+        return Err("iroh key directory is not an owned directory".to_string());
     }
-    #[cfg(not(unix))]
-    std::fs::create_dir_all(parent).map_err(|e| format!("create iroh key directory: {e}"))?;
-    Ok(())
+    if meta.permissions().mode() & 0o777 != 0o700 {
+        directory
+            .set_permissions(std::fs::Permissions::from_mode(0o700))
+            .map_err(|e| format!("secure iroh key directory: {e}"))?;
+    }
+    Ok(directory)
 }
 
-/// Reject symlinks and repair older key files before any read or rewrite.
-fn secure_existing_key_file(path: &Path) -> Result<(), String> {
-    let meta = match std::fs::symlink_metadata(path) {
-        Ok(meta) => meta,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        Err(e) => return Err(format!("inspect iroh key file: {e}")),
+/// Open only the key entry under the validated directory. The descriptor is
+/// checked and tightened before any read or truncation, including old files.
+#[cfg(unix)]
+fn open_private_key_file(
+    directory: &std::fs::File,
+    flags: libc::c_int,
+) -> Result<Option<std::fs::File>, String> {
+    use std::os::fd::{AsRawFd, FromRawFd};
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    let name = std::ffi::CString::new(KEY_FILE).expect("static key filename has no NUL");
+    let fd = unsafe {
+        libc::openat(
+            directory.as_raw_fd(),
+            name.as_ptr(),
+            flags | libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK,
+            0o600,
+        )
     };
-    if !meta.file_type().is_file() {
-        return Err("iroh key path is not a regular file".to_string());
-    }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        if meta.permissions().mode() & 0o777 != 0o600 {
-            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
-                .map_err(|e| format!("secure iroh key file: {e}"))?;
+    if fd < 0 {
+        let error = std::io::Error::last_os_error();
+        if error.kind() == std::io::ErrorKind::NotFound && flags & libc::O_CREAT == 0 {
+            return Ok(None);
         }
+        if error.raw_os_error() == Some(libc::ELOOP) {
+            return Err("iroh key path is not a regular file".to_string());
+        }
+        return Err(format!("open iroh key file: {error}"));
     }
-    Ok(())
-}
-
-/// Persist the machine-guarded identity under owner-only directory and file
-/// permissions. Set permissions before writing any key material.
-fn persist_secret_key(path: &Path, key: &SecretKey) -> Result<(), String> {
-    let parent = path.parent().ok_or("iroh key path has no parent")?;
-    ensure_private_key_dir(parent)?;
-    secure_existing_key_file(path)?;
-    let sealed = crate::auth::encrypt_data(&key.to_bytes())?;
-    let mut options = std::fs::OpenOptions::new();
-    options.write(true).create(true).truncate(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
+    let file = unsafe { std::fs::File::from_raw_fd(fd) };
+    let meta = file
+        .metadata()
+        .map_err(|e| format!("inspect iroh key file: {e}"))?;
+    if !meta.is_file() || meta.uid() != unsafe { libc::geteuid() } {
+        return Err("iroh key path is not an owned regular file".to_string());
     }
-    let mut file = options.open(path).map_err(|e| format!("open iroh key file: {e}"))?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
+    if meta.permissions().mode() & 0o777 != 0o600 {
         file.set_permissions(std::fs::Permissions::from_mode(0o600))
             .map_err(|e| format!("secure iroh key file: {e}"))?;
     }
+    Ok(Some(file))
+}
+
+#[cfg(unix)]
+fn read_private_key_in(directory: &std::fs::File) -> Result<Option<Vec<u8>>, String> {
+    let Some(mut file) = open_private_key_file(directory, libc::O_RDONLY)? else {
+        return Ok(None);
+    };
+    let mut sealed = Vec::new();
+    file.read_to_end(&mut sealed)
+        .map_err(|e| format!("read iroh key file: {e}"))?;
+    Ok(Some(sealed))
+}
+
+#[cfg(unix)]
+fn persist_secret_key_in(directory: &std::fs::File, key: &SecretKey) -> Result<(), String> {
+    // Repair an old read-only key before opening it for writing. Both opens
+    // resolve within the now-private directory; neither follows a key link.
+    drop(open_private_key_file(directory, libc::O_RDONLY)?);
+    let sealed = crate::auth::encrypt_data(&key.to_bytes())?;
+    let mut file = open_private_key_file(directory, libc::O_WRONLY | libc::O_CREAT)?
+        .ok_or("created iroh key file is missing")?;
+    file.set_len(0)
+        .map_err(|e| format!("truncate iroh key file: {e}"))?;
     file.write_all(&sealed)
         .map_err(|e| format!("write iroh key: {e}"))?;
     Ok(())
+}
+
+#[cfg(test)]
+#[cfg(unix)]
+fn persist_secret_key(path: &Path, key: &SecretKey) -> Result<(), String> {
+    let parent = path.parent().ok_or("iroh key path has no parent")?;
+    let directory = open_private_key_dir(parent)?;
+    persist_secret_key_in(&directory, key)
+}
+
+#[cfg(not(unix))]
+fn persist_secret_key(path: &Path, key: &SecretKey) -> Result<(), String> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| format!("create iroh key directory: {e}"))?;
+    }
+    secure_existing_key_file(path)?;
+    let sealed = crate::auth::encrypt_data(&key.to_bytes())?;
+    std::fs::write(path, &sealed).map_err(|e| format!("write iroh key: {e}"))
+}
+
+#[cfg(not(unix))]
+fn secure_existing_key_file(path: &Path) -> Result<(), String> {
+    match std::fs::symlink_metadata(path) {
+        Ok(meta) if meta.file_type().is_file() => Ok(()),
+        Ok(_) => Err("iroh key path is not a regular file".to_string()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(format!("inspect iroh key file: {e}")),
+    }
 }
 
 /// Load the persisted iroh identity, or generate + persist a fresh one. A
@@ -682,24 +740,35 @@ fn load_or_create_secret_key() -> Result<SecretKey, String> {
 
 fn load_or_create_secret_key_at(path: &Path) -> Result<SecretKey, String> {
     let parent = path.parent().ok_or("iroh key path has no parent")?;
-    ensure_private_key_dir(parent)?;
-    secure_existing_key_file(path)?;
-    match std::fs::read(path) {
-        Ok(sealed) => {
-            if let Ok(bytes) = crate::auth::decrypt_data(&sealed) {
-                if let Some(arr) = to_key_array(&bytes) {
-                    return Ok(SecretKey::from_bytes(&arr));
-                }
-            }
-            log::warn!(
-                "[codemux::web_remote] iroh identity key at {} unreadable; regenerating",
-                path.display()
-            );
+    #[cfg(unix)]
+    let directory = open_private_key_dir(parent)?;
+    #[cfg(unix)]
+    let sealed = read_private_key_in(&directory)?;
+    #[cfg(not(unix))]
+    let sealed = {
+        std::fs::create_dir_all(parent).map_err(|e| format!("create iroh key directory: {e}"))?;
+        secure_existing_key_file(path)?;
+        match std::fs::read(path) {
+            Ok(bytes) => Some(bytes),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+            Err(e) => return Err(format!("read iroh key file: {e}")),
         }
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-        Err(e) => return Err(format!("read iroh key file: {e}")),
+    };
+    if let Some(sealed) = sealed {
+        if let Ok(bytes) = crate::auth::decrypt_data(&sealed) {
+            if let Some(arr) = to_key_array(&bytes) {
+                return Ok(SecretKey::from_bytes(&arr));
+            }
+        }
+        log::warn!(
+            "[codemux::web_remote] iroh identity key at {} unreadable; regenerating",
+            path.display()
+        );
     }
     let key = SecretKey::generate();
+    #[cfg(unix)]
+    persist_secret_key_in(&directory, &key)?;
+    #[cfg(not(unix))]
     persist_secret_key(path, &key)?;
     Ok(key)
 }
@@ -719,9 +788,16 @@ fn to_key_array(bytes: &[u8]) -> Option<[u8; 32]> {
 pub fn persisted_node_id() -> Option<String> {
     let path = key_file_path();
     std::fs::symlink_metadata(&path).ok()?;
-    ensure_private_key_dir(path.parent()?).ok()?;
-    secure_existing_key_file(&path).ok()?;
-    let sealed = std::fs::read(path).ok()?;
+    #[cfg(unix)]
+    let sealed = {
+        let directory = open_private_key_dir(path.parent()?).ok()?;
+        read_private_key_in(&directory).ok()??
+    };
+    #[cfg(not(unix))]
+    let sealed = {
+        secure_existing_key_file(&path).ok()?;
+        std::fs::read(path).ok()?
+    };
     let bytes = crate::auth::decrypt_data(&sealed).ok()?;
     let arr = to_key_array(&bytes)?;
     Some(SecretKey::from_bytes(&arr).public().to_string())
@@ -1231,6 +1307,44 @@ mod tests {
         std::os::unix::fs::symlink(&target, dir.join(KEY_FILE)).unwrap();
         let err = load_or_create_secret_key_at(&dir.join(KEY_FILE)).unwrap_err();
         assert!(err.contains("not a regular file"), "{err}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn iroh_identity_key_accepts_owned_directory_relocation_without_redirecting_io() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        let first = temp.path().join("first");
+        let second = temp.path().join("second");
+        std::fs::create_dir(&first).unwrap();
+        std::fs::create_dir(&second).unwrap();
+        let relocated = temp.path().join("codemux");
+        std::os::unix::fs::symlink(&first, &relocated).unwrap();
+        let path = relocated.join(KEY_FILE);
+        let original = SecretKey::generate();
+        persist_secret_key(&path, &original).unwrap();
+        assert_eq!(
+            load_or_create_secret_key_at(&path).unwrap().public(),
+            original.public()
+        );
+        assert_eq!(
+            std::fs::metadata(&first).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+
+        // The path changes after validation, but the open descriptor still
+        // writes only to the original user-owned directory.
+        let directory = open_private_key_dir(&relocated).unwrap();
+        std::fs::remove_file(&relocated).unwrap();
+        std::os::unix::fs::symlink(&second, &relocated).unwrap();
+        let replacement = SecretKey::generate();
+        persist_secret_key_in(&directory, &replacement).unwrap();
+        assert_eq!(
+            load_or_create_secret_key_at(&first.join(KEY_FILE)).unwrap().public(),
+            replacement.public()
+        );
+        assert!(!second.join(KEY_FILE).exists());
     }
 
     // ── Handshake / session gate ──────────────────────────────────────
