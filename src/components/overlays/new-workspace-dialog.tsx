@@ -1162,6 +1162,7 @@ export function NewWorkspaceDialog({ open, onOpenChange }: Props) {
           "current_terminal",
           null,
           launchSelection,
+          true,
         );
       }
 

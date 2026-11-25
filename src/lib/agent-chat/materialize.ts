@@ -739,6 +739,8 @@ export async function materializeWithPreset(
       preset.id,
       "current_terminal",
       null,
+      undefined,
+      true,
     );
   } catch (err) {
     const message = errorMessage(err);

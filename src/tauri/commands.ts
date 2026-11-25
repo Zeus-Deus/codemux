@@ -1430,6 +1430,8 @@ export const applyPreset = async (
   overrideMode?: LaunchMode | "current_terminal" | "existing_panes",
   initialPrompt?: string | null,
   modelSelection?: ModelSelection | null,
+  /** Confirm the command reaches a terminal tab the caller just created. */
+  freshTerminal?: boolean,
 ) => {
   const sequence = beginRemoteNavigation();
   await invoke("apply_preset", {
@@ -1438,6 +1440,7 @@ export const applyPreset = async (
     overrideMode,
     initialPrompt,
     modelSelection: modelSelection ?? null,
+    ...(freshTerminal !== undefined ? { freshTerminal } : {}),
   });
   if (isRemoteClient()) await refreshRemoteWorkspaceView(workspaceId, undefined, undefined, sequence);
 };

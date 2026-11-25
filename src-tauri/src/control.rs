@@ -1257,6 +1257,7 @@ pub(crate) async fn dispatch_request_as<R: Runtime>(
             let preset_id = request.params.get("preset_id").and_then(Value::as_str).unwrap_or_default().to_string();
             let override_mode = request.params.get("override_mode").and_then(Value::as_str).map(String::from);
             let initial_prompt = request.params.get("initial_prompt").and_then(Value::as_str).map(String::from);
+            let fresh_terminal = request.params.get("fresh_terminal").and_then(Value::as_bool);
             let model_selection = request
                 .params
                 .get("model_selection")
@@ -1281,6 +1282,7 @@ pub(crate) async fn dispatch_request_as<R: Runtime>(
                 initial_prompt,
                 model_selection,
                 None,
+                fresh_terminal,
             )
             .map(|()| serde_json::json!({ "ok": true }))
         }

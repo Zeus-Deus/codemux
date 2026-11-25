@@ -1588,6 +1588,8 @@ describe("materializeWithPreset", () => {
         "builtin-claude",
         "current_terminal",
         null,
+        undefined,
+        true,
       );
       // CLI path does not mint its own chat pane / session / turn.
       expect(agentChatCreatePane).not.toHaveBeenCalled();
@@ -1614,7 +1616,7 @@ describe("materializeWithPreset", () => {
       expect(actions.markPromptRetained).toHaveBeenCalledWith(draft.draftId);
       expect(actions.markManualPromptRequired).not.toHaveBeenCalled();
       expect(actions.markPromoted).not.toHaveBeenCalled();
-      expect(applyPreset).toHaveBeenCalledWith("ws-project", "builtin-shell", "current_terminal", null);
+      expect(applyPreset).toHaveBeenCalledWith("ws-project", "builtin-shell", "current_terminal", null, undefined, true);
     });
 
     it("empty/whitespace prompt becomes null when delegated to applyPreset", async () => {
@@ -1631,6 +1633,8 @@ describe("materializeWithPreset", () => {
         "builtin-claude",
         "current_terminal",
         null,
+        undefined,
+        true,
       );
       expect(result.success).toBe(true);
       expect(actions.markPromoted).toHaveBeenCalled();
@@ -1657,7 +1661,7 @@ describe("materializeWithPreset", () => {
 
     it("applyPreset failure → markSendFailed, no markPromoted", async () => {
       vi.mocked(applyPreset).mockRejectedValueOnce(
-        new Error("claude is not installed"),
+        new Error("Terminal shell is not writable"),
       );
       const actions = makeActions();
       const draft = makeDraft({
@@ -1669,11 +1673,11 @@ describe("materializeWithPreset", () => {
 
       expect(result).toEqual({
         success: false,
-        error: "claude is not installed",
+        error: "Terminal shell is not writable",
       });
       expect(actions.markSendFailed).toHaveBeenCalledWith(
         "draft-1",
-        "claude is not installed",
+        "Terminal shell is not writable",
       );
       expect(actions.markPromoted).not.toHaveBeenCalled();
       // The workspace was created but not rolled back (locked policy).

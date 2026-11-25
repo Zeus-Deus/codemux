@@ -321,7 +321,7 @@ async function startThreadIn(
   // The id is kept so the timeline's "Open thread" can land on this
   // conversation rather than merely on the workspace containing it.
   const tabId = await createTab(workspaceId, "terminal");
-  await applyPreset(workspaceId, presetId, "current_terminal", null, modelSelection);
+  await applyPreset(workspaceId, presetId, "current_terminal", null, modelSelection, true);
   return tabId ?? null;
 }
 

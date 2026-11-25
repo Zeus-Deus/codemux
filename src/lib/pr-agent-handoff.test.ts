@@ -117,6 +117,7 @@ beforeEach(() => {
   workspaces = [];
   lastSelectedAgentId = null;
   useChatDraftStore.setState({ draftsById: {}, activeDraftId: null });
+  usePrAgentRunsStore.getState().clear();
 });
 
 // ── Prompt composition ────────────────────────────────────────────────
@@ -265,11 +266,12 @@ describe("handOffToAgent — routes", () => {
     expect(out.route).toBe("current");
     expect(mockCreateTab).toHaveBeenCalledWith("ws-here", "terminal");
     expect(mockApplyPreset).toHaveBeenCalledTimes(1);
-    const [wsId, presetId, mode, prompt] = mockApplyPreset.mock.calls[0];
+    const [wsId, presetId, mode, prompt, , freshTerminal] = mockApplyPreset.mock.calls[0];
     expect(wsId).toBe("ws-here");
     expect(presetId).toBe("builtin-claude");
     expect(mode).toBe("current_terminal");
     expect(prompt).toBeNull();
+    expect(freshTerminal).toBe(true);
     expect(mockCreateWorktree).not.toHaveBeenCalled();
     expect(mockToastSuccess).toHaveBeenCalledWith(
       expect.stringContaining("without the PR task"),
@@ -366,6 +368,7 @@ describe("handOffToAgent — routes", () => {
     expect(wsId).toBe("ws-adopted");
     expect(mode).toBe("current_terminal");
     expect(prompt).toBeNull();
+    expect(mockApplyPreset.mock.calls[0][5]).toBe(true);
     expect(Object.values(useChatDraftStore.getState().draftsById)[0].inputDraft).toBe(out.prompt);
   });
 
@@ -381,6 +384,17 @@ describe("handOffToAgent — routes", () => {
 
     expect(mockGetCheckLogExcerpt).toHaveBeenCalledWith("/repo", 285, "rust (ubuntu-latest)");
     expect(out.prompt).toContain("panicked at 'index out of bounds'");
+  });
+
+  it("does not claim an agent opened when the fresh PTY write fails", async () => {
+    mockApplyPreset.mockRejectedValueOnce(new Error("Terminal shell is not writable"));
+
+    await expect(handOffToAgent(req(CHECK_TASK, { currentWorkspaceId: "ws-here" })))
+      .rejects.toThrow("Terminal shell is not writable");
+
+    expect(mockToastSuccess).not.toHaveBeenCalled();
+    expect(usePrAgentRunsStore.getState().runs).toEqual([]);
+    expect(Object.values(useChatDraftStore.getState().draftsById)).toEqual([]);
   });
 
   it("uses the remembered agent preset when there is one", async () => {

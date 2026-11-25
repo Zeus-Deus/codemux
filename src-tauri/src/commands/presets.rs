@@ -337,6 +337,7 @@ pub fn apply_preset<R: tauri::Runtime>(
     initial_prompt: Option<String>,
     model_selection: Option<crate::agent_capability::ModelSelection>,
     select: Option<bool>,
+    fresh_terminal: Option<bool>,
 ) -> Result<(), String> {
     // Look up the preset
     let store = presets.inner.lock().unwrap_or_else(|e| e.into_inner());
@@ -403,6 +404,7 @@ pub fn apply_preset<R: tauri::Runtime>(
     let has_starting_prompt = initial_prompt
         .as_deref()
         .is_some_and(|prompt| !prompt.trim().is_empty());
+    let fresh_terminal = fresh_terminal.unwrap_or(false);
 
     match effective_mode {
         "current_terminal" => {
@@ -410,8 +412,42 @@ pub fn apply_preset<R: tauri::Runtime>(
             let session_id = active_session_for_workspace(&state, &workspace_id)
                 .ok_or_else(|| "No active terminal session in workspace".to_string())?;
 
-            if initial_prompt.is_some() {
-                // Agent launch with a starting prompt: rename the tab and request manual entry.
+            if initial_prompt.is_some() || fresh_terminal {
+                // A promptless current-terminal launch used to send one
+                // combined command. Keep that behavior when the terminal is
+                // fresh so later commands cannot land inside the first agent.
+                let commands_to_write = if fresh_terminal {
+                    vec![commands
+                        .iter()
+                        .filter(|command| !command.is_empty())
+                        .cloned()
+                        .collect::<Vec<_>>()
+                        .join(" && ")]
+                } else {
+                    commands.clone()
+                };
+                for command in &commands_to_write {
+                    if command.is_empty() {
+                        continue;
+                    }
+                    let (cmd, prompt_requires_manual_entry) =
+                        crate::branch_name::prepare_agent_command(
+                            command,
+                            initial_prompt.as_deref(),
+                        );
+                    if fresh_terminal {
+                        write_current_terminal_command(&sessions_arc, &session_id, &cmd, true)?;
+                    }
+                    state.update_terminal_session_command(&session_id, command.clone());
+                    if !fresh_terminal {
+                        write_command_when_ready(sessions_arc.clone(), session_id.clone(), cmd, 120);
+                    }
+                    if prompt_requires_manual_entry {
+                        report_prompt_requires_manual_entry(&app, &session_id, &preset.name);
+                    }
+                }
+                // Keep the new tab generic when a confirmed fresh write
+                // fails. A named agent tab would imply it opened.
                 let snap = state.snapshot();
                 if let Some(ws) = snap
                     .workspaces
@@ -422,22 +458,6 @@ pub fn apply_preset<R: tauri::Runtime>(
                     let _ =
                         state.set_tab_icon(&workspace_id, &ws.active_tab_id, preset.icon.clone());
                 }
-
-                for command in &commands {
-                    if command.is_empty() {
-                        continue;
-                    }
-                    let (cmd, prompt_requires_manual_entry) =
-                        crate::branch_name::prepare_agent_command(
-                            command,
-                            initial_prompt.as_deref(),
-                        );
-                    state.update_terminal_session_command(&session_id, command.clone());
-                    write_command_when_ready(sessions_arc.clone(), session_id.clone(), cmd, 120);
-                    if prompt_requires_manual_entry {
-                        report_prompt_requires_manual_entry(&app, &session_id, &preset.name);
-                    }
-                }
             } else {
                 let combined = commands
                     .iter()
@@ -447,8 +467,8 @@ pub fn apply_preset<R: tauri::Runtime>(
                     .join(" && ");
 
                 if !combined.is_empty() {
-                    state.update_terminal_session_command(&session_id, combined.clone());
-                    write_command_to_pty(&sessions_arc, &session_id, &combined);
+                    write_current_terminal_command(&sessions_arc, &session_id, &combined, false)?;
+                    state.update_terminal_session_command(&session_id, combined);
                 }
             }
         }
@@ -602,7 +622,9 @@ pub fn open_provider_install_terminal<R: tauri::Runtime>(
         let sessions = pty_state.sessions.clone();
         let command = command.to_string();
         std::thread::spawn(move || {
-            wait_and_write(&sessions, &session_id.0, &command, 120, b"");
+            if let Err(error) = wait_and_write(&sessions, &session_id.0, &command, 120, b"") {
+                eprintln!("[codemux::presets] cannot type install command: {error}");
+            }
         });
     }
     crate::state::emit_app_state(&app);
@@ -683,10 +705,24 @@ fn write_command_to_pty(
     sessions: &Arc<std::sync::Mutex<std::collections::HashMap<String, terminal::SessionRuntime>>>,
     session_id: &str,
     command: &str,
-) {
+) -> Result<(), String> {
     let payload = build_pty_command_payload(command);
-    if let Err(error) = terminal::write_pty_input_sync(sessions, session_id, &payload) {
-        eprintln!("[codemux::presets] cannot write command to {session_id}: {error}");
+    terminal::write_pty_input_sync(sessions, session_id, &payload)
+}
+
+/// A fresh current tab needs the same writer and shell readiness checks as
+/// a tab created by `apply_preset` itself. Wait for the PTY acknowledgement
+/// before the caller reports that its agent opened.
+fn write_current_terminal_command(
+    sessions: &Arc<std::sync::Mutex<std::collections::HashMap<String, terminal::SessionRuntime>>>,
+    session_id: &str,
+    command: &str,
+    fresh_terminal: bool,
+) -> Result<(), String> {
+    if fresh_terminal {
+        wait_and_write_command(sessions, session_id, command, 120)
+    } else {
+        write_command_to_pty(sessions, session_id, command)
     }
 }
 
@@ -708,7 +744,7 @@ fn build_pty_payload(command: &str, terminator: &[u8]) -> Vec<u8> {
 
 /// Write a command to a newly-spawned PTY after the shell is ready.
 ///
-/// Phase 1: Polls for `writer.is_some()` (every 50ms, up to 5s).
+/// Phase 1: Polls for `writer.is_some()` (every 50ms, up to 15s).
 /// Phase 2: Detects shell readiness via quiet-after-output heuristic — waits
 ///          until PTY output has arrived and then gone quiet for `settle_ms`.
 ///
@@ -721,7 +757,9 @@ pub(crate) fn write_command_when_ready(
     settle_ms: u64,
 ) {
     std::thread::spawn(move || {
-        wait_and_write_command(&sessions, &session_id, &command, settle_ms);
+        if let Err(error) = wait_and_write_command(&sessions, &session_id, &command, settle_ms) {
+            eprintln!("[codemux::presets] cannot write command to {session_id}: {error}");
+        }
     });
 }
 
@@ -731,8 +769,8 @@ fn wait_and_write_command(
     session_id: &str,
     command: &str,
     settle_ms: u64,
-) {
-    wait_and_write(sessions, session_id, command, settle_ms, PTY_COMMAND_TERMINATOR);
+) -> Result<(), String> {
+    wait_and_write(sessions, session_id, command, settle_ms, PTY_COMMAND_TERMINATOR)
 }
 
 /// Tell the user a prompt cannot be delivered safely through this terminal.
@@ -775,7 +813,7 @@ fn wait_and_write(
     command: &str,
     settle_ms: u64,
     terminator: &[u8],
-) {
+) -> Result<(), String> {
     // Only commands reach the PTY through this helper. Untrusted
     // starting prompts never enter a PTY input queue.
     // Phase 1: poll until the PTY writer is available (shell process spawned).
@@ -830,7 +868,7 @@ fn wait_and_write(
              after {:?}",
             writer_poll_start.elapsed()
         );
-        return;
+        return Err(format!("Timed out waiting for PTY writer for session {session_id}"));
     }
 
     let command_to_write = {
@@ -857,7 +895,7 @@ fn wait_and_write(
     };
 
     if command_to_write.is_empty() {
-        return;
+        return Err(format!("No command to write to PTY session {session_id}"));
     }
 
     // Phase 2: wait for shell output to arrive and then go quiet.
@@ -935,10 +973,9 @@ fn wait_and_write(
              (payload_len={})",
             payload.len(),
         ),
-        Err(error) => {
-            eprintln!("[codemux::presets] cannot write command to {session_id}: {error}")
-        }
+        Err(error) => return Err(error),
     }
+    Ok(())
 }
 
 /// Check whether a command's binary exists on `PATH` for the current user.
@@ -1059,7 +1096,7 @@ mod tests {
         let sessions = make_sessions();
         insert_session_with_writer(&sessions, "sess");
 
-        write_command_to_pty(&sessions, "sess", "echo hello");
+        write_command_to_pty(&sessions, "sess", "echo hello").unwrap();
 
         // Verify command was written — text followed by CR (0x0D),
         // not LF (0x0A). See `PTY_COMMAND_TERMINATOR` for why CR is
@@ -1128,7 +1165,7 @@ mod tests {
             guard.insert("sess".into(), runtime);
         }
 
-        write_command_to_pty(&sessions, "sess", "claude --dangerously-skip-permissions");
+        write_command_to_pty(&sessions, "sess", "claude --dangerously-skip-permissions").unwrap();
 
         let recorded = calls.lock().unwrap();
         assert_eq!(
@@ -1162,7 +1199,7 @@ mod tests {
             guard.insert("sess".into(), runtime);
         }
 
-        wait_and_write(&sessions, "sess", "npm install -g @openai/codex", 30, b"");
+        wait_and_write(&sessions, "sess", "npm install -g @openai/codex", 30, b"").unwrap();
 
         assert_eq!(*calls.lock().unwrap(), vec![b"npm install -g @openai/codex".to_vec()]);
     }
@@ -1204,7 +1241,7 @@ mod tests {
 
         let start = std::time::Instant::now();
         // Call synchronous core directly with short settle time
-        wait_and_write_command(&sessions, "sess", "test-cmd", 80);
+        wait_and_write_command(&sessions, "sess", "test-cmd", 80).unwrap();
         let elapsed = start.elapsed();
 
         producer.join().unwrap();
@@ -1226,7 +1263,7 @@ mod tests {
         insert_session_with_writer(&sessions, "sess");
 
         let start = std::time::Instant::now();
-        wait_and_write_command(&sessions, "sess", "timeout-cmd", 120);
+        wait_and_write_command(&sessions, "sess", "timeout-cmd", 120).unwrap();
         let elapsed = start.elapsed();
 
         assert!(
@@ -1257,8 +1294,10 @@ mod tests {
         }
 
         let start = std::time::Instant::now();
-        wait_and_write_command(&sessions, "no-writer", "cmd", 120);
+        let result = wait_and_write_command(&sessions, "no-writer", "cmd", 120);
         let elapsed = start.elapsed();
+
+        assert!(result.is_err(), "an unconfirmed preset launch must fail");
 
         assert!(
             elapsed >= std::time::Duration::from_secs(14),
@@ -1311,7 +1350,7 @@ mod tests {
 
         let start = std::time::Instant::now();
         // settle_ms = 80 so Phase 2's quiet detection fires quickly.
-        wait_and_write_command(&sessions, "slow-spawn", "echo hi", 80);
+        wait_and_write_command(&sessions, "slow-spawn", "echo hi", 80).unwrap();
         let elapsed = start.elapsed();
         producer.join().unwrap();
 
@@ -1345,6 +1384,36 @@ mod tests {
     }
 
     #[test]
+    fn promptless_fresh_terminal_waits_for_delayed_writer_and_confirms_command() {
+        let sessions = make_sessions();
+        let calls = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        sessions
+            .lock()
+            .unwrap()
+            .insert("fresh".to_string(), SessionRuntime::new("fresh"));
+
+        let producer_sessions = sessions.clone();
+        let producer_calls = calls.clone();
+        let producer = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(150));
+            let mut guard = producer_sessions.lock().unwrap();
+            let runtime = guard.get_mut("fresh").unwrap();
+            runtime.writer = Some(Box::new(RecordingWriter {
+                calls: producer_calls,
+            }));
+            runtime.pending_output.push_back(b"$ ".to_vec());
+        });
+
+        // The caller created this tab but supplied no starting prompt.
+        // Returning success must mean the preset command reached its writer.
+        let result = write_current_terminal_command(&sessions, "fresh", "agent --flag", true);
+        producer.join().unwrap();
+
+        assert_eq!(result, Ok(()));
+        assert_eq!(*calls.lock().unwrap(), vec![b"agent --flag\r".to_vec()]);
+    }
+
+    #[test]
     fn test_resume_command_overrides_original_command() {
         let sessions = make_sessions();
         insert_session_with_writer(&sessions, "sess");
@@ -1369,7 +1438,8 @@ mod tests {
             "sess",
             "claude --dangerously-skip-permissions --system-prompt \"$CODEMUX_AGENT_CONTEXT\"",
             80,
-        );
+        )
+        .unwrap();
 
         producer.join().unwrap();
 

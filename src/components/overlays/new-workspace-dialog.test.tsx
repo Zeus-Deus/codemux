@@ -1714,12 +1714,34 @@ describe("Non-git project", () => {
         "current_terminal",
         null,
         { model: null, reasoning: null, context: null },
+        true,
       );
     });
     expect(Object.values(useChatDraftStore.getState().draftsById)[0].inputDraft).toBe("Tidy the notes");
     expect(createWorkspace).toHaveBeenCalledWith("/path/to/project");
     expect(createWorktreeWorkspaceResult).not.toHaveBeenCalled();
     expect(generateBranchName).not.toHaveBeenCalled();
+  });
+
+  it("keeps the prompt recoverable and gives no launch success when the fresh PTY write fails", async () => {
+    setAppState("/path/to/project");
+    (checkIsGitRepo as Mock).mockResolvedValue(false);
+    (applyPreset as Mock).mockRejectedValueOnce("Terminal shell is not writable");
+    renderDialog(true);
+
+    const dialog = await screen.findByRole("dialog");
+    fireEvent.change(
+      within(dialog).getByPlaceholderText("What do you want to do?"),
+      { target: { value: "Tidy the notes" } },
+    );
+    fireEvent.click(within(dialog).getByRole("button", { name: /Create/i }));
+
+    await waitFor(() => {
+      expect(useUIStore.getState().pendingWorkspaces[0]?.status).toBe("failed");
+    });
+    expect(useUIStore.getState().pendingWorkspaces[0].draft?.prompt).toBe("Tidy the notes");
+    expect(toast.success).not.toHaveBeenCalled();
+    expect(Object.values(useChatDraftStore.getState().draftsById)).toEqual([]);
   });
 });
 
