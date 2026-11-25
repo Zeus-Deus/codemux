@@ -465,7 +465,7 @@ describe("openEnvironmentConnection", () => {
       return null;
     }));
     const connectDevice = vi.fn(async (_deviceId: string) => ({ ...grant, nodeId: remote.nodeId }));
-    const listDevices = vi.fn(async () => [remote]);
+    const listDevices = vi.fn(async (): Promise<RegisteredDevice[]> => [remote]);
     const runtime = startEnvironmentRuntime({
       registry: { listDevices, connectDevice },
       dialer: { dial },
