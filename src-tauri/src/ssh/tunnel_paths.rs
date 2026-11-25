@@ -19,7 +19,7 @@ pub(super) const DISCOVERY_TIMEOUT: Duration = Duration::from_secs(6);
 const MAX_DISCOVERY_OUTPUT: u64 = 16 * 1024;
 const PATH_MARKER: &str = "codemux:pty-path:v1 ";
 const SOCKET_ROOT_UNAVAILABLE: &str =
-    "The device has no usable private workspace socket directory or startup path. Check its socket, PID, and log entries under the SSH home, runtime, and temporary directories.";
+    "The device has no usable private workspace socket directory or startup path. Check its root marker, socket, PID, and log entries under the SSH home, runtime, and temporary directories.";
 const LOCAL_SOCKET_FILE: &str = "pty.sock";
 
 #[derive(Clone, Copy)]
@@ -240,6 +240,14 @@ socket_fits() {
     case "$1/$KEY.sock" in /*[!A-Za-z0-9_./-]*) return 1;; /*) ;; *) return 1;; esac
     [ "${#1}" -le "$((103 - ${#KEY} - 6))" ]
 }
+publish_root_marker() (
+    STAGE=$(mktemp -d "$STATE/.root.XXXXXXXX") || exit 1
+    NEXT="$STAGE/$KEY.root"
+    trap 'rm -f "$NEXT"; rmdir "$STAGE"' 0
+    # Pass the state directory to mv and use the final marker name for
+    # the source. An existing directory at the marker then blocks rename.
+    printf '%s\n' "$ROOT" > "$NEXT" && mv -f "$NEXT" "$STATE"
+)
 select_state || unusable_root
 MARKER="$STATE/$KEY.root"
 LOCK="$STATE/$KEY.lock.fd"
@@ -250,8 +258,10 @@ if [ "$PROBE_ONLY" = 1 ]; then
 else
     lock_socket_path "$LOCK" || exit 1
 fi
-if [ -f "$MARKER" ] && [ ! -L "$MARKER" ]; then
-    ROOT=$(cat "$MARKER") || ROOT=
+[ ! -L "$MARKER" ] || unusable_root
+if [ -e "$MARKER" ]; then
+    [ -f "$MARKER" ] && [ -O "$MARKER" ] || unusable_root
+    ROOT=$(cat "$MARKER") || unusable_root
 fi
 # An active legacy listener must be renamed on the same filesystem.
 OLD=
@@ -279,8 +289,10 @@ if [ -z "$ROOT" ] || ! private_directory "$ROOT" || [ ! -w "$ROOT" ] || ! socket
         private_directory "$ROOT" && socket_fits "$ROOT" || exit 1
         # Recording the root before renaming lets the next attempt recover if
         # interrupted. With a live legacy socket, discovery retries migration.
-        NEXT=$(mktemp "$STATE/.root.XXXXXXXX") || exit 1
-        printf '%s\n' "$ROOT" > "$NEXT" && mv -f "$NEXT" "$MARKER" || exit 1
+        if ! publish_root_marker; then
+            [ "$ROOT" = "$STATE" ] || rmdir "$ROOT"
+            unusable_root
+        fi
     fi
 fi
 SOCKET="$ROOT/$KEY.sock"
@@ -563,6 +575,26 @@ mod tests {
             SOCKET_ROOT_UNAVAILABLE,
         );
         assert_eq!(fs::read_dir(long_tmp).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn long_home_discovery_rejects_a_directory_at_the_root_marker() {
+        let home = private_temp();
+        let long_home = home.path().join("h".repeat(100));
+        let state = long_home.join(".cmux-tunnels");
+        let marker = state.join(format!("{WORKSPACE}.root"));
+        fs::create_dir_all(&marker).unwrap();
+        fs::set_permissions(&state, fs::Permissions::from_mode(0o700)).unwrap();
+        let tmp = private_temp();
+
+        for discovery in [SocketDiscovery::Probe, SocketDiscovery::Prepare] {
+            assert_eq!(
+                run_socket_search(&long_home, None, tmp.path(), discovery).unwrap_err(),
+                SOCKET_ROOT_UNAVAILABLE,
+            );
+        }
+        assert_eq!(fs::read_dir(marker).unwrap().count(), 0);
+        assert_eq!(fs::read_dir(tmp.path()).unwrap().count(), 0);
     }
 
     #[test]
