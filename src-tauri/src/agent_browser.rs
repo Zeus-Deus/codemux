@@ -290,17 +290,26 @@ fn kill_owned_browser_daemons_in(dir: &std::path::Path) {
 }
 
 /// Directory where codemux stores per-session runtime files (PID + log
-/// files for each agent-browser daemon). On Unix this is `~/.codemux/run`
-/// and on Windows it follows the same data-dir convention as the rest of
-/// the app via `dirs::home_dir()`.
+/// files for each agent-browser daemon). Windows uses a new private directory
+/// because older releases created `~/.codemux/run` with an inherited ACL.
 ///
 /// The directory is created lazily on first use. Returns `None` if no
 /// home directory is discoverable — callers should treat that as "skip
 /// log/PID-file integration" rather than fail the whole flow.
 pub fn run_dir() -> Option<PathBuf> {
-    let dir = dirs::home_dir()?.join(".codemux").join("run");
+    let dir = browser_run_dir_for(&dirs::home_dir()?);
     prepare_run_dir(&dir)?;
     Some(dir)
+}
+
+#[cfg(windows)]
+fn browser_run_dir_for(home: &std::path::Path) -> PathBuf {
+    home.join(".codemux-browser-run")
+}
+
+#[cfg(not(windows))]
+fn browser_run_dir_for(home: &std::path::Path) -> PathBuf {
+    home.join(".codemux").join("run")
 }
 
 fn prepare_run_dir(dir: &std::path::Path) -> Option<()> {
@@ -577,22 +586,33 @@ fn browser_control_endpoint_ready(session: &str, dir: &std::path::Path) -> bool 
     }
     #[cfg(windows)]
     {
-        let port = std::fs::read_to_string(dir.join(format!("{session}.port")))
-            .ok()
-            .and_then(|value| value.trim().parse::<u16>().ok())
-            .unwrap_or_else(|| {
-                // agent-browser v0.24.0 falls back to this session hash when
-                // its .port file is absent, and may reuse that TCP endpoint.
-                let hash = session.chars().fold(0i32, |hash, ch| {
-                    hash.wrapping_shl(5).wrapping_sub(hash).wrapping_add(ch as i32)
-                });
-                49152 + (hash.unsigned_abs() % 16383) as u16
-            });
+        let port = browser_control_port(session, dir);
         std::net::TcpStream::connect_timeout(
             &std::net::SocketAddr::from(([127, 0, 0, 1], port)),
             Duration::from_millis(50),
         ).is_ok()
     }
+}
+
+#[cfg(windows)]
+fn browser_control_port(session: &str, dir: &std::path::Path) -> u16 {
+    let path = dir.join(format!("{session}.port"));
+    std::fs::read_to_string(path)
+        .ok()
+        .and_then(|value| value.trim().parse::<u16>().ok())
+        .unwrap_or_else(|| {
+            // agent-browser v0.24.0 uses the session hash if its .port file
+            // is absent, unreadable, or invalid.
+            let hash = session.chars().fold(0i32, |hash, ch| {
+                hash.wrapping_shl(5).wrapping_sub(hash).wrapping_add(ch as i32)
+            });
+            49152 + (hash.unsigned_abs() % 16383) as u16
+        })
+}
+
+#[cfg(windows)]
+fn browser_control_listener_owned_by_pid(session: &str, dir: &std::path::Path, pid: u32) -> bool {
+    listener_owned_by_pid(browser_control_port(session, dir), pid)
 }
 
 fn require_owned_browser_session(session: &str) -> Result<(), String> {
@@ -627,6 +647,10 @@ fn require_owned_browser_session_in(session: &str, dir: &std::path::Path) -> Res
     }
     if owned_browser_pid(session, pid).is_none() {
         return Err(format!("Browser session {session} is already used by another process"));
+    }
+    #[cfg(windows)]
+    if !browser_control_listener_owned_by_pid(session, dir, pid) {
+        return Err(format!("Browser session {session} has a control port not owned by its daemon"));
     }
     Ok(())
 }
@@ -1882,6 +1906,13 @@ impl AgentBrowserManager {
         self.sessions.lock().await.get(session_key).map(|s| s.port)
     }
 
+    async fn clear_failed_stream_allocation(&self, session_key: &str, port: u16) {
+        let mut sessions = self.sessions.lock().await;
+        if sessions.get(session_key).is_some_and(|s| s.port == port && !s.running) {
+            sessions.remove(session_key);
+        }
+    }
+
     /// **Deprecated.** No-op kept for binary/source compatibility with any
     /// external caller that linked against the old aliasing-based API.
     ///
@@ -2275,7 +2306,7 @@ impl AgentBrowserManager {
         // its PID. Every step here shells out, sleeps, or blocks on a TCP
         // probe, so the whole sequence runs on a blocking thread under hard
         // timeouts so it can never stall the async runtime (issue #96).
-        let (port_alive, pid) = tokio::task::spawn_blocking(move || -> Result<(bool, Option<u32>), String> {
+        let launch_result = tokio::task::spawn_blocking(move || -> Result<(bool, Option<u32>), String> {
             if std::net::TcpListener::bind(("127.0.0.1", port)).is_err() {
                 return Err(format!("Browser stream port {port} was taken by another process"));
             }
@@ -2379,7 +2410,17 @@ impl AgentBrowserManager {
             Ok((port_alive, Some(record.pid)))
         })
         .await
-        .map_err(|e| format!("agent-browser launch task failed: {e}"))??;
+        .map_err(|e| format!("agent-browser launch task failed: {e}"))
+        .and_then(|result| result);
+        let (port_alive, pid) = match launch_result {
+            Ok(result) => result,
+            Err(error) => {
+                // The next attempt must choose a fresh port if another
+                // process claimed this allocation before the launch.
+                self.clear_failed_stream_allocation(browser_id, port).await;
+                return Err(error);
+            }
+        };
 
         let now = Some(Instant::now());
         self.sessions
@@ -2448,6 +2489,23 @@ mod tests {
         let port = listener.local_addr().unwrap().port();
         assert!(listener_owned_by_pid(port, std::process::id()));
         assert!(!listener_owned_by_pid(port, u32::MAX));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn control_listener_must_belong_to_browser_daemon() {
+        let temp = tempfile::tempdir().unwrap();
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::fs::write(temp.path().join("owned.port"), port.to_string()).unwrap();
+        assert!(browser_control_listener_owned_by_pid("owned", temp.path(), std::process::id()));
+        assert!(!browser_control_listener_owned_by_pid("owned", temp.path(), u32::MAX));
+
+        std::fs::write(temp.path().join("owned.port"), "invalid").unwrap();
+        assert!(!browser_control_listener_owned_by_pid("owned", temp.path(), std::process::id()));
+        assert_eq!(browser_control_port("default", temp.path()), 50838);
+        std::fs::write(temp.path().join("default.port"), "invalid").unwrap();
+        assert_eq!(browser_control_port("default", temp.path()), 50838);
     }
 
     #[cfg(unix)]
@@ -2934,6 +2992,28 @@ mod tests {
         assert_eq!(p1, p2, "Same session key must return same port");
     }
 
+    #[tokio::test]
+    async fn failed_stream_launch_releases_taken_port_for_retry() {
+        let mgr = AgentBrowserManager::new();
+        let session = format!("browser-port-race-{}", uuid::Uuid::new_v4().simple());
+        let mut blocked = None;
+        for _ in 0..5 {
+            let port = mgr.allocate_port(&session).await.unwrap();
+            if let Ok(listener) = std::net::TcpListener::bind(("127.0.0.1", port)) {
+                blocked = Some((port, listener));
+                break;
+            }
+            mgr.clear_failed_stream_allocation(&session, port).await;
+        }
+        let (port, blocker) = blocked.expect("could not reserve an allocated stream port");
+        let error = mgr.start_stream(&session).await.unwrap_err();
+        assert!(error.contains("was taken by another process"), "{error}");
+        assert!(mgr.get_port(&session).await.is_none());
+        let retry_port = mgr.allocate_port(&session).await.unwrap();
+        assert_ne!(retry_port, port);
+        drop(blocker);
+    }
+
     /// Regression test for the open→close→open gap: the agent-facing
     /// "close" runs through run_command (not close()), so the session entry
     /// used to keep running = true after a close. The second open then
@@ -3173,8 +3253,20 @@ mod tests {
         );
         assert!(
             s.contains(".codemux"),
-            "pid file should live under .codemux/run/, got: {s}"
+            "pid file should live under the browser runtime directory, got: {s}"
         );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn legacy_inherited_run_acl_does_not_block_browser_after_upgrade() {
+        let temp = tempfile::tempdir().unwrap();
+        let legacy = temp.path().join(".codemux").join("run");
+        std::fs::create_dir_all(&legacy).unwrap();
+        let private = browser_run_dir_for(temp.path());
+        assert_ne!(private, legacy);
+        prepare_run_dir(&private).expect("new browser runtime directory is private");
+        clack_private_fs::require_private_directory(&private).unwrap();
     }
 
     #[cfg(unix)]
@@ -3284,13 +3376,19 @@ mod tests {
             .spawn()
             .unwrap();
         let pid = child.id();
-        let start_time = (0..20)
-            .find_map(|_| {
-                let start = browser_process_start(pid, session, &token);
-                if start.is_none() { std::thread::sleep(Duration::from_millis(10)); }
-                start
-            })
-            .unwrap();
+        let started_waiting = Instant::now();
+        let start_time = loop {
+            if let Some(start) = browser_process_start(pid, session, &token) {
+                break start;
+            }
+            if started_waiting.elapsed() >= Duration::from_secs(3) {
+                let status = child.try_wait().unwrap();
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("browser process identity unavailable after 3s: pid={pid}, child_status={status:?}, executable={binary:?}");
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        };
         let record = BrowserPidRecord { pid, start_time, token: token.clone() };
         assert!(browser_process_matches(&record, session));
         assert!(!browser_process_matches(&record, "another-session"));

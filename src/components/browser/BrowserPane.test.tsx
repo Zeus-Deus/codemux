@@ -4,6 +4,7 @@ import { act, cleanup, fireEvent, render, screen } from "@testing-library/react"
 import userEvent from "@testing-library/user-event";
 
 import { useAppStore } from "@/stores/app-store";
+import type { AppStateSnapshot } from "@/tauri/types";
 
 const mocks = vi.hoisted(() => ({
   startBrowserStream: vi.fn(),
@@ -37,6 +38,7 @@ import { BrowserPane, MAX_AUTO_START_RETRIES } from "./BrowserPane";
 class FakeWebSocket {
   static readonly OPEN = 1;
   static sent: Array<Record<string, unknown>> = [];
+  static urls: string[] = [];
   static opened = 0;
   readyState = 0;
   onopen: (() => void) | null = null;
@@ -44,6 +46,7 @@ class FakeWebSocket {
   onerror: ((ev: unknown) => void) | null = null;
   onclose: (() => void) | null = null;
   constructor(public url: string) {
+    FakeWebSocket.urls.push(url);
     setTimeout(() => {
       this.readyState = FakeWebSocket.OPEN;
       FakeWebSocket.opened++;
@@ -69,6 +72,7 @@ beforeEach(() => {
   mocks.toastSuccess.mockReset();
   mocks.toastError.mockReset();
   FakeWebSocket.sent = [];
+  FakeWebSocket.urls = [];
   FakeWebSocket.opened = 0;
   vi.stubGlobal("WebSocket", FakeWebSocket);
   useAppStore.setState({ appState: null });
@@ -82,6 +86,46 @@ afterEach(() => {
 });
 
 describe("BrowserPane start failures", () => {
+  it("connects to the newly started port when the session snapshot has an old URL", async () => {
+    useAppStore.setState({
+      appState: {
+        schema_version: 1,
+        active_workspace_id: "ws-1",
+        workspaces: [],
+        terminal_sessions: [],
+        browser_sessions: [],
+        agent_browser_sessions: [{
+          session_id: "abs-1",
+          workspace_id: "ws-1",
+          cli_session_name: "browser-1",
+          stream_url: "ws://localhost:9223",
+          current_url: null,
+          is_active: true,
+          pane_id: null,
+          browser_id: "browser-1",
+          user_dismissed: false,
+        }],
+        notifications: [],
+        detected_ports: [],
+        pane_statuses: {},
+        persistence: {
+          schema_version: 1,
+          stores_layout_metadata: true,
+          stores_terminal_metadata: true,
+          stores_live_process_state: false,
+        },
+        config: {} as AppStateSnapshot["config"],
+      },
+    });
+    mocks.startBrowserStream.mockResolvedValue("ws://127.0.0.1:9224");
+
+    renderPane();
+    await act(async () => {
+      await vi.waitFor(() => expect(FakeWebSocket.urls).toHaveLength(1));
+    });
+    expect(FakeWebSocket.urls).toEqual(["ws://127.0.0.1:9224"]);
+  });
+
   it("retries a failed start a few times, then waits for Retry now", async () => {
     vi.useFakeTimers();
     mocks.startBrowserStream.mockRejectedValue("daemon exited");

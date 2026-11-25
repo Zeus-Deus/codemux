@@ -307,19 +307,9 @@ export const BrowserPane = memo(function BrowserPane({ browserId, focused, visib
     }
   }, []);
 
-  // Keep the stream URL reactive.
-  //
-  // The agent browser session in app state owns the canonical
-  // `stream_url`. When the Rust manager re-allocates a port (after a
-  // teardown/respawn or after the bind-test rejects a stale port), the
-  // backend writes the new port into `agent_browser_sessions` and the
-  // store re-emits.  We read that value directly here so the WebSocket
-  // reconnect is driven by state changes, not by a one-shot
-  // `startBrowserStream` return value cached in a closure.
-  //
-  // Falling back to the value returned by `startBrowserStream` keeps
-  // the legacy non-agent path (no `agentSession`) working unchanged —
-  // there is no reactive source there, so the one-shot URL is fine.
+  // A state update can trigger a reconnect, but the state URL may still be
+  // stale while startBrowserStream reallocates a port. Its return value is
+  // the verified listener for this attempt.
   const reactiveStreamUrl = agentSession?.stream_url;
 
   // Start stream and connect WebSocket
@@ -340,11 +330,7 @@ export const BrowserPane = memo(function BrowserPane({ browserId, focused, visib
 
       let streamUrl: string;
       try {
-        const startResult = await startBrowserStream(streamSessionId);
-        // Prefer the reactive value when present so port re-allocations
-        // don't strand the WebSocket on an old URL.  The Tauri command
-        // call still happens for its side effect (spawning the daemon).
-        streamUrl = reactiveStreamUrl ?? startResult;
+        streamUrl = await startBrowserStream(streamSessionId);
       } catch (err) {
         if (!active) return;
         console.error("[browser] startBrowserStream FAILED", err);
