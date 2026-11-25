@@ -612,6 +612,13 @@ impl CodexSession {
             Some(registry) => registry.plugin_catalog(workspace_id.as_deref()).await,
             None => Vec::new(),
         };
+        // Recovery can settle between the tool snapshot and the resume-key
+        // comparison. Remember both sides of that window before deciding a
+        // missing tool is a durable catalog change.
+        let catalog_recovering_before_snapshot = match mcp_registry.as_ref() {
+            Some(registry) => registry.has_visible_startup_retry(mcp_project_scope.as_ref()).await,
+            None => false,
+        };
         let dynamic_tools = if let Some(context) = managed.as_ref() {
             Some(
                 context
@@ -798,7 +805,7 @@ impl CodexSession {
             .and_then(|v| v.get("requireOriginal"))
             .and_then(Value::as_bool)
             .unwrap_or(false);
-        let catalog_recovering = match mcp_registry.as_ref() {
+        let catalog_recovering = catalog_recovering_before_snapshot || match mcp_registry.as_ref() {
             Some(registry) => registry.has_visible_startup_retry(mcp_project_scope.as_ref()).await,
             None => false,
         };
