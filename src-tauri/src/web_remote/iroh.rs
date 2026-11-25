@@ -1207,6 +1207,7 @@ fn persist_secret_key(path: &Path, key: &SecretKey) -> Result<(), String> {
 
 #[cfg(windows)]
 fn persist_secret_key(path: &Path, key: &SecretKey) -> Result<(), String> {
+    use std::io::Write;
     use std::os::windows::ffi::OsStrExt;
     use windows_sys::Win32::Storage::FileSystem::{
         MoveFileExW, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH,
@@ -1267,24 +1268,71 @@ fn secure_existing_key_file(path: &Path) -> Result<(), String> {
     }
 }
 
+/// Open the app-data root through the pinned private key directory. Resolving
+/// the configured path again could select a different root after a relocation.
+#[cfg(unix)]
+fn legacy_key_dir_from_private(directory: &std::fs::File) -> Result<std::fs::File, String> {
+    use std::os::fd::{AsRawFd, FromRawFd};
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    #[cfg(target_os = "linux")]
+    const SEARCH_ONLY: libc::c_int = libc::O_PATH;
+    #[cfg(target_os = "macos")]
+    const SEARCH_ONLY: libc::c_int = libc::O_SEARCH;
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    const SEARCH_ONLY: libc::c_int = libc::O_RDONLY;
+
+    let parent = std::ffi::CString::new("..").expect("static parent name has no NUL");
+    let fd = unsafe {
+        libc::openat(
+            directory.as_raw_fd(),
+            parent.as_ptr(),
+            SEARCH_ONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )
+    };
+    if fd < 0 {
+        return Err(format!("open pinned app-data directory: {}", std::io::Error::last_os_error()));
+    }
+    let root = unsafe { std::fs::File::from_raw_fd(fd) };
+    let meta = root.metadata().map_err(|e| format!("inspect pinned app-data directory: {e}"))?;
+    if !meta.is_dir()
+        || meta.uid() != unsafe { libc::geteuid() }
+        || meta.permissions().mode() & 0o022 != 0
+    {
+        return Err("pinned app-data directory permissions are unsafe".to_string());
+    }
+    check_key_acl(&root, "pinned app-data directory", KeyAclScope::Ancestor)?;
+
+    // The private directory must be a direct child of this root. A symlinked
+    // child or a moved directory has no provable sibling legacy key.
+    let child = std::ffi::CString::new(KEY_DIR).expect("static directory name has no NUL");
+    let mut entry: libc::stat = unsafe { std::mem::zeroed() };
+    if unsafe {
+        libc::fstatat(root.as_raw_fd(), child.as_ptr(), &mut entry, libc::AT_SYMLINK_NOFOLLOW)
+    } < 0 {
+        return Err(format!("inspect pinned iroh key directory: {}", std::io::Error::last_os_error()));
+    }
+    let private_meta = directory.metadata().map_err(|e| format!("inspect pinned iroh key directory: {e}"))?;
+    if entry.st_mode & libc::S_IFMT != libc::S_IFDIR
+        || entry.st_dev as u64 != private_meta.dev()
+        || entry.st_ino as u64 != private_meta.ino()
+    {
+        return Err("iroh key directory is not a direct child of its pinned app-data directory".to_string());
+    }
+    Ok(root)
+}
+
 /// Copy an existing root-level key only after validating its inode. The app
 /// data directory is an ancestor here: its unrelated permissions stay intact.
 #[cfg(unix)]
 fn migrate_legacy_secret_key(path: &Path, directory: &std::fs::File) -> Result<Option<SecretKey>, String> {
-    use std::os::fd::{AsRawFd, FromRawFd};
-    use std::os::unix::fs::MetadataExt;
-
-    let Some(legacy) = legacy_key_file_path(path) else {
+    if legacy_key_file_path(path).is_none() {
         return Ok(None);
-    };
-    let legacy_dir = open_key_dir(
-        legacy.parent().ok_or("legacy iroh key has no parent")?,
-        KeyDirAccess::AncestorReadOnly,
-    )?;
+    }
+    let legacy_dir = legacy_key_dir_from_private(directory)?;
     let Some(mut file) = open_private_key_file(&legacy_dir, true)? else {
         return Ok(None);
     };
-    let old_meta = file.metadata().map_err(|e| format!("inspect legacy iroh key: {e}"))?;
     let mut sealed = Vec::new();
     file.read_to_end(&mut sealed)
         .map_err(|e| format!("read legacy iroh key: {e}"))?;
@@ -1293,54 +1341,8 @@ fn migrate_legacy_secret_key(path: &Path, directory: &std::fs::File) -> Result<O
         return Ok(None);
     };
     persist_secret_key_in(directory, &key)?;
-
-    // A new iroh-identity directory is itself an entry in the app-data root.
-    // Sync that parent before removing the recovery copy. Search-only roots
-    // cannot be opened for directory sync, so keep the private legacy key in
-    // that case; a crash can then recover the same node ID from either copy.
-    let cleanup_dir = (|| -> Result<std::fs::File, String> {
-        let dot = std::ffi::CString::new(".").expect("static directory name has no NUL");
-        let fd = unsafe {
-            libc::openat(
-                legacy_dir.as_raw_fd(),
-                dot.as_ptr(),
-                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
-            )
-        };
-        if fd < 0 {
-            return Err(format!("open app-data directory for sync: {}", std::io::Error::last_os_error()));
-        }
-        let readable = unsafe { std::fs::File::from_raw_fd(fd) };
-        let expected = legacy_dir.metadata().map_err(|e| format!("inspect app-data directory: {e}"))?;
-        let actual = readable.metadata().map_err(|e| format!("inspect app-data sync handle: {e}"))?;
-        if actual.dev() != expected.dev() || actual.ino() != expected.ino() {
-            return Err("app-data directory changed before sync".to_string());
-        }
-        readable.sync_all().map_err(|e| format!("sync app-data directory: {e}"))?;
-        Ok(readable)
-    })();
-    let cleanup_dir = match cleanup_dir {
-        Ok(dir) => dir,
-        Err(error) => {
-            log::warn!("[codemux::web_remote] keeping private legacy iroh key: {error}");
-            return Ok(Some(key));
-        }
-    };
-
-    // Delete only the same entry we validated. A failed cleanup leaves a
-    // private legacy copy, while the new key is already safely published.
-    let name = std::ffi::CString::new(KEY_FILE).expect("static key filename has no NUL");
-    let mut entry: libc::stat = unsafe { std::mem::zeroed() };
-    let inspected = unsafe {
-        libc::fstatat(legacy_dir.as_raw_fd(), name.as_ptr(), &mut entry, libc::AT_SYMLINK_NOFOLLOW)
-    };
-    if inspected == 0 && entry.st_dev as u64 == old_meta.dev() && entry.st_ino as u64 == old_meta.ino() {
-        if unsafe { libc::unlinkat(legacy_dir.as_raw_fd(), name.as_ptr(), 0) } < 0 {
-            log::warn!("[codemux::web_remote] could not remove migrated iroh key: {}", std::io::Error::last_os_error());
-        } else if let Err(error) = cleanup_dir.sync_all() {
-            log::warn!("[codemux::web_remote] could not sync removed legacy iroh key: {error}");
-        }
-    }
+    // Keep the 0600 legacy copy for crash recovery. A check-then-unlink would
+    // race another owner-controlled rename of the legacy directory entry.
     Ok(Some(key))
 }
 
@@ -2149,12 +2151,51 @@ mod tests {
         let loaded = load_or_create_secret_key_at(&path).unwrap();
         assert_eq!(loaded.public(), original.public());
         assert_eq!(persisted_node_id_at(&path).as_deref(), Some(node_id.as_str()));
-        assert!(!legacy.exists());
+        assert!(legacy.exists(), "the private legacy key remains for crash recovery");
         assert_eq!(std::fs::metadata(&relocated).unwrap().permissions().mode() & 0o777, 0o750);
         assert_eq!(std::fs::metadata(&unrelated).unwrap().permissions().mode() & 0o777, 0o640);
         assert_eq!(std::fs::metadata(relocated.join(KEY_DIR)).unwrap().permissions().mode() & 0o777, 0o700);
         assert_eq!(std::fs::metadata(relocated.join(KEY_DIR).join(KEY_FILE)).unwrap().permissions().mode() & 0o777, 0o600);
         assert_eq!(std::fs::read(&unrelated).unwrap(), b"keep");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn iroh_identity_key_migration_uses_pinned_app_data_root_after_relocation() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        let first = temp.path().join("first");
+        let second = temp.path().join("second");
+        std::fs::create_dir(&first).unwrap();
+        std::fs::create_dir(&second).unwrap();
+        let configured = temp.path().join("codemux");
+        std::os::unix::fs::symlink(&first, &configured).unwrap();
+        let path = configured.join(KEY_DIR).join(KEY_FILE);
+        let first_key = SecretKey::generate();
+        let second_key = SecretKey::generate();
+        for (root, key) in [(&first, &first_key), (&second, &second_key)] {
+            let legacy = root.join(KEY_FILE);
+            std::fs::write(&legacy, crate::auth::encrypt_data(&key.to_bytes()).unwrap()).unwrap();
+            std::fs::set_permissions(&legacy, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
+
+        let private = open_private_key_dir(path.parent().unwrap()).unwrap();
+        std::fs::remove_file(&configured).unwrap();
+        std::os::unix::fs::symlink(&second, &configured).unwrap();
+
+        let migrated = migrate_legacy_secret_key(&path, &private).unwrap().unwrap();
+        assert_eq!(migrated.public(), first_key.public());
+        assert_eq!(load_or_create_secret_key_at(&first.join(KEY_DIR).join(KEY_FILE)).unwrap().public(), first_key.public());
+        assert!(!second.join(KEY_DIR).exists());
+        assert_eq!(
+            decode_secret_key(&std::fs::read(first.join(KEY_FILE)).unwrap()).unwrap().public(),
+            first_key.public()
+        );
+        assert_eq!(
+            decode_secret_key(&std::fs::read(second.join(KEY_FILE)).unwrap()).unwrap().public(),
+            second_key.public()
+        );
     }
 
     #[cfg(windows)]
@@ -2209,7 +2250,7 @@ mod tests {
         assert_eq!(loaded.public(), original.public());
         assert_eq!(std::fs::metadata(&app_dir).unwrap().permissions().mode() & 0o777, 0o750);
         assert_eq!(std::fs::metadata(app_dir.join(KEY_DIR)).unwrap().permissions().mode() & 0o777, 0o700);
-        assert!(!legacy.exists());
+        assert!(legacy.exists(), "the private legacy key remains for crash recovery");
     }
 
     #[cfg(unix)]
