@@ -151,6 +151,9 @@ impl AuthRecord {
 
 // ── Auth State (managed by Tauri) ────────────────────────────────
 
+pub(crate) const SIGN_IN_SESSION_CHANGED: &str =
+    "Authentication changed during sign-in. Try signing in again.";
+
 struct OAuthLaunch {
     generation: u64,
     revision: i64,
@@ -241,13 +244,13 @@ impl AuthState {
         expires_at: &str,
     ) -> Result<Option<(u64, AuthRecord)>, String> {
         self.replace_session_if_current(launch.generation, || {
-            let record = AuthRecord::new(token, expires_at, None, Some("github"))?;
-            if !db.save_oauth_token_if_revision(&record.encrypted, launch.revision)? {
-                return Ok(None);
+            let record =
+                save_auth_at_revision(db, launch.revision, token, expires_at, None, "github")?;
+            if let Some(record) = &record {
+                // Hide the previous account's settings pending identity verification.
+                self.set_local_session(Some(&record.stored));
             }
-            // Hide the previous account's settings pending identity verification.
-            self.set_local_session(Some(&record.stored));
-            Ok(Some(record))
+            Ok(record)
         })
     }
 
@@ -313,7 +316,7 @@ impl AuthState {
     }
 
     /// Advance the generation only if the expected session was replaced.
-    fn replace_session_if_current<T>(
+    pub(crate) fn replace_session_if_current<T>(
         &self,
         expected_generation: u64,
         replace: impl FnOnce() -> Result<Option<T>, String>,
@@ -511,6 +514,20 @@ pub(crate) fn save_auth_with_method(
         None => db.save_auth_token(&record.encrypted)?,
     }
     Ok(record)
+}
+
+pub(crate) fn save_auth_at_revision(
+    db: &DatabaseStore,
+    expected_revision: i64,
+    token: &str,
+    expires_at: &str,
+    user: Option<&AuthUser>,
+    method: &str,
+) -> Result<Option<AuthRecord>, String> {
+    let record = AuthRecord::new(token, expires_at, user, Some(method))?;
+    let account_id = user.map(|user| user.id.as_str());
+    let saved = db.save_auth_token_if_revision(&record.encrypted, account_id, expected_revision)?;
+    Ok(saved.then_some(record))
 }
 
 fn encode_record(stored: &StoredAuth) -> Result<Vec<u8>, String> {

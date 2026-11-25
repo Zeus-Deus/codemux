@@ -3,8 +3,8 @@ use tauri::{Emitter, Manager, State};
 
 use crate::auth::{
     api_base_url, derive_auth_secret, is_token_expired, load_auth_record,
-    login_email_api, save_auth_with_method, signup_email_api, AuthResponse, AuthState,
-    AuthStatePayload, AuthUser,
+    login_email_api, save_auth_at_revision, signup_email_api, AuthResponse, AuthState,
+    AuthStatePayload, AuthUser, SIGN_IN_SESSION_CHANGED,
 };
 use crate::database::DatabaseStore;
 
@@ -449,6 +449,9 @@ pub async fn signin_email<R: tauri::Runtime>(
         return Err("Email and password are required".into());
     }
 
+    let (generation, revision) = auth_state.session_snapshot(|| db.auth_session_revision());
+    let revision = revision?;
+
     // Bitwarden-style zero-knowledge derivation: stretch
     // (password, email) locally into a high-entropy AuthSecret that
     // goes to Better Auth in place of the raw password. Must produce
@@ -472,14 +475,18 @@ pub async fn signin_email<R: tauri::Runtime>(
         image: api_resp.user.image.clone(),
     };
 
-    auth_state.try_replace_session(|| {
-        let record = save_auth_with_method(
+    let result = auth_state.replace_session_if_current(generation, || {
+        let Some(record) = save_auth_at_revision(
             &db,
+            revision,
             &api_resp.token,
             &api_resp.expires_at,
             Some(&user),
-            Some("email"),
-        )?;
+            "email",
+        )?
+        else {
+            return Ok(None);
+        };
         auth_state.set_local_session(Some(&record.stored));
         let payload = AuthStatePayload {
             authenticated: true,
@@ -493,12 +500,15 @@ pub async fn signin_email<R: tauri::Runtime>(
                 auth_method: record.stored.auth_method,
             },
         );
-        Ok(AuthResponse {
+        Ok(Some(AuthResponse {
             token: api_resp.token,
             expires_at: api_resp.expires_at,
             user,
-        })
-    })
+        }))
+    })?;
+    result
+        .map(|(_, response)| response)
+        .ok_or_else(|| SIGN_IN_SESSION_CHANGED.into())
 }
 
 #[tauri::command]

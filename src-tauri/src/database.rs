@@ -6156,12 +6156,18 @@ impl DatabaseStore {
             .map_err(|error| format!("Failed to load auth session revision: {error}"))
     }
 
-    pub(crate) fn save_oauth_token_if_revision(
+    /// Install a sign-in result only if its launch revision is still current.
+    pub(crate) fn save_auth_token_if_revision(
         &self,
         encrypted_data: &[u8],
+        account_id: Option<&str>,
         expected_revision: i64,
     ) -> Result<bool, String> {
-        self.replace_auth_token(encrypted_data, Some(expected_revision))
+        let saved = self.replace_auth_token(encrypted_data, Some(expected_revision))?;
+        if saved && account_id.is_some() {
+            self.mark_account_auth_verified_if_current(encrypted_data);
+        }
+        Ok(saved)
     }
 
     fn replace_auth_token(
@@ -6182,7 +6188,7 @@ impl DatabaseStore {
 
     // The single row survives sign-out, including a sign-out performed while
     // there is no token to delete. The first write obtains SQLite's writer
-    // lock before comparing the revision against a pending OAuth launch.
+    // lock before comparing the revision against a pending sign-in attempt.
     fn advance_auth_revision(
         conn: &Connection,
         expected_revision: Option<i64>,
@@ -6726,7 +6732,7 @@ mod tests {
         assert_eq!(reopened.auth_session_revision().unwrap(), initial + 1);
         assert!(reopened.load_auth_token().is_none());
         assert!(!reopened
-            .save_oauth_token_if_revision(b"stale-token", initial)
+            .save_auth_token_if_revision(b"stale-token", None, initial)
             .unwrap());
         assert!(reopened.load_auth_token().is_none());
     }

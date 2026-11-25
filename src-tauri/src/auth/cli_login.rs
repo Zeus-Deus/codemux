@@ -38,10 +38,13 @@ use serde::Deserialize;
 
 use crate::auth::{
     api_base_url, derive_auth_secret, is_token_expired, load_auth_record,
-    login_email_api, save_auth_with_method, AuthUser,
+    login_email_api, save_auth_at_revision, AuthUser, SIGN_IN_SESSION_CHANGED,
 };
 #[cfg(test)]
-use crate::auth::{load_cached_user, load_stored_auth_method, load_token, save_auth};
+use crate::auth::{
+    clear_token, load_cached_user, load_stored_auth_method, load_token, save_auth,
+    save_auth_with_method,
+};
 use crate::database::DatabaseStore;
 
 /// Environment variable accepted in place of an interactive prompt. Meant
@@ -132,6 +135,8 @@ pub(crate) async fn sign_in(
         ));
     }
 
+    let revision = db.auth_session_revision().map_err(LoginError::Local)?;
+
     // Same zero-knowledge derivation the GUI runs: the server only ever
     // sees the stretched secret. `login_email_api` takes `&AuthSecret`,
     // so the compiler refuses to let the raw password past this line.
@@ -150,14 +155,16 @@ pub(crate) async fn sign_in(
         image: api_resp.user.image.clone(),
     };
 
-    save_auth_with_method(
+    save_auth_at_revision(
         db,
+        revision,
         &api_resp.token,
         &api_resp.expires_at,
         Some(&user),
-        Some("email"),
+        "email",
     )
-    .map_err(|e| LoginError::Local(format!("Could not persist the session: {e}")))?;
+    .map_err(|e| LoginError::Local(format!("Could not persist the session: {e}")))?
+    .ok_or_else(|| LoginError::Local(SIGN_IN_SESSION_CHANGED.into()))?;
 
     Ok(user)
 }
@@ -248,10 +255,12 @@ pub(crate) async fn sign_in_with_token(
         return Err(LoginError::Local("A token is required.".to_string()));
     }
 
+    let revision = db.auth_session_revision().map_err(LoginError::Local)?;
     let (user, expires_at) = verify_bearer(token).await?;
 
-    save_auth_with_method(db, token, &expires_at, Some(&user), Some("token"))
-        .map_err(|e| LoginError::Local(format!("Could not persist the session: {e}")))?;
+    save_auth_at_revision(db, revision, token, &expires_at, Some(&user), "token")
+        .map_err(|e| LoginError::Local(format!("Could not persist the session: {e}")))?
+        .ok_or_else(|| LoginError::Local(SIGN_IN_SESSION_CHANGED.into()))?;
 
     Ok(user)
 }
@@ -687,6 +696,40 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn pending_email_login_cannot_undo_empty_session_logout() {
+        if crate::test_isolation::isolated(
+            "auth::cli_login::tests::pending_email_login_cannot_undo_empty_session_logout",
+        ) {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("auth.sqlite");
+        let db = DatabaseStore::test_file(&path);
+        let other = DatabaseStore::test_file(&path);
+        let email = "pending@example.test";
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("POST", "/api/auth/desktop/signin")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body_from_request(move |_| {
+                assert!(other.load_auth_token().is_none());
+                clear_token(&other).unwrap();
+                signin_mock_body(email).into_bytes()
+            })
+            .create_async()
+            .await;
+        let _guard = ApiUrlGuard::set(&server.url());
+
+        let error = sign_in(&db, email, "fixture-password".into())
+            .await
+            .unwrap_err();
+        mock.assert_async().await;
+        assert_eq!(error.user_message(), SIGN_IN_SESSION_CHANGED);
+        assert!(db.load_auth_token().is_none());
+    }
+
+    #[tokio::test]
     #[serial_test::serial(mockserver)]
     async fn login_sends_the_derived_secret_not_the_raw_password() {
         // Complements the structural leak tests in `auth/api.rs` by
@@ -861,6 +904,52 @@ mod tests {
             auth_status(&db),
             AuthStatusReport::SignedIn { .. }
         ));
+    }
+
+    #[tokio::test]
+    async fn pending_token_login_cannot_replace_a_newer_session() {
+        if crate::test_isolation::isolated(
+            "auth::cli_login::tests::pending_token_login_cannot_replace_a_newer_session",
+        ) {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("auth.sqlite");
+        let db = DatabaseStore::test_file(&path);
+        let other = DatabaseStore::test_file(&path);
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("GET", "/api/auth/desktop/verify")
+            .match_header("authorization", "Bearer pending-token")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body_from_request(move |_| {
+                let user = AuthUser {
+                    id: "new-account".into(),
+                    email: "new@example.test".into(),
+                    name: None,
+                    image: None,
+                };
+                save_auth_with_method(
+                    &other,
+                    "new-token",
+                    "2099-01-01T00:00:00Z",
+                    Some(&user),
+                    Some("email"),
+                )
+                .unwrap();
+                verify_mock_body("pending@example.test").into_bytes()
+            })
+            .create_async()
+            .await;
+        let _guard = ApiUrlGuard::set(&server.url());
+
+        let error = sign_in_with_token(&db, "pending-token").await.unwrap_err();
+        mock.assert_async().await;
+        assert_eq!(error.user_message(), SIGN_IN_SESSION_CHANGED);
+        assert_eq!(load_token(&db).unwrap().0, "new-token");
+        assert_eq!(load_cached_user(&db).unwrap().id, "new-account");
+        assert_eq!(load_stored_auth_method(&db).as_deref(), Some("email"));
     }
 
     #[tokio::test]

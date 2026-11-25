@@ -208,17 +208,19 @@ fn tungstenite_to_axum(msg: TungMessage) -> Option<AxumMessage> {
 
 /// `ANY /proxy/browser/:port/api/*rest` — forward the daemon's HTTP endpoints
 /// (`/api/status`, `/api/command`) with a minimal, credential-free request.
-pub async fn http_forward<R: Runtime>(
+pub(super) async fn http_forward<R: Runtime>(
     State(app): State<AppHandle<R>>,
+    life: Option<Extension<ListenerLife>>,
     Path((port, rest)): Path<(u16, String)>,
     method: Method,
     uri: Uri,
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    if let Err(resp) = super::server::require_session(&app, &headers) {
-        return resp;
-    }
+    let session = match super::server::require_session(&app, &headers) {
+        Ok(session) => session,
+        Err(resp) => return resp,
+    };
     if !port_in_range(port) {
         return (StatusCode::BAD_REQUEST, "port out of range").into_response();
     }
@@ -228,9 +230,31 @@ pub async fn http_forward<R: Runtime>(
     if has_control_char(&rest) {
         return (StatusCode::BAD_REQUEST, "invalid path").into_response();
     }
-    match forward(port, &method, &rest, uri.query(), &headers, &body).await {
+    let Some(Extension(life)) = life else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    let shared = app.state::<WebRemoteState>().shared();
+    let check_access = || {
+        if !life.live() || !super::lan_wanted(&shared.config.lock().unwrap()) {
+            return Err(StatusCode::SERVICE_UNAVAILABLE);
+        }
+        if !super::server::session_active(&app, &session.id) {
+            return Err(StatusCode::UNAUTHORIZED);
+        }
+        Ok(())
+    };
+    let mut shutdown = life.clone();
+    let upstream = tokio::select! {
+        biased;
+        _ = shutdown.stopped() => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+        result = forward(port, &method, &rest, uri.query(), &headers, &body, &check_access) => result,
+    };
+    // The daemon response, including its entire body, is buffered upstream.
+    // Release it only if the original session still has access.
+    match check_access().and(upstream) {
         Ok(resp) => resp,
-        Err(()) => (StatusCode::BAD_GATEWAY, "daemon unreachable").into_response(),
+        Err(StatusCode::BAD_GATEWAY) => (StatusCode::BAD_GATEWAY, "daemon unreachable").into_response(),
+        Err(status) => status.into_response(),
     }
 }
 
@@ -243,7 +267,8 @@ async fn forward(
     query: Option<&str>,
     headers: &HeaderMap,
     body: &[u8],
-) -> Result<Response, ()> {
+    check_access: impl Fn() -> Result<(), StatusCode>,
+) -> Result<Response, StatusCode> {
     let target = match query {
         Some(q) if !q.is_empty() => format!("/api/{rest}?{q}"),
         _ => format!("/api/{rest}"),
@@ -271,32 +296,35 @@ async fn forward(
     let mut wire = head.into_bytes();
     wire.extend_from_slice(body);
 
+    check_access()?;
+    let upstream_error = StatusCode::BAD_GATEWAY;
     let mut stream = tokio::time::timeout(
         Duration::from_secs(5),
         tokio::net::TcpStream::connect(("127.0.0.1", port)),
     )
     .await
-    .map_err(|_| ())?
-    .map_err(|_| ())?;
+    .map_err(|_| upstream_error)?
+    .map_err(|_| upstream_error)?;
 
+    check_access()?;
     // One write_all → the whole request lands in a single loopback segment,
     // satisfying the daemon's single-peek read.
-    stream.write_all(&wire).await.map_err(|_| ())?;
+    stream.write_all(&wire).await.map_err(|_| upstream_error)?;
     let _ = stream.flush().await;
 
     let raw = tokio::time::timeout(Duration::from_secs(30), read_response(&mut stream, method))
         .await
-        .map_err(|_| ())?
-        .map_err(|_| ())?;
+        .map_err(|_| upstream_error)?
+        .map_err(|_| upstream_error)?;
 
-    let parsed = parse_http_response(&raw, method).ok_or(())?;
+    let parsed = parse_http_response(&raw, method).ok_or(upstream_error)?;
     let mut builder = axum::response::Response::builder().status(parsed.status);
     if let Some(ct) = parsed.content_type {
         builder = builder.header(header::CONTENT_TYPE, ct);
     }
     builder
         .body(axum::body::Body::from(parsed.body))
-        .map_err(|_| ())
+        .map_err(|_| upstream_error)
 }
 
 /// Read a full HTTP/1.1 response off `stream`.
@@ -625,6 +653,78 @@ mod tests {
         tokio::time::timeout(Duration::from_secs(1), life.stopped())
             .await
             .expect("an upgrade on the old listener must observe its shutdown");
+    }
+
+    #[tokio::test]
+    async fn http_proxy_drops_a_pending_account_response_after_logout() {
+        use axum::{body::Body, http::Request};
+        use tokio::io::{AsyncBufReadExt, BufReader};
+        use tower::ServiceExt;
+
+        tokio::time::timeout(Duration::from_secs(10), async {
+            let app = tauri::test::mock_app();
+            let db = crate::database::DatabaseStore::new_in_memory();
+            auth::seed_account_browser(&db, "account", "account-browser");
+            db.web_remote_insert_session("paired", None, None, &auth::sha256_hex("paired-browser"), true)
+                .unwrap();
+            app.manage(db);
+            app.manage(WebRemoteState::default());
+            let shared = app.state::<WebRemoteState>().shared();
+            {
+                let mut config = shared.config.lock().unwrap();
+                config.enabled = true;
+                config.lan_enabled = true;
+            }
+
+            let daemon = bind_test_daemon().await;
+            let port = daemon.local_addr().unwrap().port();
+            let (_shutdown, rx) = watch::channel(false);
+            let router = server::router(app.handle().clone()).layer(Extension(ListenerLife(rx)));
+            let request = |token: &str| {
+                Request::builder()
+                    .uri(format!("/proxy/browser/{port}/api/status"))
+                    .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                    .body(Body::empty())
+                    .unwrap()
+            };
+
+            let db = app.state::<crate::database::DatabaseStore>();
+            let daemon_replies = async {
+                for sign_out in [true, false] {
+                    let (stream, _) = daemon.accept().await.unwrap();
+                    let mut stream = BufReader::new(stream);
+                    let mut request_line = String::new();
+                    stream.read_line(&mut request_line).await.unwrap();
+                    assert_eq!(request_line, "GET /api/status HTTP/1.1\r\n");
+                    if sign_out {
+                        db.clear_auth_token().unwrap();
+                    }
+                    stream
+                        .get_mut()
+                        .write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 20\r\n\r\nmock daemon response")
+                        .await
+                        .unwrap();
+                }
+            };
+            let proxy_requests = async {
+                let revoked = router.clone().oneshot(request("account-browser")).await.unwrap();
+                assert_eq!(revoked.status(), StatusCode::UNAUTHORIZED);
+                assert!(axum::body::to_bytes(revoked.into_body(), 1024).await.unwrap().is_empty());
+
+                let paired = router.clone().oneshot(request("paired-browser")).await.unwrap();
+                assert_eq!(paired.status(), StatusCode::OK);
+                assert_eq!(paired.headers()[header::CONTENT_TYPE], "text/plain");
+                let body = axum::body::to_bytes(paired.into_body(), 1024).await.unwrap();
+                assert_eq!(body.as_ref(), b"mock daemon response");
+            };
+            tokio::join!(daemon_replies, proxy_requests);
+
+            shared.config.lock().unwrap().lan_enabled = false;
+            let disabled = router.oneshot(request("paired-browser")).await.unwrap();
+            assert_eq!(disabled.status(), StatusCode::SERVICE_UNAVAILABLE);
+        })
+        .await
+        .expect("loopback HTTP proxy requests must complete");
     }
 
     #[test]
