@@ -100,5 +100,8 @@
     "typescript": "^7.0.2",
     "vite": "^7.3.8",
     "vitest": "^4.1.12"
+  },
+  "overrides": {
+    "katex": "0.18.2"
   }
 }
