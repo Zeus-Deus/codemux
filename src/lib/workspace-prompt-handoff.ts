@@ -7,13 +7,13 @@ import { useChatDraftStore } from "@/stores/chat-draft-store";
 export function saveWorkspacePrompt(
   workspaceId: string,
   prompt: string,
-  agentOpened: boolean,
+  commandDelivered: boolean,
   message: string,
   tone: "success" | "warning" = "success",
-  openAgent?: () => Promise<unknown>,
+  openTerminal?: () => Promise<unknown>,
 ): void {
   if (!prompt) return;
-  useChatDraftStore.getState().saveWorkspacePrompt(workspaceId, prompt, agentOpened);
+  useChatDraftStore.getState().saveWorkspacePrompt(workspaceId, prompt, commandDelivered);
   toast[tone](message, {
     description: "The exact prompt is saved in Drafts.",
     duration: 10_000,
@@ -26,12 +26,12 @@ export function saveWorkspacePrompt(
         });
       },
     },
-    ...(openAgent ? {
+    ...(openTerminal ? {
       cancel: {
-        label: "Open agent",
+        label: "Open terminal",
         onClick: (event: { preventDefault: () => void }) => {
           event.preventDefault();
-          void openAgent().catch((error) => toast.failure("Couldn't open agent tab", error));
+          void openTerminal().catch((error) => toast.failure("Couldn't open terminal tab", error));
         },
       },
     } : {}),

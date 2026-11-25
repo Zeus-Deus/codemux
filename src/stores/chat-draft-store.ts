@@ -98,8 +98,8 @@ export interface ChatDraft {
   /** Last materialise-and-send error, surfaced as an inline retry
    *  affordance on the composer. Cleared on next successful send. */
   lastSendError: string | null;
-  /** A terminal preset opened without receiving this draft's prompt.
-   *  The prompt remains here for the user to copy into the agent. */
+  /** A terminal received a preset command but not this draft's prompt.
+   *  The prompt remains here for manual entry if the agent becomes ready. */
   manualPromptRequired?: boolean;
   /** When `true`, this draft was created by an explicit user action
    *  (clicking the sidebar "New agent" button) and should NOT be
@@ -164,7 +164,7 @@ export interface ChatDraftStore {
   getOrCreateHomeDraft: (opts?: { lockedToHome?: boolean }) => ChatDraft;
   getOrCreateProjectDraft: (projectPath: string) => ChatDraft;
   /** Keep a terminal launch's exact unsent prompt beside its workspace. */
-  saveWorkspacePrompt: (workspaceId: string, prompt: string, agentOpened: boolean) => DraftId;
+  saveWorkspacePrompt: (workspaceId: string, prompt: string, commandDelivered: boolean) => DraftId;
 
   // Active-draft selection
   setActiveDraft: (draftId: DraftId | null) => void;
@@ -542,11 +542,11 @@ export const useChatDraftStore = create<ChatDraftStore>()(
         return draft;
       },
 
-      saveWorkspacePrompt: (workspaceId, prompt, agentOpened) => {
+      saveWorkspacePrompt: (workspaceId, prompt, commandDelivered) => {
         const draft: ChatDraft = {
           ...makeDraft({ kind: "existing_workspace", workspaceId }),
           inputDraft: prompt,
-          manualPromptRequired: agentOpened,
+          manualPromptRequired: commandDelivered,
         };
         set((state) => ({
           draftsById: { ...state.draftsById, [draft.draftId]: draft },

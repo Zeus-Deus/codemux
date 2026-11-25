@@ -270,7 +270,7 @@ describe("the Timeline tab", () => {
 });
 
 describe("agent runs on the rail", () => {
-  it("labels a manual PR handoff as opened without the task", async () => {
+  it("labels a manual PR handoff as a delivered command without the task", async () => {
     const user = userEvent.setup();
     seedRun();
     const run = usePrAgentRunsStore.getState().runs[0];
@@ -279,8 +279,27 @@ describe("agent runs on the rail", () => {
     await openTimeline(user);
 
     const row = screen.getByTestId("timeline-entry-agent");
-    expect(row).toHaveTextContent("Agent opened · task not sent");
-    expect(row).toHaveTextContent("Copy the prepared prompt from Drafts");
+    expect(row).toHaveTextContent("Launch command sent · task not sent");
+    expect(row).toHaveTextContent("Paste it only after the agent's input appears");
+    expect(within(row).getByTestId("timeline-open-terminal")).toHaveTextContent("Open terminal");
+    expect(within(row).queryByTestId("timeline-open-thread")).toBeNull();
+  });
+
+  it("opens only the workspace when a partial handoff has no confirmed tab", async () => {
+    const user = userEvent.setup();
+    seedRun();
+    const run = usePrAgentRunsStore.getState().runs[0];
+    usePrAgentRunsStore.getState().record({ ...run, threadTabId: null, promptNotSent: true });
+    renderDetail();
+    await openTimeline(user);
+
+    const row = screen.getByTestId("timeline-entry-agent");
+    expect(row).toHaveTextContent("Launch command sent · task not sent");
+    expect(within(row).queryByText("Agent opened")).toBeNull();
+    expect(within(row).queryByTestId("timeline-open-thread")).toBeNull();
+    await user.click(within(row).getByTestId("timeline-open-workspace"));
+    await waitFor(() => expect(mockActivateWorkspace).toHaveBeenCalledWith("ws-agent"));
+    expect(mockActivateTab).not.toHaveBeenCalled();
   });
 
   it("interleaves a local run between the host events it happened between", async () => {

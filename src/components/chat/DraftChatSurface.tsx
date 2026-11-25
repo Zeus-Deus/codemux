@@ -1480,7 +1480,7 @@ function DraftChatSurfaceInner({
       showStopButton={false}
       errorMessage={draft.lastSendError}
       noticeMessage={draft.manualPromptRequired
-        ? "Agent opened without this prompt. Copy it into the terminal agent. Sending here starts a separate chat."
+        ? "The launch command reached a terminal. Paste this prompt only when the agent's input is visible. Sending here starts a separate chat."
         : null}
       noticeAction={draft.manualPromptRequired ? {
         label: "Copy prompt",

@@ -7,7 +7,7 @@ vi.mock("@/tauri/commands", async (importOriginal) => ({
   listSkills: vi.fn(),
 }));
 
-import { launchDraftWithPreset } from "./draft-preset-launch";
+import { CLEAR_AFTER_PROMOTION_MS, launchDraftWithPreset } from "./draft-preset-launch";
 import { materializeWithPreset } from "./materialize";
 import { refreshSkillSelectionForCwd } from "./skill-selection-refresh";
 import { listSkills, type Skill } from "@/tauri/commands";
@@ -81,6 +81,50 @@ it("keeps a withheld CLI prompt available after showing the agent workspace", as
   expect(preserved?.inputDraft).toBe("review this issue\n&calc");
   expect(preserved?.promotedTo).toBeNull();
   expect(preserved?.materializedTo).toBeNull();
+});
+
+it("keeps a confirmed partial launch prompt after its tab state becomes unavailable", async () => {
+  vi.useFakeTimers();
+  try {
+    vi.mocked(materializeWithPreset).mockImplementationOnce(async (draft, _preset, _prompt, actions) => {
+      actions.markManualPromptRequired(draft.draftId);
+      return {
+        success: true,
+        workspaceId: "ws",
+        paneId: "cli-preset",
+        threadId: draft.threadId,
+        manualPromptRequired: true,
+        retainedDraft: true,
+        partialPreset: {
+          confirmedTabId: null,
+          confirmedCommands: 1,
+          openTabCount: null,
+          totalCommands: 2,
+        },
+      };
+    });
+    const store = useChatDraftStore.getState();
+    const draft = store.getOrCreateHomeDraft();
+    store.updateDraftInput(draft.draftId, "review this issue");
+    store.setActiveDraft(draft.draftId);
+
+    const result = await launchDraftWithPreset(draft.draftId, { id: "cli" } as TerminalPreset);
+
+    expect(result).toMatchObject({
+      success: true,
+      manualPromptRequired: true,
+      retainedDraft: true,
+      partialPreset: { confirmedTabId: null, confirmedCommands: 1 },
+    });
+    expect(useChatDraftStore.getState().activeDraftId).toBeNull();
+    vi.advanceTimersByTime(CLEAR_AFTER_PROMOTION_MS + 1);
+    expect(useChatDraftStore.getState().draftsById[draft.draftId]).toMatchObject({
+      inputDraft: "review this issue",
+      manualPromptRequired: true,
+    });
+  } finally {
+    vi.useRealTimers();
+  }
 });
 
 it("keeps a Shell draft without manual agent guidance", async () => {

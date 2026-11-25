@@ -393,10 +393,10 @@ export async function handOffToAgent(req: HandoffRequest): Promise<HandoffOutcom
     saveWorkspacePrompt(
       workspaceId,
       prompt,
-      partial ? !!threadTabId : true,
+      partial ? partial.launch.confirmedCommands > 0 : true,
       partial
         ? partialPresetStatusMessage(presetName, partial.launch, partial.tab)
-        : `${presetName} opened ${where} without the PR task. Copy the prompt to start it.`,
+        : `${presetName} launch command reached a terminal ${where}. The PR task is saved in Drafts; paste it only when the agent's input is visible.`,
       partial ? "warning" : "success",
       partial && threadTabId
         ? () => activateWorkspaceInteraction(workspaceId).then(() => activateTab(workspaceId, threadTabId))

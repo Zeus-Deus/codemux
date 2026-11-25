@@ -289,9 +289,10 @@ describe("handOffToAgent — routes", () => {
     expect(targetTabId).toBe("tab-1");
     expect(mockCreateWorktree).not.toHaveBeenCalled();
     expect(mockToastSuccess).toHaveBeenCalledWith(
-      expect.stringContaining("without the PR task"),
+      expect.stringContaining("launch command reached a terminal in this workspace"),
       expect.objectContaining({ action: expect.objectContaining({ label: "Copy prompt" }) }),
     );
+    expect(mockToastSuccess.mock.calls[0][0]).toContain("paste it only when the agent's input is visible");
     const saved = Object.values(useChatDraftStore.getState().draftsById)[0];
     expect(saved.target).toEqual({ kind: "existing_workspace", workspaceId: "ws-here" });
     expect(saved.inputDraft).toBe(out.prompt);
@@ -431,7 +432,7 @@ describe("handOffToAgent — routes", () => {
       expect.stringContaining("opened 1 of 2 tabs"),
       expect.objectContaining({
         action: expect.objectContaining({ label: "Copy prompt" }),
-        cancel: expect.objectContaining({ label: "Open agent" }),
+        cancel: expect.objectContaining({ label: "Open terminal" }),
       }),
     );
     expect(mockToastSuccess).not.toHaveBeenCalled();
@@ -456,7 +457,7 @@ describe("handOffToAgent — routes", () => {
     ]);
     expect(mockToastWarning).toHaveBeenCalledWith(
       expect.stringContaining("opened 1 of 3 tabs"),
-      expect.objectContaining({ cancel: expect.objectContaining({ label: "Open agent" }) }),
+      expect.objectContaining({ cancel: expect.objectContaining({ label: "Open terminal" }) }),
     );
     expect(mockToastSuccess).not.toHaveBeenCalled();
   });
@@ -478,13 +479,13 @@ describe("handOffToAgent — routes", () => {
     ]);
     expect(mockToastSuccess).not.toHaveBeenCalled();
     expect(mockToastWarning).toHaveBeenCalledWith(
-      expect.stringContaining("2 of 3 preset commands reached terminals; no agent tab remains open"),
+      expect.stringContaining("2 of 3 preset commands reached terminals; no terminal tab remains open"),
       expect.objectContaining({ action: expect.objectContaining({ label: "Copy prompt" }) }),
     );
     expect(mockToastWarning.mock.calls[0][1].cancel).toBeUndefined();
     const saved = Object.values(useChatDraftStore.getState().draftsById)[0];
     expect(saved.inputDraft).toContain("rust (ubuntu-latest)");
-    expect(saved.manualPromptRequired).toBe(false);
+    expect(saved.manualPromptRequired).toBe(true);
     expect(mockApplyPreset).toHaveBeenCalledTimes(1);
   });
 
@@ -510,7 +511,7 @@ describe("handOffToAgent — routes", () => {
     expect(mockToastWarning.mock.calls[0][1].cancel).toBeUndefined();
     expect(mockToastSuccess).not.toHaveBeenCalled();
     expect(mockActivateTab).not.toHaveBeenCalled();
-    expect(Object.values(useChatDraftStore.getState().draftsById)[0].manualPromptRequired).toBe(false);
+    expect(Object.values(useChatDraftStore.getState().draftsById)[0].manualPromptRequired).toBe(true);
     expect(mockGetAppState).toHaveBeenCalledTimes(2);
     expect(mockApplyPreset).toHaveBeenCalledTimes(1);
   });

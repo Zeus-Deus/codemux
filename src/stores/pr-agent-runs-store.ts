@@ -50,14 +50,14 @@ export interface AgentRunRecord {
   kind: AgentRunKind;
   /** The prepared task's check name, `path:line`, or base branch. */
   summary: string;
-  /** The terminal opened, but the prepared task was saved for manual entry. */
+  /** A launch command reached a terminal, but the task needs manual entry. */
   promptNotSent?: boolean;
   /** Where the thread landed. */
   workspaceId: string;
   workspaceTitle: string;
-  /** The tab the thread opened in, when the handoff created one — so
-   *  "Open thread" lands on the conversation rather than the workspace.
-   *  Null when the worktree route created no tab here. */
+  /** The confirmed tab, when still available, so the action navigates
+   *  there. Null when no tab can be confirmed or the worktree route created
+   *  no tab here. */
   threadTabId: string | null;
   /** Epoch ms. Sorted against host events by this. */
   createdAt: number;

@@ -756,21 +756,26 @@ export async function materializeWithPreset(
   } catch (err) {
     if (err instanceof PartialPresetLaunchError) {
       const tab = await focusConfirmedPresetTab(workspaceId, err.confirmedTabIds);
-      if (tab.tabId) {
-        if (prompt.length > 0) actions.markManualPromptRequired(draft.draftId);
-        else actions.markPromoted(draft.draftId, {
+      // A confirmed write stays confirmed even if its tab closed or the
+      // follow-up state read failed. Keep the draft's delivery notice so a
+      // later visit cannot mistake this for an untouched, retryable prompt.
+      if (prompt.length > 0) {
+        actions.markManualPromptRequired(draft.draftId);
+      } else if (tab.tabId) {
+        actions.markPromoted(draft.draftId, {
           workspaceId,
           paneId: "cli-preset",
           threadId: draft.threadId,
         });
-      } else actions.markPromptRetained(draft.draftId);
-      const manualPromptRequired = !!tab.tabId && prompt.length > 0;
+      } else {
+        actions.markPromptRetained(draft.draftId);
+      }
       return {
         success: true,
         workspaceId,
         paneId: "cli-preset",
         threadId: draft.threadId,
-        ...(manualPromptRequired ? { manualPromptRequired: true } : {}),
+        ...(prompt.length > 0 ? { manualPromptRequired: true } : {}),
         ...(!tab.tabId ? { retainedDraft: true } : {}),
         partialPreset: {
           confirmedTabId: tab.tabId,
@@ -789,15 +794,15 @@ export async function materializeWithPreset(
   // foreground shell may change before the write arrives. Keep the draft
   // visible in the sidebar with its original text for the user to copy.
   if (prompt.length > 0) {
-    const agentOpened = preset.commands.some((command) => command.trim());
-    if (agentOpened) actions.markManualPromptRequired(draft.draftId);
+    const commandDelivered = preset.commands.some((command) => command.trim());
+    if (commandDelivered) actions.markManualPromptRequired(draft.draftId);
     else actions.markPromptRetained(draft.draftId);
     return {
       success: true,
       workspaceId,
       paneId: "cli-preset",
       threadId: draft.threadId,
-      ...(agentOpened ? { manualPromptRequired: true } : { retainedDraft: true }),
+      ...(commandDelivered ? { manualPromptRequired: true } : { retainedDraft: true }),
     };
   }
 

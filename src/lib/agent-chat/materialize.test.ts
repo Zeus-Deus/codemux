@@ -1752,6 +1752,7 @@ describe("materializeWithPreset", () => {
 
       expect(result).toMatchObject({
         success: true,
+        manualPromptRequired: true,
         retainedDraft: true,
         partialPreset: {
           confirmedTabId: null,
@@ -1760,8 +1761,8 @@ describe("materializeWithPreset", () => {
           totalCommands: 2,
         },
       });
-      expect(actions.markPromptRetained).toHaveBeenCalledWith(draft.draftId);
-      expect(actions.markManualPromptRequired).not.toHaveBeenCalled();
+      expect(actions.markManualPromptRequired).toHaveBeenCalledWith(draft.draftId);
+      expect(actions.markPromptRetained).not.toHaveBeenCalled();
       expect(actions.markSendFailed).not.toHaveBeenCalled();
       expect(actions.markPromoted).not.toHaveBeenCalled();
       expect(activateTab).not.toHaveBeenCalled();

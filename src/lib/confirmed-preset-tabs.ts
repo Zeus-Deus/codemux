@@ -49,5 +49,5 @@ export function partialPresetStatusMessage(
   if (tab.openTabCount === null) {
     return `${partial.confirmedCommands} of ${partial.totalCommands} preset commands reached terminals; open tabs could not be confirmed.`;
   }
-  return `${partial.confirmedCommands} of ${partial.totalCommands} preset commands reached terminals; no agent tab remains open.`;
+  return `${partial.confirmedCommands} of ${partial.totalCommands} preset commands reached terminals; no terminal tab remains open.`;
 }

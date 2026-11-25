@@ -139,7 +139,7 @@ describe("ProjectOnboarding — task and agent", () => {
     });
   });
 
-  it("keeps the task for manual entry after opening the selected agent", async () => {
+  it("keeps the task for manual entry after delivering the launch command", async () => {
     const { onComplete } = renderOnboarding();
     await flushMountEffects();
     await goToSetupStep("  Add dark mode  ");
@@ -164,7 +164,7 @@ describe("ProjectOnboarding — task and agent", () => {
     expect(saved.inputDraft).toBe("Add dark mode");
     expect(saved.manualPromptRequired).toBe(true);
     expect(vi.mocked(toast.success)).toHaveBeenCalledWith(
-      expect.stringContaining("opened without this task"),
+      expect.stringContaining("launch command reached a terminal. Paste this task only when the agent's input is visible"),
       expect.objectContaining({ action: expect.objectContaining({ label: "Copy prompt" }) }),
     );
     expect(onComplete).toHaveBeenCalledTimes(1);
@@ -210,7 +210,7 @@ describe("ProjectOnboarding — task and agent", () => {
       expect.stringContaining("opened 1 of 2 tabs"),
       expect.objectContaining({
         action: expect.objectContaining({ label: "Copy prompt" }),
-        cancel: expect.objectContaining({ label: "Open agent" }),
+        cancel: expect.objectContaining({ label: "Open terminal" }),
       }),
     );
     expect(toast.success).not.toHaveBeenCalled();
@@ -243,7 +243,7 @@ describe("ProjectOnboarding — task and agent", () => {
     expect(activateTab).not.toHaveBeenCalled();
     const saved = Object.values(useChatDraftStore.getState().draftsById)[0];
     expect(saved.inputDraft).toBe("Add dark mode");
-    expect(saved.manualPromptRequired).toBe(false);
+    expect(saved.manualPromptRequired).toBe(true);
     expect(getAppState).toHaveBeenCalledTimes(2);
     expect(mockApplyPreset).toHaveBeenCalledTimes(1);
   });

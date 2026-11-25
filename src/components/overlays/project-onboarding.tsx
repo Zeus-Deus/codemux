@@ -384,21 +384,21 @@ export function ProjectOnboarding({ projectDir, tempWorkspaceId, onComplete, onC
           ? () => activateWorkspace(created.workspaceId).then(() => activateTab(created.workspaceId, confirmedTabId))
           : undefined;
         if (prompt) {
-          const agentOpened =
+          const commandDelivered =
             !launchError &&
-            (!partialLaunch || !!confirmedTabId) &&
+            (!partialLaunch || partialLaunch.confirmedCommands > 0) &&
             !created.adopted &&
             !!selectedAgent?.commands.some((command) => command.trim());
           saveWorkspacePrompt(
             created.workspaceId,
             prompt,
-            agentOpened,
+            commandDelivered,
             partialLaunch
               ? partialPresetStatusMessage(selectedAgent?.name ?? "Agent", partialLaunch, partialTab ?? { tabId: null, openTabCount: null })
               : launchError
               ? `Workspace opened, but ${selectedAgent?.name ?? "Agent"} could not be confirmed open. The task is saved in Drafts.`
-              : agentOpened
-              ? `${selectedAgent?.name ?? "Agent"} opened without this task. Copy the prompt to start it.`
+              : commandDelivered
+              ? `${selectedAgent?.name ?? "Agent"} launch command reached a terminal. Paste this task only when the agent's input is visible.`
               : "Workspace opened without sending this task. It is saved for later.",
             launchError || partialLaunch ? "warning" : "success",
             openConfirmedTab,

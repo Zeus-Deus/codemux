@@ -572,17 +572,17 @@ export function DraftAgentLauncher({ draft }: DraftAgentLauncherProps) {
           `${partialPresetStatusMessage(preset.name, partial, { tabId: confirmedTabId, openTabCount: partial.openTabCount })}${result.manualPromptRequired || result.retainedDraft ? " The prompt remains in Drafts." : ""}`,
           confirmedTabId ? {
             action: {
-              label: "Open agent",
+              label: "Open terminal",
               onClick: () => {
                 void activateWorkspace(result.workspaceId)
                   .then(() => activateTab(result.workspaceId, confirmedTabId))
-                  .catch((error) => toast.failure("Couldn't open agent tab", error));
+                  .catch((error) => toast.failure("Couldn't open terminal tab", error));
               },
             },
           } : undefined,
         );
       } else if (result.manualPromptRequired) {
-        toast.info(`${preset.name} opened. Your prompt is saved in the draft; open it from the sidebar to copy it.`);
+        toast.info(`${preset.name} launch command reached a terminal. Your prompt is saved in Drafts; paste it only when the agent's input is visible.`);
       }
     });
   };

@@ -650,6 +650,23 @@ describe("Submit flow", () => {
     expect(toast.success).not.toHaveBeenCalled();
   });
 
+  it("describes a confirmed launch command without claiming the agent is ready", async () => {
+    setAppState("/path/to/project");
+    renderDialog(true);
+
+    const dialog = await screen.findByRole("dialog");
+    fireEvent.change(within(dialog).getByPlaceholderText("What do you want to do?"), {
+      target: { value: "Fix the login bug" },
+    });
+    fireEvent.click(within(dialog).getByRole("button", { name: /Create/i }));
+
+    await waitFor(() => expect(toast.success).toHaveBeenCalledWith(
+      expect.stringContaining("launch command reached a terminal. Paste this task only when the agent's input is visible"),
+      expect.objectContaining({ action: expect.objectContaining({ label: "Copy prompt" }) }),
+    ));
+    expect(applyPreset).toHaveBeenCalledTimes(1);
+  });
+
   it("keeps a partially launched worktree prompt and opens its confirmed tab", async () => {
     setAppState("/path/to/project");
     (applyPreset as Mock).mockRejectedValueOnce(new PartialPresetLaunchError({
@@ -669,7 +686,7 @@ describe("Submit flow", () => {
       expect.stringContaining("opened 1 of 2 tabs"),
       expect.objectContaining({
         action: expect.objectContaining({ label: "Copy prompt" }),
-        cancel: expect.objectContaining({ label: "Open agent" }),
+        cancel: expect.objectContaining({ label: "Open terminal" }),
       }),
     ));
     expect(activateTab).toHaveBeenCalledWith("ws-new", "tab-default");
@@ -699,7 +716,7 @@ describe("Submit flow", () => {
     fireEvent.click(within(dialog).getByRole("button", { name: /Create/i }));
 
     await waitFor(() => expect(toast.warning).toHaveBeenCalledWith(
-      expect.stringContaining("1 of 2 preset commands reached terminals; no agent tab remains open"),
+      expect.stringContaining("1 of 2 preset commands reached terminals; no terminal tab remains open"),
       expect.objectContaining({ action: expect.objectContaining({ label: "Copy prompt" }) }),
     ));
     const options = (toast.warning as Mock).mock.calls[0][1];
@@ -708,7 +725,7 @@ describe("Submit flow", () => {
     expect(toast.success).not.toHaveBeenCalled();
     const saved = Object.values(useChatDraftStore.getState().draftsById)[0];
     expect(saved.inputDraft).toBe("Fix the login bug");
-    expect(saved.manualPromptRequired).toBe(false);
+    expect(saved.manualPromptRequired).toBe(true);
     expect(applyPreset).toHaveBeenCalledTimes(1);
   });
 

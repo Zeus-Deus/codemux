@@ -325,11 +325,14 @@ function AgentEntry({
           .filter(Boolean)
           .join(" · ")
       : null;
+  const openTarget = run.threadTabId
+    ? run.promptNotSent ? "terminal" : "thread"
+    : "workspace";
 
   return (
     <Row tone="ember" emberRail last={last} testId="timeline-entry-agent">
       <Line>
-        <span className="font-semibold text-accent-ember">{run.promptNotSent ? "Agent opened" : "Agent run"}</span> ·{" "}
+        <span className="font-semibold text-accent-ember">{run.promptNotSent ? "Launch command sent" : "Agent run"}</span> ·{" "}
         {run.promptNotSent ? "task not sent" : runVerb(run.kind)}
       </Line>
       <div className="flex max-w-[760px] flex-col gap-1.5 rounded-md bg-accent-ember/[0.07] px-3 py-2">
@@ -338,7 +341,7 @@ function AgentEntry({
         </span>
         {run.promptNotSent && (
           <span className={cn("text-muted-foreground", tzMeta)}>
-            Copy the prepared prompt from Drafts to start this task.
+            The prepared prompt is in Drafts. Paste it only after the agent's input appears.
           </span>
         )}
         <div className="flex items-center gap-1.5">
@@ -349,14 +352,14 @@ function AgentEntry({
           <span className="flex-1" />
           <button
             type="button"
-            data-testid="timeline-open-thread"
+            data-testid={`timeline-open-${openTarget}`}
             onClick={() => onOpenThread(run)}
             className={cn(
               "rounded-sm border-0 bg-card px-2 py-1 text-foreground/90 outline-none transition-colors duration-150 hover:bg-accent/50 focus-visible:ring-2 focus-visible:ring-focus-ring",
               tzMeta,
             )}
           >
-            Open thread
+            Open {openTarget}
           </button>
         </div>
       </div>
@@ -463,7 +466,10 @@ export function ReviewTimeline({ entries, loading, staleAgeMs }: ReviewTimelineP
     } catch (err) {
       // The workspace may have been closed since the run — say so rather
       // than failing silently on a button that looks like it worked.
-      toast.failure("Couldn't open that thread", err);
+      const target = run.threadTabId
+        ? run.promptNotSent ? "terminal" : "thread"
+        : "workspace";
+      toast.failure(`Couldn't open that ${target}`, err);
     } finally {
       setOpening(null);
     }
