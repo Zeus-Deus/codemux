@@ -1449,7 +1449,16 @@ async fn handle_tool_call(call: CallToolParams) -> Value {
         "browser_screenshot" => {
             let result = call_socket("browser_automation", browser_params(json!({ "kind": "screenshot" })))
             .await;
-            let viewport = crate::stream_input::get_viewport(crate::agent_browser::DEFAULT_STREAM_PORT).await.unwrap_or((1280, 720));
+            let viewport = call_socket("browser_automation", browser_params(json!({ "kind": "viewport_status" })))
+                .await
+                .ok()
+                .and_then(|value| {
+                    Some((
+                        u32::try_from(value.get("viewport_width")?.as_u64()?).ok()?,
+                        u32::try_from(value.get("viewport_height")?.as_u64()?).ok()?,
+                    ))
+                })
+                .unwrap_or((1280, 720));
             result.map(|data| json!({
                 "screenshot": data,
                 "viewport_width": viewport.0,

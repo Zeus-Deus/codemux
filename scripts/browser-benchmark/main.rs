@@ -138,6 +138,7 @@ async fn task(session: &str, port: u16, name: &str) -> Value {
             .await
         }
         "coordinate_text" | "unicode_text" | "keyboard_controls" => {
+            let identity = agent_browser::verified_owned_stream_identity(session, port).unwrap();
             let text = if name == "unicode_text" {
                 "Zoë — café 日本語 🚀\nSecond line".repeat(3)
             } else if name == "keyboard_controls" {
@@ -145,18 +146,19 @@ async fn task(session: &str, port: u16, name: &str) -> Value {
             } else {
                 text
             };
-            stream_input::type_at(port, &text, Some(x), Some(y))
+            stream_input::type_at(identity, &text, Some(x), Some(y))
                 .await
                 .unwrap();
             if name == "keyboard_controls" {
-                stream_input::key_press(port, "Tab").await.unwrap();
-                stream_input::key_press(port, "Enter").await.unwrap();
+                stream_input::key_press(identity, "Tab").await.unwrap();
+                stream_input::key_press(identity, "Enter").await.unwrap();
             }
             expect_state(session, port, &json!({"text":text,"trusted":true,"clicks":if name == "keyboard_controls" {1} else {0}})).await
         }
         "coordinate_clicks" => {
+            let identity = agent_browser::verified_owned_stream_identity(session, port).unwrap();
             for _ in 0..12 {
-                stream_input::click_at(port, x, y, "left").await.unwrap();
+                stream_input::click_at(identity, x, y, "left").await.unwrap();
             }
             expect_state(session, port, &json!({"clicks":12,"trusted":true})).await
         }

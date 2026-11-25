@@ -1860,6 +1860,35 @@ pub(crate) fn authenticated_stream_request(
     request
 }
 
+/// Resolve a stream launched by this app without relying on manager state.
+/// The standalone browser benchmark uses the same CLI launch path but owns no
+/// manager session; its socket connection still needs process verification.
+#[allow(dead_code)]
+pub(crate) fn verified_owned_stream_identity(session: &str, port: u16) -> Result<BrowserStreamIdentity, String> {
+    validate_session_name(session)?;
+    require_owned_browser_session(session)?;
+    let dir = run_dir_for_session(session)
+        .ok_or_else(|| format!("Cannot verify browser session {session} runtime directory"))?;
+    if !browser_daemon_has_protected_stream(session, &dir) {
+        return Err(format!("Browser session {session} uses an outdated stream daemon"));
+    }
+    let pid = read_agent_browser_daemon_pid(session)
+        .ok_or_else(|| format!("Cannot verify browser session {session} PID"))?;
+    let record = owned_browser_pid(session, pid)
+        .filter(|record| record.token == browser_owner_token())
+        .ok_or_else(|| format!("Cannot verify browser session {session} owner"))?;
+    if !listener_owned_by_pid(port, pid) {
+        return Err(format!("Browser session {session} does not own stream port {port}"));
+    }
+    Ok(BrowserStreamIdentity {
+        port,
+        pid,
+        start_time: record.start_time,
+        generation: 0,
+        listener_token: browser_listener_token_bytes(session),
+    })
+}
+
 fn refresh_stream_session_identity(
     stream: &mut StreamSession,
     record: &BrowserPidRecord,
