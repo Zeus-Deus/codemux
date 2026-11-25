@@ -618,10 +618,12 @@ impl FolderWalkFilter {
             dir.join(git_dir)
         };
         let commondir_file = git_dir.join("commondir");
+        // Worktree metadata pointers may be symlinks; the bounded reader
+        // follows them while validating the opened handle and byte count.
         let commondir_bytes = Self::read_bounded_file(
             &commondir_file,
             &mut self.rule_bytes,
-            false,
+            true,
         )?;
         let common_dir = if let Some(commondir_bytes) = commondir_bytes {
             let commondir_line = Self::rule_line(&commondir_bytes)?.ok_or_else(|| {
@@ -666,11 +668,12 @@ impl FolderWalkFilter {
         let mut builder = GitignoreBuilder::new(dir);
         let mut rejected_lines = 0;
         let mut first_rejected_line = None;
-        for (index, line) in bytes.split(|byte| *byte == b'\n').enumerate() {
+        for (index, line) in bytes.split_inclusive(|byte| *byte == b'\n').enumerate() {
             *rule_lines += 1;
             if *rule_lines > MAX_ATTACHMENT_IGNORE_RULE_LINES {
                 return Err("attachment ignore rules exceed 10,000 lines".to_string());
             }
+            let line = line.strip_suffix(b"\n").unwrap_or(line);
             let Ok(line) = std::str::from_utf8(line) else {
                 rejected_lines += 1;
                 first_rejected_line.get_or_insert(index + 1);
@@ -2567,6 +2570,33 @@ mod tests {
     }
 
     #[test]
+    fn ignore_rule_line_budget_counts_only_present_lines() {
+        let dir = tempdir().unwrap();
+        let file = dir.path().join(".ignore");
+        let rules = "# rule\n".repeat(MAX_ATTACHMENT_IGNORE_RULE_LINES);
+        let mut lines = 0;
+        FolderWalkFilter::compile_rule_bytes(dir.path(), &file, rules.as_bytes(), &mut lines)
+            .unwrap();
+        assert_eq!(lines, MAX_ATTACHMENT_IGNORE_RULE_LINES);
+
+        let mut lines = 0;
+        let too_many = "# rule\n".repeat(MAX_ATTACHMENT_IGNORE_RULE_LINES + 1);
+        let error = FolderWalkFilter::compile_rule_bytes(
+            dir.path(),
+            &file,
+            too_many.as_bytes(),
+            &mut lines,
+        )
+        .err()
+        .expect("10,001 lines must exceed the limit");
+        assert!(error.contains("exceed 10,000 lines"));
+
+        let mut lines = 0;
+        FolderWalkFilter::compile_rule_bytes(dir.path(), &file, b"", &mut lines).unwrap();
+        assert_eq!(lines, 0);
+    }
+
+    #[test]
     fn malformed_ignore_line_keeps_valid_exclusions() {
         let dir = tempdir().unwrap();
         fs::create_dir(dir.path().join(".git")).unwrap();
@@ -2822,14 +2852,16 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn symlinked_worktree_pointer_excludes_files_in_attached_subfolder() {
+    fn symlinked_worktree_metadata_excludes_files_in_attached_subfolder() {
         let dir = tempdir().unwrap();
         let common = dir.path().join("common-git");
         fs::create_dir_all(common.join("info")).unwrap();
         fs::write(common.join("info/exclude"), "*.secret\n").unwrap();
         let worktree_git = dir.path().join("worktree-git");
         fs::create_dir(&worktree_git).unwrap();
-        fs::write(worktree_git.join("commondir"), common.to_string_lossy().as_bytes()).unwrap();
+        let commondir_target = dir.path().join("commondir-target");
+        fs::write(&commondir_target, common.to_string_lossy().as_bytes()).unwrap();
+        std::os::unix::fs::symlink(&commondir_target, worktree_git.join("commondir")).unwrap();
         let pointer = dir.path().join("git-pointer");
         fs::write(&pointer, format!("gitdir: {}\n", worktree_git.display())).unwrap();
 
