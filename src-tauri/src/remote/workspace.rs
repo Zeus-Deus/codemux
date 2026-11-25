@@ -798,6 +798,10 @@ mod tests {
 
     #[test]
     fn wal_writes_are_visible_to_a_concurrent_reader_and_survive_reopen() {
+        assert!(
+            rusqlite::version_number() >= 3_054_000,
+            "bundled SQLite must include the 3.54 security fix"
+        );
         let dir = TempDir::new().unwrap();
         let store = open_store(&dir);
         let first = store
