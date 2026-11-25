@@ -19,7 +19,7 @@ pub(super) const DISCOVERY_TIMEOUT: Duration = Duration::from_secs(6);
 const MAX_DISCOVERY_OUTPUT: u64 = 16 * 1024;
 const PATH_MARKER: &str = "codemux:pty-path:v1 ";
 const SOCKET_ROOT_UNAVAILABLE: &str =
-    "The device has no usable private workspace socket directory. Check its SSH home, runtime, and temporary directories.";
+    "The device has no usable private workspace socket directory or startup path. Check its socket, PID, and log entries under the SSH home, runtime, and temporary directories.";
 const LOCAL_SOCKET_FILE: &str = "pty.sock";
 
 #[derive(Clone, Copy)]
@@ -168,13 +168,19 @@ daemon_alive() {
     case "$pid" in ''|0|*[!0-9]*) return 1 ;; esac
     kill -0 "$pid" 2>/dev/null
 }
-usable_socket_lock_path() {
+usable_socket_file() {
     [ ! -L "$1" ] && { [ ! -e "$1" ] || { [ -f "$1" ] && [ -O "$1" ] && [ -w "$1" ]; }; }
+}
+usable_socket_start_paths() {
+    # rm -f can unlink a symlink itself, including a symlink to a directory.
+    { [ ! -d "$1" ] || [ -L "$1" ]; } &&
+        { [ ! -d "$1.pid" ] || [ -L "$1.pid" ]; } &&
+        usable_socket_file "$1.log"
 }
 lock_socket_path() {
     # This file lives in an already verified private directory and is never
     # unlinked. The kernel releases its lock when the last descriptor closes.
-    usable_socket_lock_path "$1" || return 1
+    usable_socket_file "$1" || return 1
     exec 9>>"$1" || return 1
     if command -v flock >/dev/null 2>&1; then
         flock -x -w 3 9
@@ -239,7 +245,7 @@ MARKER="$STATE/$KEY.root"
 LOCK="$STATE/$KEY.lock.fd"
 ROOT=
 if [ "$PROBE_ONLY" = 1 ]; then
-    usable_socket_lock_path "$LOCK" || unusable_root
+    usable_socket_file "$LOCK" || unusable_root
     command -v flock >/dev/null 2>&1 || command -v perl >/dev/null 2>&1 || unusable_root
 else
     lock_socket_path "$LOCK" || exit 1
@@ -278,12 +284,12 @@ if [ -z "$ROOT" ] || ! private_directory "$ROOT" || [ ! -w "$ROOT" ] || ! socket
     fi
 fi
 SOCKET="$ROOT/$KEY.sock"
-usable_socket_lock_path "$SOCKET.start.fd" || unusable_root
+usable_socket_file "$SOCKET.start.fd" || unusable_root
 case "$ROOT" in
     "$TMP_ROOT"/cmux.*)
         if [ -n "$OLD" ] && ! daemon_alive "$SOCKET"; then
-            [ ! -e "$SOCKET" ] && [ ! -L "$SOCKET" ] || exit 1
-            [ ! -d "$SOCKET.pid" ] && [ ! -L "$SOCKET.pid" ] || exit 1
+            [ ! -e "$SOCKET" ] && [ ! -L "$SOCKET" ] || unusable_root
+            usable_socket_file "$SOCKET.pid" || unusable_root
             if [ "$PROBE_ONLY" = 1 ]; then
                 report_socket "$OLD"
                 exit 0
@@ -292,15 +298,16 @@ case "$ROOT" in
         fi
         ;;
 esac
-if [ "$PROBE_ONLY" = 1 ]; then
-    if daemon_alive "$SOCKET"; then
-        report_socket "$SOCKET"
-    else
+if ! daemon_alive "$SOCKET"; then
+    usable_socket_start_paths "$SOCKET" || unusable_root
+    if [ "$PROBE_ONLY" = 1 ]; then
         report_socket absent
+        exit 0
     fi
-    exit 0
 fi
-unlock_socket_path || exit 1
+if [ "$PROBE_ONLY" = 0 ]; then
+    unlock_socket_path || exit 1
+fi
 report_socket "$SOCKET"
 "#,
     );
@@ -556,6 +563,28 @@ mod tests {
             SOCKET_ROOT_UNAVAILABLE,
         );
         assert_eq!(fs::read_dir(long_tmp).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn discovery_rejects_blocked_socket_start_paths() {
+        let home = private_temp();
+        let tmp = private_temp();
+        let state = home.path().join(".cmux-tunnels");
+        fs::create_dir(&state).unwrap();
+        fs::set_permissions(&state, fs::Permissions::from_mode(0o700)).unwrap();
+
+        for suffix in ["", ".pid", ".log"] {
+            let blocker = state.join(format!("{WORKSPACE}.sock{suffix}"));
+            fs::create_dir(&blocker).unwrap();
+            for discovery in [SocketDiscovery::Probe, SocketDiscovery::Prepare] {
+                assert_eq!(
+                    run_socket_search(home.path(), None, tmp.path(), discovery).unwrap_err(),
+                    SOCKET_ROOT_UNAVAILABLE,
+                );
+            }
+            assert!(blocker.is_dir());
+            fs::remove_dir(blocker).unwrap();
+        }
     }
 
     #[test]

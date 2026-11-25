@@ -14312,16 +14312,25 @@ exit 255
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn push_without_a_private_device_socket_root_leaves_the_local_chat_running() {
+    async fn push_with_unusable_device_socket_paths_leaves_the_local_chat_running() {
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
         use std::os::unix::fs::PermissionsExt;
 
         const TEST: &str =
-            "commands::agent_chat::tests::push_without_a_private_device_socket_root_leaves_the_local_chat_running";
+            "commands::agent_chat::tests::push_with_unusable_device_socket_paths_leaves_the_local_chat_running";
         if crate::test_isolation::isolated(TEST) {
             return;
         }
         let root = crate::test_isolation::isolated_root().unwrap();
-        let remote_home = root.join("device-home");
+        // Keep the remote socket on the home route even when the test's
+        // TMPDIR is too long to hold a Unix socket path.
+        let remote = tempfile::Builder::new()
+            .prefix("cmux-device.")
+            .permissions(std::fs::Permissions::from_mode(0o700))
+            .tempdir_in("/tmp")
+            .unwrap();
+        let remote_home = remote.path();
         let state_dir = remote_home.join(".cmux-tunnels");
         std::fs::create_dir_all(&state_dir).unwrap();
         std::fs::set_permissions(&state_dir, std::fs::Permissions::from_mode(0o755)).unwrap();
@@ -14383,17 +14392,37 @@ HOME="$CODEMUX_TEST_PUSH_REMOTE_HOME" XDG_RUNTIME_DIR= exec /bin/sh -c "$2"
         provider.live.lock().unwrap().insert(thread.0.clone());
         record_session_host(&thread.0, None);
 
-        let error = super::super::hosts::workspace_push_to_host(
-            app.handle().clone(), db, workspace_id.clone(), host_id,
-        )
-        .await
-        .unwrap_err();
-        assert!(error.contains("no usable private workspace socket directory"), "{error}");
-        assert_eq!(state.find_workspace(&workspace_id).unwrap().host_id, None);
-        assert!(provider.stopped.lock().unwrap().is_empty());
-        assert!(provider.has_session(&thread).await);
-        assert_eq!(std::fs::read_to_string(log).unwrap(), "helper\ndiscovery\n");
-        assert_eq!(std::fs::read_dir(state_dir).unwrap().count(), 0);
+        let mut hasher = DefaultHasher::new();
+        workspace_id.hash(&mut hasher);
+        let socket_name = format!("{:x}.sock", hasher.finish());
+        for blocked_suffix in [None, Some(""), Some(".pid"), Some(".log")] {
+            let blocker =
+                blocked_suffix.map(|suffix| state_dir.join(format!("{socket_name}{suffix}")));
+            if let Some(entry) = &blocker {
+                std::fs::create_dir(entry).unwrap();
+            }
+            std::fs::write(&log, "").unwrap();
+            let error = super::super::hosts::workspace_push_to_host(
+                app.handle().clone(), app.state(), workspace_id.clone(), host_id,
+            )
+            .await
+            .unwrap_err();
+            assert!(error.contains("no usable private workspace socket directory"), "{error}");
+            assert_eq!(state.find_workspace(&workspace_id).unwrap().host_id, None);
+            assert!(provider.stopped.lock().unwrap().is_empty());
+            assert!(provider.has_session(&thread).await);
+            assert_eq!(std::fs::read_to_string(&log).unwrap(), "helper\ndiscovery\n");
+            assert_eq!(
+                std::fs::read_dir(&state_dir).unwrap().count(),
+                usize::from(blocker.is_some()),
+            );
+            if let Some(entry) = blocker {
+                assert!(entry.is_dir());
+                std::fs::remove_dir(entry).unwrap();
+            } else {
+                std::fs::set_permissions(&state_dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+            }
+        }
     }
 
     /// A failed move leaves the workspace where it was, and a send waiting

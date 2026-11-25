@@ -148,6 +148,10 @@ if ! private_directory "$DIR"; then
 fi
 lock_socket_path "$SOCK.start.fd" || exit 1
 if ! daemon_alive "$SOCK"; then
+    if ! usable_socket_start_paths "$SOCK"; then
+        printf '%s\n' 'Codemux cannot prepare the socket, PID, or log path' >&2
+        exit 1
+    fi
     rm -f "$SOCK" "$PIDF" || exit 1
     if command -v setsid >/dev/null 2>&1; then
         setsid "$BIN" pty-daemon --socket "$SOCK" </dev/null >>"$LOG" 2>&1 9>&- &
