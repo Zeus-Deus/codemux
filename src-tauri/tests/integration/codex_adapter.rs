@@ -89,6 +89,7 @@ async fn live_codex_app_server_accepts_shared_dynamic_tools() {
         transport: codemux_lib::mcp::McpTransport::Stdio,
         raw: serde_json::Value::Null,
         project_root: None,
+        checkout_root: None,
     };
     let row = registry
         .ensure_started(None::<&tauri::AppHandle<tauri::Wry>>, config)
