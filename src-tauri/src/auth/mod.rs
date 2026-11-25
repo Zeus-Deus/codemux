@@ -283,9 +283,15 @@ fn validate_api_base_url(raw: &str) -> Result<String, String> {
 
 /// Resolve the credential-bearing API origin before building any request.
 pub fn api_base_url() -> Result<String, String> {
+    Ok(api_base_url_override()?.unwrap_or_else(|| "https://api.codemux.org".into()))
+}
+
+/// Capture an explicit API override once so a caller can validate it before
+/// side effects and pass the exact accepted value to a child process.
+pub(crate) fn api_base_url_override() -> Result<Option<String>, String> {
     match std::env::var("CODEMUX_API_URL") {
-        Ok(raw) => validate_api_base_url(&raw),
-        Err(std::env::VarError::NotPresent) => Ok("https://api.codemux.org".into()),
+        Ok(raw) => validate_api_base_url(&raw).map(Some),
+        Err(std::env::VarError::NotPresent) => Ok(None),
         Err(std::env::VarError::NotUnicode(_)) => Err("CODEMUX_API_URL must be UTF-8".into()),
     }
 }
