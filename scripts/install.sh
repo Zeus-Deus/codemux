@@ -142,6 +142,12 @@ codemux_pinned_version() {
     printf ''
 }
 
+# <url> without its ?query or #fragment, so file names and the .sig address
+# come from the path alone. A plain file path comes back unchanged.
+codemux_url_path() {
+    printf '%s' "${1%%[?#]*}"
+}
+
 # deb | rpm | appimage | unknown, from a file name or URL.
 codemux_kind_from_filename() {
     case "$1" in
@@ -1060,7 +1066,7 @@ main() {
         METHOD="$CODEMUX_METHOD"
         note "CODEMUX_METHOD=${METHOD} (forced)"
     elif [ -n "${CODEMUX_ARTIFACT:-}" ]; then
-        METHOD=$(codemux_kind_from_filename "$CODEMUX_ARTIFACT")
+        METHOD=$(codemux_kind_from_filename "$(codemux_url_path "$CODEMUX_ARTIFACT")")
         [ "$METHOD" = "unknown" ] && die "cannot tell what CODEMUX_ARTIFACT is from its name: ${CODEMUX_ARTIFACT}"
         note "CODEMUX_ARTIFACT is a .${METHOD} — installing that"
     else
@@ -1108,12 +1114,15 @@ main() {
                 # must sign it under its own file name. Only a file already on
                 # this machine is the user's own call.
                 require_signature_tools
-                _name=$(basename "$CODEMUX_ARTIFACT")
+                # Name and <path>.sig come from the URL path; the download
+                # itself uses the URL exactly as given.
+                _path=$(codemux_url_path "$CODEMUX_ARTIFACT")
+                _name=$(basename "$_path")
                 step "Downloading the artifact you pointed at"
                 _artifact="${WORKDIR}/${_name}"
                 download_to "$CODEMUX_ARTIFACT" "$_artifact"
                 say ""
-                verify_release_artifact "$_artifact" "$CODEMUX_ARTIFACT" "$_name"
+                verify_release_artifact "$_artifact" "$_path" "$_name"
                 ;;
             *)
                 warn "CODEMUX_ARTIFACT is a local file, installed as given; its signature is not checked"

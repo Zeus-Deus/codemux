@@ -497,8 +497,10 @@ is "overlapping install keeps package resources" "$(test -d "$LIB_DIR" && echo y
 # updater = base64 of a minisign signature file), so these run offline.
 
 echo "release signatures"
+# Selects $OPENSSL when a usable one exists; base64 works in any of them.
+codemux_can_verify_signatures || true
 REAL_KEY=$(sed -n 's/.*"pubkey"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "${SCRIPT_DIR}/../src-tauri/tauri.conf.json" \
-    | openssl base64 -d -A 2>/dev/null | sed -n 2p)
+    | "$OPENSSL" base64 -d -A 2>/dev/null | sed -n 2p)
 is "embedded key is the updater key" "$CODEMUX_SIGNING_KEY" "$REAL_KEY"
 
 if ! codemux_can_verify_signatures; then
@@ -569,7 +571,8 @@ while [ $# -gt 1 ]; do
     case "$1" in -o) out="$2"; shift ;; esac
     shift
 done
-src="${FIXTURE_DIR}/${1##*/}"
+name="${1##*/}"; name="${name%%[?#]*}"
+src="${FIXTURE_DIR}/${name}"
 [ -f "$src" ] || exit 22
 if [ -n "$out" ]; then cp "$src" "$out"; else cat "$src"; fi
 CURL
@@ -636,6 +639,12 @@ CURL
     is "URL artifact without a signature fails" "$?" "1"
     is "URL artifact without a signature installs nothing" "$(test ! -e "${SIGROOT}/installed" && echo yes)" "yes"
     contains "explains the missing URL signature" "$(cat "${SIGROOT}/release.log")" "cannot be verified"
+    # The asset name and <path>.sig come from the URL path, not its query or
+    # fragment, while the download keeps the URL as given.
+    cp "$PKG" "$PKG.sig" "$RELEASE_DIR/"
+    URL_ARTIFACT="https://downloads.example/codemux_9.9.9_amd64.deb?download=1#latest" run_release_install
+    is "a URL with query and fragment verifies by its path" "$?" "0"
+    is "the query URL installs the verified file" "$(cat "${SIGROOT}/installed" 2>/dev/null)" "genuine package"
     not_contains "a URL artifact is not called unchecked" "$(cat "${SIGROOT}/release.log")" "not checked"
 
     # The same gate on the rpm (zypper --allow-unsigned-rpm) and AppImage paths.
@@ -713,7 +722,10 @@ printf '#!/bin/sh\ncase "$1" in version) echo "OpenSSL 1.1.1w  11 Sep 2023" ;; p
 printf '#!/bin/sh\ncase "$1" in pkeyutl) echo " -rawin  raw input" >&2; exit 0 ;; esac\nexit 1\n' > "${OSSL}/fips/openssl"
 chmod +x "${OSSL}/old/openssl" "${OSSL}/fips/openssl"
 cp "${OSSL}/old/openssl" "${OSSL}/leap/openssl"
-REAL_OPENSSL=$(command -v openssl || true)
+# The binary the installer's own probe picks (openssl-3 beside an old
+# openssl, for example), not whatever `openssl` comes first on PATH.
+REAL_OPENSSL=""
+if codemux_can_verify_signatures; then REAL_OPENSSL=$(command -v "$OPENSSL" || true); fi
 [ -z "$REAL_OPENSSL" ] || ln -s "$REAL_OPENSSL" "${OSSL}/leap/openssl-3"
 
 probe() { # <dir on PATH> [CODEMUX_OPENSSL] -> "<status> <OPENSSL> <problem>"
@@ -728,7 +740,7 @@ is "FIPS-only openssl lacks algorithms" "$(probe "${OSSL}/fips")" "1 openssl alg
 is "CODEMUX_OPENSSL is the only one tried" "$(probe "${OSSL}/none" "${OSSL}/old/openssl")" "1 openssl old"
 if [ -n "$REAL_OPENSSL" ] && codemux_can_verify_signatures; then
     is "Leap's openssl-3 is used beside an old openssl" "$(probe "${OSSL}/leap")" "0 openssl-3 "
-    is "CODEMUX_OPENSSL picks a binary off PATH" "$(probe "${OSSL}/none" "$REAL_OPENSSL")" "0 openssl "
+    is "CODEMUX_OPENSSL picks a binary off PATH" "$(probe "${OSSL}/none" "$REAL_OPENSSL")" "0 ${REAL_OPENSSL##*/} "
 fi
 
 tools_out() { # <family> <PATH dir> [priv] [dry run] -> output of require_signature_tools
