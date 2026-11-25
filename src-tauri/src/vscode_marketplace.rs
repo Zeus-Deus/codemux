@@ -340,7 +340,7 @@ fn read_archive_text<R: Read + std::io::Seek>(
         let lower = path.to_ascii_lowercase();
         let found = (0..archive.len()).find_map(|i| {
             let entry = archive.by_index_raw(i).ok()?;
-            let name = entry.name().to_string();
+            let name = entry.name().ok()?.to_string();
             (name.to_ascii_lowercase() == lower).then_some(name)
         });
         found.ok_or_else(|| format!("The extension archive has no \"{path}\"."))?
@@ -536,6 +536,7 @@ fn too_large_error(len: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Write;
 
     /// Trimmed to the fields we read, but shaped exactly like a real
     /// `extensionquery` response (including the light/dark irrelevant
@@ -784,5 +785,24 @@ mod tests {
     fn rejects_non_zip_download() {
         let err = extract_themes(b"not a zip file at all".to_vec()).unwrap_err();
         assert!(err.contains("not a valid .vsix package"), "{err}");
+    }
+
+    #[test]
+    fn reads_theme_entries_with_different_archive_case() {
+        let mut zip = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+        let options = zip::write::SimpleFileOptions::default();
+        zip.start_file("extension/package.json", options).unwrap();
+        zip.write_all(
+            br#"{"name":"theme","contributes":{"themes":[{"label":"L","uiTheme":"vs","path":"./theme.json"}]}}"#,
+        )
+        .unwrap();
+        zip.start_file("Extension/Theme.JSON", options).unwrap();
+        zip.write_all(br##"{"colors":{"editor.background":"#ffffff"}}"##)
+            .unwrap();
+        let bytes = zip.finish().unwrap().into_inner();
+
+        let variants = extract_themes(bytes).unwrap();
+        assert_eq!(variants.len(), 1);
+        assert!(variants[0].content.contains("editor.background"));
     }
 }
