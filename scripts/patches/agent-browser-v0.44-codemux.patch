@@ -1,0 +1,219 @@
+diff --git a/cli/src/codemux_auth.rs b/cli/src/codemux_auth.rs
+new file mode 100644
+index 00000000..719543cb
+--- /dev/null
++++ b/cli/src/codemux_auth.rs
+@@ -0,0 +1,33 @@
++//! Codemux's private sidecar protocol. A token is supplied only through the
++//! parent process environment and never persisted in a session URL or file.
++
++use std::sync::OnceLock;
++
++pub const HEADER: &str = "x-codemux-browser-token";
++pub const FIELD: &str = "codemuxToken";
++pub const BUILD_VERSION: &str = concat!(env!("CARGO_PKG_VERSION"), "+codemux.1");
++
++pub fn expected_token() -> Option<&'static str> {
++    static TOKEN: OnceLock<Option<String>> = OnceLock::new();
++    TOKEN
++        .get_or_init(|| {
++            let token = std::env::var("CODEMUX_BROWSER_SECRET").ok()?;
++            (token.len() == 64 && token.bytes().all(|byte| byte.is_ascii_hexdigit()))
++                .then_some(token)
++        })
++        .as_deref()
++}
++
++pub fn token_matches(candidate: Option<&str>) -> bool {
++    let (Some(expected), Some(candidate)) = (expected_token(), candidate) else {
++        return false;
++    };
++    if expected.len() != candidate.len() {
++        return false;
++    }
++    expected
++        .bytes()
++        .zip(candidate.bytes())
++        .fold(0u8, |difference, (left, right)| difference | (left ^ right))
++        == 0
++}
+diff --git a/cli/src/connection.rs b/cli/src/connection.rs
+index 9ed53cda..40e8f4ab 100644
+--- a/cli/src/connection.rs
++++ b/cli/src/connection.rs
+@@ -859,7 +859,7 @@ fn concurrent_daemon_config_error(session: &str) -> String {
+ fn daemon_version_matches(session: &str) -> bool {
+     let version_path = get_version_path(session);
+     match fs::read_to_string(&version_path) {
+-        Ok(v) => v.trim() == env!("CARGO_PKG_VERSION"),
++        Ok(v) => v.trim() == crate::codemux_auth::BUILD_VERSION,
+         Err(_) => false,
+     }
+ }
+@@ -1065,13 +1065,7 @@ fn ensure_daemon_locked(session: &str, opts: &DaemonOptions) -> Result<DaemonRes
+         // Check version: if the running daemon is from a different CLI
+         // version (e.g. after an upgrade), kill it and start a fresh one.
+         if !daemon_version_matches(session) {
+-            eprintln!(
+-                "{} Daemon version mismatch detected, restarting...",
+-                crate::color::warning_indicator()
+-            );
+-            stop_existing_daemon_for_restart(session);
+-            restarted = true;
+-            // Fall through to spawn a new daemon below
++            return Err("Existing browser daemon is unverified; refusing to adopt it".into());
+         } else {
+             match ready_existing_daemon_result(session, opts, Duration::from_secs(1)) {
+                 Some(result) => return Ok(result),
+@@ -1435,7 +1429,17 @@ pub(crate) fn read_timeout_for(cmd: &Value) -> Duration {
+ }
+
+ fn send_command_once(cmd: &Value, session: &str) -> Result<Response, SendError> {
+-    let mut json_str = serde_json::to_string(cmd).map_err(|e| SendError::NotSent(e.to_string()))?;
++    if !daemon_version_matches(session) {
++        return Err(SendError::NotSent(
++            "Failed to connect: authenticated browser daemon version is unavailable".into(),
++        ));
++    }
++    let token = crate::codemux_auth::expected_token()
++        .ok_or_else(|| SendError::NotSent("Codemux browser token is missing".into()))?;
++    let mut authenticated = cmd.clone();
++    authenticated[crate::codemux_auth::FIELD] = Value::String(token.to_owned());
++    let mut json_str = serde_json::to_string(&authenticated)
++        .map_err(|e| SendError::NotSent(e.to_string()))?;
+     json_str.push('\n');
+
+     let stream = connect(session).map_err(SendError::NotSent)?;
+diff --git a/cli/src/main.rs b/cli/src/main.rs
+index 32a3d801..2e441789 100644
+--- a/cli/src/main.rs
++++ b/cli/src/main.rs
+@@ -2,6 +2,7 @@ mod browser_security;
+ mod ca_bundle;
+ mod chat;
+ mod color;
++mod codemux_auth;
+ mod commands;
+ mod connection;
+ mod doctor;
+diff --git a/cli/src/native/daemon.rs b/cli/src/native/daemon.rs
+index 875bfedd..f2737f1c 100644
+--- a/cli/src/native/daemon.rs
++++ b/cli/src/native/daemon.rs
+@@ -31,6 +31,10 @@ pub(super) struct Startup {
+ }
+
+ pub async fn run_daemon(session: &str) {
++    if crate::codemux_auth::expected_token().is_none() {
++        eprintln!("Codemux browser token is missing");
++        process::exit(1);
++    }
+     if !is_valid_session_name(session) {
+         eprintln!("{}", session_name_error(session));
+         process::exit(1);
+@@ -115,7 +119,7 @@ pub async fn run_daemon(session: &str) {
+     let _ = fs::write(&pid_path, process::id().to_string());
+
+     let version_path = SessionFile::Version.path_in(&socket_dir, session);
+-    let _ = fs::write(&version_path, env!("CARGO_PKG_VERSION"));
++    let _ = fs::write(&version_path, crate::codemux_auth::BUILD_VERSION);
+
+     let stream_path = SessionFile::Stream.path_in(&socket_dir, session);
+     let _ = fs::remove_file(&stream_path);
+@@ -669,7 +673,7 @@ async fn handle_connection<S>(
+                     break;
+                 }
+
+-                let cmd: Value = match serde_json::from_str(trimmed) {
++                let mut cmd: Value = match serde_json::from_str(trimmed) {
+                     Ok(v) => v,
+                     Err(e) => {
+                         let err = serde_json::json!({
+@@ -683,6 +687,18 @@ async fn handle_connection<S>(
+                     }
+                 };
+
++                if !crate::codemux_auth::token_matches(
++                    cmd.get(crate::codemux_auth::FIELD).and_then(Value::as_str),
++                ) {
++                    let _ = writer
++                        .write_all(b"{\"success\":false,\"error\":\"Unauthorized\"}\n")
++                        .await;
++                    continue;
++                }
++                if let Some(fields) = cmd.as_object_mut() {
++                    fields.remove(crate::codemux_auth::FIELD);
++                }
++
+                 idle_activity.mark();
+
+                 let action = cmd
+diff --git a/cli/src/native/stream/http.rs b/cli/src/native/stream/http.rs
+index aadb1cf0..0ebfa482 100644
+--- a/cli/src/native/stream/http.rs
++++ b/cli/src/native/stream/http.rs
+@@ -72,6 +72,9 @@ fn is_same_origin_read_request(request: &str) -> bool {
+ /// same-origin `Origin` or `Referer`; reads also accept header-less loopback
+ /// clients.
+ fn is_authorized_api_request(method: &str, request: &str) -> bool {
++    if !crate::codemux_auth::token_matches(request_header_value(request, crate::codemux_auth::HEADER)) {
++        return false;
++    }
+     if !fetch_site_allows(request) {
+         return false;
+     }
+@@ -130,7 +133,7 @@ pub(super) async fn handle_http_request(
+         write_json_error_response_no_cors(
+             &mut stream,
+             "403 Forbidden",
+-            "Origin or Referer does not match Host header.",
++            "Unauthorized browser API request.",
+         )
+         .await;
+         return;
+@@ -320,6 +323,9 @@ pub(super) async fn relay_command_to_daemon(
+     body: &str,
+ ) -> Result<String, String> {
+     let mut cmd: Value = serde_json::from_str(body).map_err(|e| format!("Invalid JSON: {}", e))?;
++    let token = crate::codemux_auth::expected_token()
++        .ok_or_else(|| "Codemux browser token is missing".to_string())?;
++    cmd[crate::codemux_auth::FIELD] = Value::String(token.to_owned());
+
+     if cmd.get("id").is_none() {
+         let id = format!(
+diff --git a/cli/src/native/stream/websocket.rs b/cli/src/native/stream/websocket.rs
+index dc33b951..ebba3c82 100644
+--- a/cli/src/native/stream/websocket.rs
++++ b/cli/src/native/stream/websocket.rs
+@@ -301,6 +301,18 @@ async fn handle_ws_client(
+     let callback =
+         |req: &tokio_tungstenite::tungstenite::handshake::server::Request,
+          resp: tokio_tungstenite::tungstenite::handshake::server::Response| {
++            let token = req
++                .headers()
++                .get(crate::codemux_auth::HEADER)
++                .and_then(|value| value.to_str().ok());
++            if !crate::codemux_auth::token_matches(token) {
++                let mut reject =
++                    tokio_tungstenite::tungstenite::handshake::server::ErrorResponse::new(Some(
++                        "Unauthorized browser stream".to_string(),
++                    ));
++                *reject.status_mut() = tokio_tungstenite::tungstenite::http::StatusCode::FORBIDDEN;
++                return Err(reject);
++            }
+             let origin = req
+                 .headers()
+                 .get("origin")
+diff --git a/cli/src/output.rs b/cli/src/output.rs
+index 5323fc7b..80f01405 100644
+--- a/cli/src/output.rs
++++ b/cli/src/output.rs
+@@ -5371,7 +5371,7 @@ fn print_screenshot_diff(data: &serde_json::Map<String, serde_json::Value>) {
+ }
+
+ pub fn print_version() {
+-    println!("agent-browser {}", env!("CARGO_PKG_VERSION"));
++    println!("agent-browser {}", crate::codemux_auth::BUILD_VERSION);
+ }
+
+ #[cfg(test)]
