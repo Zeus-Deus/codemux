@@ -140,6 +140,16 @@ fn start_input(thread_id: &str) -> StartSessionInput {
     }
 }
 
+async fn catalog_bound_resume_cursor() -> Value {
+    let provider = provider_with_fixture();
+    let thread_id = ThreadId("catalog-bound-cursor".into());
+    let session = start_session_resilient(&provider, start_input(&thread_id.0))
+        .await
+        .unwrap();
+    provider.stop_session(thread_id).await.unwrap();
+    session.resume_cursor.expect("fresh session has a resume cursor")
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn native_hooks_use_catalogue_and_exact_config_updates_without_inference() {
     use codemux_lib::agent_provider::codex::hooks::HookUpdate;
@@ -390,16 +400,13 @@ async fn starts_session_and_reports_ready() {
         .unwrap();
     assert_eq!(session.thread_id.0, "t-ready");
     assert!(matches!(session.status, SessionStatus::Ready));
-    assert_eq!(
-        session.resume_cursor,
-        Some(json!({
-            "threadId": "c-1",
-            "pluginTools": {
-                "directNames": [],
-                "catalogKey": codemux_lib::mcp::registry::plugin_catalog_key(&[])
-            }
-        }))
-    );
+    let cursor = session.resume_cursor.as_ref().unwrap();
+    assert_eq!(cursor["threadId"], json!("c-1"));
+    assert_eq!(cursor["pluginTools"], json!({
+        "directNames": [],
+        "catalogKey": codemux_lib::mcp::registry::plugin_catalog_key(&[])
+    }));
+    assert_eq!(cursor["toolCatalogKey"].as_str().map(str::len), Some(64));
 
     let events = handle.await.unwrap();
     assert!(events
@@ -803,7 +810,9 @@ async fn thread_resume_with_recoverable_error_falls_back_to_start() {
     let mut stream = provider.event_stream();
 
     let mut input = start_input("t-resume");
-    input.resume_cursor = Some(json!({"threadId":"old-thread"}));
+    let mut cursor = catalog_bound_resume_cursor().await;
+    cursor["threadId"] = json!("old-thread");
+    input.resume_cursor = Some(cursor);
     let session = start_session_resilient(&provider, input).await.unwrap();
     assert!(matches!(session.status, SessionStatus::Ready));
 
@@ -835,7 +844,10 @@ async fn persisted_resume_cursor_reaches_codex_thread_resume() {
     let mut stream = provider.event_stream();
 
     let mut input = start_input("t-persisted-resume");
-    input.resume_cursor = Some(json!({"resume":"stored-codex-thread"}));
+    let mut cursor = catalog_bound_resume_cursor().await;
+    cursor.as_object_mut().unwrap().remove("threadId");
+    cursor["resume"] = json!("stored-codex-thread");
+    input.resume_cursor = Some(cursor);
     let session = start_session_resilient(&provider, input).await.unwrap();
     assert!(matches!(session.status, SessionStatus::Ready));
 
@@ -2793,7 +2805,10 @@ async fn service_tier_ultrafast_roundtrips_and_rejects_unavailable_choices() {
     let mut input = start_input(&thread.0);
     input.model = Some("gpt-test".into());
     input.service_tier = Some("ultrafast".into());
-    input.resume_cursor = Some(json!({"resume": "native-tier-thread"}));
+    let mut cursor = catalog_bound_resume_cursor().await;
+    cursor.as_object_mut().unwrap().remove("threadId");
+    cursor["resume"] = json!("native-tier-thread");
+    input.resume_cursor = Some(cursor);
     start_session_resilient(&provider, input).await.unwrap();
 
     async fn send_and_capture(
@@ -2995,16 +3010,19 @@ async fn runtime_status_is_busy_while_a_turn_start_is_in_flight() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn resume_accepts_legacy_cursors_and_preserves_plugin_snapshots() {
+async fn resume_restarts_legacy_cursors_and_preserves_matching_plugin_snapshots() {
     let empty = json!({
         "directNames": [],
         "catalogKey": codemux_lib::mcp::registry::plugin_catalog_key(&[])
     });
     let saved = json!({"directNames":["fixture__original"],"catalogKey":"previously-announced"});
+    let mut matching = catalog_bound_resume_cursor().await;
+    matching["pluginTools"] = saved.clone();
     for (index, (cursor, expected)) in [
         (json!({"threadId":"c-1"}), empty.clone()),
-        (json!({"resume":"c-1"}), empty),
-        (json!({"threadId":"c-1","pluginTools":saved}), saved),
+        (json!({"resume":"c-1"}), empty.clone()),
+        (json!({"threadId":"c-1","pluginTools":saved}), empty),
+        (matching, saved),
     ]
     .into_iter()
     .enumerate()
@@ -3015,10 +3033,10 @@ async fn resume_accepts_legacy_cursors_and_preserves_plugin_snapshots() {
         input.resume_cursor = Some(cursor);
         let session = start_session_resilient(&provider, input).await.unwrap();
         assert!(matches!(session.status, SessionStatus::Ready));
-        assert_eq!(
-            session.resume_cursor,
-            Some(json!({"threadId":"c-1","pluginTools":expected}))
-        );
+        let resumed = session.resume_cursor.as_ref().unwrap();
+        assert_eq!(resumed["threadId"], json!("c-1"));
+        assert_eq!(resumed["pluginTools"], expected);
+        assert_eq!(resumed["toolCatalogKey"].as_str().map(str::len), Some(64));
         provider.stop_session(ThreadId(thread_id)).await.unwrap();
     }
 }
