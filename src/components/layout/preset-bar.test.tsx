@@ -302,7 +302,7 @@ describe("PresetBar — draft mode dispatch", () => {
     expect(mockAgentChatCreatePane).not.toHaveBeenCalled();
   });
 
-  it("shows where to find a withheld CLI prompt", async () => {
+  it("keeps a withheld CLI prompt and waits for agent input before pasting", async () => {
     const draft = useChatDraftStore.getState().getOrCreateHomeDraft();
     useChatDraftStore.getState().updateDraftTarget(draft.draftId, {
       kind: "project",
@@ -325,7 +325,9 @@ describe("PresetBar — draft mode dispatch", () => {
     await userEvent.click(screen.getByRole("button", { name: /claude/i }));
     await flushPromises();
 
-    expect(mockToast.info).toHaveBeenCalledWith(expect.stringContaining("open it from the sidebar"));
+    expect(mockToast.info).toHaveBeenCalledWith(expect.stringContaining(
+      "Your prompt is saved in Drafts; paste it only when the agent's input is visible",
+    ));
     expect(useChatDraftStore.getState().draftsById[draft.draftId]?.inputDraft).toBe("review this issue &calc");
   });
 
