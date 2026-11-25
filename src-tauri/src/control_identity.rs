@@ -11,6 +11,23 @@ use serde_json::Value;
 use std::ffi::OsString;
 use std::sync::OnceLock;
 
+/// Authenticate the OS account on the other end of a local Unix socket.
+/// The socket path and a client's claimed identity carry no such proof.
+#[cfg(unix)]
+pub(crate) fn local_peer_credentials(
+    stream: &tokio::net::UnixStream,
+) -> std::io::Result<tokio::net::unix::UCred> {
+    let peer = stream.peer_cred()?;
+    // SAFETY: geteuid takes no arguments and returns the current effective UID.
+    if peer.uid() != unsafe { libc::geteuid() } {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "Codemux Unix socket requires a peer running as the same user",
+        ));
+    }
+    Ok(peer)
+}
+
 /// Present (any value, even empty) on every process Codemux starts for an
 /// agent, and inherited by everything that process starts.
 pub const AGENT_PROCESS_ENV: &str = "CODEMUX_AGENT_PROCESS";

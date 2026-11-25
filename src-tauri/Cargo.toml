@@ -231,6 +231,9 @@ windows-sys = { version = "0.59", features = [
     "Wdk_Foundation",
     "Wdk_Storage_FileSystem",
     "Win32_Foundation",
+    # Explicit current-user security descriptors for the attention-hook pipe.
+    "Win32_Security",
+    "Win32_Security_Authorization",
     "Win32_Storage_FileSystem",
     # IO_STATUS_BLOCK for confined skill writes and CancelIoEx for OpenCode shutdown.
     "Win32_System_IO",

@@ -292,7 +292,8 @@ pub async fn run(socket_path: PathBuf) -> Result<(), String> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(&socket_path, std::fs::Permissions::from_mode(0o600));
+        std::fs::set_permissions(&socket_path, std::fs::Permissions::from_mode(0o600))
+            .map_err(|error| format!("Restrict socket permissions on {socket_path:?}: {error}"))?;
     }
 
     let manifest = DaemonManifest {
@@ -377,6 +378,9 @@ pub async fn run(socket_path: PathBuf) -> Result<(), String> {
     loop {
         match listener.accept().await {
             Ok((stream, _addr)) => {
+                if crate::control_identity::local_peer_credentials(&stream).is_err() {
+                    continue;
+                }
                 let conn_state = state.clone();
                 tokio::spawn(async move {
                     if let Err(error) = handle_connection(stream, conn_state).await {

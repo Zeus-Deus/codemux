@@ -131,6 +131,18 @@ pub struct ManagedGrant {
     pub(crate) home: PathBuf,
     pub(crate) cache_key: String,
 }
+pub(super) fn managed_launch_input(key: &str) -> bool {
+    matches!(
+        key,
+        "CODEMUX_WORKSPACE_ID"
+            | "CODEMUX_PANE_ID"
+            | "CODEMUX_SESSION_ID"
+            | "CODEMUX_HOOK_ENDPOINT"
+            | "CODEMUX_HOOK_TOKEN"
+            | "CODEMUX_CONTROL_SOCKET"
+    )
+}
+
 impl ManagedGrant {
     pub(crate) fn launch(
         &self,
@@ -138,15 +150,7 @@ impl ManagedGrant {
     ) -> (Vec<String>, std::collections::HashMap<String, String>) {
         let mut env: std::collections::HashMap<String, String> = caller
             .into_iter()
-            .filter(|(key, _)| {
-                matches!(
-                    key.as_str(),
-                    "CODEMUX_WORKSPACE_ID"
-                        | "CODEMUX_PANE_ID"
-                        | "CODEMUX_HOOK_PORT"
-                        | "CODEMUX_CONTROL_SOCKET"
-                )
-            })
+            .filter(|(key, _)| managed_launch_input(key))
             .collect();
         env.insert("ACCESS_TOKEN".into(), self.access_token.clone());
         env.insert(
@@ -1708,6 +1712,9 @@ mod tests {
             ("CODEX_HOME".into(), "/foreign".into()),
             ("LD_PRELOAD".into(), "/foreign.so".into()),
             ("CODEMUX_WORKSPACE_ID".into(), "workspace".into()),
+            ("CODEMUX_SESSION_ID".into(), "notifier-session".into()),
+            ("CODEMUX_HOOK_ENDPOINT".into(), "hook-fixture".into()),
+            ("CODEMUX_HOOK_TOKEN".into(), "11111111111111111111111111111111".into()),
         ]);
         let (args, env) = grant.launch(caller);
         let text = args.join(" ");
@@ -1722,6 +1729,10 @@ mod tests {
         assert_eq!(env["ACCESS_TOKEN"], "synthetic-access-secret");
         assert_eq!(env["CODEX_HOME"], "/synthetic/managed-home");
         assert_eq!(env["CODEMUX_WORKSPACE_ID"], "workspace");
+        assert_eq!(env["CODEMUX_SESSION_ID"], "notifier-session");
+        assert_eq!(env["CODEMUX_HOOK_ENDPOINT"], "hook-fixture");
+        assert_eq!(env["CODEMUX_HOOK_TOKEN"], "11111111111111111111111111111111");
+        assert!(!text.contains(&env["CODEMUX_HOOK_TOKEN"]));
         for key in ["OPENAI_BASE_URL", "OPENAI_API_KEY", "LD_PRELOAD"] {
             assert!(!env.contains_key(key));
         }

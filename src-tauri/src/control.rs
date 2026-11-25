@@ -29,46 +29,188 @@ use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader
 
 #[cfg(unix)]
 mod unix_transport {
-    use std::path::Path;
+    use std::fs;
+    use std::io::{self, ErrorKind};
+    use std::os::fd::AsRawFd;
+    use std::os::unix::fs::{FileTypeExt, MetadataExt};
+    use std::os::unix::net::UnixStream as BlockingUnixStream;
+    use std::path::{Path, PathBuf};
     use tokio::net::{UnixListener, UnixStream};
+
+    use super::SOCKET_BASENAME;
+    use crate::control_identity::local_peer_credentials;
 
     pub type ServerStream = UnixStream;
     pub type ClientStream = UnixStream;
 
     pub struct Listener(UnixListener);
 
-    pub fn bind(path: &Path) -> std::io::Result<Listener> {
-        // Tokio's UnixListener::bind fails if the socket file already exists,
-        // so remove any stale file first. The caller is expected to have
-        // already established, via `sync_liveness_probe`, that no live server
-        // is holding the path.
-        let _ = std::fs::remove_file(path);
-        UnixListener::bind(path).map(Listener)
+    pub fn bind(path: &Path) -> io::Result<Listener> {
+        let uid = effective_uid();
+        let parent = path.parent().ok_or_else(untrusted_runtime)?;
+        let (parent, private) = trusted_runtime(parent, uid)?;
+        let filename = path.file_name().ok_or_else(untrusted_runtime)?;
+        let path = parent.join(filename);
+        // Serialize bind and crash recovery across Codemux instances without
+        // creating another filesystem entry in the runtime directory.
+        let directory = fs::File::open(&parent)?;
+        directory.try_lock()?;
+        match UnixListener::bind(&path) {
+            Err(error) if error.kind() == ErrorKind::AddrInUse && private => {
+                remove_stale_socket(&path, uid)?;
+                UnixListener::bind(&path).map(Listener)
+            }
+            result => result.map(Listener),
+        }
+    }
+
+    fn untrusted_runtime() -> io::Error {
+        io::Error::new(ErrorKind::PermissionDenied, "untrusted control runtime directory")
+    }
+
+    /// Resolve system path aliases such as macOS /tmp, then use the resolved
+    /// path for every operation. A directory is replaceable if an unrelated
+    /// account can write its parent without the sticky-bit restriction.
+    fn trusted_runtime(dir: &Path, uid: u32) -> io::Result<(PathBuf, bool)> {
+        if !dir.is_absolute() {
+            return Err(untrusted_runtime());
+        }
+        let private = check_runtime_ancestors(dir, uid)?;
+        let resolved = dir.canonicalize()?;
+        let private = if resolved == dir {
+            private
+        } else {
+            check_runtime_ancestors(&resolved, uid)?
+        };
+        Ok((resolved, private))
+    }
+
+    fn check_runtime_ancestors(dir: &Path, uid: u32) -> io::Result<bool> {
+        let mut private = false;
+        let ancestors: Vec<_> = dir.ancestors().collect();
+        for ancestor in ancestors.into_iter().rev() {
+            let meta = fs::symlink_metadata(ancestor)?;
+            if meta.uid() != 0 && meta.uid() != uid {
+                return Err(untrusted_runtime());
+            }
+            // The system's /tmp can be an alias, but the runtime dir itself
+            // must be a real directory. Its canonical ancestors are checked too.
+            if meta.is_symlink() && ancestor != dir {
+                continue;
+            }
+            let mode = meta.mode();
+            if !meta.is_dir()
+                || (mode & 0o022 != 0 && mode & 0o1000 == 0)
+                || (ancestor == dir && (meta.uid() != uid || mode & 0o022 != 0))
+            {
+                return Err(untrusted_runtime());
+            }
+            private |= meta.uid() == uid && mode & 0o077 == 0;
+        }
+        Ok(private)
+    }
+
+    fn remove_stale_socket(path: &Path, uid: u32) -> io::Result<()> {
+        let occupied = || io::Error::new(ErrorKind::AddrInUse, "control socket path is occupied");
+        if path.file_name().and_then(|name| name.to_str()) != Some(&format!("{SOCKET_BASENAME}.sock")) {
+            return Err(occupied());
+        }
+        let original = fs::symlink_metadata(path)?;
+        if !original.file_type().is_socket() || original.uid() != uid {
+            return Err(occupied());
+        }
+        match BlockingUnixStream::connect(path) {
+            Err(error) if error.kind() == ErrorKind::ConnectionRefused => {}
+            Err(error) => return Err(error),
+            Ok(_) => return Err(occupied()),
+        }
+        let current = fs::symlink_metadata(path)?;
+        if (current.dev(), current.ino()) != (original.dev(), original.ino())
+            || !current.file_type().is_socket()
+            || current.uid() != uid
+        {
+            return Err(occupied());
+        }
+        fs::remove_file(path)?;
+        crate::diagnostics::stderr_line(&format!(
+            "[codemux::control] Removed stale control socket at {path:?}"
+        ));
+        Ok(())
+    }
+
+    fn effective_uid() -> u32 {
+        // SAFETY: geteuid takes no arguments and returns the effective UID.
+        unsafe { libc::geteuid() }
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    fn blocking_peer_uid(stream: &BlockingUnixStream) -> io::Result<u32> {
+        let mut creds = std::mem::MaybeUninit::<libc::ucred>::uninit();
+        let mut size = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
+        // SAFETY: stream keeps the descriptor open, and creds names a writable
+        // buffer of the given size. Read it only after a successful full write.
+        let result = unsafe {
+            libc::getsockopt(
+                stream.as_raw_fd(),
+                libc::SOL_SOCKET,
+                libc::SO_PEERCRED,
+                creds.as_mut_ptr().cast(),
+                &mut size,
+            )
+        };
+        if result != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        if size as usize != std::mem::size_of::<libc::ucred>() {
+            return Err(io::Error::new(ErrorKind::InvalidData, "truncated Unix peer credentials"));
+        }
+        Ok(unsafe { creds.assume_init() }.uid)
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    fn blocking_peer_uid(stream: &BlockingUnixStream) -> io::Result<u32> {
+        let mut uid = 0;
+        let mut gid = 0;
+        // SAFETY: stream keeps the descriptor open, and both out-pointers
+        // name writable values of the types expected by getpeereid.
+        if unsafe { libc::getpeereid(stream.as_raw_fd(), &mut uid, &mut gid) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(uid)
     }
 
     impl Listener {
         /// The stream and the peer's pid (`SO_PEERCRED`), when the kernel
         /// reports one. A peer in another pid namespace reads as 0.
         pub async fn accept(&self) -> std::io::Result<(ServerStream, Option<u32>)> {
-            let (stream, _) = self.0.accept().await?;
-            let peer_pid = stream
-                .peer_cred()
-                .ok()
-                .and_then(|cred| cred.pid())
-                .and_then(|pid| u32::try_from(pid).ok());
-            Ok((stream, peer_pid))
+            loop {
+                let (stream, _) = self.0.accept().await?;
+                let Ok(peer) = local_peer_credentials(&stream) else {
+                    continue;
+                };
+                let peer_pid = peer.pid().and_then(|pid| u32::try_from(pid).ok());
+                return Ok((stream, peer_pid));
+            }
         }
     }
 
     pub async fn connect(path: &Path) -> std::io::Result<ClientStream> {
-        UnixStream::connect(path).await
+        let stream = UnixStream::connect(path).await?;
+        local_peer_credentials(&stream)?;
+        Ok(stream)
     }
 
     /// Blocking probe: does a server respond on this path right now?
     /// Safe to call from sync contexts (e.g. startup path before the tokio
     /// runtime exists) because it uses the std networking API.
     pub fn sync_liveness_probe(path: &Path) -> bool {
-        std::os::unix::net::UnixStream::connect(path).is_ok()
+        sync_liveness_probe_for_uid(path, effective_uid())
+    }
+
+    pub(super) fn sync_liveness_probe_for_uid(path: &Path, uid: u32) -> bool {
+        BlockingUnixStream::connect(path)
+            .and_then(|stream| blocking_peer_uid(&stream))
+            .is_ok_and(|peer_uid| peer_uid == uid)
     }
 }
 
@@ -233,41 +375,22 @@ pub fn control_socket_path() -> Option<PathBuf> {
         return Some(runtime_dir.join(&socket_file));
     }
 
-    // Fallback for systems without XDG_RUNTIME_DIR (e.g. minimal distros, some AppImage environments).
-    let uid = unsafe { libc::getuid() };
+    // Create the fallback privately in one operation. An existing entry
+    // must already be a private directory owned by this account.
+    use std::os::unix::fs::{DirBuilderExt, MetadataExt};
+    let uid = unsafe { libc::geteuid() };
     let fallback_dir = fallback_runtime_dir(uid);
-    if fallback_dir.exists() {
-        // Verify the existing directory is owned by us and has safe permissions.
-        use std::os::unix::fs::MetadataExt;
-        match fs::metadata(&fallback_dir) {
-            Ok(meta) => {
-                if meta.uid() != uid {
-                    crate::diagnostics::stderr_line(&format!(
-                        "[codemux::control] Fallback dir {} is owned by uid {} (expected {}); refusing to use it",
-                        fallback_dir.display(), meta.uid(), uid
-                    ));
-                    return None;
-                }
-            }
-            Err(e) => {
-                crate::diagnostics::stderr_line(&format!(
-                    "[codemux::control] Cannot stat fallback dir {}: {e}",
-                    fallback_dir.display()
-                ));
-                return None;
-            }
-        }
-    } else {
-        if let Err(e) = fs::create_dir(&fallback_dir) {
+    if let Err(error) = fs::DirBuilder::new().mode(0o700).create(&fallback_dir) {
+        let private = error.kind() == std::io::ErrorKind::AlreadyExists
+            && fs::symlink_metadata(&fallback_dir)
+                .is_ok_and(|meta| meta.is_dir() && meta.uid() == uid && meta.mode() & 0o077 == 0);
+        if !private {
             crate::diagnostics::stderr_line(&format!(
-                "[codemux::control] Failed to create fallback runtime dir {}: {e}",
+                "[codemux::control] Cannot use fallback runtime dir {}: {error}",
                 fallback_dir.display()
             ));
             return None;
         }
-        // Restrict to owner only (mode 0700).
-        use std::os::unix::fs::PermissionsExt;
-        let _ = fs::set_permissions(&fallback_dir, fs::Permissions::from_mode(0o700));
     }
     crate::diagnostics::stderr_line(&format!(
         "[codemux::control] XDG_RUNTIME_DIR unset, using fallback: {}",
@@ -290,7 +413,7 @@ fn fallback_runtime_dir(uid: u32) -> PathBuf {
 /// (see [`Connection::open`]). The server binds only [`control_socket_path`].
 #[cfg(unix)]
 pub(crate) fn control_socket_candidates() -> Vec<PathBuf> {
-    let uid = unsafe { libc::getuid() };
+    let uid = unsafe { libc::geteuid() };
     socket_candidates(
         std::env::var_os("XDG_RUNTIME_DIR").map(PathBuf::from),
         std::path::Path::new("/run/user"),
@@ -307,8 +430,8 @@ pub(crate) fn control_socket_candidates() -> Vec<PathBuf> {
 #[cfg(unix)]
 fn client_fallback_socket(dir: PathBuf, uid: u32) -> Option<PathBuf> {
     use std::os::unix::fs::MetadataExt;
-    match fs::metadata(&dir) {
-        Ok(meta) if meta.uid() != uid => None,
+    match fs::symlink_metadata(&dir) {
+        Ok(meta) if !meta.is_dir() || meta.uid() != uid || meta.mode() & 0o077 != 0 => None,
         Err(error) if error.kind() != std::io::ErrorKind::NotFound => None,
         _ => Some(dir.join(format!("{SOCKET_BASENAME}.sock"))),
     }
@@ -476,41 +599,6 @@ pub fn spawn_control_server<R: Runtime>(app: AppHandle<R>) {
             ));
         }
         return;
-    }
-
-    // Unix only: the socket lives in the filesystem, so we need to create the
-    // parent directory and sweep any stale socket file from a previous crash
-    // before `transport::bind` can succeed. Named pipes on Windows live in
-    // the `\\.\pipe\` namespace and have no filesystem footprint to clean up.
-    #[cfg(unix)]
-    {
-        if socket_path.exists() {
-            crate::diagnostics::stderr_line(&format!(
-                "[codemux::control] Existing control socket at {:?} appears stale; replacing it",
-                socket_path
-            ));
-            #[cfg(debug_assertions)]
-            {
-                let pid = std::process::id();
-                let startup_id = std::env::var("CODEMUX_STARTUP_ID").unwrap_or_else(|_| "<unset>".into());
-                crate::diagnostics::native_startup_breadcrumb(&format!(
-                    "[{}] startup_id={} pid={} component=control event=stale_socket_replace socket_path={}",
-                    chrono::Local::now().format("%s"),
-                    startup_id,
-                    pid,
-                    socket_path.display()
-                ));
-            }
-        }
-
-        if let Some(parent) = socket_path.parent() {
-            if let Err(error) = fs::create_dir_all(parent) {
-                crate::diagnostics::stderr_line(&format!(
-                    "[codemux::control] Failed to create control dir: {error}"
-                ));
-                return;
-            }
-        }
     }
 
     tauri::async_runtime::spawn(async move {
@@ -3040,7 +3128,7 @@ mod tests {
     #[test]
     fn client_fallback_lookup_creates_nothing_and_skips_foreign_dirs() {
         use std::os::unix::fs::MetadataExt;
-        let root = tempfile::tempdir().unwrap();
+        let root = private_control_test_dir();
         let uid = fs::metadata(root.path()).unwrap().uid();
         let socket_file = format!("{SOCKET_BASENAME}.sock");
         let missing = root.path().join("not-yet");
@@ -3384,8 +3472,8 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn narrowed_client_refuses_an_old_server_that_replaced_a_new_one() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = [dir.path().join("app.sock")];
+        let dir = private_control_test_dir();
+        let path = [dir.path().join(format!("{SOCKET_BASENAME}.sock"))];
         let read_only = ControlClient { name: None, access: Some(crate::agent_control::ControlAccess::ReadOnly), agent: None };
 
         let (new_app, seen) = spawn_line_server(&path[0], CONTROL_PROTOCOL_VERSION);
@@ -3394,6 +3482,7 @@ mod tests {
         assert!(reply.ok);
         assert_eq!(*seen.lock().unwrap(), vec![(0, "status".to_owned()), (0, "notify".to_owned())]);
         new_app.abort();
+        assert!(new_app.await.unwrap_err().is_cancelled());
 
         // `bind` replaces the socket file, as a restarted app does.
         let (old_app, seen) = spawn_line_server(&path[0], 1);
@@ -3967,11 +4056,84 @@ mod tests {
         accept_task.abort();
     }
 
-    /// The existing fallback-directory logic chmods the parent dir to
-    /// `0o700` on creation. This exercises that branch directly and asserts
-    /// the mode bits come out right. We don't test `control_socket_path`
-    /// itself here because it uses a fixed `/tmp/codemux-{uid}` path that
-    /// another test process might already own.
+    #[cfg(unix)]
+    #[test]
+    fn control_probe_checks_the_kernel_peer_uid() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("probe-peer.sock");
+        let _listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        let uid = unsafe { libc::geteuid() };
+        assert!(transport::sync_liveness_probe_for_uid(&path, uid));
+        assert!(!transport::sync_liveness_probe_for_uid(&path, uid.wrapping_add(1)));
+    }
+
+    #[cfg(unix)]
+    fn private_control_test_dir() -> tempfile::TempDir {
+        use std::os::unix::fs::PermissionsExt;
+
+        tempfile::Builder::new()
+            .permissions(fs::Permissions::from_mode(0o700))
+            .tempdir()
+            .unwrap()
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn control_bind_replaces_a_stale_socket_but_keeps_a_live_endpoint() {
+        let dir = private_control_test_dir();
+        let path = dir.path().join(format!("{SOCKET_BASENAME}.sock"));
+        drop(std::os::unix::net::UnixListener::bind(&path).unwrap());
+
+        let _listener = transport::bind(&path).expect("replace stale control socket");
+        assert!(transport::sync_liveness_probe(&path));
+        assert!(transport::bind(&path).is_err());
+        assert!(transport::sync_liveness_probe(&path));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn control_bind_preserves_unexpected_entries() {
+        use std::os::unix::fs::{symlink, FileTypeExt, PermissionsExt};
+
+        let dir = private_control_test_dir();
+        let filename = format!("{SOCKET_BASENAME}.sock");
+        let path = dir.path().join(&filename);
+        fs::write(&path, b"owned file").unwrap();
+        assert!(transport::bind(&path).is_err());
+        assert_eq!(fs::read(&path).unwrap(), b"owned file");
+
+        let alias = dir.path().join("alias");
+        fs::create_dir(&alias).unwrap();
+        let alias_socket = alias.join(&filename);
+        symlink(&path, &alias_socket).unwrap();
+        assert!(transport::bind(&alias_socket).is_err());
+        assert!(fs::symlink_metadata(&alias_socket).unwrap().is_symlink());
+        assert_eq!(fs::read(&path).unwrap(), b"owned file");
+
+        let unrelated = dir.path().join("other.sock");
+        drop(std::os::unix::net::UnixListener::bind(&unrelated).unwrap());
+        assert!(transport::bind(&unrelated).is_err());
+        assert!(fs::symlink_metadata(&unrelated).unwrap().file_type().is_socket());
+
+        let shared = dir.path().join("shared");
+        fs::create_dir(&shared).unwrap();
+        fs::set_permissions(&shared, fs::Permissions::from_mode(0o777)).unwrap();
+        let shared_socket = shared.join(&filename);
+        drop(std::os::unix::net::UnixListener::bind(&shared_socket).unwrap());
+        assert!(transport::bind(&shared_socket).is_err());
+        assert!(fs::symlink_metadata(&shared_socket).unwrap().file_type().is_socket());
+
+        let target = dir.path().join("target");
+        let nested = target.join("run");
+        fs::create_dir_all(&nested).unwrap();
+        let misleading = shared.join("alias");
+        symlink(&target, &misleading).unwrap();
+        assert!(transport::bind(&misleading.join("run").join(&filename)).is_err());
+        assert!(!nested.join(filename).exists());
+    }
+
+    /// A pre-existing fallback directory must already be private. Use a
+    /// temporary path because the usual fallback belongs to the running app.
     #[cfg(unix)]
     #[test]
     fn test_fallback_dir_permission_isolation() {
@@ -3981,8 +4143,11 @@ mod tests {
         std::fs::create_dir(&fallback_dir).unwrap();
         std::fs::set_permissions(&fallback_dir, std::fs::Permissions::from_mode(0o700)).unwrap();
         let meta = std::fs::metadata(&fallback_dir).unwrap();
-        // Mask off the file-type bits and compare only the permission bits.
         assert_eq!(meta.permissions().mode() & 0o777, 0o700);
+        let uid = unsafe { libc::geteuid() };
+        assert!(client_fallback_socket(fallback_dir.clone(), uid).is_some());
+        fs::set_permissions(&fallback_dir, fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(client_fallback_socket(fallback_dir, uid).is_none());
     }
 
     // ----- Windows-only tests ---------------------------------------------

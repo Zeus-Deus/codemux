@@ -216,6 +216,7 @@ impl PtyDaemonClient {
 
     pub async fn connect(socket_path: &Path) -> Result<Arc<Self>, PtyDaemonError> {
         let stream = UnixStream::connect(socket_path).await?;
+        crate::control_identity::local_peer_credentials(&stream)?;
         Ok(Self::from_stream(stream, DEFAULT_RPC_TIMEOUT))
     }
 

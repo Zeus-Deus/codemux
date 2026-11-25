@@ -914,7 +914,7 @@ impl CodexSession {
             provider_session_id: ProviderSessionId(codex_thread_id.clone()),
             cwd,
             child: RwLock::new(Arc::clone(&child)),
-            chatgpt_runtime: grant.as_ref().map(|g|managed_runtime::ManagedSession{owner:spawn.chatgpt_owner.as_ref().unwrap().clone(),spawn:spawn.clone(),env:env.iter().filter(|(k,_)|matches!(k.as_str(),"CODEMUX_WORKSPACE_ID"|"CODEMUX_PANE_ID"|"CODEMUX_HOOK_PORT"|"CODEMUX_CONTROL_SOCKET"|"CODEX_HOME")).map(|(k,v)|(k.clone(),v.clone())).collect(),revision:Mutex::new(g.revision.clone()),permission:permission_mode.clone(),models:Mutex::new(managed_models)}),
+            chatgpt_runtime: grant.as_ref().map(|g|managed_runtime::ManagedSession{owner:spawn.chatgpt_owner.as_ref().unwrap().clone(),spawn:spawn.clone(),env:env.iter().filter(|(k,_)|super::chatgpt::managed_launch_input(k) || k.as_str() == "CODEX_HOME").map(|(k,v)|(k.clone(),v.clone())).collect(),revision:Mutex::new(g.revision.clone()),permission:permission_mode.clone(),models:Mutex::new(managed_models)}),
             runtime_lease: Mutex::new(runtime_lease.clone()),
             notification_demux: Mutex::new(demux),
             state,
