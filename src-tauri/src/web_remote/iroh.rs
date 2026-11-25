@@ -628,6 +628,12 @@ enum KeyDirAccess {
     AncestorReadOnly,
 }
 
+#[cfg(unix)]
+struct KeyParent {
+    directory: std::fs::File,
+    created_child: bool,
+}
+
 #[cfg(any(target_os = "macos", all(unix, test)))]
 const ACL_FIRST_ENTRY: libc::c_int = 0;
 #[cfg(any(target_os = "macos", all(unix, test)))]
@@ -848,15 +854,63 @@ fn sync_pinned_key_parent(parent: &std::fs::File) -> Result<(), String> {
         )
     };
     if fd < 0 {
-        return Err(format!("open iroh key parent for sync: {}", std::io::Error::last_os_error()));
+        return Err(format!(
+            "open iroh key parent for sync: {}",
+            std::io::Error::last_os_error()
+        ));
     }
     let readable = unsafe { std::fs::File::from_raw_fd(fd) };
-    let expected = parent.metadata().map_err(|e| format!("inspect iroh key parent: {e}"))?;
-    let actual = readable.metadata().map_err(|e| format!("inspect iroh key sync handle: {e}"))?;
+    let expected = parent
+        .metadata()
+        .map_err(|e| format!("inspect iroh key parent: {e}"))?;
+    let actual = readable
+        .metadata()
+        .map_err(|e| format!("inspect iroh key sync handle: {e}"))?;
     if actual.dev() != expected.dev() || actual.ino() != expected.ino() {
         return Err("iroh key parent changed before sync".to_string());
     }
-    readable.sync_all().map_err(|e| format!("sync iroh key parent directory: {e}"))
+    readable
+        .sync_all()
+        .map_err(|e| format!("sync iroh key parent directory: {e}"))
+}
+
+#[cfg(unix)]
+fn ancestor_entry_may_be_new(owner: u32, mode: u32, uid: u32, created_child: bool) -> bool {
+    if created_child || uid == 0 {
+        return true;
+    }
+    if owner == uid {
+        mode & 0o200 != 0
+    } else {
+        mode & 0o022 != 0
+    }
+}
+
+/// Flush every parent that this process could have changed, including an
+/// entry left visible by an interrupted earlier attempt. A non-writable
+/// established ancestor cannot contain an entry created by this process.
+#[cfg(unix)]
+fn sync_new_key_ancestry(root: &std::fs::File, parents: &[KeyParent]) -> Result<(), String> {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    sync_pinned_key_parent(root)?;
+    let uid = unsafe { libc::geteuid() };
+    for parent in parents.iter().rev() {
+        let metadata = parent
+            .directory
+            .metadata()
+            .map_err(|e| format!("inspect iroh key ancestor before sync: {e}"))?;
+        if !ancestor_entry_may_be_new(
+            metadata.uid(),
+            metadata.permissions().mode(),
+            uid,
+            parent.created_child,
+        ) {
+            break;
+        }
+        sync_pinned_key_parent(&parent.directory)?;
+    }
+    Ok(())
 }
 
 #[cfg(unix)]
@@ -868,7 +922,7 @@ fn open_key_dir(parent: &Path, access: KeyDirAccess) -> Result<std::fs::File, St
 fn open_key_dir_with_parents(
     parent: &Path,
     access: KeyDirAccess,
-) -> Result<(std::fs::File, Vec<std::fs::File>), String> {
+) -> Result<(std::fs::File, Vec<KeyParent>), String> {
     use std::collections::VecDeque;
     use std::ffi::{CString, OsString};
     use std::os::fd::{AsRawFd, FromRawFd};
@@ -913,6 +967,7 @@ fn open_key_dir_with_parents(
         .open("/")
         .map_err(|e| format!("open filesystem root for iroh key: {e}"))?;
     let mut directories = vec![root];
+    let mut created_children = vec![false];
     let mut remaining = parts(parent)?;
     let mut links = 0;
     let uid = unsafe { libc::geteuid() };
@@ -921,11 +976,13 @@ fn open_key_dir_with_parents(
         let name = match part {
             Part::Root => {
                 directories.truncate(1);
+                created_children.truncate(1);
                 continue;
             }
             Part::Parent => {
                 if directories.len() > 1 {
                     directories.pop();
+                    created_children.pop();
                 }
                 continue;
             }
@@ -958,12 +1015,25 @@ fn open_key_dir_with_parents(
             )
         };
         if result < 0
-            && matches!(access, KeyDirAccess::PrivateCreate | KeyDirAccess::AncestorCreate)
+            && matches!(
+                access,
+                KeyDirAccess::PrivateCreate | KeyDirAccess::AncestorCreate
+            )
             && std::io::Error::last_os_error().kind() == std::io::ErrorKind::NotFound
         {
             result = unsafe { libc::mkdirat(directory.as_raw_fd(), name.as_ptr(), 0o700) };
-            if result < 0 && std::io::Error::last_os_error().kind() != std::io::ErrorKind::AlreadyExists {
-                return Err(format!("create iroh key directory: {}", std::io::Error::last_os_error()));
+            if result < 0
+                && std::io::Error::last_os_error().kind() != std::io::ErrorKind::AlreadyExists
+            {
+                return Err(format!(
+                    "create iroh key directory: {}",
+                    std::io::Error::last_os_error()
+                ));
+            }
+            if result == 0 {
+                *created_children
+                    .last_mut()
+                    .expect("parent directory remains open") = true;
             }
             result = unsafe {
                 libc::fstatat(
@@ -1040,15 +1110,20 @@ fn open_key_dir_with_parents(
         }
         check_key_acl(&opened, "iroh key directory entry", KeyAclScope::Ancestor)?;
         directories.push(opened);
+        created_children.push(false);
     }
     let search_handle = directories.pop().expect("root directory remains open");
+    created_children.pop();
     let search_meta = search_handle
         .metadata()
         .map_err(|e| format!("inspect iroh key directory: {e}"))?;
     // Legacy lookup needs only search permission on the app-data root. Keep
     // the validated descriptor: reopening it for read would reject an owned
     // 0300 directory even though its private key is accessible by name.
-    if matches!(access, KeyDirAccess::AncestorCreate | KeyDirAccess::AncestorReadOnly) {
+    if matches!(
+        access,
+        KeyDirAccess::AncestorCreate | KeyDirAccess::AncestorReadOnly
+    ) {
         if !search_meta.is_dir()
             || search_meta.uid() != uid
             || search_meta.permissions().mode() & 0o022 != 0
@@ -1056,7 +1131,15 @@ fn open_key_dir_with_parents(
             return Err("iroh key directory permissions remain unsafe".to_string());
         }
         check_key_acl(&search_handle, "iroh key directory", KeyAclScope::Ancestor)?;
-        return Ok((search_handle, directories));
+        let parents = directories
+            .into_iter()
+            .zip(created_children)
+            .map(|(directory, created_child)| KeyParent {
+                directory,
+                created_child,
+            })
+            .collect();
+        return Ok((search_handle, parents));
     }
     let dot = std::ffi::CString::new(".").expect("static directory name has no NUL");
     let fd = unsafe {
@@ -1107,7 +1190,15 @@ fn open_key_dir_with_parents(
         return Err("iroh key directory permissions remain unsafe".to_string());
     }
     check_key_acl(&directory, "iroh key directory", scope)?;
-    Ok((directory, directories))
+    let parents = directories
+        .into_iter()
+        .zip(created_children)
+        .map(|(directory, created_child)| KeyParent {
+            directory,
+            created_child,
+        })
+        .collect();
+    Ok((directory, parents))
 }
 
 /// Open the fixed private child relative to the validated app-data root.
@@ -1245,6 +1336,15 @@ fn read_private_key_in(directory: &std::fs::File, tighten: bool) -> Result<Optio
 
 #[cfg(unix)]
 fn persist_secret_key_in(directory: &std::fs::File, key: &SecretKey) -> Result<(), String> {
+    persist_secret_key_in_with_sync(directory, key, &std::fs::File::sync_all)
+}
+
+#[cfg(unix)]
+fn persist_secret_key_in_with_sync(
+    directory: &std::fs::File,
+    key: &SecretKey,
+    directory_sync: &dyn Fn(&std::fs::File) -> std::io::Result<()>,
+) -> Result<(), String> {
     use std::os::fd::{AsRawFd, FromRawFd};
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
 
@@ -1293,9 +1393,12 @@ fn persist_secret_key_in(directory: &std::fs::File, key: &SecretKey) -> Result<(
             )
         };
         if renamed < 0 {
-            return Err(format!("publish iroh key file: {}", std::io::Error::last_os_error()));
+            return Err(format!(
+                "publish iroh key file: {}",
+                std::io::Error::last_os_error()
+            ));
         }
-        directory.sync_all().map_err(|e| format!("sync iroh key directory: {e}"))?;
+        directory_sync(directory).map_err(|e| format!("sync iroh key directory: {e}"))?;
         Ok(())
     })();
     if result.is_err() {
@@ -1438,6 +1541,20 @@ fn load_or_create_secret_key() -> Result<SecretKey, String> {
 }
 
 fn load_or_create_secret_key_at(path: &Path) -> Result<SecretKey, String> {
+    #[cfg(unix)]
+    {
+        load_or_create_secret_key_at_with_sync(path, &std::fs::File::sync_all)
+    }
+    #[cfg(not(unix))]
+    {
+        load_or_create_secret_key_at_with_sync(path)
+    }
+}
+
+fn load_or_create_secret_key_at_with_sync(
+    path: &Path,
+    #[cfg(unix)] directory_sync: &dyn Fn(&std::fs::File) -> std::io::Result<()>,
+) -> Result<SecretKey, String> {
     let parent = path.parent().ok_or("iroh key path has no parent")?;
     #[cfg(unix)]
     let (legacy_root, root_parents) = if let Some(legacy) = legacy_key_file_path(path) {
@@ -1470,6 +1587,11 @@ fn load_or_create_secret_key_at(path: &Path) -> Result<SecretKey, String> {
     };
     if let Some(sealed) = sealed {
         if let Some(key) = decode_secret_key(&sealed) {
+            // The prior attempt may have failed just after renameat. A visible
+            // key is not durable until its containing directory is synced.
+            #[cfg(unix)]
+            directory_sync(&directory)
+                .map_err(|e| format!("sync existing iroh key directory: {e}"))?;
             return Ok(key);
         }
         log::warn!(
@@ -1492,14 +1614,11 @@ fn load_or_create_secret_key_at(path: &Path) -> Result<SecretKey, String> {
     // directory's entry in the app-data root before advertising its node ID.
     #[cfg(unix)]
     if let Some(root) = legacy_root.as_ref() {
-        sync_pinned_key_parent(root)?;
-        for parent in root_parents.iter().rev() {
-            sync_pinned_key_parent(parent)?;
-        }
+        sync_new_key_ancestry(root, &root_parents)?;
     }
     let key = SecretKey::generate();
     #[cfg(unix)]
-    persist_secret_key_in(&directory, &key)?;
+    persist_secret_key_in_with_sync(&directory, &key, directory_sync)?;
     #[cfg(not(unix))]
     persist_secret_key(path, &key)?;
     Ok(key)
@@ -2163,9 +2282,66 @@ mod tests {
 
         let created = load_or_create_secret_key_at(&path).unwrap();
         assert!(path.exists());
-        assert_eq!(load_or_create_secret_key_at(&path).unwrap().public(), created.public());
+        assert_eq!(
+            load_or_create_secret_key_at(&path).unwrap().public(),
+            created.public()
+        );
         let node_id = created.public().to_string();
-        assert_eq!(persisted_node_id_at(&path).as_deref(), Some(node_id.as_str()));
+        assert_eq!(
+            persisted_node_id_at(&path).as_deref(),
+            Some(node_id.as_str())
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn iroh_identity_key_first_start_below_established_search_only_ancestor() {
+        use std::os::unix::fs::PermissionsExt;
+
+        assert!(!ancestor_entry_may_be_new(0, 0o711, 1000, false));
+        assert!(ancestor_entry_may_be_new(0, 0o711, 1000, true));
+        assert!(ancestor_entry_may_be_new(0, 0o1777, 1000, false));
+        if unsafe { libc::geteuid() } == 0 {
+            return;
+        }
+
+        let temp = tempfile::tempdir().unwrap();
+        let search_only = temp.path().join("search-only");
+        let readable = search_only.join("readable");
+        std::fs::create_dir_all(&readable).unwrap();
+        std::fs::File::open(&search_only).unwrap().sync_all().unwrap();
+        std::fs::File::open(temp.path()).unwrap().sync_all().unwrap();
+        let path = readable.join("codemux").join(KEY_DIR).join(KEY_FILE);
+        std::fs::set_permissions(&search_only, std::fs::Permissions::from_mode(0o111)).unwrap();
+        let result = load_or_create_secret_key_at(&path);
+        std::fs::set_permissions(&search_only, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let key = result.unwrap();
+        assert!(path.exists());
+        assert_eq!(
+            load_or_create_secret_key_at(&path).unwrap().public(),
+            key.public()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn iroh_identity_key_retry_syncs_key_left_by_failed_publication() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("codemux").join(KEY_DIR).join(KEY_FILE);
+        let fail_sync =
+            |_: &std::fs::File| Err(std::io::Error::other("injected directory sync failure"));
+
+        let first = load_or_create_secret_key_at_with_sync(&path, &fail_sync).unwrap_err();
+        assert!(first.contains("sync iroh key directory"), "{first}");
+        let visible = decode_secret_key(&std::fs::read(&path).unwrap()).unwrap();
+
+        let retry = load_or_create_secret_key_at_with_sync(&path, &fail_sync).unwrap_err();
+        assert!(
+            retry.contains("sync existing iroh key directory"),
+            "{retry}"
+        );
+        let recovered = load_or_create_secret_key_at(&path).unwrap();
+        assert_eq!(recovered.public(), visible.public());
     }
 
     #[cfg(unix)]
