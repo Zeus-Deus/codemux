@@ -64,6 +64,7 @@ export function openEnvironmentConnection(
   let fetching = false;
   let fetchEpoch = 0;
   let requiredRevision = 0;
+  let browserRejected = false;
 
   const clearGap = () => {
     clearTimeout(gapTimer);
@@ -159,7 +160,14 @@ export function openEnvironmentConnection(
     registry: opts.registry,
     deviceId: opts.device.id,
     dialer: opts.dialer,
-    onPending: () => update({ status: "pending-approval", error: null }),
+    onPending: (browserLabel) =>
+      update({ status: "pending-approval", pendingBrowserLabel: browserLabel ?? null, error: null }),
+    onBrowserRejected: (reason) => {
+      browserRejected = true;
+      update(reason === "session_revoked"
+        ? { status: "revoked", error: "This machine revoked access for this client." }
+        : { status: "unauthorized", error: "Update Codemux and try again." });
+    },
     onMintError: (error) => {
       if (error.kind === "unauthorized" || error.kind === "not_found") return;
       update({ status: "offline", error: error.message });
@@ -191,8 +199,11 @@ export function openEnvironmentConnection(
         clearGap();
         if (connected) resync();
       },
-      onUnauthorized: () =>
-        update({ status: "unauthorized", error: "Sign in again to reach this machine." }),
+      onUnauthorized: () => {
+        if (!browserRejected) {
+          update({ status: "unauthorized", error: "Sign in again to reach this machine." });
+        }
+      },
     },
   });
   transport.subscribe(APP_STATE_EVENT);

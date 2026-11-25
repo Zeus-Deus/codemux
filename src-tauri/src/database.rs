@@ -1294,6 +1294,9 @@ fn create_schema(conn: &Connection) -> Result<(), String> {
         // reads back as a paired device; account sessions set it to 'account'.
         "ALTER TABLE web_remote_sessions ADD COLUMN source TEXT NOT NULL DEFAULT 'pair'",
         "ALTER TABLE web_remote_sessions ADD COLUMN account_user_id TEXT",
+        "ALTER TABLE web_remote_sessions ADD COLUMN relay_browser_hash TEXT",
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_web_remote_relay_browser \
+             ON web_remote_sessions(account_user_id, relay_browser_hash)",
         // Backfill permission_mode for rows created before the column above
         // existed. Those rows read back NULL, which makes backend
         // auto-resume rebuild the live session with no permissionMode (SDK
@@ -6085,6 +6088,47 @@ impl DatabaseStore {
         Ok(())
     }
 
+    /// Resolve or create the account session for a relay browser's credential.
+    /// Revoked rows retain their browser binding so reconnecting cannot
+    /// re-enroll the same browser. Concurrent dials resolve to the same row.
+    pub(crate) fn web_remote_relay_session(
+        &self,
+        account_user_id: &str,
+        relay_browser_hash: &str,
+        name: &str,
+        approved: bool,
+    ) -> Result<WebRemoteSessionRecord, String> {
+        let conn = self.conn.lock().unwrap();
+        let find_session = || {
+            conn.query_row(
+                "SELECT id, name, user_agent, token_hash, created_at, last_seen_at, approved, revoked, source, account_user_id
+                 FROM web_remote_sessions WHERE account_user_id = ?1 AND relay_browser_hash = ?2",
+                params![account_user_id, relay_browser_hash],
+                Self::row_to_web_remote_session,
+            )
+        };
+        match find_session() {
+            Ok(row) => return Ok(row),
+            Err(rusqlite::Error::QueryReturnedNoRows) => {}
+            Err(e) => return Err(format!("Failed to read web_remote relay session: {e}")),
+        }
+
+        let id = uuid::Uuid::new_v4().to_string();
+        // The relay browser has a separate credential and never receives this
+        // HTTP bearer.
+        let token_hash =
+            crate::web_remote::auth::sha256_hex(&crate::web_remote::auth::random_token());
+        conn.execute(
+            "INSERT INTO web_remote_sessions
+                (id, token_hash, created_at, last_seen_at, approved, source, account_user_id, relay_browser_hash, name)
+             VALUES (?1, ?2, datetime('now'), datetime('now'), ?3, 'account', ?4, ?5, ?6)
+             ON CONFLICT(account_user_id, relay_browser_hash) DO NOTHING",
+            params![id, token_hash, approved as i64, account_user_id, relay_browser_hash, name],
+        )
+        .map_err(|e| format!("Failed to insert web_remote relay session: {e}"))?;
+        find_session().map_err(|e| format!("Failed to read web_remote relay session: {e}"))
+    }
+
     /// Fetch a single session by id, regardless of revoked/approved state.
     pub fn web_remote_get_session(&self, id: &str) -> Option<WebRemoteSessionRecord> {
         let conn = self.conn.lock().unwrap();
@@ -6188,10 +6232,59 @@ impl DatabaseStore {
         Ok(removed > 0)
     }
 
-    /// Hard-delete a session row. Used by the reject flow — a rejected
-    /// pending device leaves no trace.
-    pub fn web_remote_delete_session(&self, id: &str) -> Result<(), String> {
+    pub(crate) fn web_remote_blocked_relay_browsers(
+        &self,
+        account_id: &str,
+        auth_record: &[u8],
+    ) -> Result<Vec<(String, Option<String>)>, String> {
         let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT id, name FROM web_remote_sessions
+             WHERE source = 'account' AND relay_browser_hash IS NOT NULL
+               AND revoked = 1 AND account_user_id = ?1
+               AND EXISTS (SELECT 1 FROM auth_tokens WHERE id = 1 AND encrypted_data = ?2)
+             ORDER BY created_at DESC, id",
+        ).map_err(|error| format!("Failed to list blocked relay browsers: {error}"))?;
+        let rows = stmt
+            .query_map(params![account_id, auth_record], |row| Ok((row.get(0)?, row.get(1)?)))
+            .map_err(|error| format!("Failed to list blocked relay browsers: {error}"))?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(|error| format!("Failed to list blocked relay browsers: {error}"))
+    }
+
+    /// Restore this exact browser's request. A second, explicit approval is
+    /// still required, even when the host usually trusts new account browsers.
+    pub(crate) fn web_remote_restore_relay_browser(
+        &self,
+        id: &str,
+        account_id: &str,
+        auth_record: &[u8],
+    ) -> Result<bool, String> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE web_remote_sessions SET approved = 0, revoked = 0
+             WHERE id = ?1 AND source = 'account' AND relay_browser_hash IS NOT NULL
+               AND revoked = 1 AND account_user_id = ?2
+               AND EXISTS (SELECT 1 FROM auth_tokens WHERE id = 1 AND encrypted_data = ?3)",
+            params![id, account_id, auth_record],
+        )
+        .map(|updated| updated != 0)
+        .map_err(|error| format!("Failed to restore blocked relay browser: {error}"))
+    }
+
+    /// Reject a pending device. Keep a revoked row for relay browsers so
+    /// automatic reconnect does not immediately recreate their request.
+    pub fn web_remote_reject_session(&self, id: &str) -> Result<(), String> {
+        let conn = self.conn.lock().unwrap();
+        let updated = conn
+            .execute(
+                "UPDATE web_remote_sessions SET revoked = 1 WHERE id = ?1 AND relay_browser_hash IS NOT NULL",
+                params![id],
+            )
+            .map_err(|e| format!("Failed to reject web_remote relay session: {e}"))?;
+        if updated != 0 {
+            return Ok(());
+        }
         conn.execute("DELETE FROM web_remote_sessions WHERE id = ?1", params![id])
             .map_err(|e| format!("Failed to delete web_remote session: {e}"))?;
         Ok(())

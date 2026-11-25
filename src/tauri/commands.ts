@@ -88,6 +88,7 @@ import type {
   RunCandidate,
   WebRemoteStatus,
   WebRemoteEndpoint,
+  BlockedRelayBrowser,
   WebRemoteSessionView,
   WebRemotePairingInfo,
   WebRemoteBindScope,
@@ -3731,6 +3732,12 @@ export const webRemoteListSessions = () =>
 
 /** Revoke a device: deletes its session and immediately closes any live
  *  sockets it holds. */
+export const webRemoteListBlockedRelayBrowsers = () =>
+  invoke<BlockedRelayBrowser[]>("web_remote_list_blocked_relay_browsers");
+
+export const webRemoteRestoreRelayBrowser = (sessionId: string) =>
+  invoke<WebRemoteStatus>("web_remote_restore_relay_browser", { sessionId });
+
 export const webRemoteRevokeSession = (sessionId: string) =>
   invoke<WebRemoteStatus>("web_remote_revoke_session", { sessionId });
 

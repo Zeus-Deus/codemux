@@ -118,7 +118,7 @@ describe("HostedFlow: select → connect", () => {
       connect: (_d, h) =>
         new Promise<void>((resolve) => {
           handlers = h;
-          h.onPending();
+          h.onPending("Relay browser 1234ABCD");
           // resolve once "approved"
           setTimeout(resolve, 0);
         }),
@@ -127,6 +127,7 @@ describe("HostedFlow: select → connect", () => {
     const p = flow.select(device("a"));
     // synchronously after onPending the state reflects waiting
     expect(flow.getState().connectStatus).toBe("waiting-approval");
+    expect(flow.getState().browserLabel).toBe("Relay browser 1234ABCD");
     handlers.onConnecting();
     expect(flow.getState().connectStatus).toBe("connecting");
     await p;

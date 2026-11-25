@@ -1808,6 +1808,11 @@ export interface WebRemoteSessionView {
   source?: string;
 }
 
+export interface BlockedRelayBrowser {
+  id: string;
+  name: string | null;
+}
+
 /** Live server + device state. Returned by `web_remote_status` and
  *  emitted as the `web-remote-state-changed` payload. Mirrors
  *  `web_remote::WebRemoteStatus`. */

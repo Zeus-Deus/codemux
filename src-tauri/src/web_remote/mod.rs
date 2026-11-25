@@ -1775,8 +1775,53 @@ pub fn web_remote_reject_session<R: Runtime>(
 ) -> Result<WebRemoteStatus, String> {
     let shared = app.state::<WebRemoteState>().shared();
     app.state::<crate::database::DatabaseStore>()
-        .web_remote_delete_session(&session_id)?;
+        .web_remote_reject_session(&session_id)?;
     shared.connections.close_session(&session_id);
+    emit_state_changed(&app);
+    Ok(build_status(&app, &shared))
+}
+
+/// Blocked-browser details stay in desktop IPC. Remote status snapshots and
+/// broadcasts continue to contain only pending or approved browser rows.
+#[derive(Debug, Serialize)]
+pub struct BlockedRelayBrowser {
+    id: String,
+    name: Option<String>,
+}
+
+#[tauri::command]
+pub fn web_remote_list_blocked_relay_browsers<R: Runtime>(
+    app: AppHandle<R>,
+) -> Result<Vec<BlockedRelayBrowser>, String> {
+    let db = app.state::<crate::database::DatabaseStore>();
+    let Some(auth_record) = db.load_auth_token() else {
+        return Ok(Vec::new());
+    };
+    let Some(account_id) = crate::auth::active_account_id_from_record(&auth_record) else {
+        return Ok(Vec::new());
+    };
+    db.web_remote_blocked_relay_browsers(&account_id, &auth_record)
+        .map(|rows| {
+            rows.into_iter()
+                .map(|(id, name)| BlockedRelayBrowser { id, name })
+                .collect()
+        })
+}
+
+#[tauri::command]
+pub fn web_remote_restore_relay_browser<R: Runtime>(
+    app: AppHandle<R>,
+    session_id: String,
+) -> Result<WebRemoteStatus, String> {
+    let db = app.state::<crate::database::DatabaseStore>();
+    let auth_record = db.load_auth_token().ok_or("Sign in to manage relay browsers.")?;
+    let account_id = crate::auth::active_account_id_from_record(&auth_record)
+        .ok_or("Sign in to manage relay browsers.")?;
+    if !db.web_remote_restore_relay_browser(&session_id, &account_id, &auth_record)? {
+        return Err("The blocked relay browser is no longer available for this account.".into());
+    }
+
+    let shared = app.state::<WebRemoteState>().shared();
     emit_state_changed(&app);
     Ok(build_status(&app, &shared))
 }

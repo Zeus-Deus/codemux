@@ -84,7 +84,7 @@ describe("createIrohConnection ticket minting", () => {
     expect(connectDevice).toHaveBeenCalledWith("d1", "NONCE", undefined);
   });
 
-  it("dials the minted node and sends grant + nonce in hello-account", async () => {
+  it("dials the minted node and sends the grant, nonce and browser key", async () => {
     const { dialer, targets, streams } = capturingDialer();
     const conn = createIrohConnection({
       registry: { connectDevice: async () => grant() },
@@ -102,8 +102,53 @@ describe("createIrohConnection ticket minting", () => {
     });
     expect(streams[0].firstFrame()).toEqual({
       kind: KIND_TEXT,
-      json: { t: "hello-account", grant: "v1.payload.sig", nonce: "NONCE" },
+      json: {
+        t: "hello-account",
+        grant: "v1.payload.sig",
+        nonce: "NONCE",
+        browser_key: expect.stringMatching(/^[0-9a-f]{64}$/),
+      },
     });
+  });
+
+  it("reuses a browser key across connects to the same host and scopes it per host", async () => {
+    const saved = new Map<string, string>();
+    vi.stubGlobal("window", {
+      localStorage: {
+        getItem: (key: string) => saved.get(key) ?? null,
+        setItem: (key: string, value: string) => saved.set(key, value),
+      },
+    });
+    try {
+      async function connect(nodeId: string): Promise<unknown> {
+        const { dialer, streams } = capturingDialer();
+        const conn = createIrohConnection({
+          registry: { connectDevice: async () => ({ ...grant(), nodeId }) },
+          deviceId: "d1",
+          dialer,
+        });
+        await conn.fetchImpl("https://app.local/api/ws-ticket", { method: "POST" });
+        const ws = conn.wsFactory("wss://ignored");
+        await tick();
+        ws.close();
+        return streams[0].firstFrame().json;
+      }
+
+      await expect(connect("paired-host")).resolves.toMatchObject({
+        browser_key: expect.stringMatching(/^[0-9a-f]{64}$/),
+      });
+      const credentials = [...saved.values()];
+      expect(credentials).toHaveLength(1);
+      await expect(connect("paired-host")).resolves.toMatchObject({
+        browser_key: credentials[0],
+      });
+      await expect(connect("other-host")).resolves.toMatchObject({
+        browser_key: expect.stringMatching(/^[0-9a-f]{64}$/),
+      });
+      expect(new Set(saved.values()).size).toBe(2);
+    } finally {
+      vi.unstubAllGlobals();
+    }
   });
 
   it("maps an account-auth mint failure to a 401 ticket", async () => {
@@ -250,6 +295,7 @@ describe("createIrohConnection overlapping mints", () => {
       t: "hello-account",
       grant: "fresh-grant",
       nonce: "NONCE-2",
+      browser_key: expect.stringMatching(/^[0-9a-f]{64}$/),
     });
   });
 

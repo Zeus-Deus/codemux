@@ -588,6 +588,8 @@ mod tests {
             "git_discard_file",
             "get_auth_token",
             "web_remote_disable",
+            "web_remote_list_blocked_relay_browsers",
+            "web_remote_restore_relay_browser",
             "hosts_add",
             "hosts_ssh_config_hosts",
             "plugin:shell|execute",

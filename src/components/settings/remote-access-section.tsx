@@ -45,16 +45,19 @@ import {
   webRemoteCreatePairing,
   webRemoteDisable,
   webRemoteEnable,
+  webRemoteListBlockedRelayBrowsers,
   webRemoteListEndpoints,
   webRemoteRegistrationStatus,
   webRemoteRejectSession,
   webRemoteRetry,
+  webRemoteRestoreRelayBrowser,
   webRemoteRevokeSession,
   webRemoteSetConfig,
   webRemoteStatus,
 } from "@/tauri/commands";
 import { onWebRemoteStateChanged } from "@/remote/web-remote-events";
 import type {
+  BlockedRelayBrowser,
   WebRemoteBindScope,
   WebRemoteEndpoint,
   WebRemotePairingInfo,
@@ -842,6 +845,7 @@ export function RemoteAccessSection() {
   const [registration, setRegistration] =
     useState<WebRemoteRegistrationStatus | null>(null);
   const [pairingPending, setPairingPending] = useState(false);
+  const [blockedRelayBrowsers, setBlockedRelayBrowsers] = useState<BlockedRelayBrowser[]>([]);
   const [sessionBusy, setSessionBusy] = useState<string | null>(null);
   const [revokingAll, setRevokingAll] = useState(false);
   const [confirmRevokeAll, setConfirmRevokeAll] = useState(false);
@@ -970,6 +974,19 @@ export function RemoteAccessSection() {
   const connectedCount = connectedSessionCount(status);
   const exposure = describeExposure(status);
   const transport = currentTransport();
+
+  useEffect(() => {
+    if (transport !== "desktop" || !status?.enabled || !status.account_signed_in) {
+      setBlockedRelayBrowsers([]);
+      return;
+    }
+    let cancelled = false;
+    void webRemoteListBlockedRelayBrowsers().then(
+      (browsers) => { if (!cancelled) setBlockedRelayBrowsers(browsers); },
+      () => { if (!cancelled) setBlockedRelayBrowsers([]); },
+    );
+    return () => { cancelled = true; };
+  }, [status, transport]);
 
   // The dedicated registration read adds the ids, the last heartbeat, the last
   // error, and this machine's display name. Refetch whenever one of the
@@ -1434,6 +1451,23 @@ export function RemoteAccessSection() {
         toast.success("Browser revoked. Its access is now blocked.");
       } catch (err) {
         toast.failure("Couldn't revoke the browser", err);
+      } finally {
+        setSessionBusy(null);
+      }
+    },
+    [],
+  );
+
+  const handleRestoreRelayBrowser = useCallback(
+    async (id: string) => {
+      setSessionBusy(id);
+      try {
+        const next = await webRemoteRestoreRelayBrowser(id);
+        setBlockedRelayBrowsers((current) => current.filter((browser) => browser.id !== id));
+        setStatus(next);
+        toast.success("Browser moved to pending approval.");
+      } catch (err) {
+        toast.failure("Couldn't restore the browser request", err);
       } finally {
         setSessionBusy(null);
       }
@@ -1954,6 +1988,28 @@ export function RemoteAccessSection() {
                     busy={sessionBusy === s.id}
                     onRevoke={() => handleRevoke(s.id)}
                   />
+                ))}
+              </div>
+            )}
+            {transport === "desktop" && accountSignedIn && blockedRelayBrowsers.length > 0 && (
+              <div className="space-y-2 pt-2">
+                <p className="text-body-sm font-medium text-muted-foreground">Blocked relay browsers</p>
+                {blockedRelayBrowsers.map((browser) => (
+                  <div className="flex items-center gap-3 rounded-lg border border-border/60 px-3.5 py-2.5" key={browser.id}>
+                    <Laptop className="size-4 shrink-0 text-muted-foreground" />
+                    <p className="min-w-0 flex-1 break-words text-body font-semibold text-foreground">
+                      {browser.name ?? "Relay browser"}
+                    </p>
+                    <Button
+                      type="button"
+                      size="sm"
+                      variant="outline"
+                      disabled={sessionBusy !== null}
+                      onClick={() => void handleRestoreRelayBrowser(browser.id)}
+                    >
+                      Move to pending
+                    </Button>
+                  </div>
                 ))}
               </div>
             )}

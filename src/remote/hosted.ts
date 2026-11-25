@@ -34,6 +34,8 @@ export interface HostedState {
   error: string | null;
   /** Sub-status detail while connecting. */
   connectStatus: HostedConnectStatus;
+  /** Label the desktop shows for this browser's approval request. */
+  browserLabel: string | null;
   /** A sign-in request is in flight (disables the form). */
   busy: boolean;
 }
@@ -41,7 +43,7 @@ export interface HostedState {
 /** Callbacks the injected `connect` uses to report intermediate states. */
 export interface HostedConnectHandlers {
   /** The desktop reported the session is pending approval. */
-  onPending(): void;
+  onPending(browserLabel?: string): void;
   /** A grant mint is failing (device offline / transient); still retrying. */
   onOfflineRetry(): void;
   /** Back to a plain "connecting…" (e.g. a retry cleared the offline state). */
@@ -94,6 +96,7 @@ const INITIAL: HostedState = {
   selected: null,
   error: null,
   connectStatus: "connecting",
+  browserLabel: null,
   busy: false,
 };
 
@@ -183,11 +186,14 @@ export class HostedFlow {
       phase: "connecting",
       selected: device,
       connectStatus: "connecting",
+      browserLabel: null,
       error: null,
     });
     const handlers: HostedConnectHandlers = {
-      onPending: () => {
-        if (!attempt.signal.aborted) this.set({ connectStatus: "waiting-approval" });
+      onPending: (browserLabel) => {
+        if (!attempt.signal.aborted) {
+          this.set({ connectStatus: "waiting-approval", browserLabel: browserLabel ?? null });
+        }
       },
       onOfflineRetry: () => {
         if (!attempt.signal.aborted) this.set({ connectStatus: "offline-retrying" });

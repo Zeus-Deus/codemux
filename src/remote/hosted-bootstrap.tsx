@@ -255,7 +255,7 @@ export async function connectOverIroh(args: ConnectArgs): Promise<void> {
           registry: args.registry,
           deviceId: args.device.id,
           dialer,
-          onPending: () => {
+          onPending: (browserLabel) => {
             if (settled) return;
             if (!waitingApproval) {
               waitingApproval = true;
@@ -265,7 +265,12 @@ export async function connectOverIroh(args: ConnectArgs): Promise<void> {
                 approvalTimer = window.setTimeout(timeout, 5 * 60_000);
               }
             }
-            args.handlers.onPending();
+            args.handlers.onPending(browserLabel);
+          },
+          onBrowserRejected: (reason) => {
+            finish(new Error(reason === "session_revoked"
+              ? `Remote Access on ${args.device.name} revoked this browser.`
+              : "Refresh this tab to update Codemux, then try again."));
           },
           onMintError: (err: DeviceRegistryError) => {
             if (!settled && (
@@ -623,7 +628,9 @@ function ConnectingScreen(props: { state: HostedState; flow: HostedFlow }): Reac
   switch (props.state.connectStatus) {
     case "waiting-approval":
       title = "Waiting for approval";
-      detail = `Approve this browser on ${name} to finish connecting.`;
+      detail = props.state.browserLabel
+        ? `Approve “${props.state.browserLabel}” on ${name} to finish connecting.`
+        : `Approve this browser on ${name} to finish connecting.`;
       break;
     case "offline-retrying":
       title = "Device offline";
