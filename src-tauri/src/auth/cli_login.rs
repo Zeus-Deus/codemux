@@ -69,6 +69,8 @@ pub(crate) enum LoginError {
     /// [`LoginError::Credentials`], carries no server detail — expired and
     /// invalid must be indistinguishable from the outside.
     Token,
+    /// The local API URL policy rejected the configured origin before a request.
+    Config(String),
     /// Something local went wrong (no TTY, derivation failure, DB write).
     Local(String),
 }
@@ -90,6 +92,7 @@ impl LoginError {
                  token again from a machine that is signed in — tokens expire, \
                  and a truncated paste looks the same as an invalid one."
                 .to_string(),
+            LoginError::Config(detail) => detail.clone(),
             LoginError::Local(detail) => detail.clone(),
         }
     }
@@ -132,6 +135,9 @@ pub(crate) async fn sign_in(
             "Email and password are required.".to_string(),
         ));
     }
+    // A local URL policy error must not be classified as a server-side
+    // rejection of the user's credentials.
+    api_base_url().map_err(LoginError::Config)?;
 
     // Same zero-knowledge derivation the GUI runs: the server only ever
     // sees the stretched secret. `login_email_api` takes `&AuthSecret`,
@@ -209,7 +215,7 @@ struct VerifySession {
 /// transport problems are echoed, a rejected token is not (the CLI must
 /// not become an oracle for which tokens are live).
 async fn verify_bearer(token: &str) -> Result<(AuthUser, String), LoginError> {
-    let base = api_base_url().map_err(LoginError::Network)?;
+    let base = api_base_url().map_err(LoginError::Config)?;
     let url = format!("{base}/api/auth/desktop/verify");
     let resp = reqwest::Client::new()
         .get(&url)
@@ -766,6 +772,21 @@ mod tests {
         assert!(err
             .user_message()
             .contains("Could not reach the Codemux API"));
+        assert!(load_token(&db).is_none());
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(mockserver)]
+    async fn invalid_api_url_reports_local_configuration_error() {
+        let _guard = ApiUrlGuard::set("http://example.com");
+        let db = test_db();
+        let err = sign_in(&db, "someone@example.com", "pw".to_string())
+            .await
+            .expect_err("nonloopback HTTP must be refused before the request");
+        assert!(matches!(err, LoginError::Config(_)), "got {err:?}");
+        let message = err.user_message();
+        assert!(message.contains("CODEMUX_API_URL requires HTTPS"), "{message}");
+        assert!(!message.contains("Check the email address"), "{message}");
         assert!(load_token(&db).is_none());
     }
 

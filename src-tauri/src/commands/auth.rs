@@ -382,6 +382,7 @@ pub async fn start_oauth_flow<R: tauri::Runtime>(
     app: tauri::AppHandle<R>,
     auth_state: State<'_, AuthState>,
 ) -> Result<(), String> {
+    let base = api_base_url()?;
     let csrf_state = auth_state.generate_csrf_state();
 
     // The callback server reads the managed AuthState through the AppHandle.
@@ -389,7 +390,6 @@ pub async fn start_oauth_flow<R: tauri::Runtime>(
     // OAuth callback an atomic replacement with respect to startup refresh.
     let port = crate::auth::start_callback_server(app.clone())?;
 
-    let base = api_base_url()?;
     let url = format!(
         "{base}/api/auth/desktop/connect?provider=github&state={state}&port={port}",
         state = urlencoding::encode(&csrf_state),
