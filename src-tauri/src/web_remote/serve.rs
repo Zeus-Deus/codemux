@@ -5,8 +5,8 @@
 //! server, state restore, background loops, and the web-remote config
 //! hydration — because nothing else will: Tauri only runs `setup` from an
 //! event loop, and serve never enters one) with no display attached, binds the
-//! web-remote server through the **same** shared enable path the GUI and the
-//! `codemux remote enable` CLI use, prints a scannable pairing QR + link, and
+//! web-remote server through the **same** shared enable path the GUI uses,
+//! prints a scannable pairing QR + link, and
 //! then blocks until SIGINT / SIGTERM. This is the away-from-home SSH flow:
 //! expose the desktop's UI to a phone or laptop without a desktop session.
 //!
@@ -74,7 +74,7 @@ impl ShutdownAdmission {
 }
 
 /// Options parsed from `codemux serve [--scope …] [--port N] [--relay]`.
-/// Flag semantics mirror `codemux remote enable` exactly.
+/// Explicit flags override the persisted remote-access settings.
 #[derive(Debug, Clone)]
 pub struct ServeOptions {
     /// Bind scope: `all` | `tailscale` | `loopback`. `None` = fall back to the
@@ -104,8 +104,8 @@ pub fn run_serve(opts: ServeOptions) -> Result<(), String> {
     //    The lock also covers startup before the socket is listening.
     if crate::control::control_server_is_running() {
         return Err(
-            "Codemux is already running on this machine (GUI or serve) — stop it first, \
-             or use `codemux remote enable` to control the running instance."
+            "Codemux is already running on this machine (GUI or serve). Stop it first, \
+             or change remote access in desktop Settings."
                 .to_string(),
         );
     }
@@ -121,9 +121,8 @@ pub fn run_serve(opts: ServeOptions) -> Result<(), String> {
     //    `build_headless_app` runs the Tauri `setup` hook explicitly — Tauri
     //    itself only runs it from the event loop, which serve never enters —
     //    so the control server is listening (mutual exclusion in both
-    //    directions, `codemux remote pair`, `codemux connect status`,
-    //    `web_remote_set_relay`) and the persisted web-remote config is
-    //    hydrated before the enable below merges the CLI flags into it.
+    //    directions and `codemux connect status`) and the persisted web-remote
+    //    config is hydrated before the enable below merges the CLI flags into it.
     let app = match crate::build_headless_app() {
         Ok(app) => app,
         Err(e) => return Err(format!("failed to boot the headless backend: {e}")),
@@ -153,35 +152,37 @@ pub fn run_serve(opts: ServeOptions) -> Result<(), String> {
         //    nothing listens on the network for it to point at.
         print_banner(&handle, &result);
         let relay_only = !result.status.lan_enabled;
-        if relay_only {
+        let pairing_ready = if relay_only {
             println!();
             println!(
                 "Open https://app.codemux.org in a browser signed into your Codemux account \
                  and pick this machine."
             );
+            false
         } else {
             match web_remote::control_pair(&handle, None) {
                 Ok(pairing) => {
                     let value = serde_json::to_value(&pairing).unwrap_or(serde_json::Value::Null);
                     crate::cli::print_pairing(&value);
+                    true
                 }
                 Err(e) => {
-                    // Shouldn't happen once the server is enabled — keep serving so
-                    // `codemux remote pair` from another session can still work.
+                    // Keep serving even if the trusted startup pairing call fails.
                     eprintln!(
                         "[codemux serve] could not mint a pairing code: {e} \
-                         (the server is still running — run `codemux remote pair` to try again)"
+                         (the server is still running; stop it and use desktop Settings to manage pairing)"
                     );
+                    false
                 }
             }
-        }
+        };
         // The outside-assistant connector is independent of web remote and
         // was restored (or not) by setup; report it for relay-only too.
         let connector = crate::mcp_connector::agent_connector_status(handle.clone()).ok();
         if let Some(line) = connector.as_ref().and_then(connector_line) {
             println!("  {line}");
         }
-        print_footer(relay_only, connector.is_some_and(|status| status.enabled));
+        print_footer(pairing_ready, connector.is_some_and(|status| status.enabled));
 
         // 5. Keep-alive: block until SIGINT / SIGTERM. Still no `app.run()` —
         //    `MockRuntime::run` is an infinite polling loop with no windowing
@@ -363,8 +364,7 @@ fn print_banner<R: tauri::Runtime>(
         return;
     }
 
-    // Enumerate the reachable endpoints (the same list the Settings pane and
-    // `codemux remote enable` surface).
+    // Enumerate the reachable endpoints (the same list as the Settings pane).
     let endpoints = web_remote::web_remote_list_endpoints(handle.clone());
     if !endpoints.is_empty() {
         println!("  Reachable at:");
@@ -394,19 +394,16 @@ fn connector_line(status: &crate::mcp_connector::ConnectorStatus) -> Option<Stri
     })
 }
 
-/// Print the closing lines: how to mint more codes (or, relay-only, how to add
-/// the network listener), how to turn the connector on, the account-mode note,
-/// and the stop hint.
-fn print_footer(relay_only: bool, connector_enabled: bool) {
+/// Print the closing lines with the supported management path and stop hint.
+fn print_footer(pairing_ready: bool, connector_enabled: bool) {
     println!();
-    if relay_only {
-        println!("Run `codemux remote enable` from another SSH session to also listen on your network.");
-    } else {
-        println!("Run `codemux remote pair` from another SSH session to mint more pairing codes.");
+    if pairing_ready {
+        println!("Use the pairing code above to connect from a browser.");
     }
     if !connector_enabled {
-        println!("Run `codemux connector enable` to let outside agents connect over HTTP.");
+        println!("The outside-agent connector is off.");
     }
+    println!("Stop this server and use desktop Settings to change pairing, network, or connector access.");
     println!("Account-mode / hosted access continues to work if it was configured.");
     println!("Press Ctrl-C (or send SIGTERM) to stop the server.");
 }

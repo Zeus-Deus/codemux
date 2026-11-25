@@ -246,7 +246,7 @@ fn error_code(reply: &Value) -> &str {
 }
 
 #[test]
-fn agent_marked_cli_is_refused_admin_but_owner_is_not() {
+fn socket_admin_is_refused_for_every_caller_but_identity_still_matters_for_reads() {
     let serve = Serve::start(&[]);
     let marker = [(AGENT_PROCESS, "1")];
 
@@ -259,10 +259,10 @@ fn agent_marked_cli_is_refused_admin_but_owner_is_not() {
     assert_eq!(error_code(&terminal_agent), "admin_refused", "a terminal agent uses the current marker: {terminal_agent}");
 
     let legacy = serve.json("agent_connector_status", "{}", &[(PROVIDER_ORIGIN, "1")]);
-    assert_eq!(legacy["ok"], true, "the retired MCP marker does not identify a CLI agent: {legacy}");
+    assert_eq!(error_code(&legacy), "admin_refused", "even the retired MCP marker cannot use socket Admin: {legacy}");
 
     let owner = serve.json("agent_connector_status", "{}", &[]);
-    assert_eq!(owner["ok"], true, "{owner}");
+    assert_eq!(error_code(&owner), "admin_refused", "an unmarked peer is not authenticated as owner: {owner}");
 
     let status = serve.json("status", "{}", &marker);
     assert_eq!(status["ok"], true, "agents keep read commands: {status}");
@@ -271,16 +271,37 @@ fn agent_marked_cli_is_refused_admin_but_owner_is_not() {
 
     let native = serve.json("thread_list", r#"{"workspace_id":"none"}"#, &marker);
     assert_eq!(error_code(&native), "agent_identity_required", "{native}");
+    let legacy_read = serve.json("thread_list", r#"{"workspace_id":"none"}"#, &[(PROVIDER_ORIGIN, "1")]);
+    assert_eq!(error_code(&legacy_read), "workspace_not_found", "the retired marker is not an agent identity: {legacy_read}");
+    let unmarked_read = serve.json("thread_list", r#"{"workspace_id":"none"}"#, &[]);
+    assert_eq!(error_code(&unmarked_read), "workspace_not_found", "unmarked reads reach the workspace lookup: {unmarked_read}");
 }
 
 #[test]
-fn pty_shell_is_the_owner() {
+fn pty_shell_scrubs_inherited_agent_identity() {
+    // A trusted shell fixture records the PTY environment as soon as the app
+    // starts it. Socket `write_terminal` is Admin and cannot drive this test.
+    let fixture = tempfile::tempdir().unwrap();
+    let shell = fixture.path().join("capture-shell");
+    let env_dump = fixture.path().join("env.txt");
+    let out = fixture.path().join("out.json");
+    std::fs::write(
+        &shell,
+        format!(
+            "#!/bin/sh\nenv > '{env}'\nwhile ! '{CODEMUX}' json status '{{}}' >/dev/null 2>&1; do sleep 0.1; done\n'{CODEMUX}' json thread_list '{{\"workspace_id\":\"none\"}}' > '{out}.part'\nmv '{out}.part' '{out}'\nexec /bin/sh\n",
+            env = env_dump.display(),
+            out = out.display(),
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&shell, std::fs::Permissions::from_mode(0o700)).unwrap();
     // An instance started from an agent's shell: every identity var is set.
     let serve = Serve::start(&[
         (AGENT_PROCESS, "1"),
         (PROVIDER_ORIGIN, "1"),
         ("CODEMUX_MCP_GATEWAY_URL", "http://127.0.0.1:1/mcp"),
         ("CODEMUX_MCP_GATEWAY_TOKEN", "inherited"),
+        ("SHELL", shell.to_str().unwrap()),
     ]);
     let root = serve.root.path();
     let project = root.join("project");
@@ -288,31 +309,14 @@ fn pty_shell_is_the_owner() {
     let created = serve.json("create_workspace", &json!({ "path": project }).to_string(), &[]);
     assert_eq!(created["ok"], true, "{created}");
 
-    // Type into the new workspace's terminal, as the owner.
-    let (env_dump, out) = (root.join("env.txt"), root.join("out.json"));
-    let line = format!(
-        "env > '{env}'; '{CODEMUX}' json agent_connector_status '{{}}' > '{out}.part' && mv '{out}.part' '{out}'\n",
-        env = env_dump.display(),
-        out = out.display(),
-    );
-    let params = json!({ "data": line }).to_string();
     let deadline = Instant::now() + Duration::from_secs(60);
-    loop {
-        // The terminal registers shortly after the workspace opens.
-        let written = serve.json("write_terminal", &params, &[]);
-        if written["ok"] == true {
-            break;
-        }
-        assert!(Instant::now() < deadline, "the terminal never accepted input: {written}\n{}", serve.log());
-        std::thread::sleep(Duration::from_millis(200));
-    }
     while !out.exists() {
-        assert!(Instant::now() < deadline, "the terminal never ran the command:\n{}", serve.log());
+        assert!(Instant::now() < deadline, "the trusted shell fixture never ran:\n{}", serve.log());
         std::thread::sleep(Duration::from_millis(100));
     }
 
     let reply: Value = serde_json::from_str(&std::fs::read_to_string(&out).unwrap()).unwrap();
-    assert_eq!(reply["ok"], true, "a user's terminal is the owner: {reply}");
+    assert_eq!(error_code(&reply), "workspace_not_found", "the PTY process is not marked as an agent: {reply}");
     let env = std::fs::read_to_string(&env_dump).unwrap();
     for key in IDENTITY_VARS {
         assert!(!env.lines().any(|line| line.starts_with(&format!("{key}="))), "{key} reached the terminal");
@@ -335,11 +339,11 @@ fn setup_scripts_are_agent_processes() {
         std::fs::create_dir_all(project.join(".codemux")).unwrap();
         let file = |suffix: &str| root.join(format!("{name}.{suffix}"));
         let (env_dump, marked, unmarked, done) = (file("env"), file("marked.json"), file("unmarked.json"), file("done"));
-        // An admin command, the way an agent's script would ask; the second
-        // call clears the marker, which only the process ancestry still catches.
+        // A read whose result depends on agent identity. The second call
+        // clears the marker, leaving process ancestry to identify the agent.
         let script = format!(
-            "env > '{env}'; '{CODEMUX}' json agent_connector_status '{{}}' > '{marked}'; \
-             env -u {AGENT_PROCESS} '{CODEMUX}' json agent_connector_status '{{}}' > '{unmarked}'; touch '{done}'",
+            "env > '{env}'; '{CODEMUX}' json thread_list '{{\"workspace_id\":\"none\"}}' > '{marked}'; \
+             env -u {AGENT_PROCESS} '{CODEMUX}' json thread_list '{{\"workspace_id\":\"none\"}}' > '{unmarked}'; touch '{done}'",
             env = env_dump.display(),
             marked = marked.display(),
             unmarked = unmarked.display(),
@@ -357,16 +361,16 @@ fn setup_scripts_are_agent_processes() {
         }
         let reply = |file: &Path| -> Value { serde_json::from_str(&std::fs::read_to_string(file).unwrap()).unwrap() };
         let marked = reply(&marked);
-        assert_eq!(error_code(&marked), "admin_refused", "{name}: a setup script is an agent: {marked}");
+        assert_eq!(error_code(&marked), "agent_identity_required", "{name}: a setup script is an agent: {marked}");
         if cfg!(target_os = "linux") {
             let unmarked = reply(&unmarked);
-            assert_eq!(error_code(&unmarked), "admin_refused", "{name}: ancestry marks it too: {unmarked}");
+            assert_eq!(error_code(&unmarked), "agent_identity_required", "{name}: ancestry marks it too: {unmarked}");
         }
         let env = std::fs::read_to_string(&env_dump).unwrap();
         assert!(env.lines().any(|line| line == format!("{AGENT_PROCESS}=setup-script")), "{name}: {env}");
     }
-    let owner = serve.json("agent_connector_status", "{}", &[]);
-    assert_eq!(owner["ok"], true, "the owner keeps admin commands: {owner}");
+    let unmarked = serve.json("thread_list", r#"{"workspace_id":"none"}"#, &[]);
+    assert_eq!(error_code(&unmarked), "workspace_not_found", "a separate unmarked process reaches the workspace lookup: {unmarked}");
 }
 
 /// A socket `rerun_setup`, and a socket close that runs a worktree's
@@ -392,7 +396,7 @@ fn socket_setup_and_teardown_scripts_can_call_codemux_back() {
     // completes and the reply file is what this test checks.
     let reply_file = |phase: &str| root.join(format!("{phase}.json"));
     let script = |phase: &str| {
-        format!("'{CODEMUX}' json agent_connector_status '{{}}' > '{}' || true", reply_file(phase).display())
+        format!("'{CODEMUX}' json thread_list '{{\"workspace_id\":\"none\"}}' > '{}' || true", reply_file(phase).display())
     };
     std::fs::create_dir_all(checkout.join(".codemux")).unwrap();
     let config = json!({ "setup": [script("setup")], "teardown": [script("teardown")] });
@@ -405,12 +409,12 @@ fn socket_setup_and_teardown_scripts_can_call_codemux_back() {
     let rerun = serve.json_within("rerun_setup", &json!({ "workspace_id": id }).to_string(), limit);
     assert_eq!(rerun["data"]["status"], "complete", "{rerun}");
     let setup = reply("setup");
-    assert_eq!(error_code(&setup), "admin_refused", "the setup script was answered as an agent: {setup}");
+    assert_eq!(error_code(&setup), "agent_identity_required", "the setup script was answered as an agent: {setup}");
 
     let closed = serve.json_within("close_workspace", &json!({ "workspace_id": id }).to_string(), limit);
     assert_eq!(closed["data"]["closed"], true, "{closed}");
     let teardown = reply("teardown");
-    assert_eq!(error_code(&teardown), "admin_refused", "the teardown script was answered as an agent: {teardown}");
+    assert_eq!(error_code(&teardown), "agent_identity_required", "the teardown script was answered as an agent: {teardown}");
 }
 
 #[test]
