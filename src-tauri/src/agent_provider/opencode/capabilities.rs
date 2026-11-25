@@ -302,6 +302,68 @@ mod tests {
         server.await.unwrap();
     }
 
+    #[tokio::test]
+    async fn cold_catalog_retries_stalled_response_bodies() {
+        use super::super::api::OpenCodeApi;
+        use std::time::Duration;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let legacy_body = r#"{"all":[],"default":{},"connected":[]}"#;
+        let v2_body = r#"{"data":[]}"#;
+        for api in [OpenCodeApi::Legacy, OpenCodeApi::V2] {
+            let replies = match api {
+                OpenCodeApi::Legacy => vec![
+                    ("/provider", legacy_body, true),
+                    ("/provider", legacy_body, false),
+                ],
+                OpenCodeApi::V2 => vec![
+                    ("/api/provider", v2_body, false),
+                    ("/api/model", v2_body, true),
+                    ("/api/provider", v2_body, false),
+                    ("/api/model", v2_body, false),
+                ],
+            };
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let server = tokio::spawn(async move {
+                for (path, body, stalled) in replies {
+                    let (mut stream, _) = listener.accept().await.unwrap();
+                    let mut request = [0u8; 1024];
+                    let length = stream.read(&mut request).await.unwrap();
+                    assert!(
+                        String::from_utf8_lossy(&request[..length])
+                            .starts_with(&format!("GET {path} HTTP/1.1")),
+                        "Unexpected catalog request for {api:?}"
+                    );
+                    let headers = format!(
+                        "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                        body.len()
+                    );
+                    stream.write_all(headers.as_bytes()).await.unwrap();
+                    if stalled {
+                        stream.write_all(&body.as_bytes()[..body.len() / 2]).await.unwrap();
+                        tokio::spawn(async move {
+                            tokio::time::sleep(Duration::from_secs(2)).await;
+                            drop(stream);
+                        });
+                    } else {
+                        stream.write_all(body.as_bytes()).await.unwrap();
+                    }
+                }
+            });
+            let mut config = OpenCodeClientConfig::new(format!("http://{address}"));
+            config.api = api;
+            config.request_timeout = Duration::from_secs(1);
+            let client = OpenCodeClient::new(config).unwrap();
+
+            assert!(list_models_with_cold_retries(&client)
+                .await
+                .unwrap()
+                .is_empty());
+            server.await.unwrap();
+        }
+    }
+
     #[test]
     fn stage1_placeholder_is_empty_and_per_turn() {
         let caps = opencode_stage1_placeholder();
