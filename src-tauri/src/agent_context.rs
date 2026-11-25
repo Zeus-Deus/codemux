@@ -604,7 +604,7 @@ mod tests {
         let out = std::process::Command::new("sh")
             .arg("-c")
             .arg(&command)
-            .env("HOME", home.path())
+            .env("HOME", home.path().canonicalize().unwrap())
             .output()
             .unwrap();
         assert!(
@@ -630,7 +630,7 @@ mod tests {
     fn unix_launch_refuses_writable_and_symlinked_parents_before_writing() {
         use std::os::unix::fs::PermissionsExt;
         let root = tempfile::tempdir().unwrap();
-        let home = root.path().join("home");
+        let home = root.path().canonicalize().unwrap().join("home");
         std::fs::create_dir(&home).unwrap();
         let launch = inject_agent_context("droid", "ws-run").replace("&& droid ", "&& echo ");
 
@@ -688,7 +688,7 @@ mod tests {
         let status = std::process::Command::new("sh")
             .arg("-c")
             .arg(&launch)
-            .env("HOME", home.path())
+            .env("HOME", home.path().canonicalize().unwrap())
             .status()
             .unwrap();
         assert!(status.success());
