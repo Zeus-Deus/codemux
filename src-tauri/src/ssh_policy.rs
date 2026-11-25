@@ -20,12 +20,11 @@ pub(crate) fn verified_command_args() -> impl Iterator<Item = &'static str> {
         .chain(["-o", "ClearAllForwardings=yes"])
 }
 
-// Pin ProxyCommand first: older OpenSSH releases ignore a subsequent
-// ProxyCommand after setting ProxyJump, even when the jump was set to none.
-const NO_PROXY_JUMP: [&str; 2] = ["-o", "ProxyJump=none"];
 const PROXY_JUMP_ERROR: &str =
     "Codemux cannot verify implicit SSH ProxyJump clients. Configure a user-managed ProxyCommand instead.";
 
+// OpenSSH uses the first proxy directive it encounters. A leading
+// ProxyCommand pins the checked route and suppresses any later ProxyJump.
 const CHECKED_SSH: &str = r#"
 config=$(ssh -G "$@" </dev/null) || exit 255
 cr=$(printf "\r")
@@ -44,7 +43,7 @@ while IFS= read -r setting; do
 done <<CODEMUX_SSH_CONFIG
 $config
 CODEMUX_SSH_CONFIG
-exec ssh -o "ProxyCommand=$proxycommand" -o ProxyJump=none "$@"
+exec ssh -o "ProxyCommand=$proxycommand" "$@"
 "#;
 
 #[cfg(unix)]
@@ -125,7 +124,6 @@ pub(crate) async fn checked_native_ssh(
     command
         .arg("-o")
         .arg(format!("ProxyCommand={proxy_command}"))
-        .args(NO_PROXY_JUMP)
         .args(args);
     Ok(command)
 }
@@ -476,7 +474,7 @@ mod unattended_git_tests {
     use std::process::Command;
 
     #[test]
-    fn implicit_jumps_are_rejected_and_disabled_in_the_live_client() {
+    fn implicit_jumps_are_rejected_and_the_live_route_is_pinned() {
         let root = tempfile::tempdir().unwrap();
         let ssh = root.path().join("ssh");
         fs::write(
@@ -493,7 +491,7 @@ fi
 expected=ProxyCommand=none
 [ "$FIXTURE_ROUTE" != command ] || expected='ProxyCommand=user-fixture %h %p'
 [ "$1" = -o ] && [ "$2" = "$expected" ] || exit 2
-[ "$3" = -o ] && [ "$4" = ProxyJump=none ] || exit 2
+[ "$3" = -T ] || exit 2
 printf 'transport started\n'
 "#,
         )
@@ -553,7 +551,7 @@ printf 'transport started\n'
         let mut allowed = checked_native_ssh(&args("with-proxy")).await.unwrap();
         fs::write(
             &fixture,
-            "Host direct\n  ProxyCommand /bin/false different-fixture\nHost *\n  ProxyJump different-fixture\n",
+            "Host direct with-proxy\n  ProxyJump different-fixture\n  ProxyCommand /bin/false different-fixture\n",
         )
         .unwrap();
         let native = read_config(allowed.output().await.unwrap());
@@ -574,12 +572,16 @@ printf 'transport started\n'
             return;
         }
         let root = tempfile::tempdir().unwrap();
-        let git_location = Command::new("sh")
-            .args(["-c", "command -v git"])
-            .output()
-            .unwrap();
-        assert!(git_location.status.success(), "{git_location:?}");
-        let real_git = std::str::from_utf8(&git_location.stdout).unwrap().trim_end();
+        let locate = |program| {
+            let output = Command::new("sh")
+                .args(["-c", "command -v \"$1\"", "fixture", program])
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "{output:?}");
+            std::str::from_utf8(&output.stdout).unwrap().trim_end().to_owned()
+        };
+        let real_git = locate("git");
+        let real_ssh = locate("ssh");
         for (file, script) in [
             (
                 "git",
@@ -592,7 +594,8 @@ exec "$CODEMUX_FIXTURE_REAL_GIT" "$@"
             (
                 "ssh",
                 r#"#!/bin/sh
-[ "$1" != -G ] || exit 0
+if [ "$1" = -G ]; then exec "$CODEMUX_FIXTURE_REAL_SSH" -F /dev/null "$@"; fi
+"$CODEMUX_FIXTURE_REAL_SSH" -G -F /dev/null "$@" >/dev/null || exit 2
 printf 'verified %s\n' "$*" >&2
 exit 1
 "#,
@@ -628,7 +631,8 @@ exit 1
         let mut clone = crate::git::git_command();
         clone.current_dir(root.path())
             .env("PATH", &path)
-            .env("CODEMUX_FIXTURE_REAL_GIT", real_git)
+            .env("CODEMUX_FIXTURE_REAL_GIT", &real_git)
+            .env("CODEMUX_FIXTURE_REAL_SSH", &real_ssh)
             .args(["clone", "--", remote, "verified-clone"]);
         let _policy = unattended_git(&mut clone, Some(Path::new("verified-clone"))).unwrap();
         verify(clone.output().unwrap());
@@ -637,7 +641,8 @@ exit 1
         verify(Command::new("sh")
             .current_dir(root.path())
             .env("PATH", &path)
-            .env("CODEMUX_FIXTURE_REAL_GIT", real_git)
+            .env("CODEMUX_FIXTURE_REAL_GIT", &real_git)
+            .env("CODEMUX_FIXTURE_REAL_SSH", &real_ssh)
             .args(["-c", &script])
             .output()
             .unwrap());
@@ -687,7 +692,7 @@ exit 1
         let stderr = String::from_utf8_lossy(&output.stderr);
         assert!(stderr.contains("default "), "{stderr}");
         assert!(stderr.contains("StrictHostKeyChecking=yes"), "{stderr}");
-        assert!(stderr.contains("ProxyJump=none"), "{stderr}");
+        assert!(stderr.contains("ProxyCommand=none"), "{stderr}");
 
         let script = unattended_git_script(&format!("git ls-remote -- '{remote}'"));
         let output = Command::new("sh")
@@ -701,7 +706,7 @@ exit 1
         let stderr = String::from_utf8_lossy(&output.stderr);
         assert!(stderr.contains("default "), "{stderr}");
         assert!(stderr.contains("StrictHostKeyChecking=yes"), "{stderr}");
-        assert!(stderr.contains("ProxyJump=none"), "{stderr}");
+        assert!(stderr.contains("ProxyCommand=none"), "{stderr}");
 
         let scoped_config = root.path().join("scoped-config");
         let configure = |options: &[&str], key: &str, value: &str| {
