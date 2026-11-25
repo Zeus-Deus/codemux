@@ -69,8 +69,8 @@ async fn harvest_gemini_models() -> Result<Vec<LaunchGeminiModel>, String> {
 /// The key rides in the `x-goog-api-key` header, never the URL: reqwest
 /// errors print their URL, and the caller logs those errors to stderr.
 /// Redirects are off, since reqwest would carry that header to whatever
-/// origin a redirect names, and an error reports only the HTTP status and
-/// Google's error code, never the response text, which could echo the key.
+/// origin a redirect names. An error reports only the numeric HTTP status;
+/// response text could echo the key or contain an arbitrary server-chosen code.
 async fn harvest_gemini_models_from(
     api_base: &str,
     api_key: &str,
@@ -91,28 +91,13 @@ async fn harvest_gemini_models_from(
         .await
         .map_err(|e| format!("request: {}", e.without_url()))?;
     if !resp.status().is_success() {
-        let status = resp.status();
-        let body = resp.text().await.unwrap_or_default();
-        return Err(match google_error_code(&body) {
-            Some(code) => format!("HTTP {status} ({code})"),
-            None => format!("HTTP {status}"),
-        });
+        return Err(format!("HTTP {}", resp.status().as_u16()));
     }
     let parsed: ApiModelsResponse = resp
         .json()
         .await
         .map_err(|e| format!("decode: {}", e.without_url()))?;
     Ok(filter_and_map(parsed.models))
-}
-
-/// The `error.status` code from a Google API error body (for example
-/// `PERMISSION_DENIED`), kept only when it is a plain upper-case code so no
-/// server-chosen text reaches the logs.
-fn google_error_code(body: &str) -> Option<String> {
-    let value: serde_json::Value = serde_json::from_str(body).ok()?;
-    let code = value.get("error")?.get("status")?.as_str()?;
-    (!code.is_empty() && code.len() <= 64 && code.bytes().all(|b| b.is_ascii_uppercase() || b == b'_'))
-        .then(|| code.to_string())
 }
 
 /// Pure transformer — keep only Gemini text-generation models, strip
@@ -282,24 +267,24 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn http_errors_report_the_code_but_never_the_body() {
+    async fn http_errors_report_only_the_status() {
+        const UNKNOWN_CODE: &str = "UNKNOWN_SERVER_SELECTED_CODE";
         let mut server = mockito::Server::new_async().await;
         let _mock = server
             .mock("GET", "/models")
             .match_query(mockito::Matcher::Any)
             .with_status(403)
             .with_body(format!(
-                r#"{{"error":{{"code":403,"message":"API key {TEST_KEY} is not valid","status":"PERMISSION_DENIED"}}}}"#
+                r#"{{"error":{{"code":403,"message":"API key {TEST_KEY} is not valid","status":"{UNKNOWN_CODE}"}}}}"#
             ))
             .create_async()
             .await;
         let err = harvest_gemini_models_from(&server.url(), TEST_KEY)
             .await
             .expect_err("403 fails");
-        assert_eq!(err, "HTTP 403 Forbidden (PERMISSION_DENIED)");
+        assert_eq!(err, "HTTP 403");
         assert!(!err.contains(TEST_KEY));
-        assert_eq!(google_error_code(r#"{"error":{"status":"bad text"}}"#), None);
-        assert_eq!(google_error_code("not json"), None);
+        assert!(!err.contains(UNKNOWN_CODE));
     }
 
     #[tokio::test]
