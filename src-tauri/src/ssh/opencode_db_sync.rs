@@ -122,11 +122,6 @@ pub(crate) fn parse_sid_marker(stdout: &str) -> Option<String> {
 /// the shared `/tmp`, where other users could read them or plant the name.
 const REMOTE_BUNDLE_DIR: &str = "~/.codemux-opencode-sync";
 
-/// Quote a remote bundle path, keeping its leading `~/` expandable.
-fn remote_quote(path: &str) -> String {
-    super::push::shell_escape(path)
-}
-
 /// The same ancestor check is run on the remote before creation, reads, and
 /// deletion. Cleanup never creates a directory if the path has changed.
 fn remote_bundle_dir_guard(create: bool) -> String {
@@ -166,22 +161,20 @@ pub(crate) fn remote_import_script(remote_cwd: &str, remote_bundle: &str) -> Str
     // session directory from the process cwd.
     let cleanup =
         remote_bundle_cleanup_command(remote_bundle).expect("bundle path is generated locally");
-    let check = remote_bundle_command(
+    let import = remote_bundle_command(
         remote_bundle,
         false,
-        "[ -f \"$cmx_file\" ] && [ ! -L \"$cmx_file\" ]",
+        "[ -f \"$cmx_file\" ] && [ ! -L \"$cmx_file\" ] || exit 4\nopencode import \"$cmx_file\" 2>&1",
     )
     .expect("bundle path is generated locally");
     format!(
         "codemux_cleanup() {{ {cleanup} || :; }}\n\
          trap codemux_cleanup EXIT\n\
          mkdir -p {cwd} && cd {cwd} || exit 3\n\
-         {check} || exit 4\n\
-         opencode import {bundle} 2>&1\n\
+         {import}\n\
          rc=$?\n\
          exit $rc\n",
         cwd = shell_sq(remote_cwd),
-        bundle = remote_quote(remote_bundle),
     )
 }
 
@@ -685,8 +678,7 @@ mod tests {
     fn remote_import_script_cds_then_imports_then_cleans_up() {
         let s = remote_import_script("/home/me/ws", "~/.codemux-opencode-sync/b1.json");
         assert!(s.contains("mkdir -p '/home/me/ws' && cd '/home/me/ws' || exit 3"));
-        // `~/` stays unquoted so the remote shell expands it.
-        assert!(s.contains("opencode import ~/'.codemux-opencode-sync/b1.json'"));
+        assert!(s.contains("opencode import \"$cmx_file\""));
         assert!(s.contains("rm -f \"$cmx_file\""));
         assert!(s.contains("cmx_check_ancestor"));
         // Cleanup is installed before anything can exit early.
@@ -720,6 +712,52 @@ mod tests {
             !bundle_dir.join("b3.json").exists(),
             "the transcript was left behind"
         );
+    }
+
+    #[test]
+    fn remote_import_uses_verified_bundle_path_with_a_linked_home() {
+        use std::os::unix::fs::PermissionsExt;
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let real_home = root.join("real-home");
+        std::fs::create_dir(&real_home).unwrap();
+        let linked_home = root.join("linked-home");
+        std::os::unix::fs::symlink(&real_home, &linked_home).unwrap();
+        let bundle_dir = real_home.join(".codemux-opencode-sync");
+        std::fs::create_dir(&bundle_dir).unwrap();
+        let bundle = bundle_dir.join("linked.json");
+        std::fs::write(&bundle, "transcript").unwrap();
+        std::fs::set_permissions(&bundle, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let bin = real_home.join("bin");
+        std::fs::create_dir(&bin).unwrap();
+        let opencode = bin.join("opencode");
+        std::fs::write(
+            &opencode,
+            "#!/bin/sh\n[ \"$1\" = import ] || exit 10\n[ \"$2\" = \"$EXPECTED_BUNDLE\" ] || exit 11\n[ \"$(cat \"$2\")\" = transcript ] || exit 12\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&opencode, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let script = remote_import_script(
+            &real_home.join("workspace").to_string_lossy(),
+            "~/.codemux-opencode-sync/linked.json",
+        );
+        let out = std::process::Command::new("bash")
+            .arg("-c")
+            .arg(script)
+            .env("HOME", linked_home)
+            .env("EXPECTED_BUNDLE", &bundle)
+            .env(
+                "PATH",
+                format!("{}:{}", bin.display(), std::env::var("PATH").unwrap()),
+            )
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(!bundle.exists());
     }
 
     #[test]
@@ -827,11 +865,8 @@ mod tests {
         let home = tempfile::tempdir().unwrap();
         let elsewhere = tempfile::tempdir().unwrap();
         std::fs::set_permissions(elsewhere.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
-        std::os::unix::fs::symlink(
-            elsewhere.path(),
-            home.path().join(".codemux-opencode-sync"),
-        )
-        .unwrap();
+        std::os::unix::fs::symlink(elsewhere.path(), home.path().join(".codemux-opencode-sync"))
+            .unwrap();
         let bundle = unique_remote_bundle();
         let script =
             remote_bundle_command(&bundle, true, "set -C\nprintf data > \"$cmx_file\"").unwrap();

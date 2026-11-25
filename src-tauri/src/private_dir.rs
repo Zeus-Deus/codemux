@@ -228,17 +228,38 @@ cmx_check_owned() {
   cmx_bad=$(find "$1" -prune \( -perm -020 -o -perm -002 \) -print) || return 1
   [ -z "$cmx_bad" ]
 }
+cmx_check_chain() {
+  case "$1" in /*) ;; *) return 1 ;; esac
+  cmx_check_dir=/
+  cmx_check_ancestor "$cmx_check_dir" || return 1
+  cmx_check_rest=${1#/}
+  while [ -n "$cmx_check_rest" ]; do
+    cmx_check_part=${cmx_check_rest%%/*}
+    case "$cmx_check_part" in ''|.|..) return 1 ;; esac
+    cmx_check_dir="${cmx_check_dir%/}/$cmx_check_part"
+    cmx_check_ancestor "$cmx_check_dir" || return 1
+    case "$cmx_check_rest" in */*) cmx_check_rest=${cmx_check_rest#*/} ;; *) cmx_check_rest= ;; esac
+  done
+}
 case "$HOME" in /*) ;; *) exit 1 ;; esac
-cmx_dir=/
-cmx_check_ancestor "$cmx_dir" || exit 1
+cmx_source=/
+cmx_check_ancestor "$cmx_source" || exit 1
+cmx_uid=$(id -u) || exit 1
+cmx_resolved=/
 cmx_rest=${HOME#/}
 while [ -n "$cmx_rest" ]; do
   cmx_part=${cmx_rest%%/*}
   case "$cmx_part" in ''|.|..) exit 1 ;; esac
-  cmx_dir="${cmx_dir%/}/$cmx_part"
-  cmx_check_ancestor "$cmx_dir" || exit 1
+  cmx_source="${cmx_source%/}/$cmx_part"
+  if [ -L "$cmx_source" ]; then
+    cmx_link_owner=$(find "$cmx_source" -prune \( -uid "$cmx_uid" -o -uid 0 \) -print) || exit 1
+    [ "$cmx_link_owner" = "$cmx_source" ] || exit 1
+  fi
+  cmx_resolved=$(CDPATH= cd -P "$cmx_source" 2>/dev/null && pwd -P) || exit 1
+  cmx_check_chain "$cmx_resolved" || exit 1
   case "$cmx_rest" in */*) cmx_rest=${cmx_rest#*/} ;; *) cmx_rest= ;; esac
 done
+cmx_dir=$cmx_resolved
 cmx_check_owned "$cmx_dir" || exit 1
 "#,
     );
@@ -466,5 +487,59 @@ mod tests {
             .unwrap();
         assert!(status.success());
         assert_eq!(mode(&home_path.join("agent-launch")), 0o700);
+    }
+
+    #[test]
+    fn shell_guard_uses_a_verified_target_for_a_linked_home() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let real_home = root.join("real-home");
+        std::fs::create_dir(&real_home).unwrap();
+        std::fs::set_permissions(&real_home, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let linked_home = root.join("linked-home");
+        std::os::unix::fs::symlink(&real_home, &linked_home).unwrap();
+        let script = format!(
+            "{}printf data > \"$cmx_dir/probe\"\n",
+            shell_private_dir_guard(&["agent-launch"], true)
+        );
+        let out = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(&script)
+            .env("HOME", &linked_home)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert_eq!(
+            std::fs::read_to_string(real_home.join("agent-launch/probe")).unwrap(),
+            "data"
+        );
+        assert_eq!(mode(&real_home.join("agent-launch")), 0o700);
+    }
+
+    #[test]
+    fn shell_guard_rejects_a_linked_home_with_a_writable_target() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let unsafe_home = root.join("unsafe-home");
+        std::fs::create_dir(&unsafe_home).unwrap();
+        std::fs::set_permissions(&unsafe_home, std::fs::Permissions::from_mode(0o777)).unwrap();
+        let linked_home = root.join("linked-home");
+        std::os::unix::fs::symlink(&unsafe_home, &linked_home).unwrap();
+        let script = format!(
+            "{}printf data > \"$cmx_dir/probe\"\n",
+            shell_private_dir_guard(&["agent-launch"], true)
+        );
+        let status = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(script)
+            .env("HOME", &linked_home)
+            .status()
+            .unwrap();
+        assert!(!status.success());
+        assert!(!unsafe_home.join("agent-launch").exists());
     }
 }
