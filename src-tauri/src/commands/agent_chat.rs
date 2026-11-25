@@ -2922,9 +2922,23 @@ pub async fn begin_workspace_migration<R: Runtime>(
     app: &AppHandle<R>,
     workspace_id: &str,
 ) -> tokio::sync::OwnedRwLockWriteGuard<()> {
+    begin_workspace_migration_checked(app, workspace_id, || Ok(()))
+        .await
+        .expect("unconditional workspace migration")
+}
+
+/// Validate a move while its gate is held, before stopping any live chat.
+/// The pull path uses this to reject an unsupported source without
+/// interrupting a conversation or allowing a new session to race validation.
+pub async fn begin_workspace_migration_checked<R: Runtime>(
+    app: &AppHandle<R>,
+    workspace_id: &str,
+    validate: impl FnOnce() -> Result<(), String>,
+) -> Result<tokio::sync::OwnedRwLockWriteGuard<()>, String> {
     let gate = migration_gate_for(workspace_id).write_owned().await;
+    validate()?;
     stop_workspace_chat_sessions(app, workspace_id).await;
-    gate
+    Ok(gate)
 }
 
 /// Stop every live chat session in a workspace that push / pull is about to
@@ -14232,6 +14246,37 @@ mod tests {
         drop(migration);
         send.await.unwrap().unwrap();
         assert_eq!(*provider.started_on.lock().unwrap(), vec![None]);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn rejected_transfer_preflight_leaves_live_chat_running() {
+        let thread = "rejected-pull-chat";
+        let provider = Arc::new(PlacementProvider::default());
+        let (app, workspace) = placement_app(thread, Some(1), provider.clone()).await;
+        let handle = app.handle().clone();
+        provider.live.lock().unwrap().insert(thread.to_string());
+
+        let source = "/srv/project with space";
+        let rejected = begin_workspace_migration_checked(&handle, &workspace, || {
+            if crate::ssh::push::is_transfer_safe_remote_path(source) {
+                Ok(())
+            } else {
+                Err(crate::ssh::push::unsafe_remote_path_reason(source))
+            }
+        })
+        .await;
+        assert!(rejected.err().unwrap().contains("refusing remote path"));
+        assert!(provider.live.lock().unwrap().contains(thread));
+        assert!(provider.stopped.lock().unwrap().is_empty());
+
+        let rejected_target = begin_workspace_migration_checked(&handle, &workspace, || {
+            crate::ssh::push::rsync_ssh_target("host:").map(|_| ())
+        })
+        .await;
+        assert!(rejected_target.err().unwrap().contains("refusing SSH target"));
+        assert!(provider.live.lock().unwrap().contains(thread));
+        assert!(provider.stopped.lock().unwrap().is_empty());
     }
 
     /// A failed move leaves the workspace where it was, and a send waiting
