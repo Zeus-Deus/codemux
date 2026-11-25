@@ -9330,12 +9330,12 @@ pub(crate) fn stable_browser_session_name(cwd: &str) -> String {
     let hash = hasher.finish();
     // The basename is a branch or folder name a pull-request author can
     // choose, and the session name ends up in agent-browser argv and file
-    // names. Keep only `[A-Za-z0-9._-]`; the hash over the full cwd still
+    // names. Keep only `[A-Za-z0-9_-]`; the hash over the full cwd still
     // keeps names that map to the same text apart.
     let short_name: String = dir_name
         .chars()
         .map(|c| {
-            if c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-') {
+            if c.is_ascii_alphanumeric() || matches!(c, '_' | '-') {
                 c
             } else {
                 '-'
@@ -11325,7 +11325,7 @@ mod tests {
         assert!(name.starts_with("ws-x-eval--IFS"), "{name}");
         assert!(
             name.bytes()
-                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-')),
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-')),
             "unsafe character in session name: {name}"
         );
         // Plain branch names keep their existing session (and cookies).

@@ -186,9 +186,9 @@ pub fn build_pull_rsync_argv(opts: &PullOptions<'_>) -> Result<Vec<String>, Stri
     ])
 }
 
-/// Keep rsync's destination in SSH path mode. A colon in a host alias can
-/// change `host:~/path` into rsync's `host::~/path` daemon-module form, while
-/// an IPv6 literal needs brackets in rsync's spec but not in `ssh`'s argv.
+/// Keep rsync's destination in SSH path mode. Rsync parses a slash before the
+/// host separator as a local path and a second colon as a daemon module. An
+/// IPv6 literal needs brackets in rsync's spec but not in `ssh`'s argv.
 pub(crate) fn rsync_ssh_target(target: &str) -> Result<String, String> {
     crate::ssh::exec::validate_ssh_target(target)?;
     let (user, host) = match target.split_once('@') {
@@ -196,7 +196,17 @@ pub(crate) fn rsync_ssh_target(target: &str) -> Result<String, String> {
         Some(_) => return Err(format!("refusing SSH target {target:?}: invalid user or host")),
         None => (None, target),
     };
-    if host.is_empty() || host.starts_with('-') || user.is_some_and(|user| user.contains(':')) {
+    let safe_name = |name: &str| {
+        !name.is_empty()
+            && name.bytes().all(|byte| {
+                byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-' | b'+')
+            })
+    };
+    if host.is_empty()
+        || host.starts_with('-')
+        || user.is_some_and(|user| !safe_name(user))
+        || (!host.contains(':') && !safe_name(host))
+    {
         return Err(format!("refusing SSH target {target:?}: invalid user or host"));
     }
     if host.contains(':') {
@@ -816,6 +826,7 @@ mod tests {
     fn rsync_specs_keep_ssh_path_mode_for_ipv6_and_reject_ambiguous_targets() {
         let local = PathBuf::from("/tmp/foo");
         let path = "~/.codemux/worktrees/proj/branch";
+        assert_eq!(rsync_ssh_target("user+id@my_alias").unwrap(), "user+id@my_alias");
         for (target, rsync_host) in [("::1", "[::1]"), ("user@::1", "user@[::1]")] {
             let push = PushOptions::new(target, &local, path);
             let pull = PullOptions::new(target, path, &local);
@@ -824,7 +835,10 @@ mod tests {
             let pull_argv = build_pull_rsync_argv(&pull).unwrap();
             assert_eq!(pull_argv.get(pull_argv.len() - 2), Some(&expected));
         }
-        for target in ["host:", "user@host:", "user@-oProxyCommand=id", "user@@host", "[::1]"] {
+        for target in [
+            "host:", "user@host:", "user@-oProxyCommand=id", "user@@host", "[::1]",
+            "host/alias", "user/alias@host", "user@host/alias", "host?alias",
+        ] {
             let push = PushOptions::new(target, &local, path);
             let pull = PullOptions::new(target, path, &local);
             assert!(build_push_rsync_argv(&push).is_err(), "{target}");
@@ -909,12 +923,14 @@ mod tests {
     async fn push_and_pull_refuse_ambiguous_ssh_targets_before_any_ssh() {
         let dir = tempfile::tempdir().unwrap();
         let path = "~/.codemux/worktrees/proj/branch";
-        let push = push_workspace(PushOptions::new("host:", dir.path(), path)).await;
-        assert!(matches!(push, PushResult::RsyncFailed { ref reason } if reason.contains("refusing SSH target")), "{push:?}");
-        let local = dir.path().join("not-created");
-        let pull = pull_workspace_back(PullOptions::new("host:", path, &local)).await;
-        assert!(matches!(pull, PullResult::RsyncFailed { ref reason } if reason.contains("refusing SSH target")), "{pull:?}");
-        assert!(!local.exists());
+        for target in ["host:", "host/alias", "user/alias@host", "user@host/alias"] {
+            let push = push_workspace(PushOptions::new(target, dir.path(), path)).await;
+            assert!(matches!(push, PushResult::RsyncFailed { ref reason } if reason.contains("refusing SSH target")), "{target}: {push:?}");
+            let local = dir.path().join("not-created");
+            let pull = pull_workspace_back(PullOptions::new(target, path, &local)).await;
+            assert!(matches!(pull, PullResult::RsyncFailed { ref reason } if reason.contains("refusing SSH target")), "{target}: {pull:?}");
+            assert!(!local.exists());
+        }
     }
 
     #[test]

@@ -651,7 +651,7 @@ fn session_name(browser_id: &str) -> &str {
 fn validate_session_name(name: &str) -> Result<(), String> {
     if name.is_empty()
         || name.len() > 64
-        || !name.bytes().all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, b'.' | b'-' | b'_'))
+        || !name.bytes().all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, b'-' | b'_'))
     {
         return Err("Invalid browser session name".into());
     }
@@ -2226,7 +2226,7 @@ mod tests {
     #[tokio::test]
     async fn generated_dotted_workspace_session_is_accepted() {
         let session = crate::state::stable_browser_session_name("/workspaces/app.v2");
-        assert!(session.starts_with("ws-app.v2-"));
+        assert!(session.starts_with("ws-app-v2-"));
         validate_session_name(&session).unwrap();
         let manager = AgentBrowserManager::new();
         assert!(manager.allocate_port(&session).await.is_ok());
