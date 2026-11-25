@@ -374,6 +374,13 @@ pub fn shell_escape_for_ansi_c_quotes(s: &str) -> String {
 /// the closing quote), and it always holds a space so it is always wrapped:
 /// an unwrapped `a&calc` would let cmd.exe run `calc` through a `.cmd` shim.
 /// A trailing space covers both.
+///
+/// Quoting can't stop cmd.exe's variable expansion, which runs before it
+/// looks at quotes: `%CMDCMDLINE:~-1%` expands to the `"` PowerShell closed
+/// the argument with, so `&calc` after it would run. `!VAR!` does the same
+/// when delayed expansion is on. So `%` and `!` become their fullwidth forms
+/// (cmd.exe parses UTF-16 and only matches the ASCII ones), which also keeps
+/// text like `%USERPROFILE%` from being rewritten.
 pub fn shell_quote_for_powershell(s: &str) -> String {
     let mut body = String::with_capacity(s.len() + 1);
     for c in s.replace("\r\n", "\n").chars() {
@@ -381,6 +388,8 @@ pub fn shell_quote_for_powershell(s: &str) -> String {
             // Typographic and fullwidth forms too: Windows' best-fit mapping
             // turns them into `"` for programs that read an ANSI command line.
             '"' | '\u{201C}' | '\u{201D}' | '\u{201E}' | '\u{201F}' | '\u{FF02}' => body.push('\''),
+            '%' => body.push('\u{FF05}'),
+            '!' => body.push('\u{FF01}'),
             '\n' | '\r' | '\t' => body.push(' '),
             c if c.is_control() => {}
             c => body.push(c),
@@ -729,6 +738,36 @@ mod tests {
             "'fix'' --mcp-config ''x'"
         );
         assert_eq!(shell_quote_for_powershell(r"end\"), r"'end\ '");
+    }
+
+    /// cmd.exe expands `%VAR%` (and `!VAR!` with delayed expansion) before it
+    /// tracks quotes, so `%CMDCMDLINE:~-1%` would become a `"` that ends the
+    /// argument and runs `&calc` through a `.cmd` shim. The quoted value holds
+    /// no `%` or `!` at all.
+    #[test]
+    fn powershell_quote_leaves_no_cmd_expansion_characters() {
+        for prompt in [
+            "x %CMDCMDLINE:~-1%&calc",
+            "x !CMDCMDLINE:~-1!&calc",
+            "raise coverage to 80% in %USERPROFILE%\\src!",
+        ] {
+            let quoted = shell_quote_for_powershell(prompt);
+            for c in ['%', '!'] {
+                assert!(!quoted.contains(c), "{c:?} in {quoted:?}");
+            }
+        }
+        assert_eq!(
+            shell_quote_for_powershell("x %CMDCMDLINE:~-1%&calc"),
+            "'x \u{FF05}CMDCMDLINE:~-1\u{FF05}&calc'"
+        );
+        let (cmd, via_pty) = prepare_agent_command_for_shell(
+            "builtin-claude",
+            "claude.cmd",
+            Some("x %CMDCMDLINE:~-1%&calc"),
+            r"C:\Program Files\PowerShell\7\pwsh.exe",
+        );
+        assert!(!via_pty);
+        assert!(!cmd.contains('%'), "{cmd:?}");
     }
 
     /// Nushell reads `$'...'` as an interpolated string and runs `(...)`, so
