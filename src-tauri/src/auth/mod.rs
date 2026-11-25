@@ -214,7 +214,7 @@ impl AuthState {
     }
 
     /// Generate a CSRF state token and store it with a timestamp.
-    pub fn generate_csrf_state(&self, db: &DatabaseStore) -> Result<String, String> {
+    pub fn generate_csrf_state(&self, db: &DatabaseStore) -> Result<(String, bool), String> {
         let mut bytes = [0u8; 32];
         rand::thread_rng().fill_bytes(&mut bytes);
         let state = base64_url_encode(&bytes);
@@ -223,6 +223,7 @@ impl AuthState {
         // generation guard until the CSRF record is installed closes the gap
         // where sign-out could otherwise happen between those two actions.
         let generation = self.session_generation.lock().unwrap();
+        let cleaned_rejection = db.settle_rejected_auth_before_sign_in()?;
         let launch = OAuthLaunch {
             generation: *generation,
             revision: db.auth_session_revision()?,
@@ -234,7 +235,7 @@ impl AuthState {
         states.retain(|_, (created_at, _)| *created_at > cutoff);
         states.insert(state.clone(), (SystemTime::now(), launch));
 
-        Ok(state)
+        Ok((state, cleaned_rejection))
     }
 
     /// Validate and consume a CSRF state token (one-time use).
@@ -1248,7 +1249,7 @@ mod tests {
     #[test]
     fn csrf_state_generate_and_validate() {
         let state = AuthState::default();
-        let token = state.generate_csrf_state(&test_db()).unwrap();
+        let (token, _) = state.generate_csrf_state(&test_db()).unwrap();
         assert!(!token.is_empty());
         assert!(state.validate_csrf_state(&token));
         assert!(!state.validate_csrf_state(&token));
@@ -1263,7 +1264,7 @@ mod tests {
     #[test]
     fn oauth_state_cannot_replace_a_session_that_changed_after_launch() {
         let state = AuthState::default();
-        let token = state.generate_csrf_state(&test_db()).unwrap();
+        let (token, _) = state.generate_csrf_state(&test_db()).unwrap();
         state.replace_session(|| "explicit-sign-out");
 
         let launch = state
@@ -1290,7 +1291,7 @@ mod tests {
         let expiry = "2099-01-01T00:00:00Z";
 
         assert!(desktop.load_auth_token().is_none());
-        let csrf = state.generate_csrf_state(&desktop).unwrap();
+        let (csrf, _) = state.generate_csrf_state(&desktop).unwrap();
         clear_token(&cli).unwrap();
         let launch = state.consume_csrf_state(&csrf).unwrap();
         assert!(state
@@ -1299,7 +1300,7 @@ mod tests {
             .is_none());
         assert!(desktop.load_auth_token().is_none());
 
-        let csrf = state.generate_csrf_state(&desktop).unwrap();
+        let (csrf, _) = state.generate_csrf_state(&desktop).unwrap();
         let user = AuthUser {
             id: "different-account".into(),
             email: "fixture@example.test".into(),
@@ -1315,7 +1316,7 @@ mod tests {
             .is_none());
         assert!(replacement.is_current(&desktop));
 
-        let csrf = state.generate_csrf_state(&desktop).unwrap();
+        let (csrf, _) = state.generate_csrf_state(&desktop).unwrap();
         let launch = state.consume_csrf_state(&csrf).unwrap();
         // In-place verification may update ciphertext while OAuth is pending.
         let verified = replacement
@@ -1331,6 +1332,39 @@ mod tests {
         assert_eq!(saved.stored.token, "fresh");
         assert_eq!(saved.stored.auth_method.as_deref(), Some("github"));
         assert!(state.consume_csrf_state(&csrf).is_none());
+    }
+
+    #[test]
+    fn oauth_launch_waits_for_rejected_cleanup_and_callback_installs_after_recovery() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = DatabaseStore::test_file(&dir.path().join("auth.sqlite"));
+        let state = AuthState::default();
+        let old = save_auth_with_method(
+            &db, "rejected", "2099-01-01T00:00:00Z", None, Some("github"),
+        ).unwrap();
+        let old_revision = db.auth_session_revision().unwrap();
+        db.test_set_query_only(true);
+        assert!(db.clear_auth_token_if_current(old.encrypted()).is_err());
+        assert!(state.generate_csrf_state(&db).unwrap_err().contains("cleanup is saved"));
+        assert_eq!(db.auth_session_revision().unwrap(), old_revision);
+
+        db.test_set_query_only(false);
+        let (csrf, cleaned_rejection) = state.generate_csrf_state(&db).unwrap();
+        assert!(cleaned_rejection);
+        let launch_revision = db.auth_session_revision().unwrap();
+        assert_eq!(launch_revision, old_revision + 1);
+        assert!(db.load_raw_auth_token().unwrap().is_none());
+        // A retry that already observed the old row cannot advance the launch
+        // revision once this cleanup has committed.
+        assert!(!db.clear_auth_token_if_current(old.encrypted()).unwrap());
+        assert_eq!(db.auth_session_revision().unwrap(), launch_revision);
+
+        let launch = state.consume_csrf_state(&csrf).unwrap();
+        let installed = state.install_oauth_callback(
+            &db, launch, "fresh", "2099-01-01T00:00:00Z",
+        ).unwrap();
+        assert!(installed.is_some());
+        assert_eq!(load_token(&db).unwrap().0, "fresh");
     }
 
     #[test]

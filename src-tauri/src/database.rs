@@ -6369,6 +6369,24 @@ impl DatabaseStore {
             .map_err(|error| format!("Failed to inspect current auth record: {error}"))
     }
 
+    /// A rejected row must be durably revoked before a new sign-in captures
+    /// its auth revision. Otherwise the background retry can invalidate the
+    /// new sign-in after it has launched.
+    pub(crate) fn settle_rejected_auth_before_sign_in(&self) -> Result<bool, String> {
+        let current = self.load_raw_auth_token().map_err(|error| {
+            format!("Cannot start sign-in while auth storage cannot be inspected: {error}")
+        })?;
+        let Some(current) = current else {
+            return Ok(false);
+        };
+        if !self.rejected_auth_records.lock().unwrap().contains(&current) {
+            return Ok(false);
+        }
+        self.clear_auth_token_if_current(&current).map_err(|error| {
+            format!("Cannot start sign-in until rejected account cleanup is saved: {error}")
+        })
+    }
+
     pub fn clear_auth_token(&self) -> Result<(), String> {
         let mut conn = self.conn.lock().unwrap();
         let transaction = conn

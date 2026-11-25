@@ -2,6 +2,7 @@ import { useCallback, useEffect, useRef } from "react";
 import { useTauriEvent } from "./use-tauri-event";
 import {
   onAuthStateChanged,
+  onAuthStorageErrorCleared,
   onSettingsSynced,
   onSyncStateChanged,
   type SyncStateChangedPayload,
@@ -60,6 +61,14 @@ export function useAuthEvents() {
   );
 
   useTauriEvent(onAuthStateChanged, handleAuthEvent, [handleAuthEvent]);
+
+  const handleAuthStorageErrorCleared = useCallback((clearedError: string) => {
+    if (useAuthStore.getState().error === clearedError) {
+      useAuthStore.setState({ error: null });
+    }
+  }, []);
+
+  useTauriEvent(onAuthStorageErrorCleared, handleAuthStorageErrorCleared, [handleAuthStorageErrorCleared]);
 
   // Handle settings-synced events from the Rust backend
   const handleSettingsSynced = useCallback(

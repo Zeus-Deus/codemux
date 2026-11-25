@@ -235,6 +235,10 @@ fn emit_signed_out<R: tauri::Runtime>(app: &tauri::AppHandle<R>) {
     emit_signed_out_with_storage_error(app, None);
 }
 
+fn emit_auth_storage_error_cleared<R: tauri::Runtime>(app: &tauri::AppHandle<R>) {
+    let _ = app.emit("auth-storage-error-cleared", AUTH_CLEANUP_PENDING);
+}
+
 fn emit_signed_out_with_storage_error<R: tauri::Runtime>(
     app: &tauri::AppHandle<R>,
     storage_error: Option<String>,
@@ -286,7 +290,7 @@ fn clear_rejected_local_session_warning<R: tauri::Runtime>(
     let auth_state = app.state::<AuthState>();
     auth_state.commit_if_session_current(assigned, || {
         if matches!(db.load_raw_auth_token(), Ok(None)) {
-            emit_signed_out(app);
+            emit_auth_storage_error_cleared(app);
         }
     });
 }
@@ -561,9 +565,7 @@ pub async fn refresh_session<R: tauri::Runtime>(
                         match db.load_raw_auth_token() {
                             Ok(None) => {
                                 if let Ok(Some(assigned)) = retry_transition {
-                                    auth_state.commit_if_session_current(assigned, || {
-                                        emit_signed_out(&retry_app);
-                                    });
+                                    clear_rejected_local_session_warning(&retry_app, &db, assigned);
                                 } else if let Err(error) = finish_rejected_local_session(
                                     &retry_app, &db, &auth_state, session_generation, &expected, false,
                                 ) {
@@ -618,7 +620,10 @@ pub async fn start_oauth_flow<R: tauri::Runtime>(
     db: State<'_, DatabaseStore>,
     auth_state: State<'_, AuthState>,
 ) -> Result<(), String> {
-    let csrf_state = auth_state.generate_csrf_state(&db)?;
+    let (csrf_state, cleaned_rejection) = auth_state.generate_csrf_state(&db)?;
+    if cleaned_rejection {
+        emit_auth_storage_error_cleared(&app);
+    }
 
     // The callback server reads the managed AuthState through the AppHandle.
     // Keeping CSRF and session-generation state in that one instance makes an
@@ -650,8 +655,14 @@ pub async fn signin_email<R: tauri::Runtime>(
         return Err("Email and password are required".into());
     }
 
-    let (generation, revision) = auth_state.session_snapshot(|| db.auth_session_revision());
-    let revision = revision?;
+    let (generation, launch) = auth_state.session_snapshot(|| {
+        let cleaned_rejection = db.settle_rejected_auth_before_sign_in()?;
+        Ok::<_, String>((db.auth_session_revision()?, cleaned_rejection))
+    });
+    let (revision, cleaned_rejection) = launch?;
+    if cleaned_rejection {
+        emit_auth_storage_error_cleared(&app);
+    }
 
     // Bitwarden-style zero-knowledge derivation: stretch
     // (password, email) locally into a high-entropy AuthSecret that
@@ -1114,6 +1125,11 @@ mod tests {
         app.listen("auth-state-changed", move |event| {
             captured.lock().unwrap().push(serde_json::from_str(event.payload()).unwrap());
         });
+        let warnings_cleared = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let cleared = warnings_cleared.clone();
+        app.listen("auth-storage-error-cleared", move |_| {
+            cleared.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        });
         let mut server = mockito::Server::new_async().await;
         let mock = server.mock("GET", "/api/auth/desktop/verify")
             .match_header("authorization", "Bearer rejected-token")
@@ -1140,14 +1156,14 @@ mod tests {
         tokio::time::timeout(Duration::from_secs(8), async {
             loop {
                 if db.load_raw_auth_token().unwrap().is_none()
-                    && received.lock().unwrap().last().is_some_and(|event| event.storage_error.is_none())
+                    && warnings_cleared.load(std::sync::atomic::Ordering::SeqCst) > 0
                 {
                     return;
                 }
                 tokio::time::sleep(Duration::from_millis(20)).await;
             }
         }).await.expect("background revocation should persist after write recovery");
-        assert_eq!(received.lock().unwrap().last().unwrap().storage_error, None);
+        assert_eq!(received.lock().unwrap().len(), 1);
     }
 
     #[tokio::test]
@@ -1176,6 +1192,11 @@ mod tests {
         let captured = received.clone();
         app.listen("auth-state-changed", move |event| {
             captured.lock().unwrap().push(serde_json::from_str(event.payload()).unwrap());
+        });
+        let warnings_cleared = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let cleared = warnings_cleared.clone();
+        app.listen("auth-storage-error-cleared", move |_| {
+            cleared.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         });
 
         let mut offline_server = mockito::Server::new_async().await;
@@ -1234,13 +1255,14 @@ mod tests {
         tokio::time::timeout(Duration::from_secs(8), async {
             loop {
                 if db.load_raw_auth_token().unwrap().is_none()
-                    && received.lock().unwrap().last().is_some_and(|event| event.storage_error.is_none())
+                    && warnings_cleared.load(std::sync::atomic::Ordering::SeqCst) > 0
                 {
                     return;
                 }
                 tokio::time::sleep(Duration::from_millis(20)).await;
             }
         }).await.expect("watcher should clear the warning after revocation persists");
+        assert_eq!(received.lock().unwrap().len(), 1);
         assert_eq!(auth_state.session_snapshot(|| ()).0, signed_out_generation);
         verifier.abort();
         let _ = verifier.await;
@@ -1270,7 +1292,7 @@ mod tests {
             auth_state.clear_local_session();
             Ok(())
         }).unwrap();
-        let csrf = auth_state.generate_csrf_state(&db).unwrap();
+        let (csrf, _) = auth_state.generate_csrf_state(&db).unwrap();
         let (oauth_generation, ()) = auth_state.session_snapshot(|| ());
         let new_cache = settings_dir.join("settings-cache.json");
         std::fs::write(&new_cache, "new flow").unwrap();

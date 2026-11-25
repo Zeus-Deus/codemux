@@ -4,11 +4,16 @@ import type { AuthStatePayload } from "@/tauri/types";
 
 const events = vi.hoisted(() => ({
   authHandler: null as ((payload: AuthStatePayload) => void) | null,
+  storageErrorClearedHandler: null as ((clearedError: string) => void) | null,
 }));
 
 vi.mock("@/tauri/events", () => ({
   onAuthStateChanged: (cb: (payload: AuthStatePayload) => void) => {
     events.authHandler = cb;
+    return Promise.resolve(() => {});
+  },
+  onAuthStorageErrorCleared: (cb: (clearedError: string) => void) => {
+    events.storageErrorClearedHandler = cb;
     return Promise.resolve(() => {});
   },
   onSettingsSynced: () => Promise.resolve(() => {}),
@@ -136,7 +141,21 @@ describe("useAuthEvents GitHub callback", () => {
       error: warning,
     });
     expect(useSyncedSettingsStore.getState().settings).toEqual(DEFAULT_SETTINGS);
-    emitAuthState({ authenticated: false, user: null });
+    act(() => events.storageErrorClearedHandler?.(warning));
     expect(useAuthStore.getState().error).toBeNull();
+  });
+
+  it("clears only the old cleanup warning without ending a new OAuth flow", async () => {
+    const warning = "Account access is disabled, but local sign-out cleanup could not be saved. Codemux will retry.";
+    useAuthStore.setState({ error: warning });
+    await useAuthStore.getState().startOAuthFlow();
+    act(() => events.storageErrorClearedHandler?.(warning));
+    expect(useAuthStore.getState().oauthPending).toBe(true);
+    expect(useAuthStore.getState().oauthCallbackExpected).toBe(true);
+    expect(bootstrapSession).not.toHaveBeenCalled();
+
+    useAuthStore.setState({ error: "A newer sign-in error" });
+    act(() => events.storageErrorClearedHandler?.(warning));
+    expect(useAuthStore.getState().error).toBe("A newer sign-in error");
   });
 });
