@@ -469,13 +469,14 @@ enum FolderRuleSource {
 
 enum RuleReadError {
     Io(String),
+    Directory(String),
     Rejected(String),
 }
 
 impl RuleReadError {
     fn into_message(self) -> String {
         match self {
-            Self::Io(message) | Self::Rejected(message) => message,
+            Self::Io(message) | Self::Directory(message) | Self::Rejected(message) => message,
         }
     }
 }
@@ -530,11 +531,11 @@ impl FolderWalkFilter {
         .into_iter()
         .flatten()
         {
-            // Git treats unreadable optional config sources as unavailable.
-            // Budget and file-shape violations still reject the preview.
+            // Git treats unreadable optional config sources and directories as
+            // unavailable. Budgets and other file-shape violations stay fatal.
             let bytes = match Self::read_bounded_file(&file, rule_bytes, true) {
                 Ok(Some(bytes)) => bytes,
-                Ok(None) | Err(RuleReadError::Io(_)) => continue,
+                Ok(None) | Err(RuleReadError::Io(_) | RuleReadError::Directory(_)) => continue,
                 Err(RuleReadError::Rejected(message)) => return Err(message),
             };
             if let Some(path) = Self::config_exclude_path(&bytes, home.as_deref()) {
@@ -549,7 +550,7 @@ impl FolderWalkFilter {
         };
         let bytes = match Self::read_bounded_file(&file, rule_bytes, true) {
             Ok(Some(bytes)) => bytes,
-            Ok(None) | Err(RuleReadError::Io(_)) => return Ok(None),
+            Ok(None) | Err(RuleReadError::Io(_) | RuleReadError::Directory(_)) => return Ok(None),
             Err(RuleReadError::Rejected(message)) => return Err(message),
         };
         Self::compile_rule_bytes(&cwd, &file, &bytes, rule_lines).map(Some)
@@ -835,10 +836,15 @@ impl FolderWalkFilter {
             }
         };
         if !metadata.is_file() {
-            return Err(RuleReadError::Rejected(format!(
+            let message = format!(
                 "attachment ignore rules are not a regular file: {}",
                 file.display()
-            )));
+            );
+            return Err(if metadata.is_dir() {
+                RuleReadError::Directory(message)
+            } else {
+                RuleReadError::Rejected(message)
+            });
         }
         if metadata.len() > MAX_ATTACHMENT_IGNORE_FILE_BYTES {
             return Err(RuleReadError::Rejected(format!(
@@ -861,10 +867,15 @@ impl FolderWalkFilter {
         if !opened_metadata.is_file()
             || (!allow_symlinks && opened_metadata.file_type().is_symlink())
         {
-            return Err(RuleReadError::Rejected(format!(
+            let message = format!(
                 "attachment ignore rules are not a regular file: {}",
                 file.display()
-            )));
+            );
+            return Err(if opened_metadata.is_dir() {
+                RuleReadError::Directory(message)
+            } else {
+                RuleReadError::Rejected(message)
+            });
         }
         if opened_metadata.len() > MAX_ATTACHMENT_IGNORE_FILE_BYTES {
             return Err(RuleReadError::Rejected(format!(
@@ -3189,10 +3200,10 @@ mod tests {
         let output = std::process::Command::new(std::env::current_exe().unwrap())
             .args([
                 "--exact",
-                "commands::project_files::tests::unreadable_config_fallback_child",
+                "commands::project_files::tests::optional_config_fallback_child",
                 "--nocapture",
             ])
-            .env("CODEMUX_ATTACHMENT_UNREADABLE_CONFIG_CHILD", "1")
+            .env("CODEMUX_ATTACHMENT_OPTIONAL_CONFIG_CHILD", "1")
             .env("GIT_CONFIG_GLOBAL", "/dev/null")
             .env("GIT_CONFIG_SYSTEM", system_config)
             .env("XDG_CONFIG_HOME", xdg)
@@ -3209,8 +3220,38 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn unreadable_config_fallback_child() {
-        if std::env::var_os("CODEMUX_ATTACHMENT_UNREADABLE_CONFIG_CHILD").is_none() {
+    fn directory_optional_git_config_uses_picker_fallback() {
+        let dir = tempdir().unwrap();
+        let xdg = dir.path().join("xdg");
+        fs::create_dir_all(xdg.join("git")).unwrap();
+        fs::write(xdg.join("git/ignore"), "*.secret\n").unwrap();
+        let system_config = dir.path().join("directory-system-config");
+        fs::create_dir(&system_config).unwrap();
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "commands::project_files::tests::optional_config_fallback_child",
+                "--nocapture",
+            ])
+            .env("CODEMUX_ATTACHMENT_OPTIONAL_CONFIG_CHILD", "1")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_SYSTEM", system_config)
+            .env("XDG_CONFIG_HOME", xdg)
+            .env("HOME", dir.path())
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "stdout: {}\nstderr: {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn optional_config_fallback_child() {
+        if std::env::var_os("CODEMUX_ATTACHMENT_OPTIONAL_CONFIG_CHILD").is_none() {
             return;
         }
         let dir = tempdir().unwrap();
