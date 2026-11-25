@@ -19,6 +19,36 @@ use serde::Deserialize;
 
 use crate::auth::{api_base_url, api_client, AuthSecret};
 
+#[derive(Debug)]
+pub(crate) enum AuthApiError {
+    Config(String),
+    Client(String),
+    Transport(String),
+    Redirect,
+    Rejected(String),
+    Parse(String),
+}
+
+impl std::fmt::Display for AuthApiError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Config(detail) | Self::Client(detail) | Self::Rejected(detail) => {
+                formatter.write_str(detail)
+            }
+            Self::Transport(detail) => write!(formatter, "Request failed: {detail}"),
+            Self::Redirect => formatter
+                .write_str("Authentication endpoint redirected; credentials were not resent"),
+            Self::Parse(detail) => write!(formatter, "Parse response: {detail}"),
+        }
+    }
+}
+
+impl From<AuthApiError> for String {
+    fn from(error: AuthApiError) -> Self {
+        error.to_string()
+    }
+}
+
 // ── Wire types ───────────────────────────────────────────────────
 //
 // These exactly match the JSON shape Better Auth's
@@ -77,26 +107,30 @@ pub(crate) fn build_signup_body(email: &str, secret: &AuthSecret, name: &str) ->
 pub(crate) async fn login_email_api(
     email: &str,
     secret: &AuthSecret,
-) -> Result<ApiAuthResp, String> {
-    let base = api_base_url()?;
+) -> Result<ApiAuthResp, AuthApiError> {
+    let base = api_base_url().map_err(AuthApiError::Config)?;
     let url = format!("{base}/api/auth/desktop/signin");
 
-    let resp = api_client(&base)?
+    let resp = api_client(&base).map_err(AuthApiError::Client)?
         .post(&url)
         .json(&build_signin_body(email, secret))
         .send()
         .await
-        .map_err(|e| format!("Request failed: {e}"))?;
+        .map_err(|e| AuthApiError::Transport(e.to_string()))?;
+
+    if resp.status().is_redirection() {
+        return Err(AuthApiError::Redirect);
+    }
 
     if !resp.status().is_success() {
         let body: serde_json::Value = resp.json().await.unwrap_or_default();
         let msg = body["error"].as_str().unwrap_or("Authentication failed");
-        return Err(msg.to_string());
+        return Err(AuthApiError::Rejected(msg.to_string()));
     }
 
     resp.json::<ApiAuthResp>()
         .await
-        .map_err(|e| format!("Parse response: {e}"))
+        .map_err(|e| AuthApiError::Parse(e.to_string()))
 }
 
 /// POST `/api/auth/desktop/signup` with `{email, password: auth_secret, name}`.
@@ -106,21 +140,25 @@ pub(crate) async fn signup_email_api(
     email: &str,
     secret: &AuthSecret,
     name: &str,
-) -> Result<(), String> {
-    let base = api_base_url()?;
+) -> Result<(), AuthApiError> {
+    let base = api_base_url().map_err(AuthApiError::Config)?;
     let url = format!("{base}/api/auth/desktop/signup");
 
-    let resp = api_client(&base)?
+    let resp = api_client(&base).map_err(AuthApiError::Client)?
         .post(&url)
         .json(&build_signup_body(email, secret, name))
         .send()
         .await
-        .map_err(|e| format!("Request failed: {e}"))?;
+        .map_err(|e| AuthApiError::Transport(e.to_string()))?;
+
+    if resp.status().is_redirection() {
+        return Err(AuthApiError::Redirect);
+    }
 
     if !resp.status().is_success() {
         let body: serde_json::Value = resp.json().await.unwrap_or_default();
         let msg = body["error"].as_str().unwrap_or("Sign-up failed");
-        return Err(msg.to_string());
+        return Err(AuthApiError::Rejected(msg.to_string()));
     }
 
     Ok(())
@@ -358,5 +396,41 @@ mod tests {
             !stderr_out.contains(DISTINCTIVE_PASSWORD),
             "raw password leaked to stderr during signup:\n{stderr_out}"
         );
+    }
+    #[tokio::test]
+    #[serial_test::serial(mockserver)]
+    async fn auth_secret_posts_do_not_follow_redirects() {
+        let mut origin = mockito::Server::new_async().await;
+        let mut sink = mockito::Server::new_async().await;
+        let sink_hit = sink.mock("POST", "/capture").expect(0).create_async().await;
+        let target = format!("{}/capture", sink.url());
+        let signin = origin
+            .mock("POST", "/api/auth/desktop/signin")
+            .with_status(307)
+            .with_header("location", target.as_str())
+            .create_async()
+            .await;
+        let signup = origin
+            .mock("POST", "/api/auth/desktop/signup")
+            .with_status(308)
+            .with_header("location", target.as_str())
+            .create_async()
+            .await;
+
+        let previous_url = std::env::var("CODEMUX_API_URL").ok();
+        std::env::set_var("CODEMUX_API_URL", origin.url());
+        let secret = derive_auth_secret(DISTINCTIVE_PASSWORD, DISTINCTIVE_EMAIL).unwrap();
+        let signin_result = login_email_api(DISTINCTIVE_EMAIL, &secret).await;
+        let signup_result = signup_email_api(DISTINCTIVE_EMAIL, &secret, DISTINCTIVE_NAME).await;
+        match previous_url {
+            Some(url) => std::env::set_var("CODEMUX_API_URL", url),
+            None => std::env::remove_var("CODEMUX_API_URL"),
+        }
+
+        assert!(matches!(signin_result.unwrap_err(), AuthApiError::Redirect));
+        assert!(matches!(signup_result.unwrap_err(), AuthApiError::Redirect));
+        signin.assert_async().await;
+        signup.assert_async().await;
+        sink_hit.assert_async().await;
     }
 }

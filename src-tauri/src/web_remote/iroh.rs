@@ -1384,6 +1384,33 @@ mod tests {
             .await
     }
 
+    #[tokio::test]
+    #[serial_test::serial(mockserver)]
+    async fn grant_verification_never_forwards_a_grant_on_redirect() {
+        let mut origin = mockito::Server::new_async().await;
+        let mut destination = mockito::Server::new_async().await;
+        let leaked = destination
+            .mock("POST", "/capture")
+            .expect(0)
+            .create_async()
+            .await;
+        let redirect_target = format!("{}/capture", destination.url());
+        let source = origin
+            .mock("POST", "/api/devices/grant/verify")
+            .match_body(mockito::Matcher::Json(json!({ "grant": "private-grant" })))
+            .with_status(307)
+            .with_header("location", &redirect_target)
+            .create_async()
+            .await;
+
+        let error = verify_grant(&origin.url(), "private-grant")
+            .await
+            .unwrap_err();
+        assert!(error.contains("307"), "{error}");
+        source.assert_async().await;
+        leaked.assert_async().await;
+    }
+
     async fn run_account_admit(
         api_url: &str,
         db: &DatabaseStore,
