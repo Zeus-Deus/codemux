@@ -4,9 +4,11 @@ import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 
 const mockOpenExternalUrl = vi.hoisted(() => vi.fn().mockResolvedValue("browser"));
 const mockOpenUrl = vi.hoisted(() => vi.fn().mockResolvedValue(undefined));
+const mockTauri = vi.hoisted(() => ({ enabled: false }));
 
 vi.mock("@tauri-apps/api/core", () => ({
   convertFileSrc: (path: string) => `mock-asset:${path}`,
+  isTauri: () => mockTauri.enabled,
 }));
 vi.mock("@/lib/open-url", () => ({ openExternalUrl: mockOpenExternalUrl }));
 vi.mock("@tauri-apps/plugin-opener", () => ({ openUrl: mockOpenUrl }));
@@ -17,6 +19,7 @@ afterEach(() => {
   cleanup();
   mockOpenExternalUrl.mockClear();
   mockOpenUrl.mockClear();
+  mockTauri.enabled = false;
 });
 
 describe("MarkdownRendered", () => {
@@ -87,7 +90,7 @@ describe("MarkdownRendered", () => {
     ["![Diagram](http://127.0.0.1:4141/status)", "http://127.0.0.1:4141/status"],
     ["![Diagram](https%3A%2F%2Fevil.example%2Fpixel)", "https://evil.example/pixel"],
     ['<img src="https%3A%2F%2Fevil.example%2Fpixel" alt="Diagram">', "https://evil.example/pixel"],
-    ["![Diagram](%2F%2Fevil.example%2Fpixel)", "//evil.example/pixel"],
+    ["![Diagram](%2F%2Fevil.example%2Fpixel)", "https://evil.example/pixel"],
   ])("requires confirmation before opening a remote image from %s", (content, src) => {
     const { container, getByRole } = render(
       <MarkdownRendered
@@ -128,6 +131,19 @@ describe("MarkdownRendered", () => {
     expect(mockOpenExternalUrl).not.toHaveBeenCalled();
     expect(mockOpenUrl).not.toHaveBeenCalled();
     expect(screen.getByText("https://example.com/x.png")).toBeInTheDocument();
+    fireEvent(screen.getByRole("button", { name: "Cancel" }), new MouseEvent("auxclick", {
+      bubbles: true,
+      cancelable: true,
+      button: 1,
+    }));
+    expect(mockOpenExternalUrl).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
+    expect(mockOpenExternalUrl).not.toHaveBeenCalled();
+    expect(mockOpenUrl).not.toHaveBeenCalled();
+    fireEvent.click(getByRole("button", { name: /diagram/i }));
+    fireEvent.click(screen.getByRole("button", { name: "Open image" }));
+    expect(mockOpenUrl).toHaveBeenCalledExactlyOnceWith("https://example.com/x.png");
+    expect(mockOpenExternalUrl).not.toHaveBeenCalled();
   });
 
   it("leaves data URIs alone", () => {
@@ -148,6 +164,38 @@ describe("MarkdownRendered", () => {
   ])("preserves a local preview source: %s", (src) => {
     const { container } = render(<MarkdownRendered content={`![Local](${src})`} />);
     expect(container.querySelector("img")?.getAttribute("src")).toBe(src);
+    expect(mockOpenUrl).not.toHaveBeenCalled();
+  });
+
+  it("previews the exact Windows asset host in Tauri", () => {
+    mockTauri.enabled = true;
+    const src = "http://asset.localhost/tmp/screenshot.png";
+    const { container } = render(<MarkdownRendered content={`![Local](${src})`} />);
+    expect(container.querySelector("img")?.getAttribute("src")).toBe(src);
+    expect(mockOpenUrl).not.toHaveBeenCalled();
+  });
+
+  it("keeps the Windows asset host inert in a hosted browser", () => {
+    const src = "http://asset.localhost/tmp/screenshot.png";
+    const { container, getByRole } = render(<MarkdownRendered content={`![Local](${src})`} />);
+    expect(container.querySelector("img")).toBeNull();
+    fireEvent.click(getByRole("button", { name: /local/i }));
+    expect(screen.getByText(src)).toBeInTheDocument();
+    expect(mockOpenUrl).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    "http://asset.localhost:80/tmp/screenshot.png",
+    "http://asset.localhost:4141/tmp/screenshot.png",
+    "http://sub.asset.localhost/tmp/screenshot.png",
+    "http://asset.localhost.evil/tmp/screenshot.png",
+    "http://asset.localhost./tmp/screenshot.png",
+    "https://asset.localhost/tmp/screenshot.png",
+  ])("keeps asset host lookalikes inert in Tauri: %s", (src) => {
+    mockTauri.enabled = true;
+    const { container } = render(<MarkdownRendered content={`![Remote](${src})`} />);
+    expect(container.querySelector("img")).toBeNull();
+    expect(screen.getByRole("button", { name: /remote/i })).toBeInTheDocument();
     expect(mockOpenUrl).not.toHaveBeenCalled();
   });
 

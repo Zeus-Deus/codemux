@@ -1,4 +1,5 @@
 import { memo, useCallback, useMemo, useState } from "react";
+import { isTauri } from "@tauri-apps/api/core";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import { ExternalLink } from "lucide-react";
 import ReactMarkdown, { type Components } from "react-markdown";
@@ -102,6 +103,12 @@ function isRemoteImageSrc(src: string): boolean {
   return /^https?:/i.test(value) || /^\/\/[^/]/.test(value);
 }
 
+function isLocalAssetImageSrc(src: string): boolean {
+  // Tauri intercepts this exact Windows asset host. In a hosted browser,
+  // even this address could make an ordinary loopback network request.
+  return isTauri() && /^http:\/\/asset\.localhost(?=\/|[?#]|$)/i.test(src);
+}
+
 function RemoteImageReference({ src, alt }: { src: string; alt: string }) {
   const [confirmationOpen, setConfirmationOpen] = useState(false);
   const openConfirmedImage = () => {
@@ -126,7 +133,10 @@ function RemoteImageReference({ src, alt }: { src: string; alt: string }) {
         <ExternalLink className="size-4 shrink-0" aria-hidden="true" />
         {alt ? `Open remote image: ${alt}` : "Open remote image"}
       </button>
-      <AlertDialogContent>
+      <AlertDialogContent
+        onClick={(event) => event.stopPropagation()}
+        onAuxClick={(event) => event.stopPropagation()}
+      >
         <AlertDialogHeader>
           <AlertDialogTitle>Open remote image?</AlertDialogTitle>
           <AlertDialogDescription>
@@ -274,8 +284,11 @@ function MarkdownRenderedImpl({
         // Decode before deciding whether the source is remote: an encoded
         // `https%3A%2F%2F...` destination would otherwise become a live URL
         // in resolveAssetSrc after passing the initial check.
-        if (imagePath && isRemoteImageSrc(imagePath)) {
-          return <RemoteImageReference src={imagePath} alt={label} />;
+        if (imagePath && isRemoteImageSrc(imagePath) && !isLocalAssetImageSrc(imagePath)) {
+          // A protocol-relative reference must open as an absolute HTTPS
+          // address. Invalid web URLs stay inert instead of reaching <img>.
+          const url = webUrl(imagePath.startsWith("//") ? `https:${imagePath}` : imagePath);
+          return url ? <RemoteImageReference src={url.href} alt={label} /> : label || "Image";
         }
         const resolved = resolveAssetSrc(imagePath, filePath);
         return (
