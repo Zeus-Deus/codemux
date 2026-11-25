@@ -103,7 +103,7 @@ pub fn write(path: &Path, manifest: &Manifest) -> Result<(), String> {
 /// state, a symlink, an overexposed file, or malformed contents.
 pub fn read(path: &Path) -> Result<Option<Manifest>, String> {
     use cap_fs_ext::{FollowSymlinks, OpenOptionsFollowExt};
-    use cap_std::fs::OpenOptions;
+    use cap_std::fs::{OpenOptions, OpenOptionsExt};
     use std::io::{ErrorKind, Read};
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
 
@@ -121,7 +121,12 @@ pub fn read(path: &Path) -> Result<Option<Manifest>, String> {
         return Ok(None);
     };
     let mut options = OpenOptions::new();
-    options.read(true).follow(FollowSymlinks::No);
+    // Opening a FIFO for reading blocks until a writer connects. Reject it
+    // from the opened handle without letting an invalid manifest stall CLI.
+    options
+        .read(true)
+        .follow(FollowSymlinks::No)
+        .custom_flags(libc::O_NONBLOCK);
     let file = match dir.open_with(name, &options) {
         Ok(file) => file.into_std(),
         Err(e) if e.kind() == ErrorKind::NotFound => return Ok(None),
@@ -273,6 +278,27 @@ mod tests {
         std::fs::write(&path, vec![b'x'; 64 * 1024 + 1]).unwrap();
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
         assert!(read(&path).unwrap_err().contains("size limit"));
+    }
+
+    #[test]
+    fn read_rejects_fifo_without_waiting_for_a_writer() {
+        use std::os::unix::ffi::OsStrExt;
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        let state = private_tempdir();
+        let path = state.path().join("manifest.json");
+        let name = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+        // SAFETY: `name` is a valid NUL-terminated path in this test's private directory.
+        assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
+
+        let (sender, receiver) = mpsc::channel();
+        let reader = std::thread::spawn(move || sender.send(read(&path)).unwrap());
+        let result = receiver
+            .recv_timeout(Duration::from_secs(2))
+            .expect("reading a FIFO manifest must not block");
+        assert!(result.unwrap_err().contains("regular owner-only"));
+        reader.join().unwrap();
     }
 
     #[test]
