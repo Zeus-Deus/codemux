@@ -118,9 +118,11 @@ pub fn build_remote_command(remote_socket: &str, binary: &str) -> String {
 /// Build the ssh argv we use to spawn the tunneled daemon. Extracted
 /// so tests can assert the exact flags without forking ssh.
 pub fn build_tunnel_argv(opts: &TunnelOptions<'_>) -> Vec<String> {
-    vec![
-        "-o".into(),
-        "BatchMode=yes".into(),
+    let mut args: Vec<_> = crate::ssh_policy::VERIFIED_HOST_ARGS
+        .into_iter()
+        .map(str::to_owned)
+        .collect();
+    args.extend([
         "-o".into(),
         "ServerAliveInterval=30".into(),
         "-o".into(),
@@ -136,11 +138,13 @@ pub fn build_tunnel_argv(opts: &TunnelOptions<'_>) -> Vec<String> {
         // remote Unix socket the daemon binds.
         "-L".into(),
         format!("{}:{}", opts.local_socket.display(), opts.remote_socket),
+        "--".into(),
         opts.ssh_target.into(),
         // Remote command: reuse a live detached daemon or spawn one
         // detached, then hold the forward open. See `build_remote_command`.
         build_remote_command(opts.remote_socket, opts.remote_binary),
-    ]
+    ]);
+    args
 }
 
 /// Open the tunnel. Returns once the SSH process is alive AND the
@@ -238,6 +242,8 @@ mod tests {
         // - ServerAlive keeps the tunnel from going stale under NAT
         for must_have in [
             "BatchMode=yes",
+            "StrictHostKeyChecking=yes",
+            "ControlPath=none",
             "ExitOnForwardFailure=yes",
             "StreamLocalBindUnlink=yes",
             "ServerAliveInterval=30",
@@ -254,6 +260,7 @@ mod tests {
     fn build_tunnel_argv_uses_dash_L_for_forwarding() {
         let (_path, opts) = options();
         let argv = build_tunnel_argv(&opts);
+        assert!(!argv.iter().any(|arg| arg == "ClearAllForwardings=yes"));
         // Find the `-L` arg + the spec right after it.
         let l_idx = argv.iter().position(|a| a == "-L").expect("has -L");
         let spec = &argv[l_idx + 1];
@@ -284,6 +291,7 @@ mod tests {
         let (_path, opts) = options();
         let argv = build_tunnel_argv(&opts);
         let target_idx = argv.iter().position(|a| a == "user@host").unwrap();
+        assert_eq!(argv[target_idx - 1], "--");
         let last_idx = argv.len() - 1;
         assert!(
             target_idx < last_idx,

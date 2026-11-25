@@ -445,13 +445,10 @@ async fn probe_live_host_sessions(ssh_target: &str) -> Option<u64> {
     let cmd_str = live_sessions_script();
     let output = tokio::time::timeout(Duration::from_secs(12), async {
         tokio::process::Command::new("ssh")
+            .args(crate::ssh_policy::verified_command_args())
             .args([
                 "-o",
-                "BatchMode=yes",
-                "-o",
                 "ConnectTimeout=10",
-                "-o",
-                "StrictHostKeyChecking=accept-new",
                 "--",
                 ssh_target,
                 &cmd_str,

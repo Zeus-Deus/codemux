@@ -572,10 +572,10 @@ pub async fn automations_check_repo_access(
     let probe = tokio::time::timeout(
         std::time::Duration::from_secs(20),
         tokio::process::Command::new("ssh")
-            .arg("-o")
-            .arg("BatchMode=yes")
+            .args(crate::ssh_policy::verified_command_args())
             .arg("-o")
             .arg("ConnectTimeout=10")
+            .arg("--")
             .arg(&host.ssh_target)
             .arg(format!(
                 "GIT_TERMINAL_PROMPT=0 git ls-remote --heads '{remote}' \

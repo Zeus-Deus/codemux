@@ -107,6 +107,8 @@ docker cp "$LAPTOP_XDG/opencode/auth.json" "$CONTAINER:/home/tester/.local/share
 docker exec "$CONTAINER" chown -R tester:tester /home/tester/.local
 
 # ssh-config alias so bare `ssh <alias>` works (production shells `ssh <target>`).
+host_key=$(docker exec "$CONTAINER" cat /etc/ssh/ssh_host_ed25519_key.pub)
+printf '[127.0.0.1]:%s %s\n' "$PORT" "$host_key" > "$WORK/known_hosts"
 mkdir -p "${HOME}/.ssh"; touch "$SSH_CONFIG"; chmod 600 "$SSH_CONFIG"
 sed -i "/$MARKER_BEGIN/,/$MARKER_END/d" "$SSH_CONFIG" 2>/dev/null || true
 cat >> "$SSH_CONFIG" <<CFG
@@ -117,8 +119,8 @@ Host $SSH_ALIAS
     User tester
     IdentityFile $WORK/key
     IdentitiesOnly yes
-    StrictHostKeyChecking no
-    UserKnownHostsFile /dev/null
+    StrictHostKeyChecking yes
+    UserKnownHostsFile $WORK/known_hosts
     LogLevel ERROR
 $MARKER_END
 CFG

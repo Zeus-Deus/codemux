@@ -562,13 +562,12 @@ pub fn build_inventory_argv(ssh_target: &str, timeout_secs: u64, walk_disk: bool
     } else {
         format!("export {SKIP_DISK_ENV}=1 ; ")
     };
-    vec![
-        "-o".into(),
-        "BatchMode=yes".into(),
+    let mut args: Vec<_> = crate::ssh_policy::verified_command_args()
+        .map(str::to_owned)
+        .collect();
+    args.extend([
         "-o".into(),
         format!("ConnectTimeout={timeout_secs}"),
-        "-o".into(),
-        "StrictHostKeyChecking=accept-new".into(),
         // Ends option parsing: a target can never be read as a flag.
         "--".into(),
         ssh_target.into(),
@@ -576,7 +575,8 @@ pub fn build_inventory_argv(ssh_target: &str, timeout_secs: u64, walk_disk: bool
         // `~/.local/bin` copy wins over PATH, so an older copy on PATH
         // can't answer for a device the probe just reported current.
         format!("{env_prefix}{}", codemux_remote_command("workspace list")),
-    ]
+    ]);
+    args
 }
 
 /// Wire shape produced by `codemux-remote workspace list` on the
@@ -1074,7 +1074,8 @@ mod tests {
         let argv = build_inventory_argv("user@10.0.0.7", 15, true);
         assert!(argv.iter().any(|a| a == "BatchMode=yes"));
         assert!(argv.iter().any(|a| a == "ConnectTimeout=15"));
-        assert!(argv.iter().any(|a| a == "StrictHostKeyChecking=accept-new"));
+        assert!(argv.iter().any(|a| a == "StrictHostKeyChecking=yes"));
+        assert!(argv.iter().any(|a| a == "ControlPath=none"));
         let dd = argv.iter().position(|a| a == "--").expect("`--` before the target");
         assert_eq!(argv[dd + 1], "user@10.0.0.7");
         let cmd = argv.last().unwrap();

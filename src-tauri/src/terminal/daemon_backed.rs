@@ -1650,10 +1650,10 @@ async fn spawn_prepared_session<R: Runtime>(
                             crate::commands::hosts::shell_word_quote(&binary)
                         );
                         let check = tokio::process::Command::new("ssh")
-                            .arg("-o")
-                            .arg("BatchMode=yes")
+                            .args(crate::ssh_policy::verified_command_args())
                             .arg("-o")
                             .arg("ConnectTimeout=5")
+                            .arg("--")
                             .arg(&host.ssh_target)
                             .arg(&check_cmd)
                             .output()

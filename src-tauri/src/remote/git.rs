@@ -66,7 +66,7 @@ const BASE_FETCH_TIMEOUT_SECS: u64 = 10;
 /// - Skipped when there is no `origin` remote (remote-host projects are
 ///   frequently local-only) or for absolute `refs/...` bases.
 /// - `origin/<b>` is normalised to `<b>`.
-/// - `GIT_TERMINAL_PROMPT=0` so git never hangs on a credential prompt.
+/// - Non-interactive credentials and verified host keys for the default SSH command.
 /// - Killed after [`BASE_FETCH_TIMEOUT_SECS`] so a slow or unreachable
 ///   remote can't stall worktree creation.
 /// - All failures are swallowed; callers fall back to local refs.
@@ -85,11 +85,12 @@ fn fetch_origin_branch(repo_root: &Path, branch: &str) -> bool {
     if !has_origin {
         return false;
     }
-    let Ok(mut child) = crate::git::git_command()
-        .arg("-C")
+    let mut cmd = crate::git::git_command();
+    cmd.arg("-C")
         .arg(repo_root)
-        .args(["fetch", "--quiet", "--no-tags", "origin", branch])
-        .env("GIT_TERMINAL_PROMPT", "0")
+        .args(["fetch", "--quiet", "--no-tags", "origin", branch]);
+    non_interactive(&mut cmd, Some(repo_root));
+    let Ok(mut child) = cmd
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
@@ -409,8 +410,8 @@ pub fn ensure_origin_head(repo_root: &Path) {
     let _ = run_capped(cmd, ORIGIN_HEAD_TIMEOUT);
 }
 
-/// Never prompt. Over ssh that means BatchMode, and accepting a forge's
-/// host key on first contact (a fresh device has never seen github.com).
+/// Never prompt. The default SSH command requires the forge's verified host
+/// key on the machine running Git.
 /// A user's own ssh command (env, or `core.sshCommand` as seen from
 /// `config_dir`) wins, since `GIT_SSH_COMMAND` would override it.
 fn non_interactive(cmd: &mut Command, config_dir: Option<&Path>) {
@@ -429,10 +430,7 @@ fn non_interactive(cmd: &mut Command, config_dir: Option<&Path>) {
                 .unwrap_or(false)
         };
     if !user_ssh {
-        cmd.env(
-            "GIT_SSH_COMMAND",
-            "ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new",
-        );
+        cmd.env("GIT_SSH_COMMAND", crate::ssh_policy::verified_shell_command());
     }
 }
 

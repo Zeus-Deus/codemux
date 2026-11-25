@@ -390,10 +390,10 @@ async fn upload_file(
         .await
         .map_err(|e| format!("read local bundle {}: {e}", local.display()))?;
     let mut child = Command::new("ssh")
-        .arg("-o")
-        .arg("BatchMode=yes")
+        .args(crate::ssh_policy::verified_command_args())
         .arg("-o")
         .arg("ConnectTimeout=10")
+        .arg("--")
         .arg(ssh_target)
         .arg(format!("cat > {}", shell_sq(remote_path)))
         .stdin(Stdio::piped())
@@ -428,10 +428,10 @@ async fn download_file(
     local: &Path,
 ) -> Result<(), String> {
     let out = Command::new("ssh")
-        .arg("-o")
-        .arg("BatchMode=yes")
+        .args(crate::ssh_policy::verified_command_args())
         .arg("-o")
         .arg("ConnectTimeout=10")
+        .arg("--")
         .arg(ssh_target)
         .arg(format!("cat {}", shell_sq(remote_path)))
         .stdin(Stdio::null())
@@ -456,10 +456,10 @@ async fn download_file(
 /// Best-effort remote `rm -f`.
 async fn run_remote_rm(ssh_target: &str, remote_path: &str) -> Result<(), String> {
     let _ = Command::new("ssh")
-        .arg("-o")
-        .arg("BatchMode=yes")
+        .args(crate::ssh_policy::verified_command_args())
         .arg("-o")
         .arg("ConnectTimeout=10")
+        .arg("--")
         .arg(ssh_target)
         .arg(format!("rm -f {}", shell_sq(remote_path)))
         .stdin(Stdio::null())
@@ -476,10 +476,10 @@ async fn run_remote_login_script(
     script: &str,
 ) -> Result<(bool, String), String> {
     let mut child = Command::new("ssh")
-        .arg("-o")
-        .arg("BatchMode=yes")
+        .args(crate::ssh_policy::verified_command_args())
         .arg("-o")
         .arg("ConnectTimeout=10")
+        .arg("--")
         .arg(ssh_target)
         .arg("bash -ls")
         .stdin(Stdio::piped())

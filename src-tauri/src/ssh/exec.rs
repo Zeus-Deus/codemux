@@ -91,19 +91,18 @@ fn is_env_key(key: &str) -> bool {
         && chars.all(|c| c == '_' || c.is_ascii_alphanumeric())
 }
 
-/// Flags shared by every one-shot `ssh` call. `BatchMode` makes a missing
-/// key fail fast instead of hanging on a password prompt.
+/// Flags for a verified device command with a bounded connect time.
 pub fn one_shot_args(connect_timeout_secs: u64) -> Vec<String> {
-    vec![
-        "-o".into(),
-        "BatchMode=yes".into(),
+    let mut args: Vec<_> = crate::ssh_policy::verified_command_args()
+        .map(str::to_owned)
+        .collect();
+    args.extend([
         "-o".into(),
         format!("ConnectTimeout={connect_timeout_secs}"),
         "-o".into(),
-        "StrictHostKeyChecking=accept-new".into(),
-        "-o".into(),
         "LogLevel=ERROR".into(),
-    ]
+    ]);
+    args
 }
 
 /// Build the remote command string that runs `program args` in `cwd` with
@@ -154,7 +153,7 @@ pub fn stdio_spawn_config(
 ) -> Result<SpawnConfig, String> {
     validate_ssh_target(ssh_target)?;
     let script = remote_exec_script(program, args, env, cwd)?;
-    let mut ssh_args: Vec<String> = vec!["-T".into(), "-e".into(), "none".into()];
+    let mut ssh_args: Vec<String> = vec!["-e".into(), "none".into()];
     ssh_args.extend(one_shot_args(15));
     ssh_args.extend([
         "-o".into(),
@@ -562,6 +561,8 @@ mod tests {
         assert_eq!(cfg.args[dd + 1], "deus@zeus");
         assert!(cfg.args[dd + 2].contains("app-server"));
         assert!(cfg.args.contains(&"BatchMode=yes".to_string()));
+        assert!(cfg.args.contains(&"StrictHostKeyChecking=yes".to_string()));
+        assert!(cfg.args.contains(&"ControlPath=none".to_string()));
     }
 
     #[test]
