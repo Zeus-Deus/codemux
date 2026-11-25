@@ -2,8 +2,9 @@
 //!
 //! Nothing from the repository runs: no checkout, no hooks, no scripts, no
 //! npm. The installer makes a private bare repository, fetches exactly one
-//! commit (shallow and blobless, over https only), lists the plugin folder's
-//! tree and reads its regular files' blobs. Those files go to
+//! commit (shallow and blobless, over https only), checks that a branch or tag
+//! of the repository contains it, lists the plugin folder's tree and reads
+//! its regular files' blobs. Those files go to
 //! `<root>/.staging-<id>.<n>`, the install marker is written, and the staging
 //! folder is renamed over `<root>/<id>`. A crash in between leaves only
 //! dot-folders, which [`recover`] tidies on the next listing.
@@ -264,6 +265,49 @@ impl Git {
         Ok(sha)
     }
 
+    /// Refuse a commit that no branch or tag of `url` contains. GitHub serves
+    /// every commit in a fork network (and every pull request head) through
+    /// each repository's URL, so without this a fork's commit would install
+    /// as if it came from the named repository.
+    fn check_on_branch_or_tag(&self, url: &str, sha: &str) -> Result<(), String> {
+        // Fast path: a branch or tag tip (annotated tags list a peeled line).
+        let out = self.run(&["ls-remote", "--heads", "--tags", url], None, 8 * 1024 * 1024)?;
+        if String::from_utf8_lossy(&out).lines().any(|l| l.split('\t').next() == Some(sha)) {
+            return Ok(());
+        }
+        // Otherwise fetch the commit history (no trees or blobs) of every
+        // branch and tag, plus the commit itself, into a separate repository
+        // so the shallow install fetch is untouched, and ask which contain it.
+        let check = Self::with(self.exe.clone(), self.allow_file)?;
+        check.set_origin(url)?;
+        let want = format!("+{sha}:refs/codemux/want");
+        check.run(
+            &[
+                "fetch", "-q", "--no-tags", "--no-write-fetch-head", "--filter=tree:0", "origin",
+                "+refs/heads/*:refs/codemux/heads/*", "+refs/tags/*:refs/codemux/tags/*", &want,
+            ],
+            None,
+            1024 * 1024,
+        )?;
+        let out = check.run(
+            &[
+                "for-each-ref", "--count=1", "--contains", sha, "--format=%(refname)", "refs/codemux/heads/",
+                "refs/codemux/tags/",
+            ],
+            None,
+            4096,
+        )?;
+        if !String::from_utf8_lossy(&out).trim().is_empty() {
+            return Ok(());
+        }
+        let repo = url.strip_suffix(".git").unwrap_or(url);
+        Err(format!(
+            "Commit {} isn't on any branch or tag of {repo}. It may come from a fork or a pull request, \
+             or its branch was rewritten.",
+            &sha[..12]
+        ))
+    }
+
     /// `(mode, oid, name)` for the entries of one folder (non-recursive).
     fn list_folder(&self, sha: &str, folder: Option<&str>) -> Result<Vec<(String, String, String)>, String> {
         let spec = match folder {
@@ -406,6 +450,7 @@ pub fn fetch_plugin(
         check_subdir(s)?;
     }
     let sha = git.fetch(&want)?;
+    git.check_on_branch_or_tag(fetch_url, &sha)?;
     let git_ref = (!is_sha(&want) && want != "HEAD").then(|| want.clone());
 
     // Which folder holds plugin.js: the given one, else root, else codemux/.

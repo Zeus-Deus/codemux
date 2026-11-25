@@ -130,6 +130,61 @@ fn a_tree_url_resolves_the_ref_and_folder() {
 }
 
 #[test]
+fn only_commits_on_a_branch_or_tag_of_the_repository_install() {
+    let f = fixture();
+    let origin = PathBuf::from(f.url.strip_prefix("file://").unwrap());
+    let work = origin.parent().unwrap().join("work");
+    let origin = origin.to_str().unwrap();
+    let commit = |version: &str| {
+        std::fs::write(work.join("codemux").join(ENTRY_FILE), format!("export default {{ id: \"hello\", version: \"{version}\" }};\n")).unwrap();
+        git(&work, &["commit", "-q", "-am", version]);
+        git(&work, &["rev-parse", "HEAD"])
+    };
+
+    // Reachable only through an annotated tag, one commit behind its tip.
+    git(&work, &["checkout", "-q", "-b", "release", &f.first]);
+    let tagged_parent = commit("1.1.0");
+    commit("1.2.0");
+    git(&work, &["tag", "-a", "v1.2.0", "-m", "v1.2.0"]);
+    git(&work, &["push", "-q", origin, "refs/tags/v1.2.0"]);
+
+    // What GitHub serves through a parent's URL but no branch or tag holds:
+    // a pull request head, and a commit whose only ref is gone (a fork's).
+    git(&work, &["checkout", "-q", "-b", "fork", &f.second]);
+    let pull = commit("6.6.6");
+    git(&work, &["push", "-q", origin, "HEAD:refs/pull/1/head"]);
+    let fork = commit("6.6.7");
+    git(&work, &["push", "-q", origin, "HEAD:refs/heads/gone"]);
+    git(Path::new(origin), &["update-ref", "-d", "refs/heads/gone"]);
+
+    for (tree, want) in [
+        (Some(format!("{fork}/codemux")), None),
+        (None, Some(fork.clone())),
+        (None, Some(pull.clone())),
+        (None, Some("refs/pull/1/head".to_string())),
+    ] {
+        let err = install::fetch_plugin(&test_git(), &f.url, tree.as_deref(), want.as_deref(), None)
+            .err()
+            .unwrap_or_else(|| panic!("{tree:?} {want:?} installed"));
+        assert!(err.contains("isn't on any branch or tag") && err.contains("fork"), "{err}");
+    }
+
+    // Branch tips, older branch commits and tagged history still install.
+    for (want, sha) in [
+        ("main", &f.second),
+        (f.second.as_str(), &f.second),
+        (f.first.as_str(), &f.first),
+        ("v1.2.0", &git(&work, &["rev-parse", "v1.2.0^{commit}"])),
+        (tagged_parent.as_str(), &tagged_parent),
+    ] {
+        let fetched = install::fetch_plugin(&test_git(), &f.url, None, Some(want), None).unwrap();
+        assert_eq!(&fetched.sha, sha, "{want}");
+    }
+    let fetched = install::fetch_plugin(&test_git(), &f.url, Some(&format!("{tagged_parent}/codemux")), None, None).unwrap();
+    assert_eq!(fetched.sha, tagged_parent);
+}
+
+#[test]
 fn a_local_or_linked_folder_is_never_replaced() {
     let f = fixture();
     std::fs::create_dir_all(f.root.join("hello")).unwrap();
