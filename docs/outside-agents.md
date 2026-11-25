@@ -623,6 +623,7 @@ A paired phone or browser can remove a clean worktree, for example with **Device
 - **Sign-in asks again after you changed the origin or port.** Sign-ins and tokens are bound to the URL. Sign in again and issue new tokens.
 - **`~/.claude.json` has a `codemux` entry that runs `codemux-remote mcp`.** An older `codemux-remote` wrote it, or you added it, and it has no thread tools. Where the Codemux app runs too, Codemux and current `codemux-remote` remove it when they start, if it is exactly what was written. To fix it now, run `claude mcp remove --scope user codemux`, then add the entry above. Neither touches an entry that runs another program.
 - **`codemux-remote` refuses `workspace_info` with "missing field `id`".** Its background service still runs the old version. Run `systemctl --user restart codemux-remote` on that device.
+- **`codemux-remote` reports that its default state directory was writable by other users.** Keep the helper stopped and follow [remote state recovery](security/remote-state-recovery.md). Start with fresh private state; do not reopen the old directory after only changing its permissions.
 
 ## Error codes
 

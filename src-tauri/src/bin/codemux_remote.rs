@@ -592,8 +592,23 @@ fn resolve_state_dir(arg: Option<PathBuf>) -> PathBuf {
 }
 
 #[cfg(unix)]
+fn checked_existing_state_dir(state_dir: &std::path::Path) -> Result<bool, String> {
+    codemux_lib::remote::config::private_dir_exists(state_dir).map_err(|e| {
+        format!(
+            "state directory {} cannot be trusted: {e}. If its daemon is running, stop it through the service manager before recovering the state; do not use `serve stop` on this directory",
+            state_dir.display()
+        )
+    })
+}
+
+#[cfg(unix)]
 fn run_serve(port: Option<u16>, state_dir_arg: Option<PathBuf>) -> ExitCode {
     let state_dir = resolve_state_dir(state_dir_arg);
+
+    if let Err(e) = codemux_lib::remote::config::ensure_private_dir(&state_dir) {
+        eprintln!("[codemux-remote] state directory: {e}. If a daemon is running, stop it through the service manager before recovering the state");
+        return ExitCode::from(2);
+    }
 
     // Singleton check: if a live daemon already owns the manifest,
     // refuse to start a second one. A stale manifest (pid not alive)
@@ -640,7 +655,7 @@ fn run_serve(port: Option<u16>, state_dir_arg: Option<PathBuf>) -> ExitCode {
 async fn run_serve_async(port: Option<u16>, state_dir: PathBuf) -> Result<(), String> {
     use codemux_lib::remote::{config, manifest, pty::PtyManager, server, workspace::WorkspaceStore};
 
-    std::fs::create_dir_all(&state_dir).map_err(|e| format!("create state dir: {e}"))?;
+    config::ensure_private_dir(&state_dir).map_err(|e| format!("create state dir: {e}"))?;
 
     // Bind first so we know what port to write into the manifest.
     let listener = server::bind_listener(port).await?;
@@ -746,6 +761,20 @@ async fn run_serve_async(port: Option<u16>, state_dir: PathBuf) -> Result<(), St
 fn run_serve_status(state_dir_arg: Option<PathBuf>) -> ExitCode {
     let state_dir = resolve_state_dir(state_dir_arg);
     let manifest_path = codemux_lib::remote::config::manifest_path(&state_dir);
+    match checked_existing_state_dir(&state_dir) {
+        Ok(true) => {}
+        Ok(false) => {
+            eprintln!(
+                "[codemux-remote] no daemon manifest at {}. Not running.",
+                manifest_path.display()
+            );
+            return ExitCode::from(1);
+        }
+        Err(e) => {
+            eprintln!("[codemux-remote] {e}");
+            return ExitCode::from(2);
+        }
+    }
     match codemux_lib::remote::manifest::read(&manifest_path) {
         Ok(None) => {
             eprintln!(
@@ -813,6 +842,17 @@ fn probe_live_terminals(endpoint: &str, secret: &str) -> Option<u64> {
 #[cfg(unix)]
 fn run_serve_stop(state_dir_arg: Option<PathBuf>) -> ExitCode {
     let state_dir = resolve_state_dir(state_dir_arg);
+    match checked_existing_state_dir(&state_dir) {
+        Ok(true) => {}
+        Ok(false) => {
+            eprintln!("[codemux-remote] no daemon to stop");
+            return ExitCode::SUCCESS;
+        }
+        Err(e) => {
+            eprintln!("[codemux-remote] {e}");
+            return ExitCode::from(2);
+        }
+    }
     let manifest_path = codemux_lib::remote::config::manifest_path(&state_dir);
     let manifest = match codemux_lib::remote::manifest::read(&manifest_path) {
         Ok(Some(m)) => m,
@@ -887,17 +927,24 @@ fn run_workspace_register(
         }
     };
 
-    let Some(manifest) = wait_for_healthy_daemon(
+    let manifest = match wait_for_healthy_daemon(
         &manifest_path,
         &client,
         std::time::Duration::from_secs(connect_timeout_secs.max(1)),
-    ) else {
-        eprintln!(
-            "[codemux-remote] daemon at {} did not become healthy within {}s",
-            manifest_path.display(),
-            connect_timeout_secs
-        );
-        return ExitCode::from(1);
+    ) {
+        Ok(Some(manifest)) => manifest,
+        Ok(None) => {
+            eprintln!(
+                "[codemux-remote] daemon at {} did not become healthy within {}s",
+                manifest_path.display(),
+                connect_timeout_secs
+            );
+            return ExitCode::from(1);
+        }
+        Err(e) => {
+            eprintln!("[codemux-remote] {e}");
+            return ExitCode::from(2);
+        }
     };
 
     // POST workspace_create.
@@ -1021,26 +1068,31 @@ fn wait_for_healthy_daemon(
     manifest_path: &std::path::Path,
     client: &reqwest::blocking::Client,
     timeout: std::time::Duration,
-) -> Option<codemux_lib::remote::manifest::Manifest> {
+) -> Result<Option<codemux_lib::remote::manifest::Manifest>, String> {
     use codemux_lib::remote::manifest;
 
+    let state_dir = manifest_path
+        .parent()
+        .ok_or_else(|| "manifest path has no state directory".to_string())?;
     let deadline = std::time::Instant::now() + timeout;
     loop {
-        if let Ok(Some(m)) = manifest::read(manifest_path) {
-            if manifest::pid_alive(m.pid) {
-                let healthy = client
-                    .get(format!("{}/health", m.endpoint))
-                    .timeout(std::time::Duration::from_secs(5))
-                    .send()
-                    .map(|r| r.status().is_success())
-                    .unwrap_or(false);
-                if healthy {
-                    return Some(m);
+        if checked_existing_state_dir(state_dir)? {
+            if let Ok(Some(m)) = manifest::read(manifest_path) {
+                if manifest::pid_alive(m.pid) {
+                    let healthy = client
+                        .get(format!("{}/health", m.endpoint))
+                        .timeout(std::time::Duration::from_secs(5))
+                        .send()
+                        .map(|r| r.status().is_success())
+                        .unwrap_or(false);
+                    if healthy {
+                        return Ok(Some(m));
+                    }
                 }
             }
         }
         if std::time::Instant::now() > deadline {
-            return None;
+            return Ok(None);
         }
         std::thread::sleep(std::time::Duration::from_millis(250));
     }
@@ -1140,6 +1192,9 @@ fn call_daemon_tool(
     use codemux_lib::remote::{config, manifest};
     use serde_json::Value;
 
+    if !checked_existing_state_dir(state_dir)? {
+        return Ok(None);
+    }
     let manifest_path = config::manifest_path(state_dir);
     let running = matches!(manifest::read(&manifest_path), Ok(Some(m)) if manifest::pid_alive(m.pid));
     if !running {
@@ -1149,7 +1204,7 @@ fn call_daemon_tool(
         .timeout(DAEMON_TOOL_TIMEOUT)
         .build()
         .map_err(|e| format!("couldn't reach the codemux-remote daemon: {e}"))?;
-    let Some(manifest) = wait_for_healthy_daemon(&manifest_path, &client, DAEMON_STARTUP_WAIT) else {
+    let Some(manifest) = wait_for_healthy_daemon(&manifest_path, &client, DAEMON_STARTUP_WAIT)? else {
         return Ok(None);
     };
 

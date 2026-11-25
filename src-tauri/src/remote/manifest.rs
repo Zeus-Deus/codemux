@@ -59,60 +59,99 @@ pub fn write(path: &Path, manifest: &Manifest) -> Result<(), String> {
     let parent = path.parent().ok_or_else(|| {
         "manifest path has no parent directory".to_string()
     })?;
-    std::fs::create_dir_all(parent)
-        .map_err(|e| format!("create state dir: {e}"))?;
-
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        // Best-effort chmod 0700 on the state dir.
-        let _ = std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700));
-    }
+    let name = path
+        .file_name()
+        .ok_or_else(|| "manifest path has no file name".to_string())?;
+    let dir =
+        super::config::open_private_dir(parent).map_err(|e| format!("create state dir: {e}"))?;
 
     let payload = serde_json::to_vec_pretty(manifest)
         .map_err(|e| format!("serialise manifest: {e}"))?;
 
-    // Atomic-replace: write to a sibling tempfile, then rename.
-    let tmp_path = path.with_extension("json.tmp");
-    {
-        use std::io::Write;
-        let mut file = std::fs::OpenOptions::new()
-            .create(true)
-            .truncate(true)
-            .write(true)
-            .open(&tmp_path)
+    // The unique 0600 file and final rename are both relative to the same
+    // verified directory handle. A stale legacy temp symlink is never opened.
+    use cap_fs_ext::{FollowSymlinks, OpenOptionsFollowExt};
+    use cap_std::fs::{OpenOptions, OpenOptionsExt};
+    use std::io::Write;
+    let temp = format!(".manifest-{}.tmp", uuid::Uuid::new_v4());
+    let mut options = OpenOptions::new();
+    options
+        .write(true)
+        .create_new(true)
+        .follow(FollowSymlinks::No)
+        .mode(0o600);
+    let result = (|| {
+        let mut file = dir
+            .open_with(&temp, &options)
             .map_err(|e| format!("open manifest tmpfile: {e}"))?;
-
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            file.set_permissions(std::fs::Permissions::from_mode(0o600))
-                .map_err(|e| format!("chmod manifest tmpfile: {e}"))?;
-        }
-
         file.write_all(&payload)
             .map_err(|e| format!("write manifest: {e}"))?;
         file.sync_all()
             .map_err(|e| format!("fsync manifest: {e}"))?;
+        drop(file);
+        dir.rename(&temp, &dir, Path::new(name))
+            .map_err(|e| format!("rename manifest into place: {e}"))
+    })();
+    if result.is_err() {
+        let _ = dir.remove_file(&temp);
     }
-
-    std::fs::rename(&tmp_path, path)
-        .map_err(|e| format!("rename manifest into place: {e}"))?;
-    Ok(())
+    result
 }
 
-/// Read the manifest from disk. Returns `Ok(None)` if the file is
-/// absent. Returns `Err` only when the file exists but is unreadable
-/// or malformed — callers can distinguish "no daemon running" from
-/// "daemon directory corrupted."
+/// Read a private manifest through its verified state directory. Returns
+/// `Ok(None)` when the directory or file is absent, and an error for unsafe
+/// state, a symlink, an overexposed file, or malformed contents.
 pub fn read(path: &Path) -> Result<Option<Manifest>, String> {
-    match std::fs::read(path) {
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(e) => Err(format!("read manifest: {e}")),
-        Ok(bytes) => serde_json::from_slice(&bytes)
-            .map(Some)
-            .map_err(|e| format!("parse manifest: {e}")),
+    use cap_fs_ext::{FollowSymlinks, OpenOptionsFollowExt};
+    use cap_std::fs::{OpenOptions, OpenOptionsExt};
+    use std::io::{ErrorKind, Read};
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    const MAX_MANIFEST_BYTES: u64 = 64 * 1024;
+
+    let parent = path
+        .parent()
+        .ok_or_else(|| "manifest path has no state directory".to_string())?;
+    let name = path
+        .file_name()
+        .ok_or_else(|| "manifest path has no file name".to_string())?;
+    let Some(dir) = super::config::open_existing_private_dir(parent)
+        .map_err(|e| format!("open manifest state directory: {e}"))?
+    else {
+        return Ok(None);
+    };
+    let mut options = OpenOptions::new();
+    // Opening a FIFO for reading blocks until a writer connects. Reject it
+    // from the opened handle without letting an invalid manifest stall CLI.
+    options
+        .read(true)
+        .follow(FollowSymlinks::No)
+        .custom_flags(libc::O_NONBLOCK);
+    let file = match dir.open_with(name, &options) {
+        Ok(file) => file.into_std(),
+        Err(e) if e.kind() == ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(format!("open manifest: {e}")),
+    };
+    let metadata = file.metadata().map_err(|e| format!("stat manifest: {e}"))?;
+    if !metadata.is_file()
+        || metadata.uid() != unsafe { libc::geteuid() }
+        || metadata.permissions().mode() & 0o077 != 0
+    {
+        return Err("manifest must be a regular owner-only file owned by this user".into());
     }
+    if metadata.len() > MAX_MANIFEST_BYTES {
+        return Err("manifest exceeds its size limit".into());
+    }
+    let mut bytes = Vec::new();
+    file.take(MAX_MANIFEST_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|e| format!("read manifest: {e}"))?;
+    if bytes.len() as u64 > MAX_MANIFEST_BYTES {
+        return Err("manifest exceeds its size limit".into());
+    }
+    serde_json::from_slice(&bytes)
+        .map(Some)
+        .map_err(|e| format!("parse manifest: {e}"))
 }
 
 /// Remove the manifest if present. Used on clean shutdown so a stale
@@ -174,10 +213,18 @@ pub fn current_host_id() -> String {
 mod tests {
     use super::*;
     use tempfile::TempDir;
+    use std::os::unix::fs::PermissionsExt;
+
+    fn private_tempdir() -> TempDir {
+        tempfile::Builder::new()
+            .permissions(std::fs::Permissions::from_mode(0o700))
+            .tempdir()
+            .unwrap()
+    }
 
     #[test]
     fn write_and_read_roundtrip() {
-        let dir = TempDir::new().unwrap();
+        let dir = private_tempdir();
         let path = dir.path().join("manifest.json");
         let manifest = Manifest::new("http://127.0.0.1:1234".into(), "test-host".into());
         write(&path, &manifest).unwrap();
@@ -191,14 +238,72 @@ mod tests {
 
     #[test]
     fn read_missing_returns_none() {
-        let dir = TempDir::new().unwrap();
+        let dir = private_tempdir();
         let path = dir.path().join("nope.json");
         assert!(read(&path).unwrap().is_none());
     }
 
     #[test]
+    fn read_missing_state_does_not_create_it() {
+        let dir = private_tempdir();
+        let state = dir.path().join("missing-state");
+        assert!(read(&state.join("manifest.json")).unwrap().is_none());
+        assert!(!state.exists());
+    }
+
+    #[test]
+    fn read_rejects_symlinked_and_overexposed_manifest() {
+        let state = private_tempdir();
+        let outside = private_tempdir();
+        let target = outside.path().join("outside.json");
+        let manifest = Manifest::new("http://127.0.0.1:1".into(), "h".into());
+        write(&target, &manifest).unwrap();
+        let path = state.path().join("manifest.json");
+        std::os::unix::fs::symlink(&target, &path).unwrap();
+        assert!(read(&path).is_err());
+        assert_eq!(read(&target).unwrap().unwrap().secret, manifest.secret);
+
+        std::fs::remove_file(&path).unwrap();
+        std::fs::write(&path, serde_json::to_vec(&manifest).unwrap()).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(read(&path).unwrap_err().contains("owner-only"));
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        assert_eq!(read(&path).unwrap().unwrap().secret, manifest.secret);
+    }
+
+    #[test]
+    fn read_rejects_oversized_manifest() {
+        let state = private_tempdir();
+        let path = state.path().join("manifest.json");
+        std::fs::write(&path, vec![b'x'; 64 * 1024 + 1]).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        assert!(read(&path).unwrap_err().contains("size limit"));
+    }
+
+    #[test]
+    fn read_rejects_fifo_without_waiting_for_a_writer() {
+        use std::os::unix::ffi::OsStrExt;
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        let state = private_tempdir();
+        let path = state.path().join("manifest.json");
+        let name = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+        // SAFETY: `name` is a valid NUL-terminated path in this test's private directory.
+        assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
+
+        let (sender, receiver) = mpsc::channel();
+        let reader = std::thread::spawn(move || sender.send(read(&path)).unwrap());
+        let result = receiver
+            .recv_timeout(Duration::from_secs(2))
+            .expect("reading a FIFO manifest must not block");
+        assert!(result.unwrap_err().contains("regular owner-only"));
+        reader.join().unwrap();
+    }
+
+    #[test]
     fn remove_idempotent() {
-        let dir = TempDir::new().unwrap();
+        let dir = private_tempdir();
         let path = dir.path().join("manifest.json");
         // Removing a non-existent manifest is fine.
         remove(&path).unwrap();
@@ -212,13 +317,38 @@ mod tests {
 
     #[test]
     fn manifest_file_mode_is_0600() {
-        use std::os::unix::fs::PermissionsExt;
-        let dir = TempDir::new().unwrap();
+        let dir = private_tempdir();
         let path = dir.path().join("manifest.json");
         let m = Manifest::new("http://127.0.0.1:1".into(), "h".into());
         write(&path, &m).unwrap();
         let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o600, "manifest must be 0600, got {mode:o}");
+    }
+
+    #[test]
+    fn stale_temp_symlink_cannot_redirect_manifest_write() {
+        let state = private_tempdir();
+        let outside = private_tempdir();
+        let target = outside.path().join("unrelated.txt");
+        std::fs::write(&target, b"keep this file").unwrap();
+        let path = state.path().join("manifest.json");
+        let legacy_temp = path.with_extension("json.tmp");
+        std::os::unix::fs::symlink(&target, &legacy_temp).unwrap();
+        std::os::unix::fs::symlink(&target, &path).unwrap();
+
+        let manifest = Manifest::new("http://127.0.0.1:1".into(), "h".into());
+        write(&path, &manifest).unwrap();
+
+        assert_eq!(std::fs::read(&target).unwrap(), b"keep this file");
+        assert!(std::fs::symlink_metadata(&legacy_temp)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert!(!std::fs::symlink_metadata(&path)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert_eq!(read(&path).unwrap().unwrap().secret, manifest.secret);
     }
 
     #[test]

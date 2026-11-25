@@ -410,9 +410,9 @@ pub fn worktree_create_output(data: &Value) -> Result<Value, String> {
 
 #[cfg(test)]
 mod tests {
+    use crate::remote::config::private_test_dir;
     use super::*;
     use std::process::Command;
-    use tempfile::TempDir;
 
     fn git(dir: &Path, args: &[&str]) -> String {
         let out = Command::new("git")
@@ -559,9 +559,9 @@ mod tests {
 
     #[test]
     fn ensure_clones_once_then_reuses_the_registered_checkout() {
-        let root = TempDir::new().unwrap();
-        let home = TempDir::new().unwrap();
-        let state = TempDir::new().unwrap();
+        let root = private_test_dir();
+        let home = private_test_dir();
+        let state = private_test_dir();
         let store = open_store(state.path());
         let (_bare, url) = bare_origin(root.path());
 
@@ -598,9 +598,9 @@ mod tests {
 
     #[test]
     fn ensure_finds_an_existing_checkout_under_projects_and_registers_it() {
-        let root = TempDir::new().unwrap();
-        let home = TempDir::new().unwrap();
-        let state = TempDir::new().unwrap();
+        let root = private_test_dir();
+        let home = private_test_dir();
+        let state = private_test_dir();
         let store = open_store(state.path());
         let (_bare, url) = bare_origin(root.path());
 
@@ -622,9 +622,9 @@ mod tests {
 
     #[test]
     fn ensure_prefers_a_registered_checkout_outside_projects() {
-        let root = TempDir::new().unwrap();
-        let home = TempDir::new().unwrap();
-        let state = TempDir::new().unwrap();
+        let root = private_test_dir();
+        let home = private_test_dir();
+        let state = private_test_dir();
         let store = open_store(state.path());
         let (_bare, url) = bare_origin(root.path());
 
@@ -649,9 +649,9 @@ mod tests {
 
     #[test]
     fn ensure_replaces_a_stale_registry_root() {
-        let root = TempDir::new().unwrap();
-        let home = TempDir::new().unwrap();
-        let state = TempDir::new().unwrap();
+        let root = private_test_dir();
+        let home = private_test_dir();
+        let state = private_test_dir();
         let store = open_store(state.path());
         let (_bare, url) = bare_origin(root.path());
 
@@ -679,8 +679,8 @@ mod tests {
 
     #[test]
     fn ensure_works_without_a_registry() {
-        let root = TempDir::new().unwrap();
-        let home = TempDir::new().unwrap();
+        let root = private_test_dir();
+        let home = private_test_dir();
         let (_bare, url) = bare_origin(root.path());
         let ensured = ensure_project(home.path(), None, &url, Some("Renamed")).expect("ensure");
         assert!(ensured.cloned);
@@ -693,8 +693,8 @@ mod tests {
 
     #[test]
     fn ensure_refuses_to_clone_over_an_unrelated_folder() {
-        let root = TempDir::new().unwrap();
-        let home = TempDir::new().unwrap();
+        let root = private_test_dir();
+        let home = private_test_dir();
         let (_bare, url) = bare_origin(root.path());
         let uid = crate::project_identity::project_uid(&canonical_remote(&url).unwrap());
         let target = home.path().join(".codemux/projects").join(
@@ -713,7 +713,7 @@ mod tests {
 
     #[test]
     fn clone_failure_carries_git_stderr_on_one_line() {
-        let home = TempDir::new().unwrap();
+        let home = private_test_dir();
         let url = format!("file://{}/missing/app.git", home.path().display());
         let err = ensure_project(home.path(), None, &url, None).unwrap_err();
         assert!(err.starts_with("couldn't clone "), "got: {err}");
@@ -729,7 +729,7 @@ mod tests {
 
     #[test]
     fn abandoned_temp_clones_are_removed_but_live_ones_kept() {
-        let dir = TempDir::new().unwrap();
+        let dir = private_test_dir();
         let dead = dir.path().join(".app-1234.clone-2000000000");
         let live = dir
             .path()
@@ -749,7 +749,7 @@ mod tests {
 
     #[test]
     fn worktree_args_start_new_branches_from_the_default_branch() {
-        let root = TempDir::new().unwrap();
+        let root = private_test_dir();
         let (_bare, url) = bare_origin(root.path());
         let repo = root.path().join("app");
         git(
@@ -768,7 +768,7 @@ mod tests {
 
     #[test]
     fn worktree_args_attach_branches_that_exist_locally_or_on_origin() {
-        let root = TempDir::new().unwrap();
+        let root = private_test_dir();
         let (bare, url) = bare_origin(root.path());
         let repo = root.path().join("app");
         git(
@@ -792,7 +792,7 @@ mod tests {
 
     #[test]
     fn worktree_args_reject_bad_input() {
-        let root = TempDir::new().unwrap();
+        let root = private_test_dir();
         let (_bare, url) = bare_origin(root.path());
         let repo = root.path().join("app");
         git(

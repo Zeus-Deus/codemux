@@ -59,12 +59,16 @@ impl WorkspaceStore {
     /// `origin_host_id`. `workspaces_root` is where blank workspaces
     /// are materialised when a caller doesn't supply a path.
     pub fn open(db_path: &Path, host_id: String, workspaces_root: PathBuf) -> Result<Self, WorkspaceError> {
+        // The registry (paths, branches, notes, remotes) and the setup logs
+        // next to it are private to this user.
         if let Some(parent) = db_path.parent() {
-            std::fs::create_dir_all(parent)
+            super::config::ensure_private_dir(parent)
                 .map_err(|e| WorkspaceError::Io(format!("create db dir: {e}")))?;
         }
+        // Checkouts keep the user's normal umask.
         std::fs::create_dir_all(&workspaces_root)
             .map_err(|e| WorkspaceError::Io(format!("create workspaces root: {e}")))?;
+        create_private_db_file(db_path)?;
 
         let conn = Connection::open(db_path).map_err(|e| WorkspaceError::Db(e.to_string()))?;
         // One-shot CLI calls (`project ensure`, `worktree create`) write to
@@ -606,6 +610,28 @@ fn git_remote_origin_url(dir: &str) -> Option<String> {
     }
 }
 
+/// Create the database file 0600 before SQLite opens it, and tighten one an
+/// older version left at the umask default. SQLite gives its -wal and -shm
+/// files the main file's mode, so they stay private too. Tightening an
+/// existing file is best-effort and uses its handle to avoid symlinks.
+fn create_private_db_file(db_path: &Path) -> Result<(), WorkspaceError> {
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(db_path)
+        .map_err(|e| WorkspaceError::Io(format!("create db file: {e}")))?;
+    if let Err(e) = file.set_permissions(std::fs::Permissions::from_mode(0o600)) {
+        eprintln!(
+            "[codemux-remote] could not restrict permissions on {}: {e}",
+            db_path.display()
+        );
+    }
+    Ok(())
+}
+
 fn basename(path: &str) -> String {
     PathBuf::from(path)
         .file_name()
@@ -618,6 +644,14 @@ fn basename(path: &str) -> String {
 mod tests {
     use super::*;
     use tempfile::TempDir;
+    use std::os::unix::fs::PermissionsExt;
+
+    fn private_tempdir() -> TempDir {
+        tempfile::Builder::new()
+            .permissions(std::fs::Permissions::from_mode(0o700))
+            .tempdir()
+            .unwrap()
+    }
 
     fn open_store(dir: &TempDir) -> WorkspaceStore {
         let db_path = dir.path().join("codemux.db");
@@ -625,9 +659,99 @@ mod tests {
         WorkspaceStore::open(&db_path, "test-host".into(), ws_root).unwrap()
     }
 
+    fn mode(path: &Path) -> u32 {
+        std::fs::metadata(path).unwrap().permissions().mode() & 0o777
+    }
+
+    /// One-shot CLI calls open the store without `serve`, so opening it
+    /// must make a fresh state dir and its database private.
+    #[test]
+    fn open_creates_a_private_state_dir_and_database() {
+        let dir = private_tempdir();
+        let state = dir.path().join("codemux-remote");
+        let db = state.join("codemux.db");
+        let store = WorkspaceStore::open(&db, "test-host".into(), state.join("workspaces")).unwrap();
+        store.create(None, dir.path().to_string_lossy().into(), None, None).unwrap();
+        assert_eq!(mode(&state), 0o700);
+        assert_eq!(mode(&db), 0o600);
+        for sidecar in ["codemux.db-wal", "codemux.db-shm"] {
+            let path = state.join(sidecar);
+            if path.exists() {
+                assert_eq!(mode(&path), 0o600, "{sidecar}");
+            }
+        }
+    }
+
+    /// A caller-supplied shared directory must not be chmodded as a side
+    /// effect of opening the registry.
+    #[test]
+    fn open_rejects_a_shared_custom_state_dir() {
+        let dir = private_tempdir();
+        let state = dir.path().join("shared");
+        let db = state.join("codemux.db");
+        drop(WorkspaceStore::open(&db, "test-host".into(), state.join("workspaces")).unwrap());
+        std::fs::set_permissions(&state, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let error = WorkspaceStore::open(&db, "test-host".into(), state.join("workspaces"))
+            .err()
+            .expect("shared custom root must be rejected");
+        assert!(error.to_string().contains("custom state directory"));
+        assert_eq!(mode(&state), 0o755);
+    }
+
+    #[test]
+    fn open_rejects_a_private_state_dir_under_a_replaceable_parent() {
+        let dir = private_tempdir();
+        let shared = dir.path().join("shared");
+        let state = shared.join("state");
+        std::fs::create_dir_all(&state).unwrap();
+        std::fs::set_permissions(&shared, std::fs::Permissions::from_mode(0o777)).unwrap();
+        std::fs::set_permissions(&state, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let db = state.join("codemux.db");
+
+        let error = WorkspaceStore::open(&db, "test-host".into(), state.join("workspaces"))
+            .err()
+            .expect("replaceable parent must be rejected");
+        assert!(error.to_string().contains("can be replaced"), "{error}");
+        assert!(!db.exists());
+    }
+
+    #[test]
+    fn open_tightens_an_existing_database_in_a_private_state_dir() {
+        let dir = private_tempdir();
+        let state = dir.path().join("state");
+        let db = state.join("codemux.db");
+        drop(WorkspaceStore::open(&db, "test-host".into(), state.join("workspaces")).unwrap());
+        std::fs::set_permissions(&db, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        WorkspaceStore::open(&db, "test-host".into(), state.join("workspaces")).unwrap();
+        assert_eq!(mode(&state), 0o700);
+        assert_eq!(mode(&db), 0o600);
+    }
+
+    #[test]
+    fn open_does_not_chmod_through_a_database_symlink() {
+        let dir = private_tempdir();
+        let state = dir.path().join("state");
+        std::fs::create_dir(&state).unwrap();
+        std::fs::set_permissions(&state, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let outside = dir.path().join("outside.db");
+        std::fs::write(&outside, b"untouched").unwrap();
+        std::fs::set_permissions(&outside, std::fs::Permissions::from_mode(0o644)).unwrap();
+        std::os::unix::fs::symlink(&outside, state.join("codemux.db")).unwrap();
+
+        assert!(WorkspaceStore::open(
+            &state.join("codemux.db"),
+            "test-host".into(),
+            state.join("workspaces")
+        )
+        .is_err());
+        assert_eq!(mode(&outside), 0o644);
+        assert_eq!(std::fs::read(&outside).unwrap(), b"untouched");
+    }
+
     #[test]
     fn create_stamps_project_identity_and_kind() {
-        let dir = TempDir::new().unwrap();
+        let dir = private_tempdir();
         let store = open_store(&dir);
 
         // A root checkout (real .git dir, no remote → path-based uid).
@@ -653,7 +777,7 @@ mod tests {
 
     #[test]
     fn create_marks_worktree_kind_and_shares_uid_with_main() {
-        let dir = TempDir::new().unwrap();
+        let dir = private_tempdir();
         let store = open_store(&dir);
 
         // Main checkout.
@@ -687,7 +811,7 @@ mod tests {
 
     #[test]
     fn sweep_backfills_legacy_rows_and_is_idempotent() {
-        let dir = TempDir::new().unwrap();
+        let dir = private_tempdir();
         let store = open_store(&dir);
 
         // Simulate a legacy row: insert directly with NULL identity
@@ -726,7 +850,7 @@ mod tests {
     fn migration_is_idempotent_across_reopen() {
         // Opening an existing DB again must not fail on the ALTER loop
         // (duplicate column) — the daemon DB upgrade path.
-        let dir = TempDir::new().unwrap();
+        let dir = private_tempdir();
         {
             let _ = open_store(&dir);
         }
@@ -741,7 +865,7 @@ mod tests {
 
     #[test]
     fn create_collapses_duplicate_main_for_same_project() {
-        let dir = TempDir::new().unwrap();
+        let dir = private_tempdir();
         let repo = dir.path().join("repo");
         std::fs::create_dir_all(repo.join(".git")).unwrap();
         let store = open_store(&dir);
@@ -773,7 +897,7 @@ mod tests {
 
     #[test]
     fn find_by_path_returns_the_earliest_row_for_that_path() {
-        let dir = TempDir::new().unwrap();
+        let dir = private_tempdir();
         let store = open_store(&dir);
         assert!(store.find_by_path("/tmp/wt").unwrap().is_none());
         let a = store.create(Some("a".into()), "/tmp/wt".into(), None, None).unwrap();
@@ -785,7 +909,7 @@ mod tests {
 
     #[test]
     fn open_sets_a_busy_timeout_for_concurrent_writers() {
-        let dir = TempDir::new().unwrap();
+        let dir = private_tempdir();
         let store = open_store(&dir);
         let timeout: i64 = store
             .conn
@@ -798,7 +922,7 @@ mod tests {
 
     #[test]
     fn create_list_close_roundtrip() {
-        let dir = TempDir::new().unwrap();
+        let dir = private_tempdir();
         let store = open_store(&dir);
         assert!(store.list().unwrap().is_empty());
 
@@ -834,7 +958,7 @@ mod tests {
 
     #[test]
     fn create_defaults_name_from_path_basename() {
-        let dir = TempDir::new().unwrap();
+        let dir = private_tempdir();
         let store = open_store(&dir);
         let ws = store.create(None, "/tmp/my-cool-repo".into(), None, None).unwrap();
         assert_eq!(ws.name, "my-cool-repo");
@@ -847,7 +971,7 @@ mod tests {
         // must still carry a project identity. The daemon derives it
         // from the path's git root so the cross-device registry never
         // gets an anonymous row (the blank-project-name bug).
-        let dir = TempDir::new().unwrap();
+        let dir = private_tempdir();
         let store = open_store(&dir);
 
         let repo = dir.path().join("passpage");
@@ -869,7 +993,7 @@ mod tests {
     fn create_falls_back_to_path_when_no_git_root() {
         // A registered path that isn't (yet) a git repo still gets a
         // non-null project_root: the path itself. Never blank.
-        let dir = TempDir::new().unwrap();
+        let dir = private_tempdir();
         let store = open_store(&dir);
         let missing = dir.path().join("not-a-repo");
         let missing_str = missing.display().to_string();
@@ -884,7 +1008,7 @@ mod tests {
         // The worktree case: when the caller DOES pass project_root
         // (pointing at the parent repo), it wins — we must not overwrite
         // it with the worktree's own directory.
-        let dir = TempDir::new().unwrap();
+        let dir = private_tempdir();
         let store = open_store(&dir);
         let ws = store
             .create(
@@ -903,7 +1027,7 @@ mod tests {
 
     #[test]
     fn create_rejects_empty_path() {
-        let dir = TempDir::new().unwrap();
+        let dir = private_tempdir();
         let store = open_store(&dir);
         let err = store.create(None, "  ".into(), None, None).unwrap_err();
         assert!(matches!(err, WorkspaceError::Invalid(_)));
@@ -911,7 +1035,7 @@ mod tests {
 
     #[test]
     fn update_changes_name_and_touches_timestamp() {
-        let dir = TempDir::new().unwrap();
+        let dir = private_tempdir();
         let store = open_store(&dir);
         let ws = store.create(None, "/tmp/a".into(), None, None).unwrap();
         let old_updated = ws.updated_at.clone();
@@ -926,7 +1050,7 @@ mod tests {
 
     #[test]
     fn close_missing_returns_not_found() {
-        let dir = TempDir::new().unwrap();
+        let dir = private_tempdir();
         let store = open_store(&dir);
         match store.close("does-not-exist") {
             Err(WorkspaceError::NotFound(_)) => {}
@@ -936,7 +1060,7 @@ mod tests {
 
     #[test]
     fn list_orders_newest_first() {
-        let dir = TempDir::new().unwrap();
+        let dir = private_tempdir();
         let store = open_store(&dir);
         let a = store.create(Some("a".into()), "/a".into(), None, None).unwrap();
         // SQLite RFC3339 strings sort lexicographically same as

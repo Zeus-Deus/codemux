@@ -67,7 +67,7 @@ fn input<T: serde::de::DeserializeOwned>() -> Result<T, String> {
 }
 fn root(path: Option<PathBuf>) -> Result<PathBuf, String> {
     let root = path.unwrap_or_else(super::super::config::default_state_dir);
-    std::fs::create_dir_all(&root).map_err(|e| e.to_string())?;
+    super::super::config::ensure_private_dir(&root).map_err(|e| e.to_string())?;
     root.canonicalize()
         .map_err(|e| format!("task state directory: {e}"))
 }

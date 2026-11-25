@@ -66,7 +66,7 @@ SEED
 
 log "starting codemux-remote serve"
 docker exec -d "$CONTAINER" bash -c \
-  'mkdir -p /root/state && codemux-remote serve --state-dir /root/state > /root/state/serve.log 2>&1'
+  'install -d -m 700 /root/state && codemux-remote serve --state-dir /root/state > /root/state/serve.log 2>&1'
 
 log "waiting for manifest"
 for i in $(seq 1 50); do

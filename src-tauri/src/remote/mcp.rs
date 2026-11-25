@@ -247,6 +247,21 @@ impl Daemon {
     /// The cached manifest while its daemon's pid is alive, otherwise a
     /// fresh read; `true` marks a fresh one.
     fn manifest(&mut self) -> Result<(Manifest, bool), String> {
+        let state_dir = self
+            .manifest_path
+            .parent()
+            .ok_or_else(|| "daemon manifest has no state directory".to_string())?;
+        match config::private_dir_exists(state_dir) {
+            Ok(true) => {}
+            Ok(false) => return Err(NOT_RUNNING.to_string()),
+            Err(e) => {
+                self.manifest = None;
+                return Err(format!(
+                    "daemon state directory {} cannot be trusted: {e}. Stop the daemon through its service manager before recovering its state",
+                    state_dir.display()
+                ));
+            }
+        }
         if let Some(cached) = self
             .manifest
             .as_ref()
@@ -296,12 +311,29 @@ impl Daemon {
 
 #[cfg(test)]
 mod tests {
+    use crate::remote::config::private_test_dir;
     use super::*;
     use crate::remote::pty::PtyManager;
     use crate::remote::server::{self, DaemonState};
     use crate::remote::workspace::WorkspaceStore;
     use std::sync::Arc;
     use tempfile::TempDir;
+
+    #[test]
+    fn cached_manifest_is_rejected_after_state_becomes_shared() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = private_test_dir();
+        let path = config::manifest_path(dir.path());
+        let mut daemon = Daemon::new(path).unwrap();
+        daemon.manifest = Some(Manifest::new("http://127.0.0.1:1".into(), "host".into()));
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o777)).unwrap();
+        let result = daemon.manifest();
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let error = result.unwrap_err();
+        assert!(error.contains("cannot be trusted"), "{error}");
+        assert!(daemon.manifest.is_none());
+    }
 
     /// A real daemon router on its own runtime. Stopping it shuts the
     /// runtime down, which closes the listener and every open connection,
@@ -314,7 +346,7 @@ mod tests {
 
     impl TestDaemon {
         fn start(host_id: &str, secret: &str) -> Self {
-            let dir = TempDir::new().unwrap();
+            let dir = private_test_dir();
             let workspaces = WorkspaceStore::open(
                 &dir.path().join("codemux.db"),
                 host_id.into(),
@@ -361,7 +393,7 @@ mod tests {
 
     /// A state dir whose manifest names `daemon`, or none when `None`.
     fn state_dir(daemon: Option<&Manifest>) -> (TempDir, PathBuf) {
-        let dir = TempDir::new().unwrap();
+        let dir = private_test_dir();
         let path = config::manifest_path(dir.path());
         if let Some(manifest) = daemon {
             manifest::write(&path, manifest).unwrap();

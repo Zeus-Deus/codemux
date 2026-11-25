@@ -7,6 +7,8 @@
 //!   ~/.local/share/codemux/scrollback/{workspace_id}/{pane_id}.dat   — serialized terminal buffer
 //!   ~/.local/share/codemux/scrollback/{workspace_id}/{pane_id}.json  — pane metadata sidecar
 
+use cap_fs_ext::{DirExt, FollowSymlinks, OpenOptionsFollowExt};
+use cap_std::fs::Dir;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::fs;
@@ -121,6 +123,13 @@ fn workspace_dir(workspace_id: &str) -> PathBuf {
     scrollback_base().join(workspace_id)
 }
 
+fn valid_id(id: &str) -> bool {
+    let mut components = Path::new(id).components();
+    matches!(components.next(), Some(std::path::Component::Normal(name)) if name == id)
+        && components.next().is_none()
+}
+
+#[cfg(test)]
 fn data_path(workspace_id: &str, pane_id: &str) -> PathBuf {
     workspace_dir(workspace_id).join(format!("{pane_id}.dat"))
 }
@@ -136,11 +145,153 @@ pub fn meta_path_for(workspace_id: &str, pane_id: &str) -> PathBuf {
 }
 
 // ── Write ──────────────────────────────────────────────────────
+//
+// Scrollback is full terminal output, which often holds tokens and `env`
+// dumps, so the tree is owner-only: directories 0700 and files 0600.
+
+/// Tighten only the directory held by this handle, never a symlink target.
+/// Existing directories that cannot be chmodded remain usable.
+fn tighten_open_dir(dir: &Dir, path: &Path) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let tightened = dir
+            .open(".")
+            .and_then(|opened| {
+                opened
+                    .into_std()
+                    .set_permissions(fs::Permissions::from_mode(0o700))
+            });
+        if let Err(e) = tightened {
+            eprintln!(
+                "[codemux::scrollback] Could not make {} private: {e}",
+                path.display()
+            );
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = (dir, path);
+}
+
+/// Open the known scrollback root without following its final component.
+fn open_scrollback_base(base: &Path, create: bool) -> std::io::Result<Dir> {
+    use std::io::{Error, ErrorKind};
+    let name = base
+        .file_name()
+        .ok_or_else(|| Error::new(ErrorKind::InvalidInput, "invalid scrollback root"))?;
+    let parent = base
+        .parent()
+        .ok_or_else(|| Error::new(ErrorKind::InvalidInput, "invalid scrollback root"))?;
+    if create {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::DirBuilderExt;
+            fs::DirBuilder::new()
+                .recursive(true)
+                .mode(0o700)
+                .create(parent)?;
+        }
+        #[cfg(not(unix))]
+        fs::create_dir_all(parent)?;
+    }
+    let parent = Dir::open_ambient_dir(parent, cap_std::ambient_authority())?;
+    if create {
+        let mut builder = cap_std::fs::DirBuilder::new();
+        #[cfg(unix)]
+        {
+            use cap_std::fs::DirBuilderExt;
+            builder.mode(0o700);
+        }
+        match parent.create_dir_with(name, &builder) {
+            Ok(()) => {}
+            Err(e) if e.kind() == ErrorKind::AlreadyExists => {}
+            Err(e) => return Err(e),
+        }
+    }
+    let dir = parent.open_dir_nofollow(name)?;
+    tighten_open_dir(&dir, base);
+    Ok(dir)
+}
+
+fn open_workspace_dir(base: &Dir, workspace_id: &str, create: bool) -> std::io::Result<Dir> {
+    use std::io::{Error, ErrorKind};
+    if !valid_id(workspace_id) {
+        return Err(Error::new(
+            ErrorKind::InvalidInput,
+            "invalid scrollback workspace ID",
+        ));
+    }
+    if create {
+        let mut builder = cap_std::fs::DirBuilder::new();
+        #[cfg(unix)]
+        {
+            use cap_std::fs::DirBuilderExt;
+            builder.mode(0o700);
+        }
+        match base.create_dir_with(workspace_id, &builder) {
+            Ok(()) => {}
+            Err(e) if e.kind() == ErrorKind::AlreadyExists => {}
+            Err(e) => return Err(e),
+        }
+    }
+    let dir = base.open_dir_nofollow(workspace_id)?;
+    if create {
+        tighten_open_dir(&dir, &workspace_dir(workspace_id));
+    }
+    Ok(dir)
+}
+
+/// Replace a file through the opened workspace directory. The temporary
+/// file is created 0600, and rename replaces a symlink itself if one exists.
+fn write_private(dir: &Dir, name: &str, contents: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    let temp = format!(".{name}.{}.tmp", uuid::Uuid::new_v4());
+    let mut options = cap_std::fs::OpenOptions::new();
+    options
+        .write(true)
+        .create_new(true)
+        .follow(FollowSymlinks::No);
+    #[cfg(unix)]
+    {
+        use cap_std::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = dir.open_with(&temp, &options)?;
+    let written = file.write_all(contents);
+    drop(file);
+    let result = written.and_then(|()| dir.rename(&temp, dir, name));
+    if result.is_err() {
+        let _ = dir.remove_file(&temp);
+    }
+    result
+}
+
+fn read_private(dir: &Dir, name: &str) -> std::io::Result<String> {
+    use std::io::Read;
+    let mut options = cap_std::fs::OpenOptions::new();
+    options.read(true).follow(FollowSymlinks::No);
+    let mut contents = String::new();
+    dir.open_with(name, &options)?
+        .read_to_string(&mut contents)?;
+    Ok(contents)
+}
+
+/// Tighten the scrollback tree left by versions that wrote it with the
+/// default umask. The base directory is the boundary, so making it 0700 is
+/// enough for files that are not rewritten again. Does not create it.
+fn secure_existing_base(base: &Path) -> bool {
+    open_scrollback_base(base, false).is_ok()
+}
 
 /// Save a single pane's scrollback to disk.
 pub fn save_scrollback(payload: &ScrollbackPayload) -> Result<(), String> {
-    let ws_dir = workspace_dir(&payload.workspace_id);
-    fs::create_dir_all(&ws_dir).map_err(|e| format!("Failed to create scrollback dir: {e}"))?;
+    if !valid_id(&payload.workspace_id) || !valid_id(&payload.pane_id) {
+        return Err("Invalid scrollback workspace or pane ID".into());
+    }
+    let base = open_scrollback_base(&scrollback_base(), true)
+        .map_err(|e| format!("Failed to create scrollback dir: {e}"))?;
+    let ws_dir = open_workspace_dir(&base, &payload.workspace_id, true)
+        .map_err(|e| format!("Failed to create scrollback dir: {e}"))?;
 
     let now_ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -161,14 +312,14 @@ pub fn save_scrollback(payload: &ScrollbackPayload) -> Result<(), String> {
         saved_at: now_ms,
     };
 
-    let data_file = data_path(&payload.workspace_id, &payload.pane_id);
-    fs::write(&data_file, &payload.data)
+    let data_file = format!("{}.dat", payload.pane_id);
+    write_private(&ws_dir, &data_file, payload.data.as_bytes())
         .map_err(|e| format!("Failed to write scrollback data: {e}"))?;
 
-    let meta_file = meta_path(&payload.workspace_id, &payload.pane_id);
+    let meta_file = format!("{}.json", payload.pane_id);
     let meta_json = serde_json::to_string_pretty(&meta)
         .map_err(|e| format!("Failed to serialize scrollback meta: {e}"))?;
-    fs::write(&meta_file, meta_json)
+    write_private(&ws_dir, &meta_file, meta_json.as_bytes())
         .map_err(|e| format!("Failed to write scrollback meta: {e}"))?;
 
     Ok(())
@@ -178,11 +329,13 @@ pub fn save_scrollback(payload: &ScrollbackPayload) -> Result<(), String> {
 
 /// Load a single pane's scrollback from disk. Returns None if not found.
 pub fn load_scrollback(workspace_id: &str, pane_id: &str) -> Option<ScrollbackRestore> {
-    let data_file = data_path(workspace_id, pane_id);
-    let meta_file = meta_path(workspace_id, pane_id);
-
-    let data = fs::read_to_string(&data_file).ok()?;
-    let meta_json = fs::read_to_string(&meta_file).ok()?;
+    if !valid_id(workspace_id) || !valid_id(pane_id) {
+        return None;
+    }
+    let base = open_scrollback_base(&scrollback_base(), false).ok()?;
+    let ws_dir = open_workspace_dir(&base, workspace_id, false).ok()?;
+    let data = read_private(&ws_dir, &format!("{pane_id}.dat")).ok()?;
+    let meta_json = read_private(&ws_dir, &format!("{pane_id}.json")).ok()?;
     let meta: ScrollbackMeta = serde_json::from_str(&meta_json).ok()?;
 
     Some(ScrollbackRestore { data, meta })
@@ -194,9 +347,16 @@ pub(crate) fn load_scrollback_meta_for_predecessor(
     pane_id: &str,
     predecessor_id: &str,
 ) -> Option<(String, String, ScrollbackMeta)> {
-    let bytes = fs::read(meta_path(workspace_id, pane_id)).ok()?;
-    let meta: ScrollbackMeta = serde_json::from_slice(&bytes).ok()?;
-    (meta.workspace_id == workspace_id && meta.pane_id == pane_id && meta.session_id == predecessor_id)
+    if !valid_id(workspace_id) || !valid_id(pane_id) {
+        return None;
+    }
+    let base = open_scrollback_base(&scrollback_base(), false).ok()?;
+    let ws_dir = open_workspace_dir(&base, workspace_id, false).ok()?;
+    let json = read_private(&ws_dir, &format!("{pane_id}.json")).ok()?;
+    let meta: ScrollbackMeta = serde_json::from_str(&json).ok()?;
+    (meta.workspace_id == workspace_id
+        && meta.pane_id == pane_id
+        && meta.session_id == predecessor_id)
         .then(|| (workspace_id.to_owned(), pane_id.to_owned(), meta))
 }
 
@@ -225,8 +385,10 @@ pub fn find_scrollback_meta_for_sessions(
     if session_ids.is_empty() {
         return found;
     }
-    let base = scrollback_base();
-    let Ok(workspace_entries) = fs::read_dir(&base) else {
+    let Ok(base) = open_scrollback_base(&scrollback_base(), false) else {
+        return found;
+    };
+    let Ok(workspace_entries) = base.entries() else {
         return found;
     };
 
@@ -240,17 +402,23 @@ pub fn find_scrollback_meta_for_sessions(
         }
 
         let workspace_id = workspace_entry.file_name().to_string_lossy().to_string();
-        let Ok(entries) = fs::read_dir(workspace_entry.path()) else {
+        let Ok(workspace) = open_workspace_dir(&base, &workspace_id, false) else {
+            continue;
+        };
+        let Ok(entries) = workspace.entries() else {
             continue;
         };
 
         for entry in entries.flatten() {
-            let path = entry.path();
-            if path.extension().and_then(|s| s.to_str()) != Some("json") {
+            if !entry.file_type().map(|t| t.is_file()).unwrap_or(false) {
+                continue;
+            }
+            let name = entry.file_name();
+            if Path::new(&name).extension().and_then(|s| s.to_str()) != Some("json") {
                 continue;
             }
 
-            let Ok(meta_json) = fs::read_to_string(&path) else {
+            let Ok(meta_json) = read_private(&workspace, &name.to_string_lossy()) else {
                 continue;
             };
             let Ok(meta) = serde_json::from_str::<ScrollbackMeta>(&meta_json) else {
@@ -276,8 +444,16 @@ pub fn find_scrollback_meta_for_sessions(
 
 /// List all pane IDs that have scrollback saved for a workspace.
 pub fn list_workspace_scrollbacks(workspace_id: &str) -> Vec<String> {
-    let ws_dir = workspace_dir(workspace_id);
-    let Ok(entries) = fs::read_dir(&ws_dir) else {
+    if !valid_id(workspace_id) {
+        return vec![];
+    }
+    let Ok(base) = open_scrollback_base(&scrollback_base(), false) else {
+        return vec![];
+    };
+    let Ok(ws_dir) = open_workspace_dir(&base, workspace_id, false) else {
+        return vec![];
+    };
+    let Ok(entries) = ws_dir.entries() else {
         return vec![];
     };
 
@@ -298,9 +474,10 @@ pub fn list_workspace_scrollbacks(workspace_id: &str) -> Vec<String> {
 
 /// Remove scrollback files for a specific workspace.
 pub fn remove_workspace_scrollback(workspace_id: &str) {
-    let ws_dir = workspace_dir(workspace_id);
-    if ws_dir.exists() {
-        let _ = fs::remove_dir_all(&ws_dir);
+    if valid_id(workspace_id) {
+        if let Ok(base) = open_scrollback_base(&scrollback_base(), false) {
+            let _ = base.remove_dir_all(workspace_id);
+        }
     }
 }
 
@@ -313,6 +490,9 @@ pub(crate) fn cleanup_on_startup(
     active_workspace_ids: &[String],
     max_bytes: u64,
 ) {
+    if !secure_existing_base(base) {
+        return;
+    }
     if recovery_pending || crate::state::retained_layouts().unreadable {
         eprintln!("[codemux::scrollback] Skipping startup cleanup during layout recovery");
         return;
@@ -333,8 +513,15 @@ pub(crate) fn cleanup_on_startup(
 
 /// Remove scrollback for a single pane.
 pub fn remove_pane_scrollback(workspace_id: &str, pane_id: &str) {
-    let _ = fs::remove_file(data_path(workspace_id, pane_id));
-    let _ = fs::remove_file(meta_path(workspace_id, pane_id));
+    if !valid_id(workspace_id) || !valid_id(pane_id) {
+        return;
+    }
+    if let Ok(base) = open_scrollback_base(&scrollback_base(), false) {
+        if let Ok(ws_dir) = open_workspace_dir(&base, workspace_id, false) {
+            let _ = ws_dir.remove_file(format!("{pane_id}.dat"));
+            let _ = ws_dir.remove_file(format!("{pane_id}.json"));
+        }
+    }
 }
 
 /// Remove scrollback directories that don't correspond to any known workspace.
@@ -512,9 +699,7 @@ pub fn refresh_stale_scrollback_metadata(store: &crate::state::AppStateStore) {
         if captures.is_empty() {
             continue;
         }
-        let Some((ws_id, pane_id, stored_meta)) =
-            metadata.get_mut(&session.session_id.0)
-        else {
+        let Some((ws_id, pane_id, stored_meta)) = metadata.get_mut(&session.session_id.0) else {
             continue;
         };
         let mut meta = stored_meta.clone();
@@ -522,18 +707,24 @@ pub fn refresh_stale_scrollback_metadata(store: &crate::state::AppStateStore) {
         let mut changed = false;
         for (key, value) in captures {
             if meta.adapter_captures.get(key) != Some(value) {
-                meta.adapter_captures
-                    .insert(key.clone(), value.clone());
+                meta.adapter_captures.insert(key.clone(), value.clone());
                 changed = true;
             }
         }
         if !changed {
             continue;
         }
-        let path = meta_path(&ws_id, &pane_id);
+        if !valid_id(&ws_id) || !valid_id(&pane_id) {
+            continue;
+        }
         match serde_json::to_string_pretty(&meta) {
             Ok(json) => {
-                if let Err(e) = fs::write(&path, json) {
+                let result = open_scrollback_base(&scrollback_base(), false)
+                    .and_then(|base| open_workspace_dir(&base, &ws_id, false))
+                    .and_then(|dir| {
+                        write_private(&dir, &format!("{pane_id}.json"), json.as_bytes())
+                    });
+                if let Err(e) = result {
                     eprintln!(
                         "[codemux::scrollback] Failed to refresh metadata for {}/{}: {e}",
                         ws_id, pane_id
@@ -544,9 +735,7 @@ pub fn refresh_stale_scrollback_metadata(store: &crate::state::AppStateStore) {
                 }
             }
             Err(e) => {
-                eprintln!(
-                    "[codemux::scrollback] Failed to serialize refreshed metadata: {e}"
-                );
+                eprintln!("[codemux::scrollback] Failed to serialize refreshed metadata: {e}");
             }
         }
     }
@@ -709,6 +898,110 @@ mod tests {
             adapter_captures: HashMap::new(),
             adapter_id: None,
             alternate_buffer: false,
+        }
+    }
+
+    #[cfg(unix)]
+    fn mode(path: &Path) -> u32 {
+        use std::os::unix::fs::PermissionsExt;
+        fs::metadata(path).unwrap().permissions().mode() & 0o777
+    }
+
+    /// Scrollback is full terminal output, so a save keeps it owner-only.
+    #[cfg(unix)]
+    #[test]
+    fn save_writes_owner_only_dirs_and_files() {
+        if crate::test_isolation::isolated("scrollback::tests::save_writes_owner_only_dirs_and_files") {
+            return;
+        }
+        save_scrollback(&test_payload("ws-private", "pane-1")).unwrap();
+        assert_eq!(mode(&scrollback_base()), 0o700);
+        assert_eq!(mode(&workspace_dir("ws-private")), 0o700);
+        assert_eq!(mode(&data_path("ws-private", "pane-1")), 0o600);
+        assert_eq!(mode(&meta_path("ws-private", "pane-1")), 0o600);
+        assert!(load_scrollback("ws-private", "pane-1").is_some());
+    }
+
+    /// Trees written by older versions at the default umask are tightened:
+    /// the base on startup, and each file when it is rewritten.
+    #[cfg(unix)]
+    #[test]
+    fn existing_world_readable_scrollback_is_tightened() {
+        use std::os::unix::fs::PermissionsExt;
+        if crate::test_isolation::isolated("scrollback::tests::existing_world_readable_scrollback_is_tightened") {
+            return;
+        }
+        let base = scrollback_base();
+        let ws_dir = workspace_dir("ws-old");
+        fs::create_dir_all(&ws_dir).unwrap();
+        let data = data_path("ws-old", "pane-1");
+        fs::write(&data, "old").unwrap();
+        for (path, old) in [(&base, 0o755), (&ws_dir, 0o755), (&data, 0o644)] {
+            fs::set_permissions(path, fs::Permissions::from_mode(old)).unwrap();
+        }
+
+        cleanup_on_startup(&base, true, false, &["ws-old".into()], u64::MAX);
+        assert_eq!(mode(&base), 0o700);
+
+        save_scrollback(&test_payload("ws-old", "pane-1")).unwrap();
+        assert_eq!(mode(&ws_dir), 0o700);
+        assert_eq!(mode(&data), 0o600);
+        assert_eq!(fs::read_to_string(&data).unwrap(), test_payload("ws-old", "pane-1").data);
+    }
+
+    /// An existing workspace symlink cannot redirect a save or a chmod.
+    #[cfg(unix)]
+    #[test]
+    fn save_rejects_workspace_symlink() {
+        use std::os::unix::fs::PermissionsExt;
+        if crate::test_isolation::isolated("scrollback::tests::save_rejects_workspace_symlink") {
+            return;
+        }
+        let base = scrollback_base();
+        fs::create_dir_all(&base).unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        fs::set_permissions(outside.path(), fs::Permissions::from_mode(0o755)).unwrap();
+        std::os::unix::fs::symlink(outside.path(), workspace_dir("ws-linked")).unwrap();
+
+        assert!(save_scrollback(&test_payload("ws-linked", "pane-1")).is_err());
+        assert_eq!(mode(outside.path()), 0o755);
+        assert!(!outside.path().join("pane-1.dat").exists());
+        assert!(load_scrollback("ws-linked", "pane-1").is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn save_rejects_scrollback_root_symlink() {
+        use std::os::unix::fs::PermissionsExt;
+        if crate::test_isolation::isolated("scrollback::tests::save_rejects_scrollback_root_symlink") {
+            return;
+        }
+        let base = scrollback_base();
+        fs::create_dir_all(base.parent().unwrap()).unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        fs::set_permissions(outside.path(), fs::Permissions::from_mode(0o755)).unwrap();
+        std::os::unix::fs::symlink(outside.path(), &base).unwrap();
+
+        assert!(save_scrollback(&test_payload("ws", "pane")).is_err());
+        assert_eq!(mode(outside.path()), 0o755);
+        assert!(!outside.path().join("ws").exists());
+    }
+
+    #[test]
+    fn save_rejects_non_component_ids() {
+        if crate::test_isolation::isolated("scrollback::tests::save_rejects_non_component_ids") {
+            return;
+        }
+        for (workspace, pane) in [
+            ("../outside", "pane"),
+            ("/tmp", "pane"),
+            ("ws", "../pane"),
+            ("ws", "a/b"),
+            (".", "pane"),
+            ("ws", ""),
+        ] {
+            assert!(save_scrollback(&test_payload(workspace, pane)).is_err());
+            assert!(load_scrollback(workspace, pane).is_none());
         }
     }
 

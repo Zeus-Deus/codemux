@@ -30,6 +30,14 @@ use std::time::{Duration, Instant};
 use serde_json::{json, Value};
 use tempfile::TempDir;
 
+fn private_tempdir() -> TempDir {
+    use std::os::unix::fs::PermissionsExt;
+    tempfile::Builder::new()
+        .permissions(std::fs::Permissions::from_mode(0o700))
+        .tempdir()
+        .unwrap()
+}
+
 fn binary_path() -> PathBuf {
     if let Ok(path) = std::env::var("CARGO_BIN_EXE_codemux-remote") {
         return PathBuf::from(path);
@@ -60,7 +68,7 @@ impl ServeFixture {
     /// developer's own Codemux app never decides who owns the `codemux`
     /// MCP name here.
     fn start_with_home(home: TempDir) -> Self {
-        Self::start_in(TempDir::new().expect("tempdir"), home)
+        Self::start_in(private_tempdir(), home)
     }
 
     /// Start the daemon on an existing state dir and `HOME`, as a restart
@@ -666,7 +674,7 @@ fn mcp_stdio_roundtrip() {
 #[test]
 fn mcp_without_a_daemon_still_answers_and_says_so() {
     let bin = binary_path();
-    let state_dir = TempDir::new().unwrap();
+    let state_dir = private_tempdir();
 
     let mut mcp = Command::new(&bin)
         .arg("mcp")
@@ -806,7 +814,7 @@ fn serve_status_reports_alive() {
 #[test]
 fn serve_status_reports_absent_when_no_manifest() {
     let bin = binary_path();
-    let state_dir = TempDir::new().unwrap();
+    let state_dir = private_tempdir();
     let out = Command::new(&bin)
         .arg("serve")
         .arg("status")
@@ -815,6 +823,109 @@ fn serve_status_reports_absent_when_no_manifest() {
         .output()
         .expect("status");
     assert!(!out.status.success(), "expected nonzero exit when no manifest");
+}
+
+#[test]
+fn unsafe_state_manifest_cannot_block_start_or_signal_a_process() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let temp = private_tempdir();
+    let state = temp.path().join("unsafe-state");
+    std::fs::create_dir(&state).unwrap();
+    std::fs::set_permissions(&state, std::fs::Permissions::from_mode(0o777)).unwrap();
+    let manifest_path = state.join("manifest.json");
+    let manifest = |pid| {
+        json!({
+            "endpoint": "http://127.0.0.1:1",
+            "secret": "untrusted",
+            "pid": pid,
+            "started_at": "2026-01-01T00:00:00Z",
+            "host_id": "test"
+        })
+    };
+    std::fs::write(
+        &manifest_path,
+        serde_json::to_vec(&manifest(std::process::id())).unwrap(),
+    )
+    .unwrap();
+
+    let bin = binary_path();
+    for args in [vec!["serve"], vec!["serve", "status"]] {
+        let output = Command::new(&bin)
+            .args(args)
+            .arg("--state-dir")
+            .arg(&state)
+            .output()
+            .unwrap();
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            !output.status.success(),
+            "untrusted manifest was accepted: {stderr}"
+        );
+        assert!(stderr.contains("state directory"), "{stderr}");
+        assert!(stderr.contains("service manager"), "{stderr}");
+        assert!(!stderr.contains("already running"), "{stderr}");
+    }
+
+    let mut target = Command::new("sleep")
+        .arg("30")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    std::fs::write(
+        &manifest_path,
+        serde_json::to_vec(&manifest(target.id())).unwrap(),
+    )
+    .unwrap();
+    let stop = Command::new(&bin)
+        .args(["serve", "stop", "--state-dir"])
+        .arg(&state)
+        .output()
+        .unwrap();
+    let target_alive = target.try_wait().unwrap().is_none();
+    let unsafe_mode = std::fs::metadata(&state).unwrap().permissions().mode() & 0o777;
+
+    // A private directory can still contain a final symlink left by a
+    // legacy writer. It must not supply the PID for `serve stop` either.
+    std::fs::set_permissions(&state, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let outside = temp.path().join("outside-manifest.json");
+    std::fs::write(
+        &outside,
+        serde_json::to_vec(&manifest(target.id())).unwrap(),
+    )
+    .unwrap();
+    std::fs::set_permissions(&outside, std::fs::Permissions::from_mode(0o600)).unwrap();
+    std::fs::remove_file(&manifest_path).unwrap();
+    std::os::unix::fs::symlink(&outside, &manifest_path).unwrap();
+    let symlink_stop = Command::new(&bin)
+        .args(["serve", "stop", "--state-dir"])
+        .arg(&state)
+        .output()
+        .unwrap();
+    let target_alive_after_symlink = target.try_wait().unwrap().is_none();
+    let _ = target.kill();
+    let _ = target.wait();
+    let stderr = String::from_utf8_lossy(&stop.stderr);
+    assert!(
+        !stop.status.success(),
+        "untrusted manifest was accepted: {stderr}"
+    );
+    assert!(stderr.contains("service manager"), "{stderr}");
+    assert!(
+        target_alive,
+        "serve stop signaled the PID in an untrusted manifest"
+    );
+    assert_eq!(unsafe_mode, 0o777);
+    assert!(
+        !symlink_stop.status.success(),
+        "serve stop trusted a symlinked manifest: {}",
+        String::from_utf8_lossy(&symlink_stop.stderr)
+    );
+    assert!(
+        target_alive_after_symlink,
+        "serve stop signaled a symlinked PID"
+    );
 }
 
 #[test]
@@ -918,7 +1029,7 @@ fn workspace_register_subcommand_registers_in_daemon() {
 #[test]
 fn workspace_register_fails_clean_without_daemon() {
     let bin = binary_path();
-    let state_dir = TempDir::new().unwrap();
+    let state_dir = private_tempdir();
 
     let out = Command::new(&bin)
         .arg("workspace")
