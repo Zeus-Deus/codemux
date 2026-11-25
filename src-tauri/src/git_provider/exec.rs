@@ -15,6 +15,7 @@
 
 use std::io::Read;
 use std::process::{Child, Command, ExitStatus, Stdio};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
 use std::time::{Duration, Instant};
 
 pub(crate) const MAX_CAPTURE_BYTES: usize = 8 * 1024 * 1024;
@@ -32,7 +33,7 @@ pub(crate) enum TimedFailure {
     Spawn(std::io::Error),
     /// Waiting on the child itself failed.
     Wait(std::io::Error),
-    /// The deadline lapsed; the child was killed and reaped.
+    /// The deadline lapsed; the direct child has exited or was killed and reaped.
     Timeout,
     /// A child produced more output than the hosting integration can retain.
     OutputTooLarge {
@@ -80,11 +81,14 @@ fn run_timed_with_policy(
     let mut child = cmd.spawn().map_err(TimedFailure::Spawn)?;
     let stdout = drain(child.stdout.take());
     let stderr = drain(child.stderr.take());
+    let deadline = Instant::now() + timeout;
 
-    match wait_with_deadline(child, Instant::now() + timeout) {
+    match wait_with_deadline(child, deadline) {
         Ok(status) => {
-            let stdout = join(stdout);
-            let stderr = join(stderr);
+            // The direct child can exit while one of its descendants still
+            // owns a write end. The same deadline must cover both drains.
+            let stdout = receive(stdout, deadline)?;
+            let stderr = receive(stderr, deadline)?;
             if stderr.exceeded_limit
                 || (stdout.exceeded_limit && (!allow_successful_stdout_prefix || !status.success()))
             {
@@ -102,10 +106,8 @@ fn run_timed_with_policy(
         }
         Err(failure) => {
             // Whichever way the wait failed, the child has been killed and
-            // reaped by now. The drain threads are deliberately not joined:
-            // there is no output to report, and a grandchild still holding
-            // the write end would make the join the very hang the deadline
-            // exists to prevent. The readers end at EOF on their own.
+            // reaped by now. A descendant may still hold a write end, so
+            // leave the readers to finish when those descriptors close.
             drop(stdout);
             drop(stderr);
             Err(failure)
@@ -128,8 +130,6 @@ fn run_timed_with_policy(
 /// gone and still honours the deadline.
 #[cfg(unix)]
 fn wait_with_deadline(mut child: Child, deadline: Instant) -> Result<ExitStatus, TimedFailure> {
-    use std::sync::mpsc::{self, RecvTimeoutError};
-
     // The caller keeps the `Child` — and with it the sole right to kill and
     // reap — exactly as before. The observer thread only *watches* for the
     // exit: `waitid(WNOWAIT)` blocks until the child is a zombie but does not
@@ -227,9 +227,13 @@ fn wait_with_deadline(mut child: Child, deadline: Instant) -> Result<ExitStatus,
 /// the child can exit without blocking on a full OS pipe.
 fn drain<R: Read + Send + 'static>(
     pipe: Option<R>,
-) -> Option<std::thread::JoinHandle<CapturedPipe>> {
+) -> Option<Receiver<CapturedPipe>> {
     let pipe = pipe?;
-    Some(std::thread::spawn(move || capture_pipe(pipe)))
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(capture_pipe(pipe));
+    });
+    Some(rx)
 }
 
 /// Retain at most one stream's budget while consuming the rest to EOF.
@@ -251,10 +255,20 @@ pub(crate) fn capture_pipe<R: Read>(mut pipe: R) -> CapturedPipe {
     captured
 }
 
-fn join(handle: Option<std::thread::JoinHandle<CapturedPipe>>) -> CapturedPipe {
-    handle
-        .and_then(|h| h.join().ok())
-        .unwrap_or_default()
+fn receive(
+    reader: Option<Receiver<CapturedPipe>>,
+    deadline: Instant,
+) -> Result<CapturedPipe, TimedFailure> {
+    let Some(reader) = reader else {
+        return Ok(CapturedPipe::default());
+    };
+    match reader.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
+        Ok(captured) => Ok(captured),
+        Err(RecvTimeoutError::Timeout) => Err(TimedFailure::Timeout),
+        Err(RecvTimeoutError::Disconnected) => Err(TimedFailure::Wait(std::io::Error::other(
+            "subprocess output reader exited without reporting",
+        ))),
+    }
 }
 
 #[cfg(test)]
@@ -372,6 +386,22 @@ mod tests {
             started.elapsed() < Duration::from_secs(10),
             "the deadline must be enforced, not waited out"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn exited_child_with_a_descendant_holding_stdout_obeys_the_deadline() {
+        // Confirm this shell exits immediately even though its background
+        // child remains; the runner must then time out while draining.
+        let started = Instant::now();
+        let status = sh("sleep 2 & exit 7").status().unwrap();
+        assert_eq!(status.code(), Some(7));
+        assert!(started.elapsed() < Duration::from_secs(1));
+
+        let started = Instant::now();
+        let result = run_timed(sh("sleep 2 & exit 7"), Duration::from_millis(250));
+        assert!(matches!(result, Err(TimedFailure::Timeout)));
+        assert!(started.elapsed() < Duration::from_secs(1));
     }
 
     #[test]
