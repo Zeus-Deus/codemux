@@ -28,7 +28,7 @@
 //! restores anyway. So the on-disk result is byte-for-byte the same record.
 //!
 //! Everything the raw password touches is confined to
-//! [`resolve_password`] and [`sign_in`], which immediately stretch it into
+//! [`resolve_password`] and [`verify_email_sign_in`], which immediately stretch it into
 //! an [`AuthSecret`](crate::auth::AuthSecret) and drop the original — the
 //! typed boundary in `auth/api.rs` makes it a compile error to send the
 //! raw value to the server.
@@ -116,15 +116,19 @@ pub(crate) fn classify_api_error(raw: &str) -> LoginError {
 
 // ── Sign-in ──────────────────────────────────────────────────────
 
-/// Sign in against `db`, persisting the same record the GUI persists.
-///
-/// Takes the password by value and drops it as soon as the `AuthSecret`
-/// is derived, exactly like `commands::auth::signin_email`.
-pub(crate) async fn sign_in(
-    db: &DatabaseStore,
-    email: &str,
-    password: String,
-) -> Result<AuthUser, LoginError> {
+/// An API-verified email session waiting for a local settings write. `connect`
+/// can hold this across its ownership check without keeping the layout lock
+/// across the network request.
+pub(crate) struct VerifiedEmailSignIn {
+    token: String,
+    expires_at: String,
+    user: AuthUser,
+}
+
+/// Validate credentials with the API without changing the local account.
+/// Takes the password by value and drops it as soon as the `AuthSecret` is
+/// derived, exactly like `commands::auth::signin_email`.
+async fn verify_email_sign_in(email: &str, password: String) -> Result<VerifiedEmailSignIn, LoginError> {
     let email = email.trim();
     if email.is_empty() || password.is_empty() {
         return Err(LoginError::Local(
@@ -143,14 +147,21 @@ pub(crate) async fn sign_in(
         .await
         .map_err(|e| classify_api_error(&e))?;
 
-    let user = AuthUser {
-        id: api_resp.user.id.clone(),
-        email: api_resp.user.email.clone(),
-        name: api_resp.user.name.clone(),
-        image: api_resp.user.image.clone(),
-    };
+    Ok(VerifiedEmailSignIn {
+        token: api_resp.token,
+        expires_at: api_resp.expires_at,
+        user: AuthUser {
+            id: api_resp.user.id,
+            email: api_resp.user.email,
+            name: api_resp.user.name,
+            image: api_resp.user.image,
+        },
+    })
+}
 
-    save_auth(db, &api_resp.token, &api_resp.expires_at, Some(&user))
+/// Persist a verified session through the same path as desktop sign-in.
+fn persist_email_sign_in(db: &DatabaseStore, verified: VerifiedEmailSignIn) -> Result<AuthUser, LoginError> {
+    save_auth(db, &verified.token, &verified.expires_at, Some(&verified.user))
         .map_err(|e| LoginError::Local(format!("Could not persist the session: {e}")))?;
     // Matches the GUI ordering: `save_auth` preserves any prior
     // auth_method, so the new value is stamped right after. Non-fatal for
@@ -160,7 +171,17 @@ pub(crate) async fn sign_in(
         eprintln!("[codemux login] persisting auth_method=email failed: {err}");
     }
 
-    Ok(user)
+    Ok(verified.user)
+}
+
+/// Sign in against `db`, persisting the same record the GUI persists.
+pub(crate) async fn sign_in(
+    db: &DatabaseStore,
+    email: &str,
+    password: String,
+) -> Result<AuthUser, LoginError> {
+    let verified = verify_email_sign_in(email, password).await?;
+    persist_email_sign_in(db, verified)
 }
 
 // ── Bearer-token sign-in ─────────────────────────────────────────
@@ -530,25 +551,27 @@ impl SignInOutcome {
     }
 }
 
-/// Step 1 of `codemux connect`: make sure this machine has a live session,
-/// prompting for credentials only when it doesn't.
+/// A `connect` sign-in prepared without changing the saved account.
+pub(crate) enum PreparedConnectSignIn {
+    AlreadySignedIn,
+    Verified(VerifiedEmailSignIn),
+}
+
+/// Step 1 of `codemux connect`: collect and verify credentials only when no
+/// live session exists. Nothing is persisted before the caller reacquires
+/// layout ownership.
 ///
 /// Takes the caller's `DatabaseStore` rather than opening its own — `connect`
 /// already holds one for the config write, and two handles to the same SQLite
 /// file for one logical operation is a needless invitation to a lock. The
 /// prompting, the `CODEMUX_PASSWORD` affordance, and the non-enumerating error
 /// mapping are all the same code `codemux login` runs.
-pub(crate) async fn ensure_signed_in(
+pub(crate) async fn prepare_connect_sign_in(
     db: &DatabaseStore,
     email: Option<String>,
-) -> Result<SignInOutcome, String> {
-    if let AuthStatusReport::SignedIn { user, .. } = auth_status(db) {
-        // `save_token` (the OAuth callback's first write) stores no profile,
-        // so a rare-but-real record has a live session and no email to name.
-        let label = user
-            .map(|u| u.email)
-            .unwrap_or_else(|| "the account stored on this machine".to_string());
-        return Ok(SignInOutcome::AlreadySignedIn(label));
+) -> Result<PreparedConnectSignIn, String> {
+    if matches!(auth_status(db), AuthStatusReport::SignedIn { .. }) {
+        return Ok(PreparedConnectSignIn::AlreadySignedIn);
     }
 
     let email = match email {
@@ -562,9 +585,29 @@ pub(crate) async fn ensure_signed_in(
         })?,
     };
     let password = resolve_password()?;
-    let user = sign_in(db, &email, password)
+    let verified = verify_email_sign_in(&email, password)
         .await
         .map_err(|e| e.user_message())?;
+    Ok(PreparedConnectSignIn::Verified(verified))
+}
+
+/// Finish `connect` sign-in while the caller holds layout ownership. Re-read
+/// the account in case another login completed while credentials were checked.
+pub(crate) fn commit_connect_sign_in(
+    db: &DatabaseStore,
+    prepared: PreparedConnectSignIn,
+) -> Result<SignInOutcome, String> {
+    if let AuthStatusReport::SignedIn { user, .. } = auth_status(db) {
+        // `save_token` may store a live session without a cached profile.
+        let label = user
+            .map(|u| u.email)
+            .unwrap_or_else(|| "the account stored on this machine".to_string());
+        return Ok(SignInOutcome::AlreadySignedIn(label));
+    }
+    let PreparedConnectSignIn::Verified(verified) = prepared else {
+        return Err("The saved account changed during setup. Run `codemux connect` again.".into());
+    };
+    let user = persist_email_sign_in(db, verified).map_err(|e| e.user_message())?;
     Ok(SignInOutcome::SignedIn(user.email))
 }
 
@@ -968,7 +1011,7 @@ mod tests {
     // ── connect's step 1 ─────────────────────────────────────────
 
     #[tokio::test]
-    async fn ensure_signed_in_is_a_no_op_when_a_session_exists() {
+    async fn connect_sign_in_is_a_no_op_when_a_session_exists() {
         // `codemux connect` on an already-signed-in box must not prompt —
         // it has to be safe to re-run from a script.
         let db = test_db();
@@ -980,9 +1023,10 @@ mod tests {
         };
         save_auth(&db, "tok", "2099-01-01T00:00:00Z", Some(&user)).unwrap();
 
-        let outcome = ensure_signed_in(&db, None)
+        let prepared = prepare_connect_sign_in(&db, None)
             .await
             .expect("an existing session short-circuits");
+        let outcome = commit_connect_sign_in(&db, prepared).unwrap();
         assert_eq!(
             outcome,
             SignInOutcome::AlreadySignedIn("connect@example.com".to_string())
@@ -992,7 +1036,7 @@ mod tests {
 
     #[tokio::test]
     #[serial_test::serial(mockserver)]
-    async fn ensure_signed_in_signs_in_when_the_session_expired() {
+    async fn connect_sign_in_waits_to_persist_an_expired_session_replacement() {
         // An expired record must be treated as signed out, not reused.
         let email = "reconnect@example.com";
         let mut server = mockito::Server::new_async().await;
@@ -1008,8 +1052,10 @@ mod tests {
 
         let db = test_db();
         save_auth(&db, "old", "2000-01-01T00:00:00Z", None).unwrap();
-        let outcome = ensure_signed_in(&db, Some(email.to_string())).await;
+        let prepared = prepare_connect_sign_in(&db, Some(email.to_string())).await;
         std::env::remove_var(PASSWORD_ENV);
+        assert_eq!(load_token(&db).unwrap().0, "old", "verification made no DB write");
+        let outcome = commit_connect_sign_in(&db, prepared.unwrap());
 
         assert_eq!(
             outcome.expect("signs in again"),

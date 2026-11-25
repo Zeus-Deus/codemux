@@ -1126,9 +1126,8 @@ async fn run_control_cli(cli: Cli) -> Result<Exit, String> {
             crate::auth::cli_login::run_login(email, token, status).await?;
             Ok(Exit::Done)
         }
-        // `connect` is local for the same reason `login` is — it exists to set
-        // up a machine that has nothing running yet. It reaches for the control
-        // socket only when it detects a live instance (see `web_remote::connect`).
+        // `connect` sets up an idle machine. It checks backend ownership before
+        // credential verification and again before saving account and relay state.
         Some(CommandSet::Connect {
             command,
             email,

@@ -7,7 +7,7 @@
 //!
 //! | step | what it does | reuses |
 //! |------|--------------|--------|
-//! | 1 | sign in (or report the existing session) | [`crate::auth::cli_login::ensure_signed_in`] |
+//! | 1 | verify sign-in, then save it under layout ownership | [`crate::auth::cli_login::prepare_connect_sign_in`] |
 //! | 2 | persist `enabled` + `relay_mode_enabled` | [`super::update_config_headless`] while no backend owns the config |
 //! | 3 | keep it running across logout/reboot | a systemd **user** unit running `codemux serve` |
 //!
@@ -27,8 +27,8 @@
 //! toggle. With nothing running there is no such owner, so the headless
 //! load-modify-save in [`super::update_config_headless`] is the only way to
 //! configure a box *before* anything is up. `connect` checks layout ownership
-//! before login and holds the layout lock through that write. `connect off`
-//! stops an active managed service when systemd is available, then takes the
+//! before login, then reacquires it to save both the account and relay config.
+//! `connect off` stops an active managed service when systemd is available, then takes the
 //! same lock before using that local write path. Without a user bus, it still
 //! disables relay once ownership is clear and reports the unit left installed.
 //!
@@ -958,25 +958,27 @@ fn default_host() -> Option<SystemdUserHost> {
 /// `codemux connect [--email …] [--scope …] [--port N]`.
 pub async fn run_connect(opts: ConnectOptions) -> Result<(), String> {
     // Do not prompt for credentials when a backend owns this layout but has
-    // not yet opened its control socket. Login can take long enough for a
-    // backend to start, so acquire ownership again before the config write.
+    // not yet opened its control socket. Credential verification can take long
+    // enough for a backend to start, so save nothing until ownership is checked
+    // again. Never hold the blocking layout lock across the API await.
     drop(require_stopped_connect_owner()?);
     let db = crate::database::init_database()?;
 
-    // Step 1 — account. Everything downstream (relay registration, discovery
-    // from a browser) is account-scoped, so this is the gate.
-    let identity = cli_login::ensure_signed_in(&db, opts.email)
-        .await?
-        .identity()
-        .to_string();
+    // Step 1 — verify the account without writing it yet. Everything
+    // downstream (relay registration, browser discovery) is account-scoped.
+    let prepared_sign_in = cli_login::prepare_connect_sign_in(&db, opts.email).await?;
 
-    // Step 2 — configuration. Keep the layout lock through load-modify-save;
-    // a backend that appeared during login must be handled in Settings.
-    let cfg = {
+    // Step 2 — save the account and configuration under one ownership hold.
+    // A backend that appeared during verification is handled in Settings.
+    let (identity, cfg) = {
         let _layout_lock = require_stopped_connect_owner()?;
-        super::update_config_headless(&db, |cfg| {
+        let identity = cli_login::commit_connect_sign_in(&db, prepared_sign_in)?
+            .identity()
+            .to_string();
+        let cfg = super::update_config_headless(&db, |cfg| {
             apply_connect_request(cfg, opts.scope.clone(), opts.port)
-        })?
+        })?;
+        (identity, cfg)
     };
 
     // Step 3 — keep it running.
