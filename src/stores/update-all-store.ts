@@ -310,9 +310,9 @@ export const useUpdateAll = create<Store>((set, get) => {
                 // The display may still hold agent rows from an earlier check.
                 // Do not run those installers after an unsuccessful re-check.
                 const reason = refreshed.error ?? "Couldn't check device agents after the helper update";
+                failed.push({ machine, label: "Agent discovery", reason });
                 for (const rest of ordered) {
                   patchItem(itemKey(machine, rest.item), { phase: "failed", message: reason });
-                  failed.push({ machine, label: rest.label, reason });
                 }
                 return;
               }

@@ -110,7 +110,7 @@ export function UpdatesSection() {
     const result = approved.items.length ? await runPlan(approved) : { updated: 0, failed: [] };
     const label = (n: number) => `${n} update${n === 1 ? "" : "s"}`;
     if (result.failed.length) {
-      toast.warning(`${result.failed.length} of ${approved.items.length} updates failed`, {
+      toast.warning(`${result.updated} updated, ${result.failed.length} failed`, {
         description: result.failed.map((f) => `${names[f.machine] ?? f.machine} · ${f.label}: ${f.reason}`).join("\n"),
       });
     } else if (result.updated) {
@@ -155,7 +155,7 @@ export function UpdatesSection() {
       {summary && !running && (
         <p role="status" className="-mt-3 mb-6 text-body-sm text-muted-foreground">
           {summary.failed.length
-            ? `${summary.updated} updated, ${summary.failed.length} failed. Failed items show why below.`
+            ? `${summary.updated} updated, ${summary.failed.length} failed. See details below.`
             : `${summary.updated} updated. ${restartNotice(machines)}`}
         </p>
       )}

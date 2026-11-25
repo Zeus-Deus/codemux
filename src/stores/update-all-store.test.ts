@@ -259,9 +259,45 @@ describe("runPlan", () => {
     expect(invoke.mock.calls.map(([cmd]) => cmd)).toEqual(["device_helper_update", "provider_updates_device"]);
     expect(summary).toMatchObject({
       updated: 1,
-      failed: [{ machine: key, label: "Codex", reason: "Error: SSH timed out" }],
+      failed: [{ machine: key, label: "Agent discovery", reason: "Error: SSH timed out" }],
     });
     expect(useUpdateAll.getState().machines[key]?.providers).toEqual([report("codex")]);
+    expect(useUpdateAll.getState().items[itemKey(key, "helper")]?.phase).toBe("updated");
+    expect(useUpdateAll.getState().items[itemKey(key, "codex")]).toEqual({ phase: "failed", message: "Error: SSH timed out" });
+  });
+
+  it("reports failed agent discovery after a helper-only bulk upgrade", async () => {
+    const key = hostKey(2);
+    useUpdateAll.setState({
+      machines: {
+        [key]: {
+          loading: false,
+          providers: [],
+          helperVersion: "0.23.0",
+          appVersion: "0.24.0",
+          error: "Update Codemux on this device to manage its agents",
+          latestCheck: { helperVersion: "0.23.0", providerInventoryFresh: false },
+        },
+      },
+    });
+    invoke.mockImplementation(async (cmd: string) => {
+      if (cmd === "device_helper_update") {
+        return { host_id: 2, status: "upgraded", from: "0.23.0", to: "0.24.0", message: null };
+      }
+      if (cmd === "provider_updates_device") throw new Error("SSH timed out");
+      throw new Error(`unexpected ${cmd}`);
+    });
+
+    const plan = buildPlan(useUpdateAll.getState().machines as Record<string, MachineState>, {});
+    expect(plan.items).toEqual([{ machine: key, item: "helper", label: "Codemux" }]);
+    const summary = await useUpdateAll.getState().runPlan(plan);
+
+    expect(invoke.mock.calls.map(([cmd]) => cmd)).toEqual(["device_helper_update", "provider_updates_device"]);
+    expect(summary).toMatchObject({
+      updated: 1,
+      failed: [{ machine: key, label: "Agent discovery", reason: "Error: SSH timed out" }],
+    });
+    expect(useUpdateAll.getState().items[itemKey(key, "helper")]?.phase).toBe("updated");
   });
 
   it("updates a device's helper before its providers and reports partial failure", async () => {

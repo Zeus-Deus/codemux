@@ -84,12 +84,52 @@ describe("UpdatesSection", () => {
     fireEvent.click(within(dialog).getByRole("button", { name: "Update all" }));
     await waitFor(() => expect(toast.warning).toHaveBeenCalled());
     const [title, options] = vi.mocked(toast.warning).mock.calls[0];
-    expect(title).toBe("1 of 3 updates failed");
+    expect(title).toBe("2 updated, 1 failed");
     expect((options as { description: string }).description).toContain("buildbox · Codex: npm failed (exit 1)");
     expect(invoke).toHaveBeenCalledWith("provider_update_local", { provider: "claude" });
     expect(await screen.findByText(/EACCES: permission denied/)).toBeInTheDocument();
     expect(screen.getByText(/v0.24.0 installed · v0.23.0 running · Restart required/)).toBeInTheDocument();
     expect(screen.getByRole("status")).toHaveTextContent("2 updated, 1 failed");
+  });
+
+  it("reports failed agent discovery after a helper-only bulk update", async () => {
+    vi.mocked(toast.warning).mockClear();
+    let checks = 0;
+    invoke.mockImplementation(async (cmd: string) => {
+      if (cmd === "provider_updates_local") return [];
+      if (cmd === "provider_updates_device") {
+        checks++;
+        if (checks === 1) {
+          return {
+            host_id: 2,
+            helper_version: "0.23.0",
+            running_version: null,
+            serve_alive: null,
+            app_version: "0.24.0",
+            providers: null,
+            error: "Update Codemux on this device to manage its agents",
+          };
+        }
+        throw new Error("SSH timed out");
+      }
+      if (cmd === "device_helper_update") {
+        return { host_id: 2, status: "upgraded", from: "0.23.0", to: "0.24.0", message: null };
+      }
+      throw new Error(`unexpected ${cmd}`);
+    });
+
+    render(<UpdatesSection />);
+    fireEvent.click(await screen.findByRole("button", { name: "Update all (1)" }));
+    const dialog = await screen.findByRole("alertdialog");
+    fireEvent.click(within(dialog).getByRole("button", { name: "Update all" }));
+
+    await waitFor(() => expect(toast.warning).toHaveBeenCalledTimes(1));
+    const [title, options] = vi.mocked(toast.warning).mock.calls[0];
+    expect(title).toBe("1 updated, 1 failed");
+    expect((options as { description: string }).description).toBe("buildbox · Agent discovery: Error: SSH timed out");
+    expect(screen.getByRole("status")).toHaveTextContent("1 updated, 1 failed. See details below.");
+    expect(screen.getByText(/Status check failed: Error: SSH timed out/)).toBeInTheDocument();
+    expect(useUpdateAll.getState().items["host:2/helper"]?.phase).toBe("updated");
   });
 
   it("shows a restart requirement after refreshing a device with an older running daemon", async () => {
