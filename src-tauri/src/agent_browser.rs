@@ -1594,6 +1594,37 @@ fn pid_alive(pid: u32) -> bool {
     }
 }
 
+/// Only a definite process exit permits releasing a tracked stream. A failed
+/// ownership lookup alone can be transient while the browser remains alive.
+#[cfg(unix)]
+fn process_exit_confirmed(pid: u32) -> bool {
+    if pid == 0 || pid > i32::MAX as u32 {
+        return true;
+    }
+    (unsafe { libc::kill(pid as i32, 0) }) == -1
+        && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
+}
+
+#[cfg(windows)]
+fn process_exit_confirmed(pid: u32) -> bool {
+    use windows_sys::Win32::Foundation::{CloseHandle, GetLastError, ERROR_INVALID_PARAMETER, STILL_ACTIVE};
+    use windows_sys::Win32::System::Threading::{
+        GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+    };
+
+    if pid == 0 {
+        return true;
+    }
+    let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
+    if handle.is_null() {
+        return unsafe { GetLastError() } == ERROR_INVALID_PARAMETER;
+    }
+    let mut exit_code = 0;
+    let checked = unsafe { GetExitCodeProcess(handle, &mut exit_code) } != 0;
+    unsafe { CloseHandle(handle) };
+    checked && exit_code != STILL_ACTIVE as u32
+}
+
 /// Per-session stream state. The session is keyed externally by the
 /// session id (workspace_id, cli_session_name, or browser_id depending
 /// on caller); inside we cache the things we actually need to reason
@@ -3294,25 +3325,30 @@ impl AgentBrowserManager {
 
     /// Reconcile a provisional `running` flag with the verified daemon after
     /// a first or failed command. The lifecycle gate remains held by callers.
-    async fn refresh_running_session(&self, browser_id: &str, session: &str, outcome: BrowserActionOutcome) -> bool {
-        let session = session.to_owned();
-        let pid = tokio::task::spawn_blocking(move || live_owned_browser_pid(&session))
+    async fn refresh_running_session(&self, browser_id: &str, session: &str, outcome: BrowserActionOutcome) -> Result<bool, String> {
+        let lookup_session = session.to_owned();
+        let pid = tokio::task::spawn_blocking(move || live_owned_browser_pid(&lookup_session))
             .await
             .ok()
             .flatten();
         let mut ready = false;
         if let Some(entry) = self.sessions.lock().await.get_mut(browser_id) {
+            if entry.confirmation_pending && pid.is_none()
+                && entry.pid.is_some_and(|old_pid| !process_exit_confirmed(old_pid)) {
+                return Err(format!("Could not verify pending browser daemon for session {session}"));
+            }
+            let replaced = pid.is_some() && entry.pid.is_some() && pid != entry.pid;
             ready = pid.is_some() && (outcome == BrowserActionOutcome::Completed || (entry.browser_ready && entry.pid == pid));
             entry.running = pid.is_some();
             entry.browser_ready = ready;
             if outcome == BrowserActionOutcome::ConfirmationPending && pid.is_some() {
                 entry.confirmation_pending = true;
-            } else if ready || pid.is_none() {
+            } else if ready || pid.is_none() || replaced {
                 entry.confirmation_pending = false;
             }
             entry.pid = pid;
         }
-        ready
+        Ok(ready)
     }
 
     /// **Deprecated.** No-op kept for binary/source compatibility with any
@@ -3356,7 +3392,7 @@ impl AgentBrowserManager {
             sessions.get(browser_id).is_some_and(|s| s.running)
         };
         if was_running {
-            let ready = self.refresh_running_session(browser_id, &session, BrowserActionOutcome::Failed).await;
+            let ready = self.refresh_running_session(browser_id, &session, BrowserActionOutcome::Failed).await?;
             let pending = self.sessions.lock().await.get(browser_id)
                 .is_some_and(|entry| entry.running && entry.confirmation_pending);
             if pending {
@@ -3478,7 +3514,7 @@ impl AgentBrowserManager {
         if action == "close" {
             self.note_close_finished(browser_id).await;
         } else {
-            self.refresh_running_session(browser_id, session, outcome).await;
+            let _ = self.refresh_running_session(browser_id, session, outcome).await;
         }
     }
 
@@ -3796,6 +3832,10 @@ impl AgentBrowserManager {
         record: Option<BrowserPidRecord>,
         ownership: Option<bool>,
     ) -> Result<BrowserPidRecord, String> {
+        if record.is_none() && process_exit_confirmed(expected_pid) {
+            self.clear_stale_running_stream_allocation(browser_id, port).await;
+            return Err(format!("Browser session {session} daemon exited"));
+        }
         if record.as_ref().is_some_and(|record| record.pid != expected_pid) {
             self.clear_stale_running_stream_allocation(browser_id, port).await;
             return Err(format!("Browser session {session} changed since its last successful open"));
@@ -5841,6 +5881,15 @@ mod tests {
         assert!(retry.unwrap_err().contains("confirmation is pending"));
         assert!(manager.sessions.lock().await.get(&session).unwrap().confirmation_pending);
 
+        // A temporary failure to read this daemon's PID must not let spawn
+        // send another open and overwrite the pending request.
+        std::fs::remove_file(&daemon_pid_path).unwrap();
+        let uncertain = manager.spawn(&session).await.unwrap_err();
+        assert!(uncertain.contains("Could not verify pending browser daemon"));
+        assert!(manager.sessions.lock().await.get(&session).unwrap().confirmation_pending);
+        assert!(daemon.try_wait().unwrap().is_none());
+        std::fs::write(&daemon_pid_path, daemon.id().to_string()).unwrap();
+
         let spawn = manager.spawn(&session).await;
         assert!(spawn.unwrap_err().contains("confirmation is pending"));
         assert!(daemon.try_wait().unwrap().is_none());
@@ -6003,6 +6052,36 @@ mod tests {
 
         daemon.kill().unwrap();
         daemon.wait().unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn exited_daemon_releases_its_occupied_stream_port() {
+        let manager = AgentBrowserManager::new();
+        let session = format!("browser-dead-port-{}", uuid::Uuid::new_v4().simple());
+        let port = manager.allocate_port(&session).await.unwrap();
+        let listener = std::net::TcpListener::bind(("127.0.0.1", port)).unwrap();
+        let mut daemon = std::process::Command::new("sh")
+            .args(["-c", "true"])
+            .spawn().unwrap();
+        let dead_pid = daemon.id();
+        daemon.wait().unwrap();
+        assert!(process_exit_confirmed(dead_pid));
+        {
+            let mut sessions = manager.sessions.lock().await;
+            let stream = sessions.get_mut(&session).unwrap();
+            stream.running = true;
+            stream.browser_ready = true;
+            stream.pid = Some(dead_pid);
+        }
+
+        let error = manager.reconcile_existing_stream_process(
+            &session, &session, port, dead_pid, None, None,
+        ).await.err().unwrap();
+        assert!(error.contains("daemon exited"));
+        assert!(manager.get_port(&session).await.is_none());
+        assert_ne!(manager.allocate_port(&session).await.unwrap(), port);
+        drop(listener);
     }
 
     #[tokio::test]
