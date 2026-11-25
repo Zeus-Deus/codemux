@@ -3,6 +3,7 @@ import {
   useCallback,
   useContext,
   useEffect,
+  useId,
   useMemo,
   useRef,
   useState,
@@ -144,16 +145,18 @@ export function RetainedImagesProvider({
   );
 }
 
-/** Where `path` may load from: the reply's kept copy first (it outlives the
- *  original, but may still be landing), then the path the reply wrote. */
-function useImageCandidates(path: string): readonly ImageCandidate[] {
+/** Kept copies are app-owned. An agent-authored original enters this list
+ *  only after the reader explicitly asks to load it. */
+function useImageCandidates(path: string, loadOriginal: boolean): readonly ImageCandidate[] {
   const retained = useContext(RetainedImagesContext)?.get(path);
   return useMemo(
-    () => [
-      ...(retained ? [{ path: retained, read: readChatImage, kept: true }] : []),
-      { path, read: readLocalChatImage },
-    ],
-    [path, retained],
+    () =>
+      loadOriginal
+        ? [{ path, read: readLocalChatImage }]
+        : retained
+          ? [{ path: retained, read: readChatImage, kept: true }]
+          : [],
+    [path, retained, loadOriginal],
   );
 }
 
@@ -181,10 +184,9 @@ function firstSource(
 }
 
 /**
- * Desktop WebKit can load a converted asset URL directly. Browser/dev-mock
- * clients cannot reach the host filesystem through that protocol, so a failed
- * load falls back to a bounded IPC read and a blob URL. Each candidate gets
- * both attempts before the next one is tried.
+ * App-owned copies may use the asset protocol and fall back to bounded IPC.
+ * Agent-authored originals use bounded IPC only, after an explicit click;
+ * merely rendering their path must never start an asset or filesystem read.
  */
 function useLocalImageSource(candidates: readonly ImageCandidate[]) {
   // Unambiguous for any paths, NUL included.
@@ -230,6 +232,29 @@ function useLocalImageSource(candidates: readonly ImageCandidate[]) {
       });
   }, [candidate, candidates, key, state]);
 
+  useEffect(() => {
+    if (!candidate || candidate.kept || state.blob || state.failed) return;
+    let cancelled = false;
+    void requestBlobUrl(candidate)
+      .then((url) => {
+        if (cancelled || currentKey.current !== key) return;
+        setStored((current) =>
+          current.key === key && current.index === state.index
+            ? { ...current, blob: url }
+            : current,
+        );
+      })
+      .catch(() => {
+        if (cancelled || currentKey.current !== key) return;
+        setStored((current) =>
+          current.key === key && current.index === state.index
+            ? { ...current, failed: true }
+            : current,
+        );
+      });
+    return () => { cancelled = true; };
+  }, [candidate, key, state.blob, state.failed, state.index]);
+
   // Every source failed, but the kept copy may only have been landing (its
   // background copy can hold the bytes after the original is gone): load it
   // when the backend records it, and read it once more right away in case
@@ -263,7 +288,7 @@ function useLocalImageSource(candidates: readonly ImageCandidate[]) {
     src:
       state.failed || !candidate
         ? null
-        : (state.blob ?? resolveAssetSrc(candidate.path, null)),
+        : (state.blob ?? (candidate.kept ? resolveAssetSrc(candidate.path, null) : null)),
     failed: state.failed,
     onError,
   };
@@ -293,8 +318,13 @@ export function MarkdownLocalImage({
       ? rawCaption.trim()
       : basename(path);
   const [open, setOpen] = useState(false);
-  const candidates = useImageCandidates(path);
+  const pathDescriptionId = useId();
+  const [approval, setApproval] = useState({ path, allowed: false });
+  if (approval.path !== path) setApproval({ path, allowed: false });
+  const loadOriginal = approval.path === path && approval.allowed;
+  const candidates = useImageCandidates(path, loadOriginal);
   const thumbnail = useLocalImageSource(candidates);
+  const offerLoad = !loadOriginal && (thumbnail.failed || !thumbnail.src);
 
   if (!path) return null;
 
@@ -302,18 +332,25 @@ export function MarkdownLocalImage({
     <span
       className="not-prose my-3 block max-w-2xl overflow-hidden rounded-lg border border-hairline-strong bg-card shadow-sm"
       data-chat-local-image
+      data-chat-local-image-path={path}
     >
       <button
         type="button"
         className="group block w-full cursor-zoom-in text-left focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-focus-ring"
-        aria-label={`Open ${caption}`}
-        onClick={() => setOpen(true)}
+        aria-label={`${offerLoad ? "Load" : "Open"} ${caption}`}
+        aria-describedby={offerLoad ? pathDescriptionId : undefined}
+        onClick={() => {
+          if (offerLoad) setApproval({ path, allowed: true });
+          else setOpen(true);
+        }}
       >
         <span className="flex min-h-28 max-h-72 w-full items-center justify-center overflow-hidden bg-surface-1">
-          {thumbnail.failed || !thumbnail.src ? (
+          {offerLoad || thumbnail.failed || !thumbnail.src ? (
             <span className="flex flex-col items-center gap-2 py-10 text-muted-foreground">
               <ImageOff className="size-6 opacity-50" aria-hidden />
-              <span className="text-label">Image unavailable</span>
+              <span className="text-label">
+                {offerLoad ? "Load local image" : thumbnail.failed ? "Image unavailable" : "Loading image…"}
+              </span>
             </span>
           ) : (
             <img
@@ -327,15 +364,28 @@ export function MarkdownLocalImage({
         </span>
         <span className="flex min-w-0 items-center gap-2 border-t border-hairline px-3 py-2 text-label">
           <ImageIcon className="size-3.5 shrink-0 text-muted-foreground" aria-hidden />
-          <span className="min-w-0 flex-1 truncate font-medium text-foreground">
-            {children ?? caption}
+          <span className="min-w-0 flex-1">
+            <span className="block truncate font-medium text-foreground">
+              {children ?? caption}
+            </span>
           </span>
           <span className="flex shrink-0 items-center gap-1 text-label text-muted-foreground">
             <Maximize2 className="size-3" aria-hidden />
-            Expand
+            {offerLoad ? "Load image" : "Expand"}
           </span>
         </span>
       </button>
+      {offerLoad && (
+        <span
+          id={pathDescriptionId}
+          role="region"
+          aria-label="Original image path"
+          tabIndex={0}
+          className="thin-scrollbar block max-h-24 overflow-y-auto break-all border-t border-hairline px-3 py-2 font-mono text-label text-muted-foreground"
+        >
+          {path}
+        </span>
+      )}
 
       <ImageLightbox
         open={open}

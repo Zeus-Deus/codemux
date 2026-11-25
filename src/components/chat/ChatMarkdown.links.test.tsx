@@ -7,6 +7,7 @@ import {
   screen,
   waitFor,
 } from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
 
 const mocks = vi.hoisted(() => ({
   openUrl: vi.fn().mockResolvedValue(undefined),
@@ -75,7 +76,49 @@ describe("ChatMarkdown selection compatibility", () => {
 });
 
 describe("ChatMarkdown rich external links", () => {
-  it("adds the destination favicon to any labelled http(s) link", () => {
+  it("returns focus to a remote image link after Escape or Cancel", async () => {
+    const { container } = render(
+      <ChatMarkdown>{"![Proof](https://images.example.test/proof.png)"}</ChatMarkdown>,
+    );
+    const link = container.querySelector('a[data-streamdown="link"]') as HTMLAnchorElement;
+    expect(link).toHaveTextContent("Proof");
+    expect(container.querySelector("img")).toBeNull();
+
+    link.focus();
+    await userEvent.keyboard("{Enter}");
+    await waitFor(() => expect(screen.getByRole("button", { name: "Cancel" })).toHaveFocus());
+    await userEvent.keyboard("{Escape}");
+    await waitFor(() => expect(link).toHaveFocus());
+
+    await userEvent.keyboard("{Enter}");
+    await userEvent.click(screen.getByRole("button", { name: "Cancel" }));
+    await waitFor(() => expect(link).toHaveFocus());
+    expect(mocks.openUrl).not.toHaveBeenCalled();
+  });
+
+  it("keeps confirmation actions outside the scrollable long link address", () => {
+    const url = `https://links.example.test/${"a".repeat(4096)}`;
+    const { container } = render(<ChatMarkdown>{`[Reference](${url})`}</ChatMarkdown>);
+
+    fireEvent.click(container.querySelector('[data-streamdown="link"]') as HTMLAnchorElement);
+
+    const dialog = screen.getByRole("alertdialog");
+    const details = screen.getByRole("region", { name: "Link confirmation details" });
+    const address = screen.getByRole("region", { name: "Full link URL" });
+    expect(dialog).toHaveClass("max-h-[calc(100dvh-2rem)]", "overflow-hidden");
+    expect(details).toHaveClass("min-h-0", "overflow-y-auto");
+    expect(details).toHaveAttribute("tabindex", "0");
+    expect(screen.getByText("links.example.test")).toBeInTheDocument();
+    expect(address).toHaveTextContent(url);
+    expect(address).toHaveClass("max-h-48", "overflow-y-auto");
+    expect(address).toHaveAttribute("tabindex", "0");
+    expect(dialog.querySelector("[data-slot='alert-dialog-footer']")?.parentElement).toBe(dialog);
+    expect(screen.getByRole("button", { name: "Cancel" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Open link" })).toBeInTheDocument();
+    expect(mocks.openUrl).not.toHaveBeenCalled();
+  });
+
+  it("adds the destination favicon to a trusted labelled http(s) link", () => {
     const { container } = render(
       <ChatMarkdown>
         {"Committed and shipped: [PR #235](https://github.com/example/repo/pull/235)."}
@@ -126,6 +169,44 @@ describe("ChatMarkdown rich external links", () => {
         "https://platform.openai.com/docs",
       ),
     );
+  });
+
+  it.each([
+    "[![Badge](https://images.example/badge.png)](https://example.com/docs)",
+    "[![Screenshot](/tmp/screenshot.png)](https://example.com/docs)",
+  ])("keeps a linked image's outer destination as the only action (%s)", (markdown) => {
+    const { container } = render(<ChatMarkdown>{markdown}</ChatMarkdown>);
+    const links = container.querySelectorAll('a[data-streamdown="link"]');
+    expect(links).toHaveLength(1);
+    expect(links[0]).toHaveAttribute("href", "https://example.com/docs");
+    expect(links[0]).toHaveTextContent(/Badge|Screenshot/);
+    expect(links[0]?.querySelector("a, button, img")).toBeNull();
+    expect(container.querySelector("[data-chat-local-image]")).toBeNull();
+
+    fireEvent.click(links[0]!);
+    expect(screen.getByText("https://example.com/docs")).toBeInTheDocument();
+    expect(screen.queryByText("https://images.example/badge.png")).toBeNull();
+  });
+
+  it.each([
+    "[![Badge](https://images.example/badge.png)](/tmp/outer.png)",
+    "[![Screenshot](/tmp/inner.png)](/tmp/outer.png)",
+  ])("keeps a local-image link as one preview action (%s)", (markdown) => {
+    const { container } = render(<ChatMarkdown>{markdown}</ChatMarkdown>);
+    const previews = container.querySelectorAll("[data-chat-local-image]");
+    expect(previews).toHaveLength(1);
+    expect(previews[0]).toHaveTextContent(/Badge|Screenshot/);
+    expect(previews[0]?.querySelectorAll("button")).toHaveLength(1);
+    expect(previews[0]?.querySelector("button a, button button")).toBeNull();
+    expect(container.querySelector('img[src*="images.example"]')).toBeNull();
+  });
+
+  it("leaves a network-share image inert without starting a local preview", () => {
+    const { container } = render(
+      <ChatMarkdown>{"![Share](//server/share/proof.png)"}</ChatMarkdown>,
+    );
+    expect(container.querySelector("[data-chat-local-image], img")).toBeNull();
+    expect(container).toHaveTextContent("Share");
   });
 
   it("never navigates an external link itself, not even on middle click", () => {
@@ -259,7 +340,7 @@ describe("ChatMarkdown rich external links", () => {
 
   it("falls back to a globe when a site's favicon fails", () => {
     const { container } = render(
-      <ChatMarkdown>{"[Reference](https://missing-favicon.invalid/page)"}</ChatMarkdown>,
+      <ChatMarkdown>{"[Reference](https://gitlab.com/page)"}</ChatMarkdown>,
     );
     const wrapper = container.querySelector(".chat-markdown-link-favicon");
     const image = wrapper?.querySelector("img");
@@ -274,7 +355,7 @@ describe("ChatMarkdown rich external links", () => {
   it("holds only the label's first character in the nowrap span for styled labels", () => {
     const { container } = render(
       <ChatMarkdown>
-        {"[**A very long bolded release title**](https://example.com/releases/1)"}
+        {"[**A very long bolded release title**](https://github.com/releases/1)"}
       </ChatMarkdown>,
     );
 
@@ -289,7 +370,7 @@ describe("ChatMarkdown rich external links", () => {
     expect(leading?.textContent).toBe("A");
     expect(leading?.querySelector("img")).toHaveAttribute(
       "src",
-      "https://www.google.com/s2/favicons?domain=example.com&sz=32",
+      "https://www.google.com/s2/favicons?domain=github.com&sz=32",
     );
     expect(link).toHaveTextContent("A very long bolded release title");
   });
@@ -318,11 +399,13 @@ describe("ChatMarkdown rich external links", () => {
     expect(link?.querySelector(".chat-markdown-link-favicon")).not.toBeNull();
   });
 
-  it("requests no favicon for a non-public destination", () => {
-    const { container } = render(
-      <ChatMarkdown>{"[dashboard](http://192.168.1.10:8080/status)"}</ChatMarkdown>,
-    );
-
+  it.each([
+    "http://192.168.1.10:8080/status",
+    "https://git.corp.example.com/project",
+    "https://private.github.com/project",
+    "https://ordinary-public-site.com/page",
+  ])("requests no favicon for an unlisted destination (%s)", (url) => {
+    const { container } = render(<ChatMarkdown>{`[dashboard](${url})`}</ChatMarkdown>);
     const wrapper = container.querySelector(".chat-markdown-link-favicon");
     expect(wrapper?.querySelector("img")).toBeNull();
     expect(wrapper?.querySelector("svg")).toBeInTheDocument();
@@ -402,7 +485,7 @@ describe("ChatMarkdown non-web link destinations", () => {
 });
 
 describe("ChatMarkdown local image links", () => {
-  it("upgrades a labelled absolute PNG link to a clickable preview", () => {
+  it("upgrades a labelled absolute PNG link to a click-to-load preview", () => {
     const { container, getByRole } = render(
       <ChatMarkdown>
         {"[Terminal screenshot](/home/me/screenshots/terminal.png)"}
@@ -412,7 +495,7 @@ describe("ChatMarkdown local image links", () => {
     expect(container.querySelector("[data-chat-local-image]")).toBeInTheDocument();
     expect(container.querySelector("a")).toBeNull();
     expect(
-      getByRole("button", { name: "Open Terminal screenshot" }),
+      getByRole("button", { name: "Load Terminal screenshot" }),
     ).toBeInTheDocument();
   });
 
@@ -423,12 +506,12 @@ describe("ChatMarkdown local image links", () => {
 
     expect(container.querySelector("[data-chat-local-image]")).toBeInTheDocument();
     expect(
-      getByRole("button", { name: "Open Agent Chat unchanged" }),
+      getByRole("button", { name: "Load Agent Chat unchanged" }),
     ).toBeInTheDocument();
   });
 
-  // Parity cases for the backend's copy planner (`reply_images.rs`): it must
-  // keep every image rendered here (it may keep a few that are not).
+  // The path labels still describe the original image, which requires a click
+  // before any read unless an existing app-owned copy is available.
   const renderedCaptions = (markdown: string) => {
     const { container } = render(
       <TooltipProvider>
@@ -445,13 +528,13 @@ describe("ChatMarkdown local image links", () => {
       renderedCaptions(
         "- ```markdown\n  [Example](/tmp/example.png)\n  ```\n\n[Actual proof](/tmp/actual.png)",
       ),
-    ).toEqual(["Open Actual proof"]);
+    ).toEqual(["Load Actual proof"]);
   });
 
   it("renders links and images whose destination is on its own line", () => {
     expect(
       renderedCaptions("[Proof](\n/tmp/proof.png\n) and ![Shot](\n/tmp/shot.png\n)"),
-    ).toEqual(["Open Proof", "Open Shot"]);
+    ).toEqual(["Load Proof", "Load Shot"]);
   });
 
   it("renders autolinks, table cells and headings, but not reference links or raw HTML", () => {
@@ -463,7 +546,7 @@ describe("ChatMarkdown local image links", () => {
           "See [the mockup][m].\n\n[m]: /tmp/mockup.png\n\n" +
           '<a href="/tmp/html.png">h</a>',
       ),
-    ).toEqual(["Open file:///tmp/auto.png", "Open cell", "Open h"]);
+    ).toEqual(["Load file:///tmp/auto.png", "Load cell", "Load h"]);
   });
 
   it("renders only the inline image when reference links point at other blocks", () => {
@@ -471,7 +554,7 @@ describe("ChatMarkdown local image links", () => {
     const definitions = Array.from({ length: 8 }, (_, i) => `[r${i}]: /tmp/r${i}.png`).join("\n");
     expect(
       renderedCaptions(`See ${uses}.\n\n[Proof](/tmp/proof.png)\n\n${definitions}`),
-    ).toEqual(["Open Proof"]);
+    ).toEqual(["Load Proof"]);
   });
 
   it("renders an image after a code block holding deep indentation and markers", () => {
@@ -479,7 +562,7 @@ describe("ChatMarkdown local image links", () => {
       renderedCaptions(
         "```text\n" + " ".repeat(100) + "deeply indented\n" + "> ".repeat(20) + "\n```\n\n[Proof](/tmp/proof.png)",
       ),
-    ).toEqual(["Open Proof"]);
+    ).toEqual(["Load Proof"]);
   });
 
   const renderedPaths = (markdown: string) => {
@@ -488,8 +571,8 @@ describe("ChatMarkdown local image links", () => {
         <ChatMarkdown>{markdown}</ChatMarkdown>
       </TooltipProvider>,
     );
-    return [...container.querySelectorAll("[data-chat-local-image] img")].map((image) =>
-      image.getAttribute("src"),
+    return [...container.querySelectorAll("[data-chat-local-image-path]")].map((card) =>
+      card.getAttribute("data-chat-local-image-path"),
     );
   };
 
@@ -498,7 +581,7 @@ describe("ChatMarkdown local image links", () => {
       renderedCaptions(
         "```text\n" + " ".repeat(256) + "x\n" + "> ".repeat(40) + "\n" + " ".repeat(128) + "- yaml\n```\n\n[Proof](/tmp/proof.png)",
       ),
-    ).toEqual(["Open Proof"]);
+    ).toEqual(["Load Proof"]);
   });
 
   it("renders an image after a quoted code block with a deeply indented line", () => {
@@ -506,7 +589,7 @@ describe("ChatMarkdown local image links", () => {
       renderedCaptions(
         "> ```text\n> " + " ".repeat(100) + "example\n> ```\n>\n> [Proof](/tmp/proof.png)",
       ),
-    ).toEqual(["Open Proof"]);
+    ).toEqual(["Load Proof"]);
   });
 
   it("renders only the used footnote image among many unused ones", () => {
@@ -516,25 +599,25 @@ describe("ChatMarkdown local image links", () => {
     ).join("");
     expect(
       renderedCaptions(`> See [^used].\n>\n${unused}> [^used]: [Proof](/tmp/proof.png)`),
-    ).toEqual(["Open Proof"]);
+    ).toEqual(["Load Proof"]);
   });
 
   it("reads a bare carriage return as a line ending", () => {
     expect(
       renderedCaptions(" ".repeat(64) + "- x\r\r[Proof](/tmp/proof.png)"),
-    ).toEqual(["Open Proof"]);
+    ).toEqual(["Load Proof"]);
   });
 
   it("renders an image after deeply nested lists", () => {
     expect(
       renderedCaptions("- ".repeat(40) + "x\n\n\n[Proof](/tmp/proof.png)"),
-    ).toEqual(["Open Proof"]);
+    ).toEqual(["Load Proof"]);
   });
 
   it("renders a footnote image whose reference differs only in case folding", () => {
     expect(
       renderedCaptions("> See [^SS].\n>\n> [^ß]: [Proof](/tmp/proof.png)"),
-    ).toEqual(["Open Proof"]);
+    ).toEqual(["Load Proof"]);
   });
 
   it("names image paths as decodeURI does, keeping undecodable ones as written", () => {
@@ -567,6 +650,21 @@ describe("ChatMarkdown local image links", () => {
     expect(link).toHaveTextContent("implementation");
     expect(link).not.toHaveAttribute("href");
     expect(link).toHaveAttribute("title", "/home/me/src/app.tsx");
+  });
+
+  it("keeps an image label inert when its source-file destination cannot resolve", () => {
+    const { container } = render(
+      <ChatMarkdown>{"[![Badge](https://images.example.test/badge.png)](src/missing.ts)"}</ChatMarkdown>,
+    );
+
+    const links = container.querySelectorAll('a[data-streamdown="link"]');
+    expect(links).toHaveLength(1);
+    expect(links[0]).toHaveTextContent("Badge");
+    expect(links[0]).not.toHaveAttribute("href");
+    expect(links[0]).toHaveAttribute("data-inert-link");
+    expect(links[0]?.querySelector("a, button, img")).toBeNull();
+    fireEvent.click(links[0]!);
+    expect(screen.queryByRole("alertdialog")).toBeNull();
   });
 });
 

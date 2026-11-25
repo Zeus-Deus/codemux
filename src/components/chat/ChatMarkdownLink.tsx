@@ -1,4 +1,4 @@
-import { useState, type ComponentProps } from "react";
+import { useRef, useState, type ComponentProps } from "react";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import { ExternalLink } from "lucide-react";
 
@@ -59,6 +59,7 @@ export function ChatMarkdownLink({
   ...props
 }: ChatMarkdownLinkProps) {
   const [confirmationOpen, setConfirmationOpen] = useState(false);
+  const linkRef = useRef<HTMLAnchorElement>(null);
   const threadId = chatLinkId(href);
   if (threadId) return <ChatLink {...props} threadId={threadId} className={className} onClick={onClick} onAuxClick={onAuxClick}>{children}</ChatLink>;
   const incomplete = href === INCOMPLETE_LINK;
@@ -87,6 +88,7 @@ export function ChatMarkdownLink({
   const link = (
     <a
       {...props}
+      ref={linkRef}
       href={externalHref ?? undefined}
       rel={externalHref ? "noopener noreferrer" : rel}
       title={title ?? inertHref}
@@ -124,6 +126,8 @@ export function ChatMarkdownLink({
 
   if (!externalHref) return link;
 
+  const host = new URL(externalHref).host;
+
   const openConfirmedLink = () => {
     void openUrl(externalHref).catch((error) => {
       toast.error("Could not open the link", {
@@ -135,20 +139,35 @@ export function ChatMarkdownLink({
   return (
     <AlertDialog open={confirmationOpen} onOpenChange={setConfirmationOpen}>
       {link}
-      <AlertDialogContent>
-        <AlertDialogHeader>
-          <AlertDialogMedia>
-            <ExternalLink aria-hidden="true" />
-          </AlertDialogMedia>
-          <AlertDialogTitle>Open external link?</AlertDialogTitle>
-          <AlertDialogDescription>
-            This address will open in your system browser.
-          </AlertDialogDescription>
-        </AlertDialogHeader>
-        <div className="select-text break-all rounded-lg bg-muted px-3 py-2 font-mono text-label text-muted-foreground">
-          {externalHref}
+      <AlertDialogContent
+        className="flex max-h-[calc(100dvh-2rem)] flex-col overflow-hidden"
+        onCloseAutoFocus={(event) => {
+          if (!linkRef.current?.isConnected) return;
+          event.preventDefault();
+          linkRef.current.focus({ preventScroll: true });
+        }}
+      >
+        <div role="region" aria-label="Link confirmation details" className="thin-scrollbar min-h-0 space-y-4 overflow-y-auto" tabIndex={0}>
+          <AlertDialogHeader>
+            <AlertDialogMedia>
+              <ExternalLink aria-hidden="true" />
+            </AlertDialogMedia>
+            <AlertDialogTitle>Open external link?</AlertDialogTitle>
+            <AlertDialogDescription>
+              This address will open in your system browser.
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <p className="break-all text-label text-muted-foreground">Host: <span className="font-medium text-foreground">{host}</span></p>
+          <div
+            role="region"
+            aria-label="Full link URL"
+            tabIndex={0}
+            className="thin-scrollbar max-h-48 overflow-y-auto select-text break-all rounded-lg bg-muted px-3 py-2 font-mono text-label text-muted-foreground"
+          >
+            {externalHref}
+          </div>
         </div>
-        <AlertDialogFooter>
+        <AlertDialogFooter className="shrink-0">
           <AlertDialogCancel>Cancel</AlertDialogCancel>
           <AlertDialogAction onClick={openConfirmedLink}>
             <ExternalLink data-icon="inline-start" aria-hidden="true" />

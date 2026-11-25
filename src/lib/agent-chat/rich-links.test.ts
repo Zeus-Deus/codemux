@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 
-import { externalWebLinkHost, isPublicWebHost } from "./rich-links";
+import { externalWebLinkHost, trustedFaviconHost } from "./rich-links";
 
 describe("externalWebLinkHost", () => {
   it("returns the hostname for absolute http(s) links", () => {
@@ -30,52 +30,32 @@ describe("externalWebLinkHost", () => {
   });
 });
 
-describe("isPublicWebHost", () => {
-  const cases: Array<[string, boolean]> = [
-    ["github.com", true],
-    ["docs.codemux.org", true],
-    ["sub.domain.example.co.uk", true],
-    ["EXAMPLE.COM", true],
-    ["example.com.", true],
-    ["8.8.8.8", true],
-    ["localhost", false],
-    ["intranet", false],
-    ["build.local", false],
-    ["app.localhost", false],
-    ["wiki.internal", false],
-    ["nas.lan", false],
-    ["printer.home", false],
-    ["jira.corp", false],
-    ["192.168.1.1", false],
-    ["10.0.0.5", false],
-    ["172.16.4.9", false],
-    ["172.32.4.9", true],
-    ["127.0.0.1", false],
-    ["169.254.10.1", false],
-    ["0.0.0.0", false],
-    ["[::1]", false],
-    ["::1", false],
-    ["[fc00::1]", false],
-    ["[fd12:3456::1]", false],
-    ["[fe80::1]", false],
-    ["[2606:4700::1111]", true],
-    // IPv4-mapped literals: the mapped address decides, not the `::` prefix.
-    ["[::ffff:c0a8:101]", false],
-    ["[::ffff:7f00:1]", false],
-    ["[::ffff:a00:1]", false],
-    ["[::ffff:192.168.1.1]", false],
-    ["[::ffff:808:808]", true],
-    ["", false],
-    ["   ", false],
-  ];
-
-  it.each(cases)("%s -> public: %s", (host, expected) => {
-    expect(isPublicWebHost(host)).toBe(expected);
+describe("trustedFaviconHost", () => {
+  it.each([
+    ["github.com", "github.com"],
+    ["GITHUB.COM", "github.com"],
+    ["github.com.", "github.com"],
+    ["docs.codemux.org", "docs.codemux.org"],
+    ["gitlab.com", "gitlab.com"],
+    ["developer.mozilla.org", "developer.mozilla.org"],
+    ["platform.openai.com", "platform.openai.com"],
+    ["git.corp.example.com", null],
+    ["private.github.com", null],
+    ["github.com.attacker.test", null],
+    ["github.com ", null],
+    ["example.com", null],
+    ["8.8.8.8", null],
+    ["[2001:4860:4860::8888]", null],
+    ["localhost", null],
+    ["service.home.arpa", null],
+    ["", null],
+  ])("%s -> %s", (host, expected) => {
+    expect(trustedFaviconHost(host)).toBe(expected);
   });
 
   it("rejects non-string hosts", () => {
-    expect(isPublicWebHost(undefined)).toBe(false);
-    expect(isPublicWebHost(null)).toBe(false);
-    expect(isPublicWebHost(123)).toBe(false);
+    expect(trustedFaviconHost(undefined)).toBeNull();
+    expect(trustedFaviconHost(null)).toBeNull();
+    expect(trustedFaviconHost(123)).toBeNull();
   });
 });

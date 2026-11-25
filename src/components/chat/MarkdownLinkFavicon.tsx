@@ -1,7 +1,7 @@
 import { memo, useState } from "react";
 import { Globe2 } from "lucide-react";
 
-import { isPublicWebHost } from "@/lib/agent-chat/rich-links";
+import { trustedFaviconHost } from "@/lib/agent-chat/rich-links";
 import { faviconUrlForDomain } from "@/lib/project-image";
 import { useChatMarkdownStreaming } from "./chat-markdown-streaming";
 
@@ -47,8 +47,9 @@ export function resetFaviconFailureCache() {
  *   arrives, so `docs.p`, `docs.pyt`, … would each fire a request for a
  *   hostname that never existed — flicker plus junk in the failure cache.
  *   Real icons load once the message settles.
- * - **Non-public hosts.** Intranet names and private IP literals are never
- *   sent to the third-party favicon service (see `isPublicWebHost`).
+ * - **Unlisted hosts.** The app cannot tell whether an arbitrary hostname
+ *   resolves only inside a private network, so it never sends one to the
+ *   third-party favicon service.
  * - **Recent failures.** A short TTL stops a dead host being retried on every
  *   render without permanently downgrading it after one offline moment.
  */
@@ -57,13 +58,13 @@ export const MarkdownLinkFavicon = memo(function MarkdownLinkFavicon({
   href,
 }: Record<string, unknown>) {
   const streaming = useChatMarkdownStreaming();
-  const hostname = typeof host === "string" ? host : "";
+  const hostname = trustedFaviconHost(host);
   const [failedHost, setFailedHost] = useState<string | null>(null);
-  const fallback =
-    streaming ||
-    !isPublicWebHost(hostname) ||
-    failedHost === hostname ||
-    hasRecentlyFailed(hostname);
+  const showFavicon =
+    hostname !== null &&
+    !streaming &&
+    failedHost !== hostname &&
+    !hasRecentlyFailed(hostname);
 
   return (
     <span
@@ -71,9 +72,7 @@ export const MarkdownLinkFavicon = memo(function MarkdownLinkFavicon({
       title={typeof href === "string" ? href : undefined}
       aria-hidden="true"
     >
-      {fallback ? (
-        <Globe2 className="block size-full" />
-      ) : (
+      {showFavicon && hostname !== null ? (
         <img
           src={faviconUrlForDomain(hostname, 32)}
           alt=""
@@ -85,6 +84,8 @@ export const MarkdownLinkFavicon = memo(function MarkdownLinkFavicon({
             setFailedHost(hostname);
           }}
         />
+      ) : (
+        <Globe2 className="block size-full" />
       )}
     </span>
   );

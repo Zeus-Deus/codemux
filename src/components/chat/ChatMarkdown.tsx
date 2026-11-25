@@ -1,5 +1,7 @@
 import {
+  createContext,
   isValidElement,
+  useContext,
   useMemo,
   type ComponentProps,
   type ReactNode,
@@ -153,6 +155,26 @@ const controls = {
 // GFM is likewise upstream's; math/KaTeX stays out.
 const remarkPlugins = [defaultRemarkPlugins.gfm, defaultRemarkPlugins.codeMeta];
 
+// An image used as a link label must not create a second interactive target
+// inside the outer link. The parent link owns the click destination.
+const InsideMarkdownLink = createContext(false);
+
+function MarkdownAnchor(props: ComponentProps<typeof ChatMarkdownLink>) {
+  return (
+    <InsideMarkdownLink.Provider value={true}>
+      <ChatMarkdownLink {...props} />
+    </InsideMarkdownLink.Provider>
+  );
+}
+
+function LocalImageElement(props: Record<string, unknown> & { children?: ReactNode }) {
+  const insideLink = useContext(InsideMarkdownLink);
+  if (insideLink) {
+    return String(props.caption || props.path || "Image");
+  }
+  return <MarkdownLocalImage {...props} />;
+}
+
 // The fenced/inline code shells plus the custom element `rehypeRichExternalLinks`
 // emits for decorated links. Code blocks never grow favicons (a fence's contents
 // are never parsed as links), so the two override sets are disjoint — they just
@@ -172,7 +194,11 @@ function FileLinkElement({ sourceHref, ...props }: Record<string, unknown>) {
   // anchor back to `ChatMarkdownLink`, which renders every non-web
   // destination inert while still surfacing it on hover. A chip that cannot
   // resolve must not look clickable, but the reader still deserves the path.
-  if (!meta) return <ChatMarkdownLink {...props} href={href} />;
+  if (!meta) return (
+    <InsideMarkdownLink.Provider value={true}>
+      <ChatMarkdownLink {...props} href={href} />
+    </InsideMarkdownLink.Provider>
+  );
   return <MarkdownFileLink meta={meta}>{label}</MarkdownFileLink>;
 }
 
@@ -212,16 +238,21 @@ function plainText(node: ReactNode): string {
 const markdownComponents: Components = {
   ...CHAT_MARKDOWN_COMPONENTS,
   inlineCode: InlineSourceReference,
-  a: ChatMarkdownLink,
+  a: MarkdownAnchor,
+  // Local filesystem images have already become `chat-local-image` nodes.
+  // Leave every other image as a confirmed link so message text cannot
+  // trigger a request to an arbitrary remote host just by being displayed.
+  img: ImageReference,
   [CHAT_LINK_FAVICON_TAG]: MarkdownLinkFavicon,
-  [CHAT_LOCAL_IMAGE_TAG]: MarkdownLocalImage,
+  [CHAT_LOCAL_IMAGE_TAG]: LocalImageElement,
   [CHAT_FILE_LINK_TAG]: FileLinkElement,
 };
 
-function PassiveImage(props: ComponentProps<"img"> | (Record<string, unknown> & ExtraProps)) {
+function ImageReference(props: ComponentProps<"img"> | (Record<string, unknown> & ExtraProps)) {
   const { src, alt } = props;
   const href = typeof src === "string" ? src : undefined;
   const label = typeof alt === "string" && alt ? alt : href || "Image reference";
+  if (useContext(InsideMarkdownLink)) return label;
   return <ChatMarkdownLink href={href}>{label}</ChatMarkdownLink>;
 }
 
@@ -229,8 +260,8 @@ function PassiveImage(props: ComponentProps<"img"> | (Record<string, unknown> & 
 // local-image/file upgrades so snapshot prose never consults current resources.
 const passiveMarkdownComponents: Components = {
   ...CHAT_MARKDOWN_COMPONENTS,
-  a: ChatMarkdownLink,
-  img: PassiveImage,
+  a: MarkdownAnchor,
+  img: ImageReference,
 };
 const passiveRehypePlugins = [rehypeSelectionSafeText];
 

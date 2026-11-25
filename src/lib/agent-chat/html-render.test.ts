@@ -102,6 +102,12 @@ describe("buildHtmlRenderDocument", () => {
     expect(html.indexOf('<style id="codemux-theme">')).toBeLessThan(html.indexOf("<title>"));
   });
 
+  it("sets the document referrer policy before authored resources", () => {
+    const html = buildHtmlRenderDocument('<img src="https://example.com/pixel.png">', theme);
+    expect(html.indexOf('<meta name="referrer" content="no-referrer">'))
+      .toBeLessThan(html.indexOf('<img src="https://example.com/pixel.png">'));
+  });
+
   it("does not inject into a <head> inside a script or comment", () => {
     const page = '<!-- <head> --><script>const s = "<head>";</script><p>x</p>';
     const html = buildHtmlRenderDocument(page, theme);
@@ -124,12 +130,12 @@ describe("buildHtmlRenderDocument", () => {
     const html = buildHtmlRenderDocument(page, theme);
     const at = page.indexOf("<head>") + "<head>".length;
     expect(html.slice(0, at)).toBe(page.slice(0, at));
-    expect(html.slice(at).startsWith('<meta charset="utf-8"><style id="codemux-theme">')).toBe(true);
+    expect(html.slice(at).startsWith('<meta charset="utf-8"><meta name="referrer" content="no-referrer"><style id="codemux-theme">')).toBe(true);
   });
 
   it("adds a head right after a headless html tag", () => {
     const html = buildHtmlRenderDocument("<!doctype html><html><body><p>x</p></body></html>", theme);
-    expect(html.startsWith('<!doctype html><html><head><meta charset="utf-8"><style id="codemux-theme">')).toBe(true);
+    expect(html.startsWith('<!doctype html><html><head><meta charset="utf-8"><meta name="referrer" content="no-referrer"><style id="codemux-theme">')).toBe(true);
   });
 
   it("strips characters that could break out of the theme rule", () => {

@@ -78,9 +78,8 @@ pub struct AgentChatEventPayload {
     /// bubble this event materializes.
     #[serde(default)]
     pub persisted_id: Option<i64>,
-    /// Conversation-owned copies of the local images a top-level reply
-    /// links to; the stored row carries the same list on its `item`. A copy
-    /// may still be landing, so readers fall back to the original path.
+    /// Copies recorded for replies created by older versions. New replies
+    /// load local images only after an explicit action in the chat UI.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub retained_images: Vec<super::reply_images::RetainedReplyImage>,
 }
@@ -4842,11 +4841,27 @@ pub(crate) async fn write_thread_chat_image(
     Ok((path, media_type))
 }
 
+/// Reject path spellings that can select a network share or device namespace
+/// before any filesystem operation is allowed to resolve them.
+pub(super) fn is_network_or_device_image_path(path: &str) -> bool {
+    let bytes = path.as_bytes();
+    // Windows treats mixed leading separators as UNC or device namespaces.
+    // POSIX gives `//` implementation-defined meaning too. Check this before
+    // canonicalize or metadata can contact a remote share.
+    let separator = |byte: u8| matches!(byte, b'/' | b'\\');
+    (bytes.len() >= 2 && separator(bytes[0]) && separator(bytes[1]))
+        || path.starts_with("\\??\\")
+        || path.starts_with("/??/")
+}
+
 /// Read an absolute local image path with the same bounds as
 /// [`agent_chat_read_local_image`]: an existing regular file with an image
 /// extension, at most the attachment cap even if it grows mid-read, and
 /// image content by magic bytes.
 pub(super) async fn read_bounded_local_image(path: &str) -> Result<ChatImageBytes, String> {
+    if is_network_or_device_image_path(path) {
+        return Err("validation_error: network or device image paths are not allowed".to_string());
+    }
     let candidate = std::path::Path::new(path);
     if !candidate.is_absolute() {
         return Err("validation_error: local image path must be absolute".to_string());
@@ -8942,29 +8957,16 @@ pub fn forward_event<R: Runtime>(app: &AppHandle<R>, mut event: ProviderRuntimeE
     //   - session_state_changed / session_configured: lifecycle only
     //   - runtime_warning: transient diagnostics (except the Hermes restriction)
     //   - resume_cursor_updated: already persisted above
-    // Local images a top-level reply links to get conversation-owned copies;
-    // the live payload names them once the row that owns them exists.
-    let mut retained_images = Vec::new();
     if should_persist_event(&event) {
         if let Some(thread_id) = thread_id_for_event(&event) {
             if !thread_id.0.is_empty() {
-                let planned = plan_reply_images(app, &event);
-                if let Ok(payload) = persisted_event_payload(&event, &planned) {
+                if let Ok(payload) = serde_json::to_string(&event) {
                     let db: State<'_, DatabaseStore> = app.state();
-                    let appended = if planned.is_empty() {
-                        db.append_agent_chat_message(&thread_id.0, &payload)
-                    } else {
-                        db.append_agent_chat_reply_with_image_job(&thread_id.0, &payload)
-                    };
-                    match appended {
+                    match db.append_agent_chat_message(&thread_id.0, &payload) {
                         Ok(row_id) => {
                             persisted_id = row_id;
                             if row_id.is_some() && matches!(&event, ProviderRuntimeEvent::TurnCompleted { .. }) {
                                 crate::plugins::platform_transport::committed(app, &thread_id.0);
-                            }
-                            if let (Some(row_id), false) = (row_id, planned.is_empty()) {
-                                super::reply_images::spawn_copies(app, row_id);
-                                retained_images = planned;
                             }
                         }
                         Err(error) => {
@@ -9043,7 +9045,7 @@ pub fn forward_event<R: Runtime>(app: &AppHandle<R>, mut event: ProviderRuntimeE
         thread_id: thread_id.clone(),
         event,
         persisted_id,
-        retained_images,
+        retained_images: Vec::new(),
     };
     if thread_id.0.is_empty() {
         // Thread-less lifecycle/warning traffic is low-frequency; the
@@ -9054,46 +9056,6 @@ pub fn forward_event<R: Runtime>(app: &AppHandle<R>, mut event: ProviderRuntimeE
         return;
     }
     fan_out_to_thread_channels(app, &thread_id, &payload);
-}
-
-/// Copies to keep for a top-level reply's linked local images. A device
-/// thread's paths name files on that device, not here.
-fn plan_reply_images<R: Runtime>(
-    app: &AppHandle<R>,
-    event: &ProviderRuntimeEvent,
-) -> Vec<super::reply_images::RetainedReplyImage> {
-    let ProviderRuntimeEvent::ItemCompleted {
-        thread_id,
-        item: crate::agent_provider::CompletedItem::AssistantText { text },
-        subagent_id: None,
-        ..
-    } = event
-    else {
-        return Vec::new();
-    };
-    let planned = super::reply_images::plan(&thread_id.0, text);
-    if planned.is_empty() || thread_runs_on_device(app, &thread_id.0) {
-        return Vec::new();
-    }
-    planned
-}
-
-/// The stored row for `event`; a reply's planned copies ride on its item.
-fn persisted_event_payload(
-    event: &ProviderRuntimeEvent,
-    retained_images: &[super::reply_images::RetainedReplyImage],
-) -> serde_json::Result<String> {
-    if retained_images.is_empty() {
-        return serde_json::to_string(event);
-    }
-    let mut value = serde_json::to_value(event)?;
-    if let Some(item) = value.get_mut("item").and_then(serde_json::Value::as_object_mut) {
-        item.insert(
-            "retained_images".into(),
-            serde_json::to_value(retained_images)?,
-        );
-    }
-    serde_json::to_string(&value)
 }
 
 /// Deliver one already-persisted payload to every channel attached to
@@ -11509,7 +11471,7 @@ mod tests {
         let dir = root.path().join("source");
         std::fs::create_dir_all(&dir).unwrap();
         let cache = dir.join(format!("tool-1-{}.png", "d".repeat(64)));
-        // Reply copies are named `<uuid>.<ext>` (see `reply_images::plan`).
+        // Older reply copies were named `<uuid>.<ext>`.
         // One is recorded on its reply row; the other has landed on disk but
         // its job has not recorded it yet, so only the name keeps it safe.
         let recorded = dir.join(format!("{}.png", uuid::Uuid::new_v4()));

@@ -32,6 +32,8 @@ export interface ToolResultImage {
   src: string;
   /** MIME type when known, used for the `alt` text / lightbox label. */
   mediaType?: string;
+  /** Set only for an app-resolved local asset, never for a URL in tool output. */
+  trustedLocal?: boolean;
 }
 
 function isRecord(v: unknown): v is Record<string, unknown> {

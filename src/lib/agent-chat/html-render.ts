@@ -248,6 +248,9 @@ function blankNonMarkup(html: string): string {
 export function buildHtmlRenderDocument(html: string, theme: HtmlRenderTheme): string {
   const markup =
     (/<meta\s[^>]*charset/i.test(html.slice(0, 4096)) ? "" : '<meta charset="utf-8">') +
+    // The iframe attribute governs navigation into the frame; its srcDoc
+    // document needs its own policy before any authored resource can load.
+    '<meta name="referrer" content="no-referrer">' +
     `<style id="codemux-theme">${themeCss(theme)}</style><script>${BOOTSTRAP_SCRIPT}</script>`;
   // A document's own `<html>` and `<head>` tags open it: only a doctype, the
   // `<html>` tag, whitespace, and comments (already blanked) can precede

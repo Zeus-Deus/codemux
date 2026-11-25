@@ -1,6 +1,7 @@
 /// <reference types="@testing-library/jest-dom/vitest" />
 import { afterEach, describe, expect, it } from "vitest";
-import { cleanup, fireEvent, render, screen } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
 
 import { TooltipProvider } from "@/components/ui/tooltip";
 import type { ToolCallItem } from "@/lib/agent-chat/types";
@@ -486,6 +487,115 @@ describe("GenericToolBody edge cases", () => {
 });
 
 describe("Tool result images", () => {
+  it("returns keyboard focus to the remote image control after dismissal or approval", async () => {
+    render(<ToolCallBody item={makeTool({ result_content: [
+      { type: "image_url", image_url: { url: "https://private.example.test/proof.png" } },
+    ] })} />);
+
+    const trigger = screen.getByRole("button", { name: "Load remote image" });
+    trigger.focus();
+    await userEvent.keyboard("{Enter}");
+    await waitFor(() => expect(screen.getByRole("button", { name: "Cancel" })).toHaveFocus());
+    await userEvent.keyboard("{Escape}");
+    await waitFor(() => expect(trigger).toHaveFocus());
+
+    await userEvent.keyboard("{Enter}");
+    await userEvent.click(screen.getByRole("button", { name: "Cancel" }));
+    await waitFor(() => expect(trigger).toHaveFocus());
+
+    await userEvent.keyboard("{Enter}");
+    await userEvent.click(screen.getByRole("button", { name: "Load image" }));
+    await waitFor(() => expect(screen.getByRole("button", { name: "Open image" })).toHaveFocus());
+
+    fireEvent.error(screen.getByRole("img"));
+    const retry = screen.getByRole("button", { name: "Retry image" });
+    expect(retry).toHaveFocus();
+    await userEvent.keyboard("{Enter}");
+    expect(screen.getByRole("button", { name: "Open image" })).toHaveFocus();
+  });
+
+  it("keeps confirmation actions outside the scrollable long image address", () => {
+    const url = `https://private.example.test/${"a".repeat(4096)}`;
+    render(<ToolCallBody item={makeTool({ result_content: [
+      { type: "image_url", image_url: { url } },
+    ] })} />);
+
+    fireEvent.click(screen.getByRole("button", { name: "Load remote image" }));
+
+    const dialog = screen.getByRole("alertdialog");
+    const details = screen.getByRole("region", { name: "Image confirmation details" });
+    const address = screen.getByRole("region", { name: "Full image URL" });
+    expect(dialog).toHaveClass("max-h-[calc(100dvh-2rem)]", "overflow-hidden");
+    expect(details).toHaveClass("min-h-0", "overflow-y-auto");
+    expect(details).toHaveAttribute("tabindex", "0");
+    expect(screen.getByText("private.example.test")).toBeInTheDocument();
+    expect(address).toHaveTextContent(url);
+    expect(address).toHaveClass("max-h-48", "overflow-y-auto");
+    expect(address).toHaveAttribute("tabindex", "0");
+    expect(dialog.querySelector("[data-slot='alert-dialog-footer']")?.parentElement).toBe(dialog);
+    expect(screen.getByRole("button", { name: "Cancel" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Load image" })).toBeInTheDocument();
+    expect(screen.queryByRole("img")).not.toBeInTheDocument();
+  });
+
+  it("requires confirmation before loading an untrusted URL image", () => {
+    const url = "https://private.example.test/screenshot.png";
+    render(<ToolCallBody item={makeTool({ result_content: [
+      { type: "image_url", image_url: { url } },
+    ] })} />);
+
+    expect(screen.queryByRole("img")).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Load remote image" }));
+    expect(screen.getByRole("alertdialog")).toHaveTextContent(url);
+    expect(screen.queryByRole("img")).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
+    expect(screen.queryByRole("img")).not.toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: "Load remote image" }));
+    fireEvent.click(screen.getByRole("button", { name: "Load image" }));
+    expect(screen.getByRole("img")).toHaveAttribute("src", url);
+    expect(screen.getByRole("img")).toHaveAttribute("referrerpolicy", "no-referrer");
+  });
+
+  it("requires a new confirmation if an approved URL image changes", () => {
+    const prefix = "https://private.example.test/very-long-screenshot-name-";
+    const item = (url: string) => makeTool({ result_content: [
+      { type: "image_url", image_url: { url } },
+    ] });
+    const view = render(<ToolCallBody item={item(`${prefix}one.png`)} />);
+    fireEvent.click(screen.getByRole("button", { name: "Load remote image" }));
+    fireEvent.click(screen.getByRole("button", { name: "Load image" }));
+    expect(screen.getByRole("img")).toHaveAttribute("src", `${prefix}one.png`);
+    fireEvent.error(screen.getByRole("img"));
+    expect(screen.getByRole("button", { name: "Retry image" })).toBeInTheDocument();
+
+    view.rerender(<ToolCallBody item={item(`${prefix}two.png`)} />);
+    expect(screen.queryByRole("img")).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Load remote image" }));
+    fireEvent.click(screen.getByRole("button", { name: "Load image" }));
+    expect(screen.getByRole("img")).toHaveAttribute("src", `${prefix}two.png`);
+    expect(screen.queryByRole("button", { name: "Retry image" })).not.toBeInTheDocument();
+  });
+
+  it("closes the lightbox when its image URL changes", async () => {
+    const prefix = "https://private.example.test/very-long-screenshot-name-";
+    const item = (url: string) => makeTool({ result_content: [
+      { type: "image_url", image_url: { url } },
+    ] });
+    const view = render(<ToolCallBody item={item(`${prefix}one.png`)} />);
+    fireEvent.click(screen.getByRole("button", { name: "Load remote image" }));
+    fireEvent.click(screen.getByRole("button", { name: "Load image" }));
+    fireEvent.click(screen.getByRole("button", { name: "Open image" }));
+    expect(screen.getByRole("dialog", { name: "Tool result image" })).toBeInTheDocument();
+
+    view.rerender(<ToolCallBody item={item(`${prefix}two.png`)} />);
+    expect(screen.queryByRole("dialog", { name: "Tool result image" })).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Load remote image" }));
+    fireEvent.click(screen.getByRole("button", { name: "Load image" }));
+    await waitFor(() => expect(screen.getByRole("button", { name: "Open image" })).toHaveFocus());
+    expect(screen.queryByRole("dialog", { name: "Tool result image" })).not.toBeInTheDocument();
+  });
+
   it("renders a valid image block as a thumbnail without dumping its base64 payload", () => {
     render(
       <ToolCallBody

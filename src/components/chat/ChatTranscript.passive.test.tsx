@@ -1,4 +1,4 @@
-import { cleanup, fireEvent, render, waitFor } from "@testing-library/react";
+import { cleanup, fireEvent, render } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import type { ChatViewItem } from "@/lib/agent-chat/types";
@@ -59,10 +59,15 @@ describe("passive snapshot prose through the real cached rendering chain", () =>
     fireEvent.click(view.getByRole("link", { name: /xternal reference/ }));
     expect(view.getByRole("alertdialog")).toBeInTheDocument();
   });
-  it("retains automatic rich resources for ordinary live prose", async () => {
+  it("keeps live remote references inert until opened while preserving local images", () => {
     const view = render(tree(false));
-    await waitFor(() => expect(view.container.querySelector('.chat-markdown img[src*="google.com/s2/favicons"]')).not.toBeNull());
-    expect(view.container.querySelector('.chat-markdown img[src="https://private.example.test/secret.png"]')).not.toBeNull();
+    expect(view.container.querySelector('.chat-markdown img[src*="google.com/s2/favicons"]')).toBeNull();
+    expect(view.container.querySelector('.chat-markdown-link-favicon svg')).not.toBeNull();
+    expect(view.container.querySelector('.chat-markdown img[src="https://private.example.test/secret.png"]')).toBeNull();
+    const imageLink = view.getByRole("link", { name: "Remote image" });
+    expect(imageLink).toHaveAttribute("href", "https://private.example.test/secret.png");
+    fireEvent.click(imageLink);
+    expect(view.getByRole("alertdialog")).toBeInTheDocument();
     expect(view.container.querySelector('[data-chat-local-image]')).not.toBeNull();
   });
 });

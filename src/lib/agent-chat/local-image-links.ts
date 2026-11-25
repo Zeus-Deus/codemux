@@ -52,12 +52,19 @@ export function localImagePath(destination: unknown): string | null {
     path = decodePath(path);
   }
 
+  // A double separator denotes a Windows UNC/device path (and is
+  // implementation-defined on POSIX). Never turn a chat reference into a
+  // network-share read just because it looks like an absolute image path.
+  if (/^[\\/]{2}/.test(path) || /^[\\/]\?\?[\\/]/.test(path)) return null;
   const absolute = path.startsWith("/") || /^[a-zA-Z]:[\\/]/.test(path);
   return absolute && SUPPORTED_IMAGE_EXTENSION.test(path) ? path : null;
 }
 
 function textContent(node: HastNode): string {
   if (node.type === "text") return node.value ?? "";
+  if (node.tagName === "img" && typeof node.properties?.alt === "string") {
+    return node.properties.alt;
+  }
   return (node.children ?? []).map(textContent).join("");
 }
 
@@ -65,12 +72,16 @@ function upgradeNode(node: HastNode) {
   if (node.type === "element" && node.tagName === "a") {
     const path = localImagePath(node.properties?.href);
     if (path) {
+      const caption = textContent(node).trim();
       node.tagName = CHAT_LOCAL_IMAGE_TAG;
       node.properties = {
         path,
-        caption: textContent(node).trim(),
+        caption,
         sourceSyntax: "link",
       };
+      // The preview is itself a button. Its former link label must be text,
+      // not a nested image reference that creates a second action.
+      node.children = [];
     }
   } else if (node.type === "element" && node.tagName === "img") {
     const path = localImagePath(node.properties?.src);

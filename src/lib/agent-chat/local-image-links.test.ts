@@ -23,13 +23,19 @@ describe("localImagePath", () => {
     "/tmp/notes.txt",
     "file://other-host/tmp/proof.png",
     "javascript:/tmp/proof.png",
+    "//server/share/proof.png",
+    "\\\\server\\share\\proof.png",
+    "\\\\?\\C:\\proof.png",
+    "file:////server/share/proof.png",
+    "/%5Cserver/share/proof.png",
+    "/??/UNC/server/share/proof.png",
   ])("rejects a non-local or unsupported destination: %s", (input) => {
     expect(localImagePath(input)).toBeNull();
   });
 });
 
 describe("rehypeLocalImageLinks", () => {
-  it("upgrades a normal Markdown link while preserving its label children", () => {
+  it("upgrades a normal Markdown link with a text-only caption", () => {
     const tree = {
       type: "root",
       children: [
@@ -56,7 +62,32 @@ describe("rehypeLocalImageLinks", () => {
         sourceSyntax: "link",
       },
     });
-    expect(tree.children[0].children[0].tagName).toBe("strong");
+    expect(tree.children[0].children).toEqual([]);
+  });
+
+  it("turns a linked image label into alt text before creating a preview", () => {
+    const tree = {
+      type: "root",
+      children: [{
+        type: "element",
+        tagName: "a",
+        properties: { href: "/tmp/outer.png" },
+        children: [{
+          type: "element",
+          tagName: "img",
+          properties: { src: "https://images.example/badge.png", alt: "Badge" },
+          children: [],
+        }],
+      }],
+    };
+
+    rehypeLocalImageLinks()(tree);
+
+    expect(tree.children[0]).toMatchObject({
+      tagName: CHAT_LOCAL_IMAGE_TAG,
+      properties: { path: "/tmp/outer.png", caption: "Badge" },
+      children: [],
+    });
   });
 
   it("upgrades absolute Markdown image syntax", () => {
