@@ -87,6 +87,9 @@ async fn real_opencode_models_approvals_tools_interrupt_and_resume() {
     let mut config = OpenCodeClientConfig::new(handle.base_url.clone());
     config.api = handle.api;
     config.server_password = Some(handle.server_password.clone());
+    // A cold real CLI can spend more than the UI's five-second budget
+    // loading its catalog on a busy runner. Keep acceptance bounded.
+    config.request_timeout = Duration::from_secs(20);
     let client = OpenCodeClient::new(config).unwrap();
     let providers = client.list_models().await.unwrap();
     let models = &providers
