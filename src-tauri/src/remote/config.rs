@@ -43,6 +43,14 @@ pub fn ensure_private_dir(dir: &std::path::Path) -> std::io::Result<()> {
 /// Verify an existing state directory without creating one. Commands that
 /// inspect an existing daemon use this before trusting a manifest from disk.
 pub fn private_dir_exists(dir: &std::path::Path) -> std::io::Result<bool> {
+    open_existing_private_dir(dir).map(|opened| opened.is_some())
+}
+
+/// Open a verified state directory only when it already exists. Manifest
+/// readers keep this handle while opening the file inside it.
+pub(crate) fn open_existing_private_dir(
+    dir: &std::path::Path,
+) -> std::io::Result<Option<cap_std::fs::Dir>> {
     use std::io::{Error, ErrorKind};
 
     if dir.as_os_str().is_empty() {
@@ -53,8 +61,8 @@ pub fn private_dir_exists(dir: &std::path::Path) -> std::io::Result<bool> {
     }
 
     match std::fs::symlink_metadata(dir) {
-        Ok(_) => verify_private_dir_with_default(dir, &default_state_dir()).map(|_| true),
-        Err(e) if e.kind() == ErrorKind::NotFound => Ok(false),
+        Ok(_) => verify_private_dir_with_default(dir, &default_state_dir()).map(Some),
+        Err(e) if e.kind() == ErrorKind::NotFound => Ok(None),
         Err(e) => Err(e),
     }
 }

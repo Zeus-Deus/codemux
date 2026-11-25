@@ -884,6 +884,26 @@ fn unsafe_state_manifest_cannot_block_start_or_signal_a_process() {
         .output()
         .unwrap();
     let target_alive = target.try_wait().unwrap().is_none();
+    let unsafe_mode = std::fs::metadata(&state).unwrap().permissions().mode() & 0o777;
+
+    // A private directory can still contain a final symlink left by a
+    // legacy writer. It must not supply the PID for `serve stop` either.
+    std::fs::set_permissions(&state, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let outside = temp.path().join("outside-manifest.json");
+    std::fs::write(
+        &outside,
+        serde_json::to_vec(&manifest(target.id())).unwrap(),
+    )
+    .unwrap();
+    std::fs::set_permissions(&outside, std::fs::Permissions::from_mode(0o600)).unwrap();
+    std::fs::remove_file(&manifest_path).unwrap();
+    std::os::unix::fs::symlink(&outside, &manifest_path).unwrap();
+    let symlink_stop = Command::new(&bin)
+        .args(["serve", "stop", "--state-dir"])
+        .arg(&state)
+        .output()
+        .unwrap();
+    let target_alive_after_symlink = target.try_wait().unwrap().is_none();
     let _ = target.kill();
     let _ = target.wait();
     let stderr = String::from_utf8_lossy(&stop.stderr);
@@ -896,9 +916,15 @@ fn unsafe_state_manifest_cannot_block_start_or_signal_a_process() {
         target_alive,
         "serve stop signaled the PID in an untrusted manifest"
     );
-    assert_eq!(
-        std::fs::metadata(&state).unwrap().permissions().mode() & 0o777,
-        0o777
+    assert_eq!(unsafe_mode, 0o777);
+    assert!(
+        !symlink_stop.status.success(),
+        "serve stop trusted a symlinked manifest: {}",
+        String::from_utf8_lossy(&symlink_stop.stderr)
+    );
+    assert!(
+        target_alive_after_symlink,
+        "serve stop signaled a symlinked PID"
     );
 }
 
