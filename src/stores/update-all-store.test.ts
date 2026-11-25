@@ -7,6 +7,7 @@ import type { ProviderUpdateReport } from "@/stores/provider-update-store";
 import {
   LOCAL,
   buildPlan,
+  helperNeedsRestart,
   hostKey,
   isOlderVersion,
   itemKey,
@@ -64,6 +65,50 @@ describe("buildPlan", () => {
       { machine: LOCAL, label: "Cursor", reason: "Run `omarchy update`" },
       { machine: hostKey(3), label: "nas", reason: "couldn't connect" },
     ]);
+  });
+});
+
+describe("refreshDevice", () => {
+  it("ignores a pre-install check that finishes after a helper update", async () => {
+    useUpdateAll.setState({
+      machines: {
+        [hostKey(2)]: { loading: false, providers: [], helperVersion: "0.23.0", runningVersion: null, appVersion: "0.24.0" },
+      },
+    });
+    let finishUpdate!: () => void;
+    let finishOldCheck!: () => void;
+    const updateGate = new Promise<void>((resolve) => { finishUpdate = resolve; });
+    const oldCheckGate = new Promise<void>((resolve) => { finishOldCheck = resolve; });
+    let checks = 0;
+    invoke.mockImplementation(async (cmd: string) => {
+      if (cmd === "device_helper_update") {
+        await updateGate;
+        return { host_id: 2, status: "upgraded", from: "0.23.0", to: "0.24.0", message: null };
+      }
+      if (cmd === "provider_updates_device") {
+        checks++;
+        if (checks === 1) {
+          await oldCheckGate;
+          return { host_id: 2, helper_version: "0.23.0", running_version: null, serve_alive: null, app_version: "0.24.0", providers: [], error: null };
+        }
+        return { host_id: 2, helper_version: "0.24.0", running_version: "0.23.0", serve_alive: true, app_version: "0.24.0", providers: [report("codex")], error: null };
+      }
+      throw new Error(`unexpected ${cmd}`);
+    });
+
+    const update = useUpdateAll.getState().updateOne(hostKey(2), "helper");
+    const oldCheck = useUpdateAll.getState().refreshDevice(2, true);
+    finishUpdate();
+    expect(await update).toBe(true);
+    finishOldCheck();
+    await oldCheck;
+
+    const state = useUpdateAll.getState().machines[hostKey(2)];
+    expect(checks).toBe(2);
+    expect(state?.helperVersion).toBe("0.24.0");
+    expect(state?.providers.map((provider) => provider.provider)).toEqual(["codex"]);
+    expect(state?.loading).toBe(false);
+    expect(helperNeedsRestart(state)).toBe(true);
   });
 });
 

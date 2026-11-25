@@ -153,6 +153,7 @@ interface Store {
 }
 
 export const useUpdateAll = create<Store>((set, get) => {
+  const deviceRefreshGeneration = new Map<MachineKey, number>();
   const patchMachine = (key: MachineKey, value: Partial<MachineState>) =>
     set((s) => ({
       machines: { ...s.machines, [key]: { providers: [], loading: false, ...s.machines[key], ...value } },
@@ -201,23 +202,30 @@ export const useUpdateAll = create<Store>((set, get) => {
 
     async refreshDevice(hostId, force = false) {
       const key = hostKey(hostId);
-      if (get().machines[key]?.loading) return;
+      if (get().machines[key]?.loading && !force) return;
+      // An explicit check or post-install refresh supersedes an older read.
+      // Its response must not restore the pre-install helper version.
+      const generation = (deviceRefreshGeneration.get(key) ?? 0) + 1;
+      deviceRefreshGeneration.set(key, generation);
+      const isLatest = () => deviceRefreshGeneration.get(key) === generation;
       patchMachine(key, { loading: true });
       try {
         const report = await invoke<DeviceProvidersReport>("provider_updates_device", { hostId, force });
-        patchMachine(key, {
-          providers: report.providers ?? [],
-          helperVersion: report.helper_version,
-          runningVersion: report.running_version,
-          serveAlive: report.serve_alive,
-          appVersion: report.app_version,
-          error: report.error,
-          checkedAt: Date.now(),
-        });
+        if (isLatest()) {
+          patchMachine(key, {
+            providers: report.providers ?? [],
+            helperVersion: report.helper_version,
+            runningVersion: report.running_version,
+            serveAlive: report.serve_alive,
+            appVersion: report.app_version,
+            error: report.error,
+            checkedAt: Date.now(),
+          });
+        }
       } catch (error) {
-        patchMachine(key, { error: String(error), helperVersion: null, runningVersion: null, serveAlive: null });
+        if (isLatest()) patchMachine(key, { error: String(error), helperVersion: null, runningVersion: null, serveAlive: null });
       } finally {
-        patchMachine(key, { loading: false });
+        if (isLatest()) patchMachine(key, { loading: false });
       }
     },
 

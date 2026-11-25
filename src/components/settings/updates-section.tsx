@@ -404,10 +404,10 @@ function HelperRow({ machine, state }: { machine: MachineKey; state: MachineStat
           ? { text: `v${state.helperVersion} → v${state.appVersion}`, tone: "available" as const }
           : restartRequired
             ? { text: `v${state.helperVersion} installed · v${state.runningVersion} running · Restart required`, tone: "error" as const }
-            : item?.phase === "updated"
-              ? { text: `v${state.helperVersion}${item.message ? ` · ${item.message}` : ""}`, tone: "done" as const }
-              : state.serveAlive === false
-                ? { text: `v${state.helperVersion} installed · service stopped`, tone: "muted" as const }
+            : state.serveAlive === false
+              ? { text: `v${state.helperVersion} installed · service stopped`, tone: "muted" as const }
+              : item?.phase === "updated" && !state.runningVersion
+                ? { text: `v${state.helperVersion}${item.message ? ` · ${item.message}` : ""}`, tone: "done" as const }
                 : !state.runningVersion
                   ? { text: `v${state.helperVersion} installed · running version unavailable`, tone: "muted" as const }
                   : { text: `v${state.helperVersion} · up to date`, tone: "muted" as const };

@@ -34,12 +34,14 @@ const report = (provider: string, patch: Record<string, unknown> = {}) => ({
 let installedVersion = "0.23.0";
 let runningVersion = "0.23.0";
 let statusAvailable = true;
+let serviceAlive = true;
 
 beforeEach(() => {
   invoke.mockReset();
   installedVersion = "0.23.0";
   runningVersion = "0.23.0";
   statusAvailable = true;
+  serviceAlive = true;
   useUpdateAll.setState({ machines: {}, items: {}, running: false, summary: null });
   invoke.mockImplementation(async (cmd: string) => {
     switch (cmd) {
@@ -49,7 +51,7 @@ beforeEach(() => {
           report("cursor", { can_update: false, manager: "Omarchy system package", message: "Run `omarchy update`" }),
         ];
       case "provider_updates_device":
-        return { host_id: 2, helper_version: installedVersion, running_version: statusAvailable ? runningVersion : null, serve_alive: statusAvailable ? true : null, app_version: "0.24.0", providers: [report("codex")], error: null };
+        return { host_id: 2, helper_version: installedVersion, running_version: statusAvailable && serviceAlive ? runningVersion : null, serve_alive: statusAvailable ? serviceAlive : null, app_version: "0.24.0", providers: [report("codex")], error: null };
       case "device_helper_update":
         installedVersion = "0.24.0";
         statusAvailable = true;
@@ -115,5 +117,17 @@ describe("UpdatesSection", () => {
     fireEvent.click(within(row).getByRole("button", { name: "Update" }));
     expect(await screen.findByText("v0.24.0 installed · v0.23.0 running · Restart required")).toBeInTheDocument();
     expect(invoke).toHaveBeenCalledWith("provider_updates_device", { hostId: 2, force: true });
+  });
+
+  it("shows a stopped service after updating its helper", async () => {
+    statusAvailable = false;
+    serviceAlive = false;
+    render(<UpdatesSection />);
+    const row = (await screen.findByText("v0.23.0 → v0.24.0")).closest("[data-settings-row]");
+    if (!(row instanceof HTMLElement)) throw new Error("helper row missing");
+
+    fireEvent.click(within(row).getByRole("button", { name: "Update" }));
+    expect(await screen.findByText("v0.24.0 installed · service stopped")).toBeInTheDocument();
+    expect(screen.queryByText(/already running headless service keeps its previous version/)).not.toBeInTheDocument();
   });
 });
