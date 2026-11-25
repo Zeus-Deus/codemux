@@ -8,6 +8,7 @@ import { Unicode11Addon } from "@xterm/addon-unicode11";
 import { SearchAddon } from "@xterm/addon-search";
 import { Copy, RotateCcw } from "lucide-react";
 import { Button } from "@/components/ui/button";
+import { useConfirm } from "@/components/ui/confirm-dialog";
 import { shouldLoadWebglAddon } from "./webgl-renderer-probe";
 import { isAppShortcut } from "@/lib/app-shortcuts";
 import { matchesKeyCombo } from "@/lib/keybind-utils";
@@ -57,10 +58,13 @@ import { openRightPanelDoc } from "@/lib/open-right-panel-doc";
 import { toast } from "@/lib/toast";
 import {
   findTerminalLinks,
+  hyperlinkDestination,
+  hyperlinkTitle,
   isLoopbackUrl,
   rangeForMatch,
   readLogicalLine,
   resolveTerminalPath,
+  terminalHyperlinkTarget,
   type TerminalLinkMatch,
 } from "./terminal-links";
 import { describeTerminalStatus, reconcileMountedStatus } from "./terminal-status-view";
@@ -185,6 +189,7 @@ export const TerminalPane = memo(function TerminalPane({ sessionId, paneId, focu
   const [search, setSearch] = useState<SearchAddon | null>(null);
   const [findOpen, setFindOpen] = useState(false);
   const [findToken, setFindToken] = useState(0);
+  const { confirm, dialog: linkConfirmDialog } = useConfirm();
   // Pending display:none after a fade-out, so a status flip mid-fade can cancel it.
   const overlayHideTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const ptyDecoderRef = useRef(new TextDecoder("utf-8", { fatal: false }));
@@ -398,13 +403,60 @@ export const TerminalPane = memo(function TerminalPane({ sessionId, paneId, focu
       altClickMovesCursor: true,
       // `term.unicode` (Unicode 11 widths below) is a proposed API.
       allowProposedApi: true,
-      // OSC 8 hyperlinks: same gesture and routing as detected links.
+      // OSC 8 hyperlinks: same gesture and routing as detected links. Their
+      // label is arbitrary program output that can hide, wrap or restyle the
+      // text the user sees, so every one is confirmed, showing the real
+      // address, before it opens. Detected links show their own address and
+      // keep opening directly.
       linkHandler: {
+        // Lets `mailto:` through; `terminalHyperlinkTarget` refuses the rest.
+        allowNonHttpProtocols: true,
         activate: (event, uri) => {
-          if (isOpenGesture(event)) openUrl(uri);
+          if (!isOpenGesture(event)) return;
+          const target = terminalHyperlinkTarget(uri);
+          if (!target) return;
+          const host = hyperlinkDestination(target);
+          void confirm({
+            title: "Open terminal link?",
+            description: (
+              <>
+                Terminal link text can differ from where it goes. Check the address before opening it.
+                <span
+                  tabIndex={host ? 0 : undefined}
+                  className="mt-3 block max-h-16 overflow-y-auto break-all text-left text-foreground"
+                >
+                  {host ? (
+                    <>
+                      Opens <span className="font-mono font-medium">{host}</span>
+                    </>
+                  ) : (
+                    "Opens your mail app with the address below"
+                  )}
+                </span>
+                <span
+                  tabIndex={0}
+                  className="mt-2 block max-h-32 select-text overflow-y-auto break-all rounded-lg bg-muted px-3 py-2 text-left font-mono text-label text-muted-foreground"
+                >
+                  {target}
+                </span>
+              </>
+            ),
+            confirmLabel: "Open link",
+            // The dialog has no trigger to return focus to; hand it back to
+            // the terminal the click came from while it is still on screen.
+            // Skipped when the pane has since switched session or gone off
+            // screen, so focus never lands in a replaced terminal.
+            returnFocus: () => {
+              if (containerEl.isConnected && termRef.current === term && visibleRef.current) {
+                term.focus();
+              }
+            },
+          }).then((confirmed) => {
+            if (confirmed) openUrl(target);
+          });
         },
-        hover: () => {
-          containerEl.title = LINK_HINT;
+        hover: (_event, uri) => {
+          containerEl.title = hyperlinkTitle(uri, LINK_HINT);
         },
         leave: () => {
           containerEl.removeAttribute("title");
@@ -1538,6 +1590,7 @@ export const TerminalPane = memo(function TerminalPane({ sessionId, paneId, focu
       {findOpen && search && (
         <TerminalFindBar search={search} focusToken={findToken} onClose={closeFind} />
       )}
+      {linkConfirmDialog}
     </div>
     </div>
     </div>

@@ -79,10 +79,13 @@ export function resolveTerminalPath(path: string, cwd: string | null | undefined
   return normalizePath(absolute ? path : `${cwd}/${path}`);
 }
 
-/** The loopback hosts a dev server prints. These open inside Codemux. */
+/** The loopback hosts a dev server prints. These open inside Codemux, so
+ *  only web addresses qualify: `file://localhost/...` is not a dev server. */
 export function isLoopbackUrl(url: string): boolean {
   try {
-    const host = new URL(url).hostname.replace(/^\[|\]$/g, "");
+    const parsed = new URL(url);
+    if (parsed.protocol !== "http:" && parsed.protocol !== "https:") return false;
+    const host = parsed.hostname.replace(/^\[|\]$/g, "");
     return (
       host === "localhost" ||
       host.endsWith(".localhost") ||
@@ -93,6 +96,50 @@ export function isLoopbackUrl(url: string): boolean {
   } catch {
     return false;
   }
+}
+
+/** Schemes an OSC 8 hyperlink may open. Anything else (`file:`, `ssh:`,
+ *  custom app schemes) is program output asking to launch a local handler. */
+const HYPERLINK_SCHEMES = new Set(["http:", "https:", "mailto:"]);
+
+/**
+ * The address an OSC 8 hyperlink opens, or null when it must not open.
+ * Normalized through the URL parser, which percent-encodes control and
+ * non-ASCII characters, so the address shown to the user is the one opened.
+ */
+export function terminalHyperlinkTarget(uri: string): string | null {
+  try {
+    const url = new URL(uri);
+    return HYPERLINK_SCHEMES.has(url.protocol) ? url.href : null;
+  } catch {
+    return null;
+  }
+}
+
+/** The host (port included) a confirmed web link opens, shown on its own
+ *  line because a long user-info part (`https://github.com:...@evil.example/`)
+ *  can push it far along the full address. Internationalized hosts come back
+ *  in their ASCII (`xn--`) form. Null for mail links: their recipients can
+ *  sit in the path and in `to`/`cc`/`bcc` fields, so only the full address
+ *  shows them all. */
+export function hyperlinkDestination(target: string): string | null {
+  try {
+    const url = new URL(target);
+    return url.protocol === "http:" || url.protocol === "https:" ? url.host : null;
+  } catch {
+    return null;
+  }
+}
+
+const MAX_TITLE_URL = 500;
+
+/** Hover text for an OSC 8 hyperlink: its real address, then how to open it. */
+export function hyperlinkTitle(uri: string, hint: string): string {
+  const target = terminalHyperlinkTarget(uri);
+  // A refused address is shown raw, minus control and format (bidi) characters.
+  let shown = target ?? uri.replace(/[\p{Cc}\p{Cf}]/gu, "");
+  if (shown.length > MAX_TITLE_URL) shown = `${shown.slice(0, MAX_TITLE_URL)}…`;
+  return `${shown}\n${target ? hint : "This kind of link can't be opened from the terminal"}`;
 }
 
 /**

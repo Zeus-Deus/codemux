@@ -3,10 +3,13 @@ import type { Terminal } from "@xterm/xterm";
 
 import {
   findTerminalLinks,
+  hyperlinkDestination,
+  hyperlinkTitle,
   isLoopbackUrl,
   rangeForMatch,
   readLogicalLine,
   resolveTerminalPath,
+  terminalHyperlinkTarget,
 } from "./terminal-links";
 
 describe("findTerminalLinks", () => {
@@ -95,6 +98,54 @@ describe("isLoopbackUrl", () => {
     expect(isLoopbackUrl("http://[::1]:4000")).toBe(true);
     expect(isLoopbackUrl("http://app.localhost")).toBe(true);
     expect(isLoopbackUrl("https://github.com")).toBe(false);
+  });
+
+  it("only treats web addresses as dev servers", () => {
+    expect(isLoopbackUrl("file://localhost/etc/passwd")).toBe(false);
+    expect(isLoopbackUrl("ftp://127.0.0.1/")).toBe(false);
+  });
+});
+
+describe("terminalHyperlinkTarget", () => {
+  it("allows web and mail addresses only", () => {
+    expect(terminalHyperlinkTarget("https://github.com/o/r")).toBe("https://github.com/o/r");
+    expect(terminalHyperlinkTarget("http://localhost:5173")).toBe("http://localhost:5173/");
+    expect(terminalHyperlinkTarget("mailto:dev@example.com")).toBe("mailto:dev@example.com");
+    expect(terminalHyperlinkTarget("file:///etc/passwd")).toBeNull();
+    expect(terminalHyperlinkTarget("file://localhost/etc/passwd")).toBeNull();
+    expect(terminalHyperlinkTarget("javascript:alert(1)")).toBeNull();
+    expect(terminalHyperlinkTarget("vscode://file/x")).toBeNull();
+    expect(terminalHyperlinkTarget("not a url")).toBeNull();
+  });
+});
+
+describe("hyperlinkDestination", () => {
+  it("names the host, not the user-info in front of it", () => {
+    expect(hyperlinkDestination(`https://github.com:${"x".repeat(300)}@evil.example/a`)).toBe("evil.example");
+    expect(hyperlinkDestination("https://example.com:8443/a")).toBe("example.com:8443");
+    expect(hyperlinkDestination("https://bücher.example/")).toBe("xn--bcher-kva.example");
+    // Mail recipients can hide in to/cc/bcc fields; the dialog shows the
+    // full address for those instead of a one-line summary.
+    expect(hyperlinkDestination("mailto:dev@example.com?bcc=leak@evil.example")).toBeNull();
+  });
+});
+
+describe("hyperlinkTitle", () => {
+  it("shows the real address above the hint", () => {
+    expect(hyperlinkTitle("https://evil.example/oauth", "Ctrl+click to open")).toBe(
+      "https://evil.example/oauth\nCtrl+click to open",
+    );
+  });
+
+  it("says when a link cannot be opened and strips control characters", () => {
+    expect(hyperlinkTitle("file:///etc/‮passwd\u0007", "Ctrl+click to open")).toBe(
+      "file:///etc/passwd\nThis kind of link can't be opened from the terminal",
+    );
+  });
+
+  it("truncates a very long address", () => {
+    const title = hyperlinkTitle(`https://example.com/${"a".repeat(1000)}`, "hint");
+    expect(title.split("\n")[0]).toHaveLength(501);
   });
 });
 

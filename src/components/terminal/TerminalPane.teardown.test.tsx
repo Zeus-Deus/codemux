@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
-import { act, cleanup, fireEvent, render } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, waitFor } from "@testing-library/react";
 import { attachPtyOutput, createBrowserPane, getTerminalScrollback, resizePty, restartTerminalSession, writeToPty } from "@/tauri/commands";
 import { updateAppShortcuts } from "@/lib/app-shortcuts";
 import { remoteViewHost, setRemoteViewHost } from "@/remote/client-view";
@@ -1050,6 +1050,128 @@ describe("TerminalPane links", () => {
       link.activate(new MouseEvent("click", { ctrlKey: true }));
     });
     expect(openRightPanelDoc).toHaveBeenCalledWith("ws-1", "/tmp/a/src/App.tsx", 12, 5);
+  });
+});
+
+describe("TerminalPane OSC 8 hyperlinks", () => {
+  type LinkHandler = {
+    allowNonHttpProtocols?: boolean;
+    activate: (event: MouseEvent, uri: string, range: unknown) => void;
+    hover?: (event: MouseEvent, uri: string, range: unknown) => void;
+  };
+
+  afterEach(() => {
+    cleanup();
+    flushAllTeardowns();
+    setTeardownScheduler(null);
+    h.terminals.length = 0;
+    h.rows = [];
+  });
+
+  /** Mounts a pane whose first row shows `label`, and returns xterm's OSC 8
+   *  handler plus the range covering that label. */
+  async function hyperlink(label: string) {
+    h.rows = [label];
+    openExternalUrl.mockClear();
+    vi.mocked(createBrowserPane).mockClear();
+    schedulerHarness();
+    const view = renderPane("sess-a");
+    await act(async () => {});
+    const term = h.terminals[h.terminals.length - 1];
+    const handler = term.options.linkHandler as LinkHandler;
+    const range = { start: { x: 1, y: 1 }, end: { x: label.length, y: 1 } };
+    const click = async (uri: string) => {
+      await act(async () => {
+        handler.activate(new MouseEvent("click", { ctrlKey: true }), uri, range);
+      });
+    };
+    return { view, handler, range, click };
+  }
+
+  it("asks even when the text looks like its own address", async () => {
+    // The buffer text can be concealed, recolored or wrapped, so matching
+    // text alone never proves what the user saw.
+    const { view, click } = await hyperlink("https://github.com/acme/app/pull/7");
+    await click("https://github.com/acme/app/pull/7");
+    expect(view.getByRole("alertdialog").textContent).toContain("https://github.com/acme/app/pull/7");
+    expect(openExternalUrl).not.toHaveBeenCalled();
+  });
+
+  it("shows the real address and waits for confirmation when the text differs", async () => {
+    const { view, click } = await hyperlink("https://github.com/acme/app/pull/7");
+    await click("https://evil.example/oauth");
+    const dialog = view.getByRole("alertdialog");
+    expect(dialog.textContent).toContain("https://evil.example/oauth");
+    expect(openExternalUrl).not.toHaveBeenCalled();
+
+    await act(async () => {
+      fireEvent.click(view.getByRole("button", { name: "Open link" }));
+    });
+    expect(openExternalUrl).toHaveBeenCalledWith("https://evil.example/oauth");
+  });
+
+  it("does not open a disguised link when the user cancels, and returns focus to the terminal", async () => {
+    const { view, click } = await hyperlink("docs");
+    await click("https://example.com/docs");
+    await act(async () => {
+      fireEvent.click(view.getByRole("button", { name: "Cancel" }));
+    });
+    expect(openExternalUrl).not.toHaveBeenCalled();
+    const term = h.terminals[h.terminals.length - 1];
+    await waitFor(() => expect(view.queryByRole("alertdialog")).toBeNull());
+    expect(document.activeElement).toBe(term.input);
+  });
+
+  it("names the real host outside the scrolling address", async () => {
+    const { view, click } = await hyperlink("https://github.com/acme/app/pull/7");
+    await click(`https://github.com:${"x".repeat(2000)}@evil.example/oauth`);
+    const host = view.getByText("evil.example");
+    // Its own bounded line, not inside the full-address box.
+    expect(host.parentElement?.textContent).toBe("Opens evil.example");
+    expect(host.parentElement?.className).toContain("max-h-16");
+    expect(host.parentElement?.textContent).not.toContain("xxxx");
+  });
+
+  it("shows every mail recipient in the full address, with bounded summaries", async () => {
+    const { view, click } = await hyperlink("Contact us");
+    const recipients = Array.from({ length: 200 }, (_, i) => `r${i}@example.com`).join(",");
+    await click(`mailto:${recipients}?bcc=leak@evil.example`);
+    const dialog = view.getByRole("alertdialog");
+    expect(dialog.textContent).toContain("Opens your mail app with the address below");
+    expect(dialog.textContent).toContain("bcc=leak@evil.example");
+    const summary = view.getByText("Opens your mail app with the address below");
+    expect(summary.className).toContain("max-h-16");
+    expect(view.getByRole("button", { name: "Open link" })).toBeTruthy();
+  });
+
+  it("keeps a long address inside a scrollable box", async () => {
+    const { view, click } = await hyperlink("docs");
+    await click(`https://example.com/${"a".repeat(5000)}`);
+    const address = view.getByText(/^https:\/\/example\.com\/a+$/);
+    expect(address.className).toContain("max-h-32");
+    expect(address.className).toContain("overflow-y-auto");
+    expect(address.getAttribute("tabindex")).toBe("0");
+    expect(view.getByRole("button", { name: "Open link" })).toBeTruthy();
+  });
+
+  it("never opens file or custom-scheme targets", async () => {
+    const { view, click } = await hyperlink("file://localhost/etc/passwd");
+    await click("file://localhost/etc/passwd");
+    await click("vscode://file/etc/passwd");
+    expect(openExternalUrl).not.toHaveBeenCalled();
+    expect(createBrowserPane).not.toHaveBeenCalled();
+    expect(view.queryByRole("alertdialog")).toBeNull();
+  });
+
+  it("allows mail links and shows the real address on hover", async () => {
+    const { view, handler, range, click } = await hyperlink("Contact us");
+    handler.hover?.(new MouseEvent("mouseover"), "https://evil.example/oauth", range);
+    expect(view.container.querySelector("[title]")?.getAttribute("title")).toBe(
+      "https://evil.example/oauth\nCtrl+click to open",
+    );
+    expect(handler.allowNonHttpProtocols).toBe(true);
+    await click("mailto:dev@example.com");
+    expect(view.getByRole("alertdialog").textContent).toContain("mailto:dev@example.com");
   });
 });
 
