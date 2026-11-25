@@ -1108,43 +1108,32 @@ fn rollback_failed_unix_stream_open(session: &str, before_open: Option<&BrowserP
     rollback_failed_unix_open(session, before_open);
 
     // The detached daemon can publish its PID after the launcher times out.
-    // Keep the launch attempt marker so a later successful retry is never
-    // mistaken for this failed start, even after the session gate reopens.
-    let session = session.to_owned();
-    let attempt = attempt.to_owned();
-    let result = std::thread::Builder::new()
-        .name("browser-failed-open-tracker".to_owned())
-        .spawn(move || {
-            let started = Instant::now();
-            let mut last_scan = Instant::now();
-            let mut first_scan = true;
-            while started.elapsed() < Duration::from_secs(5) {
-                let from_pid = read_agent_browser_daemon_pid(&session)
-                    .and_then(|pid| owned_browser_pid(&session, pid))
-                    .filter(|record| record.token == browser_owner_token()
-                        && browser_process_has_open_attempt(record.pid, &attempt));
-                let from_process = if from_pid.is_none()
-                    && (first_scan || last_scan.elapsed() >= Duration::from_millis(250))
-                {
-                    first_scan = false;
-                    last_scan = Instant::now();
-                    browser_daemon_for_open_attempt(&session, &attempt)
-                } else {
-                    None
-                };
-                if let Some(record) = from_pid.or(from_process)
-                {
-                    // Do not overwrite a later successful attempt's PID
-                    // record. The launch marker identifies this process for
-                    // a direct verified kill, even without a PID file.
-                    kill_verified_browser_pid(&record, &session);
-                    return;
-                }
-                std::thread::sleep(Duration::from_millis(50));
-            }
-        });
-    if let Err(error) = result {
-        eprintln!("[codemux::browser] could not track failed browser open: {error}");
+    // Finish rollback in the blocking launch worker before its session gate
+    // opens. A queued command must not reuse this process while we may kill it.
+    let started = Instant::now();
+    let mut last_scan = Instant::now();
+    let mut first_scan = true;
+    while started.elapsed() < Duration::from_secs(5) {
+        let from_pid = read_agent_browser_daemon_pid(session)
+            .and_then(|pid| owned_browser_pid(session, pid))
+            .filter(|record| record.token == browser_owner_token()
+                && browser_process_has_open_attempt(record.pid, attempt));
+        let from_process = if from_pid.is_none()
+            && (first_scan || last_scan.elapsed() >= Duration::from_millis(250))
+        {
+            first_scan = false;
+            last_scan = Instant::now();
+            browser_daemon_for_open_attempt(session, attempt)
+        } else {
+            None
+        };
+        if let Some(record) = from_pid.or(from_process) {
+            // The launch marker identifies this process for a direct verified
+            // kill without overwriting a later attempt's PID record.
+            kill_verified_browser_pid(&record, session);
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(50));
     }
 }
 
@@ -5741,6 +5730,57 @@ mod tests {
     }
 
     #[cfg(unix)]
+    #[tokio::test]
+    async fn failed_stream_rollback_blocks_queued_work_until_late_daemon_is_gone() {
+        let session = format!("browser-queued-late-open-{}", uuid::Uuid::new_v4().simple());
+        let attempt = uuid::Uuid::new_v4().simple().to_string();
+        let daemon_attempt = attempt.clone();
+        let rollback_session = session.clone();
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let rollback = tokio::spawn(run_detached_browser_lifecycle(session.clone(), async move {
+            let _ = started_tx.send(());
+            tokio::task::spawn_blocking(move || {
+                rollback_failed_unix_stream_open(&rollback_session, None, &attempt);
+            }).await.map_err(|error| error.to_string())?;
+            Ok(())
+        }));
+        started_rx.await.unwrap();
+
+        let (queued_tx, mut queued_rx) = tokio::sync::oneshot::channel();
+        let queued = tokio::spawn(run_detached_browser_lifecycle(session.clone(), async move {
+            let _ = queued_tx.send(());
+            Ok(())
+        }));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), &mut queued_rx).await.is_err(),
+            "queued command entered while rollback could still stop its daemon"
+        );
+
+        // The daemon appears after the failed launcher has started rollback.
+        // The waiting command must not run until this exact attempt is dead.
+        let (_temp, mut daemon, _record) = browser_identity_fixture_with_attempt(
+            &session, browser_owner_token(), Some(&daemon_attempt),
+        );
+        let daemon_pid_path = run_dir_for_session(&session).unwrap().join(format!("{session}.pid"));
+        std::fs::write(&daemon_pid_path, daemon.id().to_string()).unwrap();
+        tokio::time::timeout(Duration::from_secs(7), rollback).await.unwrap().unwrap().unwrap();
+        let started = Instant::now();
+        while daemon.try_wait().unwrap().is_none() && started.elapsed() < Duration::from_secs(3) {
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        let stopped = daemon.try_wait().unwrap().is_some();
+        if !stopped {
+            let _ = daemon.kill();
+            let _ = daemon.wait();
+        }
+        assert!(stopped, "queued work could reuse the failed daemon");
+        queued.await.unwrap().unwrap();
+        queued_rx.await.unwrap();
+        let _ = std::fs::remove_file(daemon_pid_path);
+        clear_session_pid(&session);
+    }
+
+    #[cfg(unix)]
     #[test]
     fn failed_stream_open_stops_daemon_without_a_pid_file() {
         let session = format!("browser-no-pid-open-{}", uuid::Uuid::new_v4().simple());
@@ -5773,7 +5813,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn failed_stream_tracker_does_not_stop_a_new_attempt() {
+    fn failed_stream_rollback_does_not_stop_a_new_attempt() {
         let session = format!("browser-new-open-{}", uuid::Uuid::new_v4().simple());
         let failed_attempt = uuid::Uuid::new_v4().simple().to_string();
         let new_attempt = uuid::Uuid::new_v4().simple().to_string();
