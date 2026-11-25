@@ -223,7 +223,7 @@ tauri-plugin-dialog = { version = "2" }
 # WebView2 key and renderer-failure events for native reload recovery
 # (`webview_recovery.rs`). Pinned to the version wry builds so
 # `PlatformWebview::controller()` hands back a type from this same crate.
-webview2-com = "=0.38.2"
+webview2-com = "=0.39.1"
 # Used by host input injection and Hermes profile filesystem identity.
 # Already in the transitive tree; the explicit dep lets us call the functions.
 windows-sys = { version = "0.59", features = [
