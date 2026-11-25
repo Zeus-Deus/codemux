@@ -9311,7 +9311,7 @@ fn remove_pane_from_tree(
 /// Cap the human-readable portion so the full session name stays well
 /// under both that limit and agent-browser's own 1–64 char cap, while
 /// the hash (computed over the *full* cwd) keeps it stable and unique.
-fn stable_browser_session_name(cwd: &str) -> String {
+pub(crate) fn stable_browser_session_name(cwd: &str) -> String {
     use std::collections::hash_map::DefaultHasher;
     use std::hash::{Hash, Hasher};
 
