@@ -58,7 +58,7 @@ pub enum McpConfigSource {
     CodexUser,
     /// `~/.config/opencode/opencode.json{,c}`
     OpenCodeUser,
-    /// `<project>/opencode.json{,c}`
+    /// `<project>/opencode.json{,c}` or `<project>/.opencode/opencode.json{,c}`
     OpenCodeProject,
 }
 

@@ -43,6 +43,13 @@ use super::paths::{enumerate_mcp_paths, is_claude_wrapped_path};
 use super::runtime::{McpServerHandle, McpServerStatus, McpTool};
 use super::{McpConfigSource, McpServerConfig};
 
+// Pause an approved first start immediately before its reservation in the
+// revocation race test. Scoped to that test's task and absent in production.
+#[cfg(test)]
+tokio::task_local! {
+    static APPROVAL_CHECKED_GATE: (Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>);
+}
+
 /// Tauri event the frontend listens to for live status updates.
 pub const MCP_STATUS_CHANGED_EVENT: &str = "mcp-status-changed";
 
@@ -95,6 +102,9 @@ pub struct McpRegistry {
     /// Coalesces concurrent config discovery for chat priming. Plugin
     /// registration and shutdown use independent per-server locks.
     prime_lock: Arc<Mutex<()>>,
+    /// Serializes project approval checks and start reservations with revocation
+    /// across server ids (including the same definition in another worktree).
+    project_approval_lock: Arc<Mutex<()>>,
     lifecycle: Arc<std::sync::Mutex<HashMap<String, std::sync::Weak<Mutex<()>>>>>,
     /// Lazily-started authenticated loopback gateway shared by provider
     /// adapters that need a remote MCP URL (OpenCode and future providers).
@@ -231,6 +241,7 @@ impl Default for McpRegistry {
             })),
             status_tx,
             prime_lock: Arc::new(Mutex::new(())),
+            project_approval_lock: Arc::new(Mutex::new(())),
             lifecycle: Arc::new(std::sync::Mutex::new(HashMap::new())),
             gateway: Arc::new(OnceCell::new()),
             native_delegation: Arc::new(std::sync::Mutex::new(None)),
@@ -604,7 +615,13 @@ impl McpRegistry {
         // A server from the project's own files waits for the user's
         // approval of this exact definition. Every start path (chat prime,
         // Settings, start by id, restart) arrives here.
-        if let Some(fingerprint) = super::project_trust::fingerprint(&config) {
+        let fingerprint = super::project_trust::fingerprint(&config);
+        let approval_guard = if fingerprint.is_some() {
+            Some(self.project_approval_lock.lock().await)
+        } else {
+            None
+        };
+        if let Some(fingerprint) = fingerprint {
             if !super::project_trust::is_approved(app, &fingerprint) {
                 let mut inner = self.inner.lock().await;
                 if let Some(existing) = inner.handles.get(&id).filter(|h| {
@@ -620,6 +637,11 @@ impl McpRegistry {
                 drop(inner);
                 emit_status_with_bus(app, &self.status_tx, &row);
                 return row;
+            }
+            #[cfg(test)]
+            if let Ok((entered, release)) = APPROVAL_CHECKED_GATE.try_with(Clone::clone) {
+                entered.notify_one();
+                release.notified().await;
             }
         }
 
@@ -666,6 +688,7 @@ impl McpRegistry {
             inner.calls_in_flight.insert(id.clone(), tracker);
             inner.handles.insert(id.clone(), placeholder);
         }
+        drop(approval_guard);
         emit_status_with_bus(
             app,
             &self.status_tx,
@@ -999,7 +1022,9 @@ impl McpRegistry {
         if super::project_trust::fingerprint(&config).as_deref() != Some(fingerprint) {
             return Err("This server changed. Refresh and review it again.".into());
         }
+        let _approval_guard = self.project_approval_lock.lock().await;
         super::project_trust::record_approval(app, fingerprint, &config)?;
+        drop(_approval_guard);
         Ok(self.ensure_started(Some(app), config).await)
     }
 
@@ -1011,6 +1036,7 @@ impl McpRegistry {
         app: &AppHandle<R>,
         fingerprint: &str,
     ) -> Result<bool, String> {
+        let approval_guard = self.project_approval_lock.lock().await;
         let revoked = super::project_trust::revoke_approval(app, fingerprint)?;
         let configs: Vec<McpServerConfig> = {
             let inner = self.inner.lock().await;
@@ -1023,6 +1049,7 @@ impl McpRegistry {
                 .map(|handle| handle.config.clone())
                 .collect()
         };
+        drop(approval_guard);
         for config in configs {
             let _ = self.stop_server(Some(app), &config.id).await;
             self.ensure_started(Some(app), config).await;
@@ -2547,6 +2574,82 @@ mod project_trust_tests {
         let row = reg.ensure_started(Some(handle), changed).await;
         assert_ne!(shown_fingerprint(&row), fingerprint);
         assert!(stays_absent(&second).await, "a changed definition ran without approval");
+        reg.shutdown_all().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn opencode_dot_directory_server_waits_for_approval() {
+        let (project, scratch) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let marker = scratch.path().join("started");
+        std::fs::create_dir(project.path().join(".opencode")).unwrap();
+        std::fs::write(
+            project.path().join(".opencode/opencode.json"),
+            serde_json::json!({"mcp":{"lint":{"type":"local",
+                "command":["sh","-c",format!("touch '{}'",marker.display())]}}}).to_string(),
+        ).unwrap();
+        let app = app();
+        let reg = McpRegistry::new();
+        let config = discovered(project.path(), "lint");
+        assert_eq!(config.sources, vec![McpConfigSource::OpenCodeProject]);
+        let row = reg.ensure_started(Some(app.handle()), config.clone()).await;
+        let fingerprint = shown_fingerprint(&row);
+        assert!(stays_absent(&marker).await);
+        reg.approve_project_server(app.handle(), &config.id, &fingerprint)
+            .await
+            .unwrap();
+        assert!(appears(&marker).await);
+        reg.shutdown_all().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn revocation_waits_for_a_first_start_reservation() {
+        let project = tempfile::tempdir().unwrap();
+        let fixture = format!("{}/tests/fixtures/plugin_mcp.py", env!("CARGO_MANIFEST_DIR"));
+        write_project(project.path(), serde_json::json!({"lint": {
+            "command": "python3", "args": [fixture]
+        }}));
+        let app = app();
+        let reg = McpRegistry::new();
+        let config = discovered(project.path(), "lint");
+        let fingerprint = super::super::project_trust::fingerprint(&config).unwrap();
+        super::super::project_trust::record_approval(app.handle(), &fingerprint, &config).unwrap();
+
+        let (entered, release) = (Arc::new(tokio::sync::Notify::new()), Arc::new(tokio::sync::Notify::new()));
+        let start_reg = reg.clone();
+        let start_app = app.handle().clone();
+        let start_config = config.clone();
+        let start_entered = entered.clone();
+        let start_release = release.clone();
+        let start = tokio::spawn(async move {
+            APPROVAL_CHECKED_GATE.scope((start_entered, start_release), async move {
+                start_reg.ensure_started(Some(&start_app), start_config).await
+            }).await
+        });
+        // Wait at the exact gap that used to exist between the approval read
+        // and insertion of the Starting handle.
+        tokio::time::timeout(std::time::Duration::from_secs(5), entered.notified())
+            .await
+            .unwrap();
+        let revoke_reg = reg.clone();
+        let revoke_app = app.handle().clone();
+        let revoke_fingerprint = fingerprint.clone();
+        let mut revoke = tokio::spawn(async move {
+            revoke_reg.revoke_project_approval(&revoke_app, &revoke_fingerprint).await
+        });
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(100), &mut revoke).await.is_err(),
+            "revocation returned before the first start was reserved"
+        );
+        release.notify_one();
+        tokio::time::timeout(std::time::Duration::from_secs(10), start)
+            .await.unwrap().unwrap();
+        assert!(tokio::time::timeout(std::time::Duration::from_secs(10), revoke)
+            .await.unwrap().unwrap().unwrap());
+        let row = reg.list_runtime().await.into_iter()
+            .find(|row| row.id == config.id).unwrap();
+        shown_fingerprint(&row);
         reg.shutdown_all().await;
     }
 

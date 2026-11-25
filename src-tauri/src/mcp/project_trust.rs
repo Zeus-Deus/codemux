@@ -1,10 +1,11 @@
 //! Local consent for MCP servers defined by a project's own files.
 //!
-//! `<project>/.codemux/mcp.json`, `.mcp.json`, `.cursor/mcp.json` and
-//! `opencode.json{,c}` are repository content: whoever wrote the repository
-//! chose their commands, URLs and headers. Codemux starts such a server, or
-//! sends it environment-derived credentials, only after the user approves
-//! that exact definition for that project on this computer.
+//! `<project>/.codemux/mcp.json`, `.mcp.json`, `.cursor/mcp.json`,
+//! `opencode.json{,c}`, and `.opencode/opencode.json{,c}` are repository
+//! content: whoever wrote the repository chose their commands, URLs and
+//! headers. Codemux starts such a server or sends it environment-derived
+//! credentials only after the user approves that exact definition for that
+//! project on this computer.
 //!
 //! Approvals live in their own local database table, never in the
 //! repository or the settings paired devices can read. Each one
