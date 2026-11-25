@@ -1535,6 +1535,12 @@ impl DatabaseStore {
         self.conn.lock().unwrap().busy_handler(Some(handler)).unwrap();
     }
 
+    #[cfg(test)]
+    pub(crate) fn test_query_only(&self, enabled: bool) {
+        let statement = if enabled { "PRAGMA query_only=ON" } else { "PRAGMA query_only=OFF" };
+        self.conn.lock().unwrap().execute_batch(statement).unwrap();
+    }
+
     /// Create an in-memory database (fallback if file DB fails, and for tests).
     pub fn new_in_memory() -> Self {
         let conn = Connection::open_in_memory().expect("Failed to open in-memory database");
