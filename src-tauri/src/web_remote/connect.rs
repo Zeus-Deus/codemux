@@ -97,7 +97,15 @@ const ACTIVE_POLL_INTERVAL: Duration = Duration::from_millis(500);
 /// shell that installed it.
 pub fn systemd_unit(exec_path: &str, api_url: Option<&str>) -> String {
     let environment = match api_url {
-        Some(url) if !url.trim().is_empty() => format!("Environment=CODEMUX_API_URL={url}\n"),
+        Some(url) if !url.trim().is_empty() => {
+            // systemd expands `%` specifiers even in Environment=. Quote the
+            // assignment and preserve the accepted URL literally for serve.
+            let escaped = url
+                .replace('\\', "\\\\")
+                .replace('"', "\\\"")
+                .replace('%', "%%");
+            format!("Environment=\"CODEMUX_API_URL={escaped}\"\n")
+        }
         _ => String::new(),
     };
     format!(
@@ -1240,7 +1248,7 @@ mod tests {
         assert!(!default.contains("Environment="), "no stray env line:\n{default}");
 
         let custom = systemd_unit("/usr/bin/codemux", Some("https://api.example.test"));
-        assert!(custom.contains("Environment=CODEMUX_API_URL=https://api.example.test\n"));
+        assert!(custom.contains("Environment=\"CODEMUX_API_URL=https://api.example.test\"\n"));
         // Still a well-formed unit: the env line sits inside [Service].
         let service_idx = custom.find("[Service]").unwrap();
         let install_idx = custom.find("[Install]").unwrap();
@@ -1249,6 +1257,40 @@ mod tests {
 
         // An empty value is treated as unset rather than written as a blank.
         assert!(!systemd_unit("/usr/bin/codemux", Some("  ")).contains("Environment="));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn unit_preserves_percent_encoded_api_url_for_systemd() {
+        let url = "https://api.example.test/api%2Ftenant";
+        let unit = systemd_unit("/usr/bin/env", Some(url));
+        assert!(unit.contains(
+            "Environment=\"CODEMUX_API_URL=https://api.example.test/api%%2Ftenant\""
+        ));
+
+        // Test mode uses the real systemd unit parser without installing or
+        // starting a user service. A non-systemd Linux host can still run the
+        // deterministic unit-text assertion above.
+        let Some(binary) = ["/usr/lib/systemd/systemd", "/lib/systemd/systemd"]
+            .into_iter()
+            .find(|path| Path::new(path).is_file())
+        else {
+            return;
+        };
+        let dir = tempfile::TempDir::new().unwrap();
+        std::fs::write(dir.path().join("codemux-api-env-probe.service"), unit).unwrap();
+        let output = std::process::Command::new(binary)
+            .args(["--user", "--test", "--unit=codemux-api-env-probe.service"])
+            .env("SYSTEMD_UNIT_PATH", format!("{}:", dir.path().display()))
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "systemd could not parse the generated unit");
+        assert!(
+            String::from_utf8_lossy(&output.stdout)
+                .lines()
+                .any(|line| line.trim() == format!("Environment: CODEMUX_API_URL={url}")),
+            "systemd changed the API URL while parsing the unit"
+        );
     }
 
     #[tokio::test]
