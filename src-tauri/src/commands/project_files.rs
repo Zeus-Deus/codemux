@@ -518,7 +518,7 @@ impl FolderWalkFilter {
             let Some(bytes) = Self::read_bounded_file(&file, rule_bytes, true)? else {
                 continue;
             };
-            if let Some(path) = Self::config_exclude_path(&bytes, home.as_deref())? {
+            if let Some(path) = Self::config_exclude_path(&bytes, home.as_deref()) {
                 exclude = Some(path);
                 break;
             }
@@ -534,35 +534,29 @@ impl FolderWalkFilter {
         Self::compile_rule_bytes(&cwd, &file, &bytes, rule_lines).map(Some)
     }
 
-    fn config_exclude_path(bytes: &[u8], home: Option<&Path>) -> Result<Option<PathBuf>, String> {
-        // Unrelated comments and settings may contain non-UTF-8 bytes; only
-        // the selected ignore path needs to be decoded.
-        for line in bytes.split(|byte| *byte == b'\n') {
-            let Some(separator) = line.iter().position(|byte| *byte == b'=') else {
-                continue;
-            };
-            if !line[..separator].trim_ascii().eq_ignore_ascii_case(b"excludesfile") {
-                continue;
-            }
-            let value = std::str::from_utf8(line[separator + 1..].trim_ascii())
-                .map_err(|_| "cannot parse global Git ignore path for folder preview".to_string())?
-                .trim_matches('"');
-            if value.is_empty() {
-                return Err("cannot parse global Git ignore path for folder preview".to_string());
-            }
-            let file = if let Some(rest) = value.strip_prefix('~') {
-                if rest.is_empty() || rest.starts_with(std::path::is_separator) {
-                    home.map(|home| home.join(rest.trim_start_matches(std::path::is_separator)))
-                        .unwrap_or_else(|| PathBuf::from(value))
-                } else {
-                    PathBuf::from(value)
-                }
+    fn config_exclude_path(bytes: &[u8], home: Option<&Path>) -> Option<PathBuf> {
+        use std::sync::OnceLock;
+
+        // Match the file picker's `ignore` parser on the bounded snapshot.
+        // Its byte matcher ignores unrelated non-UTF-8 text and falls through
+        // to lower-priority sources when the selected path cannot be decoded.
+        static EXCLUDES_FILE: OnceLock<regex::bytes::Regex> = OnceLock::new();
+        let matcher = EXCLUDES_FILE.get_or_init(|| {
+            regex::bytes::Regex::new(r#"(?im-u)^\s*excludesfile\s*=\s*"?\s*(\S+?)\s*"?\s*$"#)
+                .expect("valid Git excludesFile pattern")
+        });
+        let captures = matcher.captures(bytes)?;
+        let value = std::str::from_utf8(captures.get(1)?.as_bytes()).ok()?;
+        Some(if let Some(rest) = value.strip_prefix('~') {
+            if rest.is_empty() || rest.starts_with(std::path::is_separator) {
+                home.map(|home| home.join(rest.trim_start_matches(std::path::is_separator)))
+                    .unwrap_or_else(|| PathBuf::from(value))
             } else {
                 PathBuf::from(value)
-            };
-            return Ok(Some(file));
-        }
-        Ok(None)
+            }
+        } else {
+            PathBuf::from(value)
+        })
     }
 
     fn check_rule_files(&mut self, dir: &Path) -> Result<(), String> {
@@ -586,7 +580,7 @@ impl FolderWalkFilter {
 
     fn load_git_exclude(&mut self, dir: &Path) -> Result<(bool, Option<Gitignore>), String> {
         let dot_git = dir.join(".git");
-        let dot_git_metadata = match std::fs::symlink_metadata(&dot_git) {
+        let dot_git_metadata = match std::fs::metadata(&dot_git) {
             Ok(metadata) => metadata,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                 return Ok((dir.join(".jj").exists(), None));
@@ -2805,6 +2799,33 @@ mod tests {
         assert!(!info.tree.contains("local.secret"));
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn symlinked_git_directory_excludes_files_in_attached_subfolder() {
+        let dir = tempdir().unwrap();
+        let git_dir = dir.path().join("git-metadata");
+        fs::create_dir_all(git_dir.join("info")).unwrap();
+        fs::write(git_dir.join("info/exclude"), "*.secret\n").unwrap();
+        let project = dir.path().join("project");
+        let child = project.join("child");
+        fs::create_dir_all(&child).unwrap();
+        std::os::unix::fs::symlink(&git_dir, project.join(".git")).unwrap();
+        fs::write(child.join("hidden.secret"), "x").unwrap();
+        fs::write(child.join("visible.txt"), "x").unwrap();
+
+        let picked = walk_project(&child);
+        assert!(picked.paths.iter().any(|path| path == "visible.txt"));
+        assert!(!picked.paths.iter().any(|path| path == "hidden.secret"));
+        let info = read_folder_for_attachment_blocking(
+            child.to_string_lossy().into_owned(),
+            None,
+            1,
+        )
+        .unwrap();
+        assert!(info.tree.contains("visible.txt"));
+        assert!(!info.tree.contains("hidden.secret"));
+    }
+
     #[test]
     fn child_gitignore_negation_overrides_parent() {
         let dir = tempdir().unwrap();
@@ -2960,6 +2981,66 @@ mod tests {
         .unwrap();
         assert!(info.tree.contains("visible.txt"));
         assert!(!info.tree.contains("local.secret"));
+    }
+
+    #[test]
+    fn invalid_global_excludes_values_use_picker_fallback() {
+        let dir = tempdir().unwrap();
+        let xdg = dir.path().join("xdg");
+        fs::create_dir_all(xdg.join("git")).unwrap();
+        fs::write(xdg.join("git/ignore"), "*.secret\n").unwrap();
+        let system_config = dir.path().join("system-git-config");
+        fs::write(&system_config, "").unwrap();
+
+        let mut undecodable = b"[core]\nexcludesFile = /invalid/".to_vec();
+        undecodable.extend_from_slice(&[0xff, b'\n']);
+        for (name, contents) in [
+            ("inline-comment", b"[core]\nexcludesFile = /invalid/ignore # comment\n".to_vec()),
+            ("undecodable", undecodable),
+        ] {
+            let config = dir.path().join(name);
+            fs::write(&config, contents).unwrap();
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "commands::project_files::tests::invalid_global_excludes_fallback_child",
+                    "--nocapture",
+                ])
+                .env("CODEMUX_ATTACHMENT_INVALID_GLOBAL_CHILD", "1")
+                .env("GIT_CONFIG_GLOBAL", config)
+                .env("GIT_CONFIG_SYSTEM", &system_config)
+                .env("XDG_CONFIG_HOME", &xdg)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{name}: stdout: {}\nstderr: {}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+    }
+
+    #[test]
+    fn invalid_global_excludes_fallback_child() {
+        if std::env::var_os("CODEMUX_ATTACHMENT_INVALID_GLOBAL_CHILD").is_none() {
+            return;
+        }
+        let dir = tempdir().unwrap();
+        fs::create_dir(dir.path().join(".git")).unwrap();
+        fs::write(dir.path().join("hidden.secret"), "x").unwrap();
+        fs::write(dir.path().join("visible.txt"), "x").unwrap();
+        let picked = walk_project(dir.path());
+        assert!(picked.paths.iter().any(|path| path == "visible.txt"));
+        assert!(!picked.paths.iter().any(|path| path == "hidden.secret"));
+        let info = read_folder_for_attachment_blocking(
+            dir.path().to_string_lossy().into_owned(),
+            None,
+            1,
+        )
+        .unwrap();
+        assert!(info.tree.contains("visible.txt"));
+        assert!(!info.tree.contains("hidden.secret"));
     }
 
     #[test]
