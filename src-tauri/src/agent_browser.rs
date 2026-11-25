@@ -1390,7 +1390,7 @@ fn browser_open_command(bin: &str, session: &str, port: u16) -> Result<std::proc
         std::process::Command::new(bin)
     };
     set_browser_owner_env(&mut cmd, session)?;
-    cmd.args(["open", "about:blank", "--headless", "--session", session])
+    cmd.args(["open", "about:blank", "--session", session])
         .env("AGENT_BROWSER_STREAM_PORT", port.to_string())
         .env("AGENT_BROWSER_ARGS", STEALTH_CHROMIUM_ARGS)
         .env("AGENT_BROWSER_USER_AGENT", stealth_user_agent());
@@ -2928,6 +2928,7 @@ impl AgentBrowserManager {
             .filter(|identity| identity.port == port)
     }
 
+    #[cfg(test)]
     pub(crate) async fn owns_stream_port(&self, port: u16) -> bool {
         self.verified_stream_identity_for_port(port).await.is_some()
     }
@@ -3456,7 +3457,6 @@ impl AgentBrowserManager {
                 argv.extend([
                     "open".into(),
                     "about:blank".into(),
-                    "--headless".into(),
                     "--session".into(),
                     session.clone(),
                 ]);
@@ -3615,12 +3615,12 @@ mod tests {
         let native = browser_open_command("/tmp/my browser/agent-browser", session, 9223).unwrap();
         assert_eq!(native.get_program(), std::ffi::OsStr::new("/tmp/my browser/agent-browser"));
         let args: Vec<_> = native.get_args().map(|arg| arg.to_string_lossy().into_owned()).collect();
-        assert_eq!(args, ["open", "about:blank", "--headless", "--session", session]);
+        assert_eq!(args, ["open", "about:blank", "--session", session]);
 
         let npx = browser_open_command("npx agent-browser", session, 9223).unwrap();
         assert_eq!(npx.get_program(), std::ffi::OsStr::new("npx"));
         let args: Vec<_> = npx.get_args().map(|arg| arg.to_string_lossy().into_owned()).collect();
-        assert_eq!(args, ["agent-browser", "open", "about:blank", "--headless", "--session", session]);
+        assert_eq!(args, ["agent-browser", "open", "about:blank", "--session", session]);
     }
 
     struct TestBrowserPidFile(PathBuf);
