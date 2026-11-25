@@ -2456,6 +2456,29 @@ struct NativeBrowserLaunchFailure {
 }
 
 #[cfg(target_os = "windows")]
+#[derive(Debug)]
+struct NativeBrowserCommandOutput {
+    output: std::process::Output,
+    may_have_launched: bool,
+}
+
+#[cfg(target_os = "windows")]
+fn browser_daemon_exit_confirmed(
+    record: &BrowserPidRecord,
+    retained: Option<&std::os::windows::io::OwnedHandle>,
+) -> bool {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Foundation::WAIT_OBJECT_0;
+    use windows_sys::Win32::System::Threading::WaitForSingleObject;
+
+    if let Some(handle) = retained {
+        return unsafe { WaitForSingleObject(handle.as_raw_handle(), 0) } == WAIT_OBJECT_0;
+    }
+    process_exit_confirmed(record.pid)
+        || process_start_time(record.pid).is_some_and(|start| start != record.start_time)
+}
+
+#[cfg(target_os = "windows")]
 impl NativeBrowserLaunchFailure {
     fn before_launch(error: std::io::Error) -> Self {
         Self { error, may_have_launched: false }
@@ -2613,6 +2636,7 @@ fn run_agent_browser_native(
     timeout: Duration,
 ) -> std::io::Result<std::process::Output> {
     run_agent_browser_native_with_status(bin, argv, session, stream_port, discard_stderr, timeout)
+        .map(|result| result.output)
         .map_err(|failure| failure.error)
 }
 
@@ -2624,11 +2648,17 @@ fn run_agent_browser_native_with_status(
     stream_port: u16,
     discard_stderr: bool,
     timeout: Duration,
-) -> Result<std::process::Output, NativeBrowserLaunchFailure> {
+) -> Result<NativeBrowserCommandOutput, NativeBrowserLaunchFailure> {
     let started = Instant::now();
     let (record, started_here) = ensure_owned_browser_daemon_with_status(bin, session, stream_port, timeout)?;
+    // Retain the verified process handle across command teardown so an exit
+    // check cannot accidentally observe a later occupant of the numeric PID.
+    let retained = if started_here { open_verified_browser_handle(&record, session) } else { None };
     track_browser_daemon_before_command(session, bin, &record, started_here)
-        .map_err(NativeBrowserLaunchFailure::after_launch)?;
+        .map_err(|error| NativeBrowserLaunchFailure {
+            error,
+            may_have_launched: !started_here || !browser_daemon_exit_confirmed(&record, retained.as_ref()),
+        })?;
     let remaining = timeout.saturating_sub(started.elapsed());
     let result = run_agent_browser_native_with_record(
         bin,
@@ -2639,8 +2669,23 @@ fn run_agent_browser_native_with_status(
         remaining,
         record.clone(),
     );
-    finish_browser_command(result, session, bin, &record, started_here)
-        .map_err(NativeBrowserLaunchFailure::after_launch)
+    finish_browser_command_with_status(result, session, bin, &record, started_here, retained.as_ref())
+}
+
+#[cfg(target_os = "windows")]
+fn finish_browser_command_with_status(
+    result: std::io::Result<std::process::Output>,
+    session: &str,
+    bin: &str,
+    record: &BrowserPidRecord,
+    started_here: bool,
+    retained: Option<&std::os::windows::io::OwnedHandle>,
+) -> Result<NativeBrowserCommandOutput, NativeBrowserLaunchFailure> {
+    let result = finish_browser_command(result, session, bin, record, started_here);
+    let may_have_launched = !started_here || !browser_daemon_exit_confirmed(record, retained);
+    result
+        .map(|output| NativeBrowserCommandOutput { output, may_have_launched })
+        .map_err(|error| NativeBrowserLaunchFailure { error, may_have_launched })
 }
 
 #[cfg(windows)]
@@ -3302,19 +3347,22 @@ fn execute_agent_browser_action_with_status(
     require_owned_browser_session(session).map_err(BrowserActionFailure::before_launch)?;
 
     #[cfg(target_os = "windows")]
-    let (stdout, stderr, status_success) = {
+    let (stdout, stderr, status_success, may_have_launched) = {
         let bin = resolve_binary();
         let groups = build_agent_browser_argv_groups(session, action, &params)
             .map_err(BrowserActionFailure::before_launch)?;
         let mut combined_stdout = String::new();
         let mut combined_stderr = String::new();
         let mut all_ok = true;
+        let mut previous_command_may_have_launched = false;
         for argv in &groups {
-            let out = run_agent_browser_native_with_status(&bin, argv, session, stream_port, false, action_timeout(action))
+            let command = run_agent_browser_native_with_status(&bin, argv, session, stream_port, false, action_timeout(action))
                 .map_err(|failure| BrowserActionFailure {
                     message: format!("Failed to run agent-browser: {}", failure.error),
-                    may_have_launched: failure.may_have_launched,
+                    may_have_launched: previous_command_may_have_launched || failure.may_have_launched,
                 })?;
+            previous_command_may_have_launched |= command.may_have_launched;
+            let out = command.output;
             combined_stdout.push_str(&String::from_utf8_lossy(&out.stdout));
             combined_stderr.push_str(&String::from_utf8_lossy(&out.stderr));
             if !out.status.success() {
@@ -3322,11 +3370,11 @@ fn execute_agent_browser_action_with_status(
                 break; // matches `cmd1 && cmd2` short-circuit semantics
             }
         }
-        (combined_stdout, combined_stderr, all_ok)
+        (combined_stdout, combined_stderr, all_ok, previous_command_may_have_launched)
     };
 
     #[cfg(not(target_os = "windows"))]
-    let (stdout, stderr, status_success) = {
+    let (stdout, stderr, status_success, may_have_launched) = {
         let shell_cmd = build_agent_browser_command(session, action, &params)
             .map_err(BrowserActionFailure::before_launch)?;
         let mut cmd = std::process::Command::new("sh");
@@ -3341,11 +3389,17 @@ fn execute_agent_browser_action_with_status(
             String::from_utf8_lossy(&output.stdout).to_string(),
             String::from_utf8_lossy(&output.stderr).to_string(),
             output.status.success(),
+            true,
         )
     };
 
-    if !browser_action_has_usable_output(status_success, &stdout) {
-        return Err(BrowserActionFailure::after_launch(format!("agent-browser failed: {} {}", stdout, stderr)));
+    if (!may_have_launched && action != "close")
+        || !browser_action_has_usable_output(status_success, &stdout)
+    {
+        return Err(BrowserActionFailure {
+            message: format!("agent-browser failed: {} {}", stdout, stderr),
+            may_have_launched,
+        });
     }
     if action == "close" {
         clear_session_pid(session);
@@ -4821,8 +4875,8 @@ mod tests {
     }
 
     #[cfg(windows)]
-    #[test]
-    fn failed_first_browser_command_stops_a_tracked_daemon() {
+    #[tokio::test]
+    async fn failed_first_browser_command_stops_a_tracked_daemon_and_allows_retry() {
         struct ChildGuard(std::process::Child);
         impl Drop for ChildGuard {
             fn drop(&mut self) {
@@ -4835,6 +4889,10 @@ mod tests {
         let binary = temp.path().join("agent-browser.exe");
         std::fs::copy(which::which("ping").unwrap(), &binary).unwrap();
         let session = format!("browser-first-command-{}", uuid::Uuid::new_v4().simple());
+        let manager = AgentBrowserManager::new();
+        manager.allocate_port(&session).await.unwrap();
+        let was_running = manager.note_action_start(&session, "open").await;
+        assert!(!was_running);
         let token = browser_owner_token().to_owned();
         let child = std::process::Command::new(&binary)
             .args(["-t", "127.0.0.1"])
@@ -4861,20 +4919,29 @@ mod tests {
         std::fs::write(&pid_path, pid.to_string()).unwrap();
         track_browser_daemon_before_command(&session, "unused.exe", &record, true).unwrap();
         assert_eq!(read_browser_pid_record(&own_record_path).unwrap().pid, pid);
+        let retained = open_verified_browser_handle(&record, &session).expect("verified daemon handle");
 
-        let failed = finish_browser_command(
+        let failed = finish_browser_command_with_status(
             Err(std::io::Error::other("relay failed")),
             &session,
             "unused.exe",
             &record,
             true,
+            Some(&retained),
         );
-        assert!(failed.is_err());
+        let failure = failed.err().expect("relay error must be reported");
+        assert!(!failure.may_have_launched, "reaped daemon must release provisional state");
         let stopped_waiting = Instant::now();
         while child.0.try_wait().unwrap().is_none() {
             assert!(stopped_waiting.elapsed() < Duration::from_secs(3), "failed command left its daemon running");
             std::thread::sleep(Duration::from_millis(25));
         }
+        let result = Err(BrowserActionFailure {
+            message: failure.error.to_string(),
+            may_have_launched: failure.may_have_launched,
+        });
+        manager.reconcile_action_attempt(&session, &session, "open", was_running, false, &result).await;
+        assert!(!manager.note_action_start(&session, "open").await, "next launch must be fresh");
         let _ = std::fs::remove_file(pid_path);
         let _ = std::fs::remove_file(own_record_path);
     }
