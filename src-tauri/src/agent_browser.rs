@@ -1048,6 +1048,7 @@ fn connect_unix_browser_control_until(
         }
         match socket.connect(&address) {
             Ok(()) => break,
+            Err(error) if error.raw_os_error() == Some(libc::EISCONN) => break,
             Err(error) if error.kind() == std::io::ErrorKind::WouldBlock
                 || error.kind() == std::io::ErrorKind::Interrupted
                 || error.raw_os_error().is_some_and(|code| code == libc::EINPROGRESS || code == libc::EALREADY) => {}
@@ -5243,6 +5244,21 @@ mod tests {
         assert_eq!(probe_browser_control_endpoint(session, dir.path()), BrowserControlEndpointProbe::Inconclusive);
         assert!(start.elapsed() < Duration::from_secs(1));
         assert!(browser_control_endpoint_ready(session, dir.path()));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn unix_control_connect_recovers_when_backlog_drains() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket_path = dir.path().join("browser-control-drain.sock");
+        let (listener, _clients) = saturated_control_socket(&socket_path);
+        let releaser = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(10));
+            listener.accept().unwrap().0
+        });
+        let connected = connect_unix_browser_control_until(&socket_path, Instant::now() + Duration::from_secs(1));
+        assert!(connected.is_ok(), "{connected:?}");
+        let _accepted = releaser.join().unwrap();
     }
 
     #[cfg(target_os = "linux")]
