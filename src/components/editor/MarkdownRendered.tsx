@@ -178,7 +178,7 @@ function DeferredLocalImage({
         }}
       >
         <span>{alt ? `Load local image: ${alt}` : "Load local image"}</span>
-        <span className="font-mono text-xs text-muted-foreground">{displayPath}</span>
+        <span className="font-mono text-label text-muted-foreground">{displayPath}</span>
       </button>
     );
   }
