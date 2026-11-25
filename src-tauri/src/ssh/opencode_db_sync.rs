@@ -48,10 +48,9 @@
 //! `opencode` usually lives under the user's `~/.local/bin` or
 //! `~/.opencode/bin`, which a non-interactive SSH command does NOT have on
 //! PATH (only login shells source `~/.profile` / `~/.bashrc`). So every
-//! remote `opencode` invocation runs through a **login shell fed over
-//! stdin** (`ssh host bash -ls`), which both finds the binary and sidesteps
-//! nested-quoting hazards. Plain `cat` up/downloads (always on PATH) move
-//! the JSON bundle.
+//! remote `opencode` invocation runs through a login shell. Each transfer
+//! uses a private scratch directory created and removed by that shell.
+//! The bundle travels over SSH on stdin for imports and stdout for exports.
 //!
 //! Everything here is best-effort: a failure only loses conversation
 //! continuity (the agent still launches), so callers warn-and-continue,
@@ -61,8 +60,10 @@
 
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
+use std::process::Output;
 use tokio::process::Command;
 
+use super::exec::sh_quote;
 use super::history_process::{output, ssh_command};
 
 // ── Pure helpers (unit-tested; no process / network) ──────────────────────
@@ -100,76 +101,65 @@ pub(crate) fn parse_session_id(stdout: &str) -> Option<String> {
         .map(str::to_string)
 }
 
-/// Pull `ses_…` out of a `CMX_OC_SID=<id>` marker line emitted by the
-/// remote extract script (tolerates surrounding login-shell noise).
-pub(crate) fn parse_sid_marker(stdout: &str) -> Option<String> {
-    stdout
-        .lines()
-        .filter_map(|l| l.trim().strip_prefix("CMX_OC_SID="))
-        .find(|s| s.starts_with("ses_"))
-        .map(str::to_string)
+/// The NUL frame keeps login banners out of the JSON bundle. A JSON string
+/// can encode a NUL with an escape sequence, never as a raw byte.
+fn remote_export_bundle(stdout: &[u8]) -> Result<Option<(&str, &[u8])>, String> {
+    let mut segments = stdout.splitn(3, |&byte| byte == 0);
+    segments.next();
+    let Some(frame) = segments.next() else {
+        return Ok(None);
+    };
+    let separator = segments
+        .next()
+        .and_then(|_| frame.iter().position(|&byte| byte == b'\n'))
+        .ok_or("Incomplete OpenCode export frame")?;
+    let (id, bundle) = frame.split_at(separator);
+    let session_id = std::str::from_utf8(id)
+        .ok()
+        .and_then(|id| id.strip_prefix("CMX_OC_SID="))
+        .filter(|id| id.starts_with("ses_"))
+        .ok_or("Invalid OpenCode export session ID")?;
+    Ok(Some((session_id, &bundle[1..])))
 }
 
-/// Login-shell script (fed to `bash -ls` over stdin) that imports a
-/// transferred bundle so the session associates with `remote_cwd`, then
-/// removes the bundle. Exits with `opencode import`'s status so the caller
-/// can tell success from failure.
-pub(crate) fn remote_import_script(remote_cwd: &str, remote_bundle: &str) -> String {
+// Allocate and clean up the private directory in the shell that uses it.
+const REMOTE_SCRATCH: &str = r#"umask 077
+scratch=$(mktemp -d /tmp/codemux-opencode.XXXXXXXX) || exit 1
+bundle="$scratch/session.json"
+trap 'rm -f "$bundle"; rmdir "$scratch"' EXIT
+trap 'exit 1' HUP INT TERM
+"#;
+
+fn remote_import_script(remote_cwd: &str) -> String {
     // `mkdir -p` defends against the rare case where the workspace dir
     // isn't there yet (the push rsync normally creates it first); `cd` is
     // load-bearing because `opencode import` derives the session directory
     // from the process cwd.
     format!(
         "mkdir -p {cwd} && cd {cwd} || exit 3\n\
-         opencode import {bundle} 2>&1\n\
-         rc=$?\n\
-         rm -f {bundle}\n\
-         exit $rc\n",
+         {REMOTE_SCRATCH}\
+         cat > \"$bundle\" || exit 1\n\
+         opencode import \"$bundle\"\n",
         cwd = shell_sq(remote_cwd),
-        bundle = shell_sq(remote_bundle),
     )
 }
 
-/// Login-shell script that finds the newest root session for `remote_cwd`
-/// and exports it to `remote_bundle`, echoing `CMX_OC_SID=<id>` so the
-/// caller knows the id and that a bundle was written. Always exits 0 — the
-/// absence of the marker means "nothing to pull" (no session, or opencode
-/// not on the host), not a transport error.
-pub(crate) fn remote_extract_script(remote_cwd: &str, remote_bundle: &str) -> String {
+/// Find the newest root session and emit its ID and export in a single
+/// frame. An empty successful response means there was no session.
+fn remote_extract_script(remote_cwd: &str) -> String {
     // Build the query with the shared SQL helper (which SQL-escapes the
     // directory) and pass it as a single shell-quoted argument. Splicing the
     // path through a `$dir` shell variable into the SQL literal would break
     // the query for any path containing an apostrophe (e.g. /Users/O'Brien/…),
     // silently yielding "nothing to pull".
     format!(
-        "umask 077\n\
-         sid=$(opencode db {sql} 2>/dev/null | grep -m1 '^ses_')\n\
-         if [ -n \"$sid\" ]; then\n\
-           opencode export \"$sid\" > {bundle} 2>/dev/null && echo \"CMX_OC_SID=$sid\"\n\
-         fi\n",
+        "sid=$(opencode db {sql} 2>/dev/null | grep -m1 '^ses_') || exit 0\n\
+         {REMOTE_SCRATCH}\
+         opencode export \"$sid\" > \"$bundle\" || exit $?\n\
+         printf '\\000CMX_OC_SID=%s\\n' \"$sid\"\n\
+         cat \"$bundle\" && printf '\\000'\n",
         sql = shell_sq(&newest_session_sql(remote_cwd)),
-        bundle = shell_sq(remote_bundle),
     )
-}
-
-/// Unique `/tmp` path on the remote for one transfer. No `Math.random`
-/// available; the nanosecond clock + pid is plenty unique for a transient
-/// file we delete immediately.
-fn unique_remote_bundle() -> String {
-    format!("/tmp/codemux-opencode-{}.json", unique_token())
-}
-
-fn unique_token() -> String {
-    use std::sync::atomic::{AtomicU64, Ordering};
-    static COUNTER: AtomicU64 = AtomicU64::new(0);
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
-    // Atomic counter guarantees distinctness even when two calls land in the
-    // same nanosecond tick.
-    let seq = COUNTER.fetch_add(1, Ordering::Relaxed);
-    format!("{}-{}-{}", std::process::id(), nanos, seq)
 }
 
 /// Resolve the local `opencode` binary the same way the chat provider does
@@ -205,24 +195,19 @@ pub async fn sync_opencode_session(
     let session_id = match local_newest_session_id(&bin, &dir).await? {
         Some(id) => id,
         None => {
-            eprintln!(
-                "[hosts] no local OpenCode session for {dir}; skipping OpenCode sync"
-            );
+            eprintln!("[hosts] no local OpenCode session for {dir}; skipping OpenCode sync");
             return Ok(None);
         }
     };
 
-    let remote_bundle = unique_remote_bundle();
     let bundle = export_session_local(&bin, &session_id).await?;
-    upload_file(ssh_target, &bundle, &remote_bundle).await?;
-    drop(bundle);
-
-    let script = remote_import_script(&remote_cwd.to_string_lossy(), &remote_bundle);
-    let (ok, output) = run_remote_login_script(ssh_target, &script).await?;
-    if !ok {
+    let script = remote_import_script(&remote_cwd.to_string_lossy());
+    let result = run_remote_login_script(ssh_target, &script, Some(&bundle)).await?;
+    if !result.status.success() {
         return Err(format!(
-            "remote `opencode import` failed: {}",
-            output.trim()
+            "remote `opencode import` failed ({}): {}",
+            result.status,
+            String::from_utf8_lossy(&result.stderr).trim()
         ));
     }
     eprintln!(
@@ -252,16 +237,16 @@ pub async fn pull_opencode_session(
         return Ok(None);
     };
 
-    let remote_bundle = unique_remote_bundle();
-    let script = remote_extract_script(&remote_cwd.to_string_lossy(), &remote_bundle);
-    let (ok, output) = run_remote_login_script(ssh_target, &script).await?;
-    if !ok {
+    let script = remote_extract_script(&remote_cwd.to_string_lossy());
+    let result = run_remote_login_script(ssh_target, &script, None).await?;
+    if !result.status.success() {
         return Err(format!(
-            "remote `opencode export` failed: {}",
-            output.trim()
+            "remote `opencode export` failed ({}): {}",
+            result.status,
+            String::from_utf8_lossy(&result.stderr).trim()
         ));
     }
-    let Some(session_id) = parse_sid_marker(&output) else {
+    let Some((session_id, bundle)) = remote_export_bundle(&result.stdout)? else {
         eprintln!(
             "[hosts] no remote OpenCode session at {}; skipping OpenCode pull-back",
             remote_cwd.display()
@@ -276,9 +261,9 @@ pub async fn pull_opencode_session(
         .tempdir()
         .map_err(|e| format!("create OpenCode import directory: {e}"))?;
     let local_bundle = scratch.path().join("session.json");
-    let download = download_file(ssh_target, &remote_bundle, &local_bundle).await;
-    run_remote_rm(ssh_target, &remote_bundle).await;
-    download?;
+    tokio::fs::write(&local_bundle, bundle)
+        .await
+        .map_err(|error| format!("Write local OpenCode bundle: {error}"))?;
 
     import_session_local(&bin, local_cwd, &local_bundle).await?;
 
@@ -286,15 +271,12 @@ pub async fn pull_opencode_session(
         "[hosts] pulled OpenCode session {session_id} back from {ssh_target} → {}",
         local_cwd.display()
     );
-    Ok(Some(session_id))
+    Ok(Some(session_id.to_owned()))
 }
 
 // ── Local opencode invocations ─────────────────────────────────────────────
 
-async fn local_newest_session_id(
-    bin: &Path,
-    dir: &str,
-) -> Result<Option<String>, String> {
+async fn local_newest_session_id(bin: &Path, dir: &str) -> Result<Option<String>, String> {
     let mut command = Command::new(bin);
     command.arg("db").arg(newest_session_sql(dir));
     let out = output(&mut command, None)
@@ -327,11 +309,7 @@ async fn export_session_local(bin: &Path, session_id: &str) -> Result<Vec<u8>, S
     Ok(out.stdout)
 }
 
-async fn import_session_local(
-    bin: &Path,
-    cwd: &Path,
-    bundle: &Path,
-) -> Result<(), String> {
+async fn import_session_local(bin: &Path, cwd: &Path, bundle: &Path) -> Result<(), String> {
     // `import` derives the session's directory from the process cwd, so run
     // it from the workspace dir to associate the conversation locally.
     let mut command = Command::new(bin);
@@ -350,82 +328,18 @@ async fn import_session_local(
 
 // ── SSH transport helpers ──────────────────────────────────────────────────
 
-/// Upload a local file to `remote_path` via a `cat >` pipeline (same shape
-/// as the binary-bootstrap upload; `cat` is always on PATH and `/tmp` paths
-/// carry no tilde to expand).
-async fn upload_file(
-    ssh_target: &str,
-    bundle: &[u8],
-    remote_path: &str,
-) -> Result<(), String> {
-    let mut command = ssh_command(ssh_target);
-    // A cancelled connection may leave a partial bundle on the host.
-    command.arg(format!("umask 077; cat > {}", shell_sq(remote_path)));
-    let out = output(&mut command, Some(bundle))
-        .await
-        .map_err(|e| format!("ssh upload failed: {e}"))?;
-    if !out.status.success() {
-        return Err(format!(
-            "ssh upload exited {}: {}",
-            out.status,
-            String::from_utf8_lossy(&out.stderr).trim()
-        ));
-    }
-    Ok(())
-}
-
-/// Download `remote_path` to a local file via `cat`.
-async fn download_file(
-    ssh_target: &str,
-    remote_path: &str,
-    local: &Path,
-) -> Result<(), String> {
-    let mut command = ssh_command(ssh_target);
-    command.arg(format!("cat {}", shell_sq(remote_path)));
-    let out = output(&mut command, None)
-        .await
-        .map_err(|e| format!("ssh download failed: {e}"))?;
-    if !out.status.success() {
-        return Err(format!(
-            "ssh download exited {}: {}",
-            out.status,
-            String::from_utf8_lossy(&out.stderr).trim()
-        ));
-    }
-    tokio::fs::write(local, &out.stdout)
-        .await
-        .map_err(|e| format!("write local bundle {}: {e}", local.display()))?;
-    Ok(())
-}
-
-/// Best-effort remote `rm -f`.
-async fn run_remote_rm(ssh_target: &str, remote_path: &str) {
-    let mut command = ssh_command(ssh_target);
-    command.arg(format!("rm -f {}", shell_sq(remote_path)));
-    let _ = output(&mut command, None).await;
-}
-
-/// Run a script on the remote via a **login** shell (`bash -ls`) so the
-/// user's PATH (where `opencode` lives) is in scope, feeding the script over
-/// stdin to avoid nested-quoting hazards. Returns `(exit_ok, stdout)`.
+/// Run the transfer in a login shell so the user's OpenCode is on PATH.
+/// Keep stdin available for the bundle and force pipes for its raw bytes.
 async fn run_remote_login_script(
     ssh_target: &str,
     script: &str,
-) -> Result<(bool, String), String> {
+    input: Option<&[u8]>,
+) -> Result<Output, String> {
     let mut command = ssh_command(ssh_target);
-    command.arg("bash -ls");
-    let out = output(&mut command, Some(script.as_bytes()))
+    command.arg(format!("bash -lc {}", sh_quote(script)));
+    output(&mut command, input)
         .await
-        .map_err(|e| format!("ssh login-script failed: {e}"))?;
-    let stdout = String::from_utf8_lossy(&out.stdout).to_string();
-    if !out.status.success() {
-        eprintln!(
-            "[hosts] remote opencode script exited {}: {}",
-            out.status,
-            String::from_utf8_lossy(&out.stderr).trim()
-        );
-    }
-    Ok((out.status.success(), stdout))
+        .map_err(|e| format!("SSH OpenCode transfer failed: {e}"))
 }
 
 #[cfg(test)]
@@ -466,16 +380,18 @@ mod tests {
     }
 
     #[test]
-    fn parse_sid_marker_extracts_id() {
-        let out = "motd line\nImporting...\nCMX_OC_SID=ses_abc123\n";
-        assert_eq!(parse_sid_marker(out).as_deref(), Some("ses_abc123"));
+    fn remote_export_frame_excludes_shell_output() {
+        let output = b"shell banner\n\0CMX_OC_SID=ses_abc123\n{\"fixture\":1}\n\0shell footer\n";
+        let (id, bundle) = remote_export_bundle(output).unwrap().unwrap();
+        assert_eq!(id, "ses_abc123");
+        assert_eq!(bundle, b"{\"fixture\":1}\n");
     }
 
     #[test]
-    fn parse_sid_marker_none_when_absent() {
-        assert_eq!(parse_sid_marker("nothing here\n"), None);
-        // A malformed marker (no ses_ prefix) is ignored.
-        assert_eq!(parse_sid_marker("CMX_OC_SID=garbage\n"), None);
+    fn remote_export_frame_requires_both_delimiters_and_session_id() {
+        assert_eq!(remote_export_bundle(b"nothing here\n").unwrap(), None);
+        assert!(remote_export_bundle(b"\0CMX_OC_SID=ses_fixture\n{}").is_err());
+        assert!(remote_export_bundle(b"\0CMX_OC_SID=bad_id\n{}\0").is_err());
     }
 
     #[test]
@@ -484,27 +400,75 @@ mod tests {
         assert_eq!(shell_sq("a'b"), "'a'\\''b'");
     }
 
-    #[test]
-    fn remote_import_script_cds_then_imports_then_cleans_up() {
-        let s = remote_import_script("/home/me/ws", "/tmp/codemux-opencode-1.json");
-        assert!(s.contains("mkdir -p '/home/me/ws' && cd '/home/me/ws' || exit 3"));
-        assert!(s.contains("opencode import '/tmp/codemux-opencode-1.json'"));
-        assert!(s.contains("rm -f '/tmp/codemux-opencode-1.json'"));
-        // Propagates import's exit status so callers can detect failure.
-        assert!(s.contains("exit $rc"));
+    async fn run_transfer_fixture(script: &str, opencode: &str, input: Option<&[u8]>) -> Output {
+        let mut command = Command::new("bash");
+        let fixture = format!(
+            r#"mktemp() {{
+    directory=$(command mktemp "$@") || return 1
+    printf '%s\n' "$directory" >&2
+    ls -ld "$directory" >&2
+    printf '%s\n' "$directory"
+}}
+opencode() {{
+{opencode}
+}}
+{script}"#
+        );
+        command.args(["--noprofile", "--norc", "-c", &fixture]);
+        output(&mut command, input).await.unwrap()
     }
 
-    #[test]
-    fn remote_extract_script_queries_then_exports_with_marker() {
-        let s = remote_extract_script("/home/me/ws", "/tmp/codemux-opencode-2.json");
+    fn assert_private_scratch_removed(output: &Output) {
+        let diagnostics = std::str::from_utf8(&output.stderr).unwrap();
+        let mut lines = diagnostics.lines();
+        let directory = Path::new(lines.next().unwrap());
+        assert!(lines.next().unwrap().starts_with("drwx------"));
+        assert!(!directory.exists(), "scratch remains at {directory:?}");
+    }
+
+    #[tokio::test]
+    async fn remote_import_uses_private_scratch_and_cleans_up_on_failure() {
+        let fixture = tempfile::tempdir().unwrap();
+        let workspace = fixture.path().join("user's workspace");
+        let script = remote_import_script(workspace.to_str().unwrap());
+        let fake_opencode = r#"
+test "$1" = import && test "${PWD##*/}" = "user's workspace" || return 3
+ls -l "$2" >&2
+cat "$2"
+return 17
+"#;
+        let contents = b"{\"fixture\":1}\n";
+        let result = run_transfer_fixture(&script, fake_opencode, Some(contents)).await;
+        assert_eq!(result.status.code(), Some(17));
+        assert_eq!(result.stdout, contents);
+        assert_private_scratch_removed(&result);
+        let diagnostics = std::str::from_utf8(&result.stderr).unwrap();
+        assert!(diagnostics
+            .lines()
+            .nth(2)
+            .unwrap()
+            .starts_with("-rw-------"));
+    }
+
+    #[tokio::test]
+    async fn remote_export_sends_bundle_and_cleans_up_private_scratch() {
+        let script = remote_extract_script("/home/me/ws");
         // The query is built by the shared SQL helper and passed as one
         // shell-quoted argument (no raw $dir splice into the SQL literal).
-        assert!(s.contains(&shell_sq(&newest_session_sql("/home/me/ws"))));
-        assert!(s.starts_with("umask 077\n"));
-        assert!(s.contains("opencode db"));
-        assert!(s.contains("parent_id IS NULL"));
-        assert!(s.contains("opencode export \"$sid\" > '/tmp/codemux-opencode-2.json'"));
-        assert!(s.contains("echo \"CMX_OC_SID=$sid\""));
+        assert!(script.contains(&shell_sq(&newest_session_sql("/home/me/ws"))));
+        let fake_opencode = r#"
+case "$1" in
+    db) printf 'id\nses_fixture\n' ;;
+    export) test "$2" = ses_fixture && printf '{"fixture":1}\n' ;;
+    *) return 3 ;;
+esac
+"#;
+        let result = run_transfer_fixture(&script, fake_opencode, None).await;
+        assert!(result.status.success());
+        let (id, bundle) = remote_export_bundle(&result.stdout).unwrap().unwrap();
+        assert_eq!(id, "ses_fixture");
+        assert_eq!(bundle, b"{\"fixture\":1}\n");
+        assert_private_scratch_removed(&result);
     }
 
     #[test]
@@ -513,7 +477,7 @@ mod tests {
         // apostrophe doubled), exactly like the local-side newest_session_sql —
         // never spliced raw via a shell variable, which breaks the SQL literal.
         let cwd = "/Users/O'Brien/ws";
-        let s = remote_extract_script(cwd, "/tmp/b.json");
+        let s = remote_extract_script(cwd);
         assert!(
             s.contains(&shell_sq(&newest_session_sql(cwd))),
             "must embed the SQL-escaped query; got:\n{s}"
@@ -522,14 +486,5 @@ mod tests {
             !s.contains("'$dir'"),
             "must not splice the raw path into the SQL string literal"
         );
-    }
-
-    #[test]
-    fn unique_remote_bundles_differ() {
-        // Two bundles requested back to back must not collide.
-        let a = unique_remote_bundle();
-        let b = unique_remote_bundle();
-        assert_ne!(a, b);
-        assert!(a.starts_with("/tmp/codemux-opencode-"));
     }
 }
