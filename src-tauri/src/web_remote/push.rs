@@ -498,6 +498,25 @@ mod tests {
             .unwrap()
             .get_public_key();
         assert_eq!(public_key.len(), 65);
+        let group =
+            openssl::ec::EcGroup::from_curve_name(openssl::nid::Nid::X9_62_PRIME256V1).unwrap();
+        let secret =
+            openssl::bn::BigNum::from_slice(&URL_SAFE_NO_PAD.decode(private_key).unwrap()).unwrap();
+        let mut context = openssl::bn::BigNumContext::new().unwrap();
+        let mut expected_public_key = openssl::ec::EcPoint::new(&group).unwrap();
+        expected_public_key
+            .mul_generator(&group, &secret, &context)
+            .unwrap();
+        assert_eq!(
+            public_key,
+            expected_public_key
+                .to_bytes(
+                    &group,
+                    openssl::ec::PointConversionForm::UNCOMPRESSED,
+                    &mut context,
+                )
+                .unwrap()
+        );
 
         let mut signature = VapidSignatureBuilder::from_base64(private_key, &subscription).unwrap();
         signature.add_claim("sub", "https://codemux.org");
