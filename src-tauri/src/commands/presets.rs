@@ -732,9 +732,10 @@ fn wait_and_write_command(
 /// Type an agent's initial prompt into its TUI once the agent has started.
 ///
 /// The prompt can hold untrusted text (PR comments, CI logs, issue bodies), so
-/// control characters are stripped first. Nothing is written if the shell is
-/// still in the foreground when the agent should be running: the agent exited
-/// or never started, and every prompt line would run as a shell command.
+/// control characters are stripped first, and nothing is written unless a
+/// foreground job (the agent) provably owns the terminal. Otherwise the agent
+/// exited or never started, or ownership can't be checked (Windows, remote
+/// panes), and every prompt line could run as a shell command.
 pub(crate) fn write_prompt_when_agent_ready(
     sessions: Arc<std::sync::Mutex<std::collections::HashMap<String, terminal::SessionRuntime>>>,
     session_id: String,
@@ -756,6 +757,35 @@ pub(crate) fn write_prompt_when_agent_ready(
 /// Quiet period before typing a prompt into an agent TUI, long enough for the
 /// agent to finish initializing.
 const AGENT_PROMPT_SETTLE_MS: u64 = 1500;
+
+/// Whether the program now in the terminal asked for bracketed paste: the most
+/// recent `ESC[?2004h` / `ESC[?2004l` in the session's buffered output is `h`.
+/// Shells turn it off before running a command, so a stale shell `h` does not
+/// count for the agent that follows.
+fn bracketed_paste_enabled(runtime: &terminal::SessionRuntime) -> bool {
+    const MODE: &[u8] = b"\x1b[?2004";
+    for chunk in runtime.pending_output.iter().rev() {
+        let last = chunk
+            .windows(MODE.len() + 1)
+            .rev()
+            .find(|w| w.starts_with(MODE) && matches!(w[MODE.len()], b'h' | b'l'));
+        if let Some(window) = last {
+            return window[MODE.len()] == b'h';
+        }
+    }
+    false
+}
+
+/// An agent prompt as typed input. Wrapped in bracketed paste when the agent
+/// enabled it, so its TUI inserts the whole text as one paste instead of
+/// submitting line by line; the body has no ESC left to end the paste early.
+fn agent_prompt_payload(prompt: &str, bracketed: bool) -> String {
+    if bracketed {
+        format!("\x1b[200~{prompt}\x1b[201~")
+    } else {
+        prompt.to_string()
+    }
+}
 
 /// `wait_and_write_command` with the byte(s) written after the command as a
 /// parameter: an empty `terminator` leaves the command typed but not run.
@@ -923,13 +953,23 @@ fn wait_and_write_guarded(
         writer_poll_start.elapsed()
     );
 
-    if needs_foreground_job && terminal::session_shell_owns_terminal(sessions, session_id) {
-        eprintln!(
-            "[codemux::presets] not typing the prompt into {session_id}: \
-             the shell is at its prompt, so the agent is not running"
-        );
-        return;
-    }
+    let command_to_write = if needs_foreground_job {
+        if !terminal::session_job_owns_terminal(sessions, session_id) {
+            eprintln!(
+                "[codemux::presets] not typing the prompt into {session_id}: \
+                 cannot confirm the agent owns the terminal (shell at its prompt, \
+                 remote pane, or no /proc)"
+            );
+            return;
+        }
+        let bracketed = {
+            let guard = sessions.lock().unwrap_or_else(|e| e.into_inner());
+            guard.get(session_id).is_some_and(bracketed_paste_enabled)
+        };
+        agent_prompt_payload(&command_to_write, bracketed)
+    } else {
+        command_to_write
+    };
 
     // Write the plain command text followed by the PTY command
     // terminator in a SINGLE `write_all` call. See
@@ -1174,6 +1214,107 @@ mod tests {
         wait_and_write(&sessions, "sess", "npm install -g @openai/codex", 30, b"");
 
         assert_eq!(*calls.lock().unwrap(), vec![b"npm install -g @openai/codex".to_vec()]);
+    }
+
+    #[test]
+    fn bracketed_paste_follows_the_latest_mode_switch() {
+        let mut runtime = crate::terminal::SessionRuntime::new("sess");
+        assert!(!bracketed_paste_enabled(&runtime));
+        // The shell enables it at its prompt and disables it to run a command.
+        runtime.pending_output.push_back(b"$ \x1b[?2004h".to_vec());
+        runtime.pending_output.push_back(b"gemini\r\n\x1b[?2004l\r".to_vec());
+        assert!(!bracketed_paste_enabled(&runtime));
+        runtime.pending_output.push_back(b"\x1b[?1049h\x1b[?2004h> ".to_vec());
+        runtime.pending_output.push_back(b"banner".to_vec());
+        assert!(bracketed_paste_enabled(&runtime));
+    }
+
+    #[test]
+    fn agent_prompt_payload_wraps_only_when_bracketed() {
+        assert_eq!(agent_prompt_payload("a\nb", false), "a\nb");
+        assert_eq!(agent_prompt_payload("a\nb", true), "\x1b[200~a\nb\x1b[201~");
+    }
+
+    /// An agent prompt reaches the PTY only while a job owns the terminal:
+    /// an idle shell, an unknown pid or a pid that can't be read gets nothing.
+    #[test]
+    #[serial_test::serial]
+    #[cfg(target_os = "linux")]
+    fn agent_prompt_is_written_only_while_a_job_owns_the_terminal() {
+        use portable_pty::{native_pty_system, CommandBuilder, PtySize};
+
+        fn spawn(cmd: CommandBuilder) -> (Box<dyn portable_pty::Child + Send + Sync>, u32) {
+            let pty = native_pty_system()
+                .openpty(PtySize {
+                    rows: 24,
+                    cols: 80,
+                    pixel_width: 0,
+                    pixel_height: 0,
+                })
+                .expect("openpty");
+            let child = pty.slave.spawn_command(cmd).expect("spawn");
+            drop(pty.slave);
+            let pid = child.process_id().expect("child pid");
+            std::mem::forget(pty.master);
+            (child, pid)
+        }
+        fn stop(mut child: Box<dyn portable_pty::Child + Send + Sync>, pid: u32) {
+            if let Some((_, tpgid)) = crate::terminal::read_pgrp_tpgid(pid) {
+                if tpgid > 1 && tpgid as u32 != pid {
+                    // SAFETY: plain signal to the test job's own process group.
+                    unsafe { libc::killpg(tpgid, libc::SIGKILL) };
+                }
+            }
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+
+        let sessions = make_sessions();
+        let insert = |id: &str, pid: Option<u32>| {
+            let calls: std::sync::Arc<std::sync::Mutex<Vec<Vec<u8>>>> = Default::default();
+            let mut runtime = crate::terminal::SessionRuntime::new(id);
+            runtime.writer = Some(Box::new(RecordingWriter {
+                calls: calls.clone(),
+            }));
+            runtime.child_pid = pid;
+            runtime.pending_output.push_back(b"\x1b[?2004h> ".to_vec());
+            sessions.lock().unwrap().insert(id.into(), runtime);
+            calls
+        };
+        let write = |id: &str| {
+            wait_and_write_guarded(&sessions, id, "fix\nit", 30, PTY_COMMAND_TERMINATOR, true)
+        };
+
+        let (idle, idle_pid) = spawn(CommandBuilder::new("cat"));
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        let idle_calls = insert("idle", Some(idle_pid));
+        let no_pid_calls = insert("no-pid", None);
+        let gone_calls = insert("gone", Some(u32::MAX));
+        write("idle");
+        write("no-pid");
+        write("gone");
+        stop(idle, idle_pid);
+        assert!(idle_calls.lock().unwrap().is_empty(), "typed into an idle shell");
+        assert!(no_pid_calls.lock().unwrap().is_empty());
+        assert!(gone_calls.lock().unwrap().is_empty());
+
+        let mut cmd = CommandBuilder::new("sh");
+        cmd.arg("-c");
+        cmd.arg("set -m; sleep 3600");
+        let (busy, busy_pid) = spawn(cmd);
+        let busy_calls = insert("busy", Some(busy_pid));
+        let start = std::time::Instant::now();
+        while !terminal::session_job_owns_terminal(&sessions, "busy")
+            && start.elapsed() < std::time::Duration::from_secs(5)
+        {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        write("busy");
+        stop(busy, busy_pid);
+        assert_eq!(
+            *busy_calls.lock().unwrap(),
+            vec![b"\x1b[200~fix\nit\x1b[201~\r".to_vec()]
+        );
     }
 
     #[test]

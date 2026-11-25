@@ -325,10 +325,17 @@ pub fn shell_escape_for_double_quotes(s: &str) -> String {
 /// result is printable ASCII only: a raw control byte (^U, ^O, ESC, ...) would
 /// act as a line-editing key before the quote is ever parsed. Every other byte,
 /// UTF-8 included, becomes `\xHH`, which bash and zsh decode back to the same
-/// bytes. `'` is written as `\x27` so the body never contains a quote, even
-/// for shells without `$'...'` support that read it as a plain `'...'` string,
-/// and `!` as `\x21` so bash history expansion cannot splice in other text.
-/// NUL cannot reach argv and is dropped.
+/// bytes. `'` is written as `\x27` so the body never contains a quote and
+/// cannot end the quoted argument in any shell, and `!` as `\x21` so bash
+/// history expansion cannot splice in other text. NUL cannot reach argv and
+/// is dropped.
+///
+/// Only bash and zsh decode the escapes. Other `'`-quoting shells do not:
+/// the agent gets the escaped text, or the line fails to parse (fish rejects
+/// `$'`), but the body has no quote or control byte to break out with.
+/// cmd.exe, the Windows fallback when no PowerShell is installed, has no `'`
+/// quoting and still interprets `&`, `|`, `<` and `>` in the body; agent
+/// presets are not supported there (see `inject_agent_context`).
 pub fn shell_escape_for_ansi_c_quotes(s: &str) -> String {
     use std::fmt::Write as _;
     let mut out = String::with_capacity(s.len());
@@ -618,21 +625,25 @@ mod tests {
         }
     }
 
-    /// The escaped argument must decode back to the original prompt.
+    /// The escaped argument must decode back to the original prompt in every
+    /// shell that supports `$'...'`. Shells missing from PATH are skipped.
     #[cfg(unix)]
     #[test]
-    fn ansi_c_escape_round_trips_through_bash() {
-        let Ok(bash) = which::which("bash") else {
-            return;
-        };
+    fn ansi_c_escape_round_trips_through_bash_and_zsh() {
         let prompt = "a\x15b\x0fc\x1b[31md\x03\te\x7ff\r\ng'h\\i!!j $HOME `id` é 🚀\u{9b}";
         let script = format!("printf '%s' $'{}'", shell_escape_for_ansi_c_quotes(prompt));
-        let out = std::process::Command::new(bash)
-            .args(["--norc", "--noprofile", "-c", &script])
-            .output()
-            .expect("run bash");
-        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
-        assert_eq!(String::from_utf8(out.stdout).unwrap(), prompt);
+        for (shell, args) in [("bash", ["--norc", "--noprofile"]), ("zsh", ["-f", "-d"])] {
+            let Ok(path) = which::which(shell) else {
+                continue;
+            };
+            let out = std::process::Command::new(path)
+                .args(args)
+                .args(["-c", &script])
+                .output()
+                .expect("run shell");
+            assert!(out.status.success(), "{shell}: {}", String::from_utf8_lossy(&out.stderr));
+            assert_eq!(String::from_utf8(out.stdout).unwrap(), prompt, "{shell}");
+        }
     }
 
     #[test]
