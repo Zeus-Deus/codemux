@@ -94,8 +94,9 @@ pub fn build_agent_context(
 ///   Windows users who need agents should stick with the default PowerShell.
 ///
 /// Gemini CLI has no CLI flag — it reads `GEMINI_SYSTEM_MD` pointing to a file. For Gemini,
-/// we prefix the command with an inline write that dumps `CODEMUX_AGENT_CONTEXT` to a temp
-/// file and sets the env var, so the file is only created when Gemini actually launches.
+/// we prefix the command with an inline write that dumps `CODEMUX_AGENT_CONTEXT` to a file in
+/// the user's private launch folder (see [`launch_file_path`]) and sets the env var, so the
+/// file is only created when Gemini actually launches, on whichever host runs the terminal.
 /// The Gemini inline pipeline also needs a PowerShell rewrite on Windows (no `printf`,
 /// no `&&` on PS 5.1, and `GEMINI_SYSTEM_MD=val command` inline-env syntax is Unix-only).
 ///
@@ -128,10 +129,7 @@ pub fn inject_agent_context(command: &str, workspace_id: &str) -> String {
             )
         }
         "gemini" => {
-            let path = std::env::temp_dir()
-                .join(format!("codemux-{workspace_id}-gemini-system.md"))
-                .to_string_lossy()
-                .into_owned();
+            let path = launch_file_path(workspace_id, "gemini-system.md");
             gemini_injection_command(&path, command)
         }
         "droid" => {
@@ -140,10 +138,7 @@ pub fn inject_agent_context(command: &str, workspace_id: &str) -> String {
             if command.contains("--settings") {
                 command.to_string()
             } else {
-                let path = std::env::temp_dir()
-                    .join(format!("codemux-{workspace_id}-droid-settings.json"))
-                    .to_string_lossy()
-                    .into_owned();
+                let path = launch_file_path(workspace_id, "droid-settings.json");
                 droid_injection_command(&path, command)
             }
         }
@@ -161,6 +156,38 @@ pub fn inject_agent_context(command: &str, workspace_id: &str) -> String {
 const DROID_AUTONOMY_JSON: &str =
     r#"{"sessionDefaultSettings":{"autonomyLevel":"high"}}"#;
 
+/// Folder for the Gemini and Droid launch files on Unix. `$HOME` is expanded
+/// by the shell running the command, so this is right on whichever host the
+/// terminal lives. It must never be the shared temp dir: the files decide
+/// what a full-autonomy agent is told and allowed, and a fixed name there can
+/// be created or symlinked first by another local user.
+#[cfg(unix)]
+const LAUNCH_DIR: &str = "$HOME/.codemux/agent-launch";
+
+/// Where the `kind` launch file for `workspace_id` goes. On Unix the result
+/// contains `$HOME` and must be used inside double quotes.
+fn launch_file_path(workspace_id: &str, kind: &str) -> String {
+    // Workspace ids are generated, but the path is spliced into a shell
+    // command, so keep only characters that need no quoting.
+    let id: String = workspace_id
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+        .collect();
+    let name = format!("codemux-{id}-{kind}");
+    #[cfg(unix)]
+    return format!("{LAUNCH_DIR}/{name}");
+    // %TEMP% is already private to the user on Windows.
+    #[cfg(not(unix))]
+    return std::env::temp_dir().join(name).to_string_lossy().into_owned();
+}
+
+/// Shell prefix that creates [`LAUNCH_DIR`] owner-only before a launch file
+/// is written into it.
+#[cfg(unix)]
+fn prepare_launch_dir() -> String {
+    format!("mkdir -p \"{LAUNCH_DIR}\" && chmod 700 \"{LAUNCH_DIR}\"")
+}
+
 /// Returns the shell-level expansion of the `CODEMUX_AGENT_CONTEXT` env var for
 /// the platform's default shell. Used inside `inject_agent_context` to produce a
 /// preset command string that the running shell will parse correctly. See the
@@ -176,15 +203,17 @@ fn agent_context_shell_expansion() -> &'static str {
 }
 
 /// Builds the Gemini pre-command pipeline that writes the agent context to a
-/// temp file and points `GEMINI_SYSTEM_MD` at it, then chains the actual gemini
+/// private launch file and points `GEMINI_SYSTEM_MD` at it, then chains the actual gemini
 /// invocation. Platform-specific because the shell syntax differs between
 /// POSIX shells and PowerShell.
 #[cfg(unix)]
 fn gemini_injection_command(path: &str, command: &str) -> String {
-    // POSIX shell (bash/zsh/sh/fish): `printf` → file redirect → inline env
-    // var → command. `&&` short-circuits if the write fails.
+    // POSIX shell (bash/zsh/sh/fish): private folder → `printf` → file
+    // redirect → inline env var → command. `&&` short-circuits if any step
+    // fails.
     format!(
-        "printf '%s' \"$CODEMUX_AGENT_CONTEXT\" > {path} && GEMINI_SYSTEM_MD={path} {command}"
+        "{} && printf '%s' \"$CODEMUX_AGENT_CONTEXT\" > \"{path}\" && GEMINI_SYSTEM_MD=\"{path}\" {command}",
+        prepare_launch_dir()
     )
 }
 
@@ -216,7 +245,10 @@ fn droid_injection_command(path: &str, command: &str) -> String {
     // are literal (the JSON contains no single quotes). `&&`
     // short-circuits if the write fails so we never launch droid
     // pointing at a missing/partial settings file.
-    format!("printf '%s' '{DROID_AUTONOMY_JSON}' > {path} && {command} --settings {path}")
+    format!(
+        "{} && printf '%s' '{DROID_AUTONOMY_JSON}' > \"{path}\" && {command} --settings \"{path}\"",
+        prepare_launch_dir()
+    )
 }
 
 #[cfg(windows)]
@@ -481,7 +513,7 @@ mod tests {
         assert!(result.contains(r#"{"sessionDefaultSettings":{"autonomyLevel":"high"}}"#));
         assert!(result.contains("codemux-test-ws-droid-droid-settings.json"));
         assert!(result.contains("droid --settings "));
-        assert!(result.ends_with("droid-settings.json"));
+        assert!(result.ends_with("droid-settings.json\""));
     }
 
     #[cfg(windows)]
@@ -506,10 +538,11 @@ mod tests {
         assert_eq!(result, "droid --settings /my/own.json");
     }
 
+    #[cfg(windows)]
     #[test]
     fn inject_droid_settings_path_is_cross_platform() {
-        // Regression guard mirroring the Gemini path: the droid
-        // settings file must resolve via std::env::temp_dir(), never a
+        // Regression guard mirroring the Gemini path: on Windows the droid
+        // settings file resolves via the per-user %TEMP%, never a
         // hardcoded unix path.
         let result = inject_agent_context("droid", "test-ws-dx");
         let expected_temp = std::env::temp_dir()
@@ -522,6 +555,63 @@ mod tests {
         );
     }
 
+    /// On Unix the launch files live in an owner-only folder under the
+    /// user's home, never the shared temp dir, where another local user
+    /// could create or symlink the predictable name first.
+    #[cfg(unix)]
+    #[test]
+    fn unix_launch_files_stay_out_of_shared_temp() {
+        let temp = std::env::temp_dir().to_string_lossy().into_owned();
+        for (command, name) in [
+            ("gemini --yolo", "codemux-ws-1-gemini-system.md"),
+            ("droid", "codemux-ws-1-droid-settings.json"),
+        ] {
+            let result = inject_agent_context(command, "ws-1");
+            let path = format!("\"$HOME/.codemux/agent-launch/{name}\"");
+            assert!(
+                result.starts_with(
+                    "mkdir -p \"$HOME/.codemux/agent-launch\" && chmod 700 \"$HOME/.codemux/agent-launch\" && "
+                ),
+                "{result}"
+            );
+            assert!(result.contains(&format!("> {path}")), "{result}");
+            assert!(!result.contains(&temp), "{result}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unix_launch_files_run_in_a_shell() {
+        // Run the generated command with a scratch HOME and a stand-in
+        // agent so the real write, folder mode, and argument are all
+        // exercised.
+        use std::os::unix::fs::PermissionsExt;
+        let home = tempfile::tempdir().unwrap();
+        let command = inject_agent_context("droid", "ws-run").replace("&& droid ", "&& echo ");
+        let out = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(&command)
+            .env("HOME", home.path())
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+        let dir = home.path().join(".codemux/agent-launch");
+        let file = dir.join("codemux-ws-run-droid-settings.json");
+        assert_eq!(
+            String::from_utf8_lossy(&out.stdout).trim(),
+            format!("--settings {}", file.display()),
+        );
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), DROID_AUTONOMY_JSON);
+        let mode = std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o700);
+    }
+
+    #[test]
+    fn launch_file_path_drops_shell_metacharacters_from_the_id() {
+        let path = launch_file_path("ws\"$(x)`;' 1", "droid-settings.json");
+        assert!(path.ends_with("codemux-wsx1-droid-settings.json"), "{path}");
+    }
+
     /// Regression guard: the Gemini injection path MUST resolve its temp
     /// file via `std::env::temp_dir()` — never a hardcoded `/tmp/`. On
     /// Linux `std::env::temp_dir()` typically returns `/tmp/`, so a
@@ -530,6 +620,7 @@ mod tests {
     ///
     /// The test asserts the generated shell command contains the OS-
     /// appropriate temp dir as a prefix of the gemini-system-md path.
+    #[cfg(windows)]
     #[test]
     fn test_gemini_context_path_is_cross_platform() {
         let result = inject_agent_context("gemini", "test-ws-xplat");

@@ -689,16 +689,22 @@ fn write_clipboard_image_to_disk(bytes: &[u8], mime: &str) -> Result<String, Str
         return Err(format!("Unsupported clipboard MIME type: {mime}"));
     }
 
-    let dir = std::env::temp_dir().join("codemux-clipboard-images");
-    std::fs::create_dir_all(&dir)
+    // Owner-only, never the shared temp dir: pasted screenshots often hold
+    // secrets. The folder name is how the attachment chip spots a paste.
+    let dir = crate::private_dir::user_private_dir("codemux-clipboard-images")
         .map_err(|e| format!("Failed to create clipboard image dir: {e}"))?;
 
     let ext = clipboard_image_extension(mime);
     let filename = format!("paste-{}.{}", uuid::Uuid::new_v4(), ext);
     let path = dir.join(&filename);
 
-    std::fs::write(&path, bytes)
+    let mut file = crate::private_dir::create_private_file(&path)
         .map_err(|e| format!("Failed to write clipboard image: {e}"))?;
+    if let Err(e) = std::io::Write::write_all(&mut file, bytes) {
+        drop(file);
+        let _ = std::fs::remove_file(&path);
+        return Err(format!("Failed to write clipboard image: {e}"));
+    }
 
     Ok(path.to_string_lossy().to_string())
 }
@@ -1263,7 +1269,7 @@ mod tests {
     async fn save_clipboard_image_bytes_writes_under_codemux_clipboard_dir() {
         // The artifacts must land under a clearly-named subdir so
         // operators can wipe the cache without grepping through
-        // every UUID in /tmp. Lock the directory name as part of
+        // every UUID beside them. Lock the directory name as part of
         // the contract.
         let path = save_clipboard_image_bytes(vec![0x89, 0x50, 0x4e, 0x47], "image/png".into())
             .await
@@ -1272,6 +1278,21 @@ mod tests {
             path.contains("codemux-clipboard-images"),
             "expected path under codemux-clipboard-images/, got {path}",
         );
+        cleanup_clipboard_temp(&path);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn save_clipboard_image_bytes_is_owner_only_outside_shared_temp() {
+        use std::os::unix::fs::PermissionsExt;
+        let path = save_clipboard_image_bytes(vec![0x89, 0x50, 0x4e, 0x47], "image/png".into())
+            .await
+            .unwrap();
+        let file = std::path::Path::new(&path);
+        let mode = |p: &std::path::Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode(file), 0o600);
+        assert_eq!(mode(file.parent().unwrap()), 0o700);
+        assert!(!file.starts_with(std::env::temp_dir().join("codemux-clipboard-images")));
         cleanup_clipboard_temp(&path);
     }
 

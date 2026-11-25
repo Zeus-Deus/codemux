@@ -231,13 +231,15 @@ async fn spawn_probe(binary_path: &Path) -> Result<JsonRpcChild, HarvestError> {
 }
 
 /// A Codemux-owned empty folder, so the throwaway discovery session never
-/// reads or indexes a real project.
+/// reads or indexes a real project. It is private to this user: the agent
+/// loads project config from its working folder, and a shared temp path could
+/// be created and filled by someone else first.
 fn probe_directory() -> Result<PathBuf, HarvestError> {
-    let dir = std::env::temp_dir().join("codemux-antigravity-probe");
-    std::fs::create_dir_all(&dir).map_err(|error| HarvestError::HarvestFailed {
-        message: format!("Could not create the Antigravity probe folder: {error}"),
-    })?;
-    Ok(dir)
+    crate::private_dir::user_private_dir("antigravity-probe").map_err(|error| {
+        HarvestError::HarvestFailed {
+            message: format!("Could not create the Antigravity probe folder: {error}"),
+        }
+    })
 }
 
 async fn sign_in(child: &JsonRpcChild) -> Result<Value, HarvestError> {
@@ -536,5 +538,15 @@ mod tests {
     fn an_empty_catalogue_is_a_typed_failure() {
         let error = build_capabilities(&initialize(), &json!({}), &HashMap::new()).unwrap_err();
         assert!(error.to_command_string().starts_with("antigravity_harvest_failed:"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn probe_folder_is_private_and_not_in_shared_temp() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = probe_directory().unwrap();
+        assert_ne!(dir, std::env::temp_dir().join("codemux-antigravity-probe"));
+        let mode = std::fs::symlink_metadata(&dir).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o700);
     }
 }
