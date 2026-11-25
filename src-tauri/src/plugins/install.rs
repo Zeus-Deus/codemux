@@ -580,6 +580,7 @@ impl Git {
                 return Ok(());
             }
         }
+        let has_tags = refs.iter().any(|name| name.starts_with("refs/tags/"));
         let mut searched = 0;
         for (round, depth) in depths.iter().enumerate() {
             for remote_ref in &refs {
@@ -593,9 +594,11 @@ impl Git {
                 }
             }
             searched = *depth;
-            // Every advertised branch and tag was checked at this depth. If
-            // none has omitted history, the pin is conclusively unreachable.
-            if !check.shallow_besides(sha)? {
+            // Tags were checked in a separate verifier at the first depth.
+            // Its shallow state cannot prove anything about `check`, so a
+            // complete branch search alone must not declare a tag-only pin
+            // unreachable before tags join this verifier in round two.
+            if (round > 0 || !has_tags) && !check.shallow_besides(sha)? {
                 return Err(unreachable());
             }
         }

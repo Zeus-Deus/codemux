@@ -313,6 +313,24 @@ fn provenance_checks_release_tags_before_costly_default_history() {
 }
 
 #[test]
+fn provenance_deepens_tag_only_history_after_the_default_branch_is_complete() {
+    let f = fixture();
+    let origin = PathBuf::from(f.url.strip_prefix("file://").unwrap());
+    let work = origin.parent().unwrap().join("work");
+    git(&work, &["checkout", "-q", "-b", "release", &f.first]);
+    let release = commits(&work, 4);
+    git(&work, &["tag", "-a", "v9", "-m", "v9"]);
+    git(&work, &["push", "-q", origin.to_str().unwrap(), "refs/tags/v9"]);
+
+    let verifier = test_git();
+    // Main is only two commits long, but this pin is three commits behind
+    // the tag tip and no branch contains the release commits.
+    let short = verifier.check_on_branch_or_tag_within(&f.url, &release[0], &[1]).unwrap_err();
+    assert!(short.contains("Could not confirm") && !short.contains("isn't on any branch"), "{short}");
+    verifier.check_on_branch_or_tag_within(&f.url, &release[0], &[1, 5]).unwrap();
+}
+
+#[test]
 fn initial_commit_fetch_stops_when_repository_exceeds_disk_guard() {
     let f = fixture();
     let origin = PathBuf::from(f.url.strip_prefix("file://").unwrap());
