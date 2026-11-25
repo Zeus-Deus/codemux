@@ -41,11 +41,12 @@ interface LazyImageIdentity {
   pointer: string;
 }
 
-export function ToolResultImages({ images, onImageError, lazyImageIdentity, onRetry }: {
+export function ToolResultImages({ images, onImageError, lazyImageIdentity, onRetry, pending = false }: {
   images: ToolResultImage[];
   onImageError?: () => void;
   lazyImageIdentity?: LazyImageIdentity;
   onRetry?: () => void;
+  pending?: boolean;
 }) {
   const [lightboxSelection, setLightboxSelection] = useState<{
     index: number;
@@ -63,31 +64,37 @@ export function ToolResultImages({ images, onImageError, lazyImageIdentity, onRe
       selectedSrc?.startsWith("blob:")
     )
   ));
-  const lightboxImage = !onRetry && lightboxSelection && selectedImage && selectedSourceMatches && (
+  const lightboxImage = !pending && !onRetry && lightboxSelection && selectedImage && selectedSourceMatches && (
     !needsRemoteConfirmation(selectedImage) || approvedRemoteSources[lightboxSelection.index] === selectedSrc
   ) ? selectedImage : undefined;
 
   useEffect(() => {
-    if (lightboxSelection && (onRetry || !selectedSourceMatches)) {
+    if (lightboxSelection && (pending || onRetry || !selectedSourceMatches)) {
       setLightboxSelection(null);
     }
-  }, [lightboxSelection, onRetry, selectedSourceMatches]);
+  }, [lightboxSelection, onRetry, pending, selectedSourceMatches]);
 
-  if (images.length === 0) return null;
+  const thumbnails: Array<ToolResultImage | null> = images.length === 0 && lazyImageIdentity ? [null] : images;
+  if (thumbnails.length === 0) return null;
 
   return (
     <div className="flex flex-wrap gap-2">
-      {images.map((image, i) => (
+      {thumbnails.map((image, i) => (
         <ToolResultThumbnail
-          key={lazyImageIdentity ? i : `${image.src}-${i}`}
+          key={lazyImageIdentity ? i : `${image?.src}-${i}`}
           image={image}
-          approved={!needsRemoteConfirmation(image) || approvedRemoteSources[i] === image.src}
-          onConfirm={() => setApprovedRemoteSources((current) => ({ ...current, [i]: image.src }))}
-          onOpen={() => setLightboxSelection({
-            index: i,
-            src: image.src,
-            localIdentity: image.trustedLocal ? lazyImageIdentity : undefined,
-          })}
+          pending={pending}
+          approved={!image || !needsRemoteConfirmation(image) || approvedRemoteSources[i] === image.src}
+          onConfirm={() => {
+            if (image) setApprovedRemoteSources((current) => ({ ...current, [i]: image.src }));
+          }}
+          onOpen={() => {
+            if (image) setLightboxSelection({
+              index: i,
+              src: image.src,
+              localIdentity: image.trustedLocal ? lazyImageIdentity : undefined,
+            });
+          }}
           onImageError={onImageError}
           onRetry={onRetry}
         />
@@ -115,13 +122,15 @@ function ToolResultThumbnail({
   onOpen,
   onImageError,
   onRetry,
+  pending,
 }: {
-  image: ToolResultImage;
+  image: ToolResultImage | null;
   approved: boolean;
   onConfirm: () => void;
   onOpen: () => void;
   onImageError?: () => void;
   onRetry?: () => void;
+  pending: boolean;
 }) {
   const [failed, setFailed] = useState(false);
   const [confirmationSrc, setConfirmationSrc] = useState<string | null>(null);
@@ -130,7 +139,7 @@ function ToolResultThumbnail({
 
   useEffect(() => {
     setFailed(false);
-  }, [image.src]);
+  }, [image?.src]);
 
   useEffect(() => {
     // Approval removes the dialog trigger; focus its replacement after React mounts it.
@@ -139,7 +148,7 @@ function ToolResultThumbnail({
     approvedButtonRef.current?.focus({ preventScroll: true });
   }, [approved]);
 
-  if (!approved) {
+  if (image && !pending && !approved) {
     let host: string;
     try {
       host = new URL(image.src).host || "Invalid address";
@@ -194,17 +203,19 @@ function ToolResultThumbnail({
     );
   }
 
-  if (failed || onRetry) {
+  if (pending || !image || failed || onRetry) {
+    const loading = pending || (!image && !onRetry);
     return (
       <button
         ref={approvedButtonRef}
         type="button"
-        onClick={() => onRetry ? onRetry() : setFailed(false)}
+        onClick={loading ? undefined : () => onRetry ? onRetry() : setFailed(false)}
         className="flex h-20 w-28 cursor-pointer flex-col items-center justify-center gap-1 rounded-lg border border-hairline bg-surface-1 text-label text-muted-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-focus-ring"
-        aria-label={onRetry ? "Image preview unavailable — retry" : "Retry image"}
+        aria-label={loading ? "Loading image" : onRetry ? "Image preview unavailable — retry" : "Retry image"}
+        aria-disabled={loading || undefined}
+        aria-busy={loading || undefined}
       >
-        <ImageOff className="size-5 opacity-40" aria-hidden />
-        Retry image
+        {loading ? "Loading image…" : <><ImageOff className="size-5 opacity-40" aria-hidden />Retry image</>}
       </button>
     );
   }
@@ -364,6 +375,7 @@ function LazyToolResultImage({ stub, pointer }: { stub: LazyToolResultStub; poin
     () => cached?.blob ? { src: cached.blob.src, local: false } : cached?.value ?? null,
   );
   const [failed, setFailed] = useState(false);
+  const [pending, setPending] = useState(() => !cached?.blob && !cached?.value);
   const [attempt, setAttempt] = useState(0);
   const mounted = useRef(false);
   const activeRequest = useRef<ImageRequest | null>(null);
@@ -378,11 +390,21 @@ function LazyToolResultImage({ stub, pointer }: { stub: LazyToolResultStub; poin
       idleBlobs.delete(request);
       idleBlobs.set(request, true);
     }
-    setSource(request.blob ? { src: request.blob.src, local: false } : request.value ?? null);
+    const current = request.blob ? { src: request.blob.src, local: false } : request.value ?? null;
+    setSource(current);
+    setPending(current === null);
     setFailed(false);
     request.promise.then((value) => {
-      if (mounted.current) setSource(request.blob ? { src: request.blob.src, local: false } : value);
-    }).catch(() => { if (mounted.current) setFailed(true); });
+      if (mounted.current) {
+        setSource(request.blob ? { src: request.blob.src, local: false } : value);
+        setPending(false);
+      }
+    }).catch(() => {
+      if (mounted.current) {
+        setFailed(true);
+        setPending(false);
+      }
+    });
     return () => { mounted.current = false; activeRequest.current = null; releaseImage(request); };
   }, [stub, pointer, attempt]);
 
@@ -399,21 +421,15 @@ function LazyToolResultImage({ stub, pointer }: { stub: LazyToolResultStub; poin
     });
   };
 
-  if (source) {
-    return <ToolResultImages images={[{
+  return <ToolResultImages images={source ? [{
       src: source.local ? convertFileSrc(source.src) : source.src,
       trustedLocal: source.local,
-    }]}
+    }] : []}
       lazyImageIdentity={{ stub, pointer }}
-      onRetry={failed ? () => setAttempt((value) => value + 1) : undefined}
-      onImageError={source.local ? readFallback : undefined} />;
-  }
-  return (
-    <button type="button" disabled={!failed} onClick={() => setAttempt((value) => value + 1)}
-      className="flex h-20 w-28 items-center justify-center rounded-lg border border-hairline bg-surface-1 text-label text-muted-foreground"
-      aria-label={failed ? "Image preview unavailable — retry" : "Loading image"}
-      title={failed ? "Retry the image preview, or load full output for the original data" : undefined}>
-      {failed ? "Retry image" : "Loading image…"}
-    </button>
-  );
+      pending={pending}
+      onRetry={failed ? () => {
+        setPending(true);
+        setAttempt((value) => value + 1);
+      } : undefined}
+      onImageError={source?.local ? readFallback : undefined} />;
 }

@@ -1,6 +1,6 @@
 /// <reference types="@testing-library/jest-dom/vitest" />
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 
 import { LAZY_TOOL_RESULT_KEY } from "@/lib/agent-chat/lazy-tool-result";
@@ -199,10 +199,20 @@ describe("lazy tool-result body", () => {
     expect(URL.revokeObjectURL).toHaveBeenCalledWith("blob:tool-image");
   });
 
-  it("returns focus to the retry control when an open image fallback fails", async () => {
+  it.each([
+    { outcome: "succeeds", succeeds: true },
+    { outcome: "fails again", succeeds: false },
+  ])("keeps focus through a retry that $outcome", async ({ succeeds }) => {
+    let resolveRetry!: (value: { src: string; local: boolean }) => void;
+    let rejectRetry!: (reason: Error) => void;
+    const retry = new Promise<{ src: string; local: boolean }>((resolve, reject) => {
+      resolveRetry = resolve;
+      rejectRetry = reject;
+    });
     vi.mocked(agentChatGetToolResultImage)
       .mockResolvedValueOnce({ src: "/managed/tool.png", local: true })
-      .mockRejectedValueOnce(new Error("inline image unavailable"));
+      .mockRejectedValueOnce(new Error("inline image unavailable"))
+      .mockReturnValueOnce(retry);
     render(<ToolCallBody item={imageStub()} />);
 
     await waitFor(() => expect(screen.getByRole("img")).toHaveAttribute("src", "asset:/managed/tool.png"));
@@ -212,6 +222,18 @@ describe("lazy tool-result body", () => {
     await waitFor(() => expect(screen.queryByRole("dialog", { name: "Tool result image" })).not.toBeInTheDocument());
     await waitFor(() => expect(screen.getByRole("button", { name: "Image preview unavailable — retry" })).toHaveFocus());
     expect(agentChatGetToolResultImage).toHaveBeenLastCalledWith(ROW_ID, "/1", true);
+
+    await userEvent.keyboard("{Enter}");
+    await waitFor(() => expect(screen.getByRole("button", { name: "Loading image" })).toHaveFocus());
+    expect(screen.getByRole("button", { name: "Loading image" })).toHaveAttribute("aria-disabled", "true");
+    if (succeeds) {
+      await act(async () => resolveRetry({ src: "/managed/retried.png", local: true }));
+      await waitFor(() => expect(screen.getByRole("button", { name: "Open image" })).toHaveFocus());
+      expect(screen.getByRole("img")).toHaveAttribute("src", "asset:/managed/retried.png");
+    } else {
+      await act(async () => rejectRetry(new Error("retry unavailable")));
+      await waitFor(() => expect(screen.getByRole("button", { name: "Image preview unavailable — retry" })).toHaveFocus());
+    }
   });
 
   it("evicts over-budget compressed bytes only after every mounted owner releases them", async () => {
