@@ -578,6 +578,31 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn supervised_forward_omits_unsupported_options_for_older_ssh_clients() {
+        let fixture = tempfile::tempdir().unwrap();
+        let ssh = fixture.path().join("ssh");
+        fs::write(
+            &ssh,
+            r#"#!/bin/sh
+[ "$1" = -G ] && [ "$2" = -F ] && [ "$3" = /dev/null ] || exit 1
+printf '%s\n' 'hostname localhost' 'stricthostkeychecking ask'
+"#,
+        )
+        .unwrap();
+        fs::set_permissions(&ssh, fs::Permissions::from_mode(0o700)).unwrap();
+
+        let (_, opts) = options();
+        let mut command = supervised_ssh_command(&ssh).await;
+        command.args(build_tunnel_argv(&opts));
+        let args: Vec<_> = command.as_std().get_args().collect();
+        let has_arg = |value: &str| args.iter().any(|arg| *arg == value);
+        assert!(has_arg("StrictHostKeyChecking=yes"), "{args:?}");
+        for (_, option) in FORWARD_PROCESS_OPTIONS {
+            assert!(!has_arg(option), "unsupported option {option} in {args:?}");
+        }
+    }
+
+    #[tokio::test]
     async fn supervised_forward_works_with_the_local_ssh_option_set() {
         let baseline = Command::new("ssh")
             .args(["-G", "-F", "/dev/null", "localhost"])
