@@ -694,6 +694,8 @@ fn write_clipboard_image_to_disk(bytes: &[u8], mime: &str) -> Result<String, Str
     let dir = crate::private_dir::user_private_dir("codemux-clipboard-images")
         .map_err(|e| format!("Failed to create clipboard image dir: {e}"))?;
 
+    prune_old_clipboard_images(&dir, CLIPBOARD_IMAGE_MAX_AGE);
+
     let ext = clipboard_image_extension(mime);
     let filename = format!("paste-{}.{}", uuid::Uuid::new_v4(), ext);
     let path = dir.join(&filename);
@@ -707,6 +709,34 @@ fn write_clipboard_image_to_disk(bytes: &[u8], mime: &str) -> Result<String, Str
     }
 
     Ok(path.to_string_lossy().to_string())
+}
+
+/// How long a pasted image is kept. Where the user has no runtime directory
+/// the pastes live in the cache directory, which nothing else ever clears.
+const CLIPBOARD_IMAGE_MAX_AGE: std::time::Duration = std::time::Duration::from_secs(7 * 24 * 60 * 60);
+
+/// Best-effort removal of `paste-*` files in `dir` older than `max_age`.
+fn prune_old_clipboard_images(dir: &std::path::Path, max_age: std::time::Duration) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    let now = std::time::SystemTime::now();
+    for entry in entries.flatten() {
+        if !entry.file_name().to_string_lossy().starts_with("paste-") {
+            continue;
+        }
+        let Ok(meta) = entry.metadata() else {
+            continue;
+        };
+        let old = meta
+            .modified()
+            .ok()
+            .and_then(|modified| now.duration_since(modified).ok())
+            .is_some_and(|age| age > max_age);
+        if meta.is_file() && old {
+            let _ = std::fs::remove_file(entry.path());
+        }
+    }
 }
 
 /// Persist a caller-supplied clipboard image payload to a temp file.
@@ -955,8 +985,9 @@ pub async fn grep_count_pattern(cwd: String, pattern: String) -> Result<usize, S
 mod tests {
     use super::{
         build_clipboard_image_payload, clipboard_image_extension, encode_rgba_to_png, file_exists,
-        file_signature, grep_count_pattern, list_directory, read_file, save_clipboard_image_bytes,
-        search_error_message, search_in_files, write_file, MAX_CLIPBOARD_IMAGE_BYTES,
+        file_signature, grep_count_pattern, list_directory, prune_old_clipboard_images, read_file,
+        save_clipboard_image_bytes, search_error_message, search_in_files, write_file,
+        CLIPBOARD_IMAGE_MAX_AGE, MAX_CLIPBOARD_IMAGE_BYTES,
     };
     use std::fs;
 
@@ -1294,6 +1325,30 @@ mod tests {
         assert_eq!(mode(file.parent().unwrap()), 0o700);
         assert!(!file.starts_with(std::env::temp_dir().join("codemux-clipboard-images")));
         cleanup_clipboard_temp(&path);
+    }
+
+    #[test]
+    fn prune_old_clipboard_images_removes_only_old_pastes() {
+        let dir = tempfile::tempdir().unwrap();
+        let old_paste = dir.path().join("paste-old.png");
+        let new_paste = dir.path().join("paste-new.png");
+        let other = dir.path().join("keep.png");
+        for path in [&old_paste, &new_paste, &other] {
+            std::fs::write(path, b"x").unwrap();
+        }
+        let long_ago = std::time::SystemTime::now() - std::time::Duration::from_secs(30 * 24 * 3600);
+        for path in [&old_paste, &other] {
+            std::fs::File::options()
+                .write(true)
+                .open(path)
+                .unwrap()
+                .set_modified(long_ago)
+                .unwrap();
+        }
+        prune_old_clipboard_images(dir.path(), CLIPBOARD_IMAGE_MAX_AGE);
+        assert!(!old_paste.exists());
+        assert!(new_paste.exists());
+        assert!(other.exists(), "only paste-* files are pruned");
     }
 
     // ── encode_rgba_to_png ───────────────────────────────────────

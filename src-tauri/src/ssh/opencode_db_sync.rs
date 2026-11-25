@@ -293,6 +293,9 @@ pub async fn pull_opencode_session(
         return Ok(None);
     };
 
+    // Created before the remote export so a local failure cannot strand the
+    // exported transcript on the host.
+    let local_bundle = local_bundle()?;
     let remote_bundle = unique_remote_bundle();
     let script = remote_extract_script(&remote_cwd.to_string_lossy(), &remote_bundle);
     let (ok, output) = run_remote_login_script(ssh_target, &script).await?;
@@ -310,7 +313,6 @@ pub async fn pull_opencode_session(
         return Ok(None);
     };
 
-    let local_bundle = local_bundle()?;
     let download = download_file(ssh_target, &remote_bundle, local_bundle.as_file()).await;
     let _ = run_remote_rm(ssh_target, &remote_bundle).await;
     download?;
