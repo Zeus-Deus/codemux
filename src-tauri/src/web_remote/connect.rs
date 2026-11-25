@@ -931,6 +931,7 @@ fn default_host() -> Option<SystemdUserHost> {
 
 /// `codemux connect [--email …] [--scope …] [--port N]`.
 pub async fn run_connect(opts: ConnectOptions) -> Result<(), String> {
+    let api_url = crate::auth::api_base_url_override()?;
     let db = crate::database::init_database()?;
 
     // Step 1 — account. Everything downstream (relay registration, discovery
@@ -971,7 +972,7 @@ pub async fn run_connect(opts: ConnectOptions) -> Result<(), String> {
                 let exec = resolve_exec_path()?;
                 let unit = systemd_unit(
                     &exec.display().to_string(),
-                    std::env::var("CODEMUX_API_URL").ok().as_deref(),
+                    api_url.as_deref(),
                 );
                 ServiceReport::Installed(install_service(host_ref, &unit)?)
             }
@@ -1248,6 +1249,40 @@ mod tests {
 
         // An empty value is treated as unset rather than written as a blank.
         assert!(!systemd_unit("/usr/bin/codemux", Some("  ")).contains("Environment="));
+    }
+
+    #[tokio::test]
+    async fn signed_in_connect_rejects_insecure_api_before_changing_remote_state() {
+        const TEST: &str = "web_remote::connect::tests::signed_in_connect_rejects_insecure_api_before_changing_remote_state";
+        if crate::test_isolation::isolated(TEST) {
+            return;
+        }
+
+        let db = crate::database::init_database().unwrap();
+        let user = crate::auth::AuthUser {
+            id: "existing-user".into(),
+            email: "existing@example.test".into(),
+            name: None,
+            image: None,
+        };
+        crate::auth::save_auth(&db, "existing-token", "2099-01-01T00:00:00Z", Some(&user)).unwrap();
+        let before = serde_json::to_value(super::super::load_config_from_db(&db)).unwrap();
+        let unit = SystemdUserHost::new().map(|host| host.unit_path());
+        if let Some(path) = &unit {
+            assert!(!path.exists());
+        }
+
+        std::env::set_var("CODEMUX_API_URL", "http://192.0.2.1:8787");
+        let error = run_connect(ConnectOptions::default()).await.unwrap_err();
+        assert!(error.contains("CODEMUX_API_URL requires HTTPS"), "{error}");
+        assert_eq!(
+            serde_json::to_value(super::super::load_config_from_db(&db)).unwrap(),
+            before
+        );
+        assert_eq!(crate::auth::load_token(&db).unwrap().0, "existing-token");
+        if let Some(path) = &unit {
+            assert!(!path.exists());
+        }
     }
 
     // ── Which binary the unit execs ──────────────────────────────
