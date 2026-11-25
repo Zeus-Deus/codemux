@@ -68,6 +68,9 @@ async fn harvest_gemini_models() -> Result<Vec<LaunchGeminiModel>, String> {
 
 /// The key rides in the `x-goog-api-key` header, never the URL: reqwest
 /// errors print their URL, and the caller logs those errors to stderr.
+/// Redirects are off, since reqwest would carry that header to whatever
+/// origin a redirect names, and an error reports only the HTTP status and
+/// Google's error code, never the response text, which could echo the key.
 async fn harvest_gemini_models_from(
     api_base: &str,
     api_key: &str,
@@ -77,6 +80,7 @@ async fn harvest_gemini_models_from(
     key.set_sensitive(true);
     let client = reqwest::Client::builder()
         .timeout(HARVEST_TIMEOUT)
+        .redirect(reqwest::redirect::Policy::none())
         .build()
         .map_err(|e| format!("client build: {}", e.without_url()))?;
     let resp = client
@@ -89,14 +93,26 @@ async fn harvest_gemini_models_from(
     if !resp.status().is_success() {
         let status = resp.status();
         let body = resp.text().await.unwrap_or_default();
-        let body: String = body.chars().take(500).collect();
-        return Err(format!("HTTP {status}: {body}"));
+        return Err(match google_error_code(&body) {
+            Some(code) => format!("HTTP {status} ({code})"),
+            None => format!("HTTP {status}"),
+        });
     }
     let parsed: ApiModelsResponse = resp
         .json()
         .await
         .map_err(|e| format!("decode: {}", e.without_url()))?;
     Ok(filter_and_map(parsed.models))
+}
+
+/// The `error.status` code from a Google API error body (for example
+/// `PERMISSION_DENIED`), kept only when it is a plain upper-case code so no
+/// server-chosen text reaches the logs.
+fn google_error_code(body: &str) -> Option<String> {
+    let value: serde_json::Value = serde_json::from_str(body).ok()?;
+    let code = value.get("error")?.get("status")?.as_str()?;
+    (!code.is_empty() && code.len() <= 64 && code.bytes().all(|b| b.is_ascii_uppercase() || b == b'_'))
+        .then(|| code.to_string())
 }
 
 /// Pure transformer — keep only Gemini text-generation models, strip
@@ -240,6 +256,50 @@ mod tests {
             .expect_err("closed port fails");
         assert!(err.starts_with("request:"), "{err}");
         assert!(!err.contains(TEST_KEY), "{err}");
+    }
+
+    #[tokio::test]
+    async fn redirects_are_not_followed_with_the_key() {
+        let mut other = mockito::Server::new_async().await;
+        let elsewhere = other
+            .mock("GET", mockito::Matcher::Any)
+            .expect(0)
+            .create_async()
+            .await;
+        let mut server = mockito::Server::new_async().await;
+        let _redirect = server
+            .mock("GET", "/models")
+            .match_query(mockito::Matcher::Any)
+            .with_status(302)
+            .with_header("location", &format!("{}/steal", other.url()))
+            .create_async()
+            .await;
+        let err = harvest_gemini_models_from(&server.url(), TEST_KEY)
+            .await
+            .expect_err("a redirect is not followed");
+        assert!(err.starts_with("HTTP 302"), "{err}");
+        elsewhere.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn http_errors_report_the_code_but_never_the_body() {
+        let mut server = mockito::Server::new_async().await;
+        let _mock = server
+            .mock("GET", "/models")
+            .match_query(mockito::Matcher::Any)
+            .with_status(403)
+            .with_body(format!(
+                r#"{{"error":{{"code":403,"message":"API key {TEST_KEY} is not valid","status":"PERMISSION_DENIED"}}}}"#
+            ))
+            .create_async()
+            .await;
+        let err = harvest_gemini_models_from(&server.url(), TEST_KEY)
+            .await
+            .expect_err("403 fails");
+        assert_eq!(err, "HTTP 403 Forbidden (PERMISSION_DENIED)");
+        assert!(!err.contains(TEST_KEY));
+        assert_eq!(google_error_code(r#"{"error":{"status":"bad text"}}"#), None);
+        assert_eq!(google_error_code("not json"), None);
     }
 
     #[tokio::test]
