@@ -139,7 +139,7 @@ function OutboundMcpSection({ projectRoot }: Props) {
     <div>
       <SectionHeader
         title="MCP Servers"
-        description="Model Context Protocol servers expose tools to your agent. Configured servers start when needed; plugin servers start when their plugin registers them. Toggle a row off to stop it. Servers defined in a project's own files start only after you approve them. Codemux's own MCP is always on."
+        description="Model Context Protocol servers expose tools to your agent. Configured servers start when needed; plugin servers start when their plugin registers them. Toggle a row off to stop it. Servers defined in a project's own files start only after you approve them. OpenCode 1.x chats receive no Codemux MCP tools; use OpenCode 2.x for approved project servers."
         action={
           <Button
             variant="outline"

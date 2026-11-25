@@ -178,18 +178,29 @@ impl McpServerHandle {
 /// `None` (we drop the child handle so the watchdog reaps it).
 ///
 pub async fn start_mcp_server(config: McpServerConfig) -> McpServerHandle {
-    start_mcp_server_cancellable(config, None).await
+    start_mcp_server_cancellable(config, None, ()).await
 }
 
-pub async fn start_mcp_server_cancellable(
+pub async fn start_mcp_server_cancellable<G: Send>(
     config: McpServerConfig,
     mut cancelled: Option<tokio::sync::watch::Receiver<bool>>,
+    spawn_guards: G,
 ) -> McpServerHandle {
     if matches!(config.transport, McpTransport::Http) {
+        // The first poll admits the outbound request while revocation is
+        // excluded by the approval guard. Release the guards immediately
+        // afterward so the network response cannot hold up revocation.
+        let http_start = start_http_mcp_server(config.clone());
+        tokio::pin!(http_start);
+        let mut admission_guards = Some(spawn_guards);
         return tokio::select! {
             biased;
             _ = cancellation(&mut cancelled) => stopped_handle(config.clone()),
-            handle = start_http_mcp_server(config.clone()) => handle,
+            handle = std::future::poll_fn(|cx| {
+                let result = std::future::Future::poll(http_start.as_mut(), cx);
+                drop(admission_guards.take());
+                result
+            }) => handle,
         };
     }
 
@@ -224,8 +235,14 @@ pub async fn start_mcp_server_cancellable(
         default_timeout: DEFAULT_REQUEST_TIMEOUT,
     };
 
+    if cancelled.as_ref().is_some_and(|rx| *rx.borrow() || rx.has_changed().is_err()) {
+        return stopped_handle(config);
+    }
     let immediate = config.raw.get("pluginImmediateShutdown").and_then(Value::as_bool) == Some(true);
     let spawned = if immediate { JsonRpcChild::spawn_immediate(spawn).await } else { JsonRpcChild::spawn(spawn).await };
+    // Process creation is now ordered against approval revocation and stop.
+    // Release the guards before the potentially long MCP handshake.
+    drop(spawn_guards);
     let child = match spawned {
         Ok(c) => Arc::new(c),
         Err(err) => {

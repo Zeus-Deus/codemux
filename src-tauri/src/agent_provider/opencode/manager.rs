@@ -47,13 +47,13 @@
 //! disk, so `OpenCodeSession::start`'s readopt probe recovers the
 //! conversation context on the new server.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use tokio::sync::Mutex;
 
-use super::discovery::prepared_binary;
+use super::discovery::{prepared_binary, probe_version, MINIMUM_OPENCODE_VERSION};
 use super::server::OpenCodeServer;
 
 /// Per-attempt budget for the cached-server liveness probe in
@@ -145,9 +145,9 @@ impl OpenCodeServerManager {
     /// Failure modes (returned as a stable `Err(String)` so the
     /// Tauri command surface can forward verbatim):
     ///
-    /// * Prepared-executable resolution errors (missing install, invalid
-    ///   authoritative override, or unsupported npm layout) are forwarded
-    ///   verbatim, without a best-effort `--version` probe.
+    /// * Prepared-executable resolution errors are forwarded verbatim. A
+    ///   bounded version probe then rejects binaries that cannot safely
+    ///   disable native project MCP loading.
     /// * `"spawn_failed: …"` / `"ready_banner_missing"` /
     ///   `"ready_timeout_after_…"` — passthrough from
     ///   [`OpenCodeServer::spawn`](super::server::OpenCodeServer::spawn).
@@ -176,6 +176,8 @@ impl OpenCodeServerManager {
         }
 
         let binary_path = resolve_binary().await?;
+        self.check_open()?;
+        require_project_config_isolation(&binary_path).await?;
         self.check_open()?;
         let server = OpenCodeServer::spawn(&binary_path).await?;
         if let Err(error) = self.check_open() {
@@ -312,9 +314,28 @@ async fn probe_server_alive(handle: &OpenCodeServerHandle) -> bool {
 }
 
 async fn resolve_binary() -> Result<PathBuf, String> {
-    // Spawn admission needs the selected prepared path, not a best-effort
-    // availability/version probe. Preserve authoritative resolver diagnostics.
+    // Preserve authoritative resolver diagnostics before probing the selected
+    // executable for the security-critical project-config isolation support.
     prepared_binary().await
+}
+
+async fn require_project_config_isolation(binary_path: &Path) -> Result<(), String> {
+    // OpenCode 1.14.19 reads OPENCODE_DISABLE_PROJECT_CONFIG before scanning
+    // workspace config. Older or unknown versions could launch a repository's
+    // MCP command before Codemux's approval gate sees it.
+    let minimum = semver::Version::parse(MINIMUM_OPENCODE_VERSION)
+        .expect("valid minimum OpenCode version");
+    let version = probe_version(binary_path).await
+        .and_then(|version| semver::Version::parse(version.strip_prefix('v').unwrap_or(&version)).ok());
+    match version {
+        Some(version) if version >= minimum => Ok(()),
+        Some(version) => Err(format!(
+            "OpenCode {version} cannot safely disable project MCP loading; upgrade to {MINIMUM_OPENCODE_VERSION} or newer"
+        )),
+        None => Err(format!(
+            "Cannot verify this OpenCode version supports project MCP isolation; upgrade to {MINIMUM_OPENCODE_VERSION} or newer"
+        )),
+    }
 }
 
 /// Test-only fixture: write a fake `opencode` binary into `dir` that
@@ -514,6 +535,34 @@ mod tests {
             !marker.exists(),
             "bad override must not run the valid PATH binary"
         );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    #[serial(opencode_path)]
+    async fn unsupported_or_unknown_version_cannot_start_project_loading() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let binary = tmp.path().join("opencode");
+        let marker = tmp.path().join("serve-started");
+        let _override = EnvGuard::new(&[("CODEMUX_OPENCODE_BINARY", Some(binary.as_os_str()))]);
+        for (reported, expected) in [
+            ("1.0.200", "upgrade to 1.14.19 or newer"),
+            ("unknown", "Cannot verify this OpenCode version"),
+        ] {
+            std::fs::write(&binary, format!(
+                "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then echo \"{reported}\"; exit 0; fi\nprintf serve > '{}'\n",
+                marker.display(),
+            )).unwrap();
+            std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755)).unwrap();
+            let manager = OpenCodeServerManager::new();
+            let error = manager.ensure_running().await.unwrap_err();
+            assert!(error.contains(expected), "{error}");
+            assert!(!marker.exists(), "unsupported binary started its server");
+            assert!(!manager.is_running_for_tests().await);
+        }
+        std::fs::write(&binary, "#!/bin/sh\necho opencode v2.4.1\n").unwrap();
+        assert!(require_project_config_isolation(&binary).await.is_ok());
     }
 
     #[tokio::test]
@@ -775,7 +824,7 @@ mod tests {
             let binary = tmp.path().join("opencode");
             // The direct child blocks before its ready banner, without any
             // helper descendants or sleeps. FIFO acknowledgement owns ordering.
-            std::fs::write(&binary, b"#!/bin/sh\nprintf '%s\\n' \"$$\" > \"$FAKE_OPENCODE_STARTED\"\nread ready < \"$FAKE_OPENCODE_READY\"\necho 'opencode server listening on http://127.0.0.1:1'\nexec /bin/sleep 600\n").unwrap();
+            std::fs::write(&binary, b"#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then echo 9.9.9; exit 0; fi\nprintf '%s\\n' \"$$\" > \"$FAKE_OPENCODE_STARTED\"\nread ready < \"$FAKE_OPENCODE_READY\"\necho 'opencode server listening on http://127.0.0.1:1'\nexec /bin/sleep 600\n").unwrap();
             std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755)).unwrap();
             let _env = EnvGuard::new(&[
                 ("CODEMUX_OPENCODE_BINARY", Some(binary.as_os_str())),
@@ -841,7 +890,7 @@ mod tests {
             let started = tokio::io::unix::AsyncFd::new(fixture_fifo(&started_path)).unwrap();
             let mut ready = fixture_fifo(&ready_path);
             let binary = tmp.path().join("opencode");
-            std::fs::write(&binary, b"#!/bin/sh\nprintf '%s\\n' \"$$\" > \"$FAKE_OPENCODE_STARTED\"\nread ready < \"$FAKE_OPENCODE_READY\"\necho 'opencode server listening on http://127.0.0.1:1'\nexec /bin/sleep 600\n").unwrap();
+            std::fs::write(&binary, b"#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then echo 9.9.9; exit 0; fi\nprintf '%s\\n' \"$$\" > \"$FAKE_OPENCODE_STARTED\"\nread ready < \"$FAKE_OPENCODE_READY\"\necho 'opencode server listening on http://127.0.0.1:1'\nexec /bin/sleep 600\n").unwrap();
             std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755)).unwrap();
             let _env = EnvGuard::new(&[
                 ("CODEMUX_OPENCODE_BINARY", Some(binary.as_os_str())),

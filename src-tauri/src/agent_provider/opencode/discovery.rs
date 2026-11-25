@@ -408,9 +408,9 @@ fn read_small_text(path: &Path, limit: u64) -> Option<String> {
 }
 
 /// Run `opencode --version` and pull the version token out of the
-/// first line. Returns `None` on any failure — the caller treats that
-/// as "binary present but version unknown".
-async fn probe_version(binary_path: &Path) -> Option<String> {
+/// first line. Returns `None` on any failure; spawn admission rejects an
+/// unknown version because it cannot establish project-config isolation.
+pub(crate) async fn probe_version(binary_path: &Path) -> Option<String> {
     let mut cmd = Command::new(binary_path);
     cmd.arg("--version").kill_on_drop(true);
     sanitize_gui_env_tokio(&mut cmd);
