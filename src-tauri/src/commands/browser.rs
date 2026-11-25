@@ -223,7 +223,7 @@ pub async fn agent_browser_respond_confirmation(
     browser_id: String,
     id: String,
     approve: bool,
-) -> Result<(), String> {
+) -> Result<Option<BrowserPendingConfirmation>, String> {
     manager.respond_confirmation(&browser_id, &id, approve).await
 }
 

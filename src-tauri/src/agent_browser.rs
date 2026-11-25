@@ -1478,9 +1478,14 @@ fn output_capture_and_track_browser_daemon(
 }
 
 #[cfg(not(windows))]
-fn track_late_browser_daemon(session: &str) {
+fn browser_daemon_trackers() -> &'static std::sync::Mutex<HashSet<String>> {
     static TRACKERS: OnceLock<std::sync::Mutex<HashSet<String>>> = OnceLock::new();
-    let trackers = TRACKERS.get_or_init(|| std::sync::Mutex::new(HashSet::new()));
+    TRACKERS.get_or_init(|| std::sync::Mutex::new(HashSet::new()))
+}
+
+#[cfg(not(windows))]
+fn track_late_browser_daemon(session: &str) {
+    let trackers = browser_daemon_trackers();
     let Ok(mut pending) = trackers.lock() else { return };
     if !pending.insert(session.to_owned()) {
         return;
@@ -1508,6 +1513,22 @@ fn track_late_browser_daemon(session: &str) {
             pending.remove(session.as_str());
         }
     }
+}
+
+#[cfg(not(windows))]
+async fn wait_for_late_browser_daemon_tracking(session: &str) -> bool {
+    let deadline = Instant::now() + Duration::from_secs(6);
+    while Instant::now() < deadline {
+        let pending = browser_daemon_trackers()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .contains(session);
+        if !pending {
+            return true;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    false
 }
 
 fn previous_app_has_exited(record: &BrowserPidRecord) -> bool {
@@ -3479,20 +3500,32 @@ fn browser_result_confirmation_details(result: &BrowserAutomationResult) -> Opti
     browser_json_confirmation(&result.data)
 }
 
-fn browser_confirmation_response_accepted(
+#[derive(Debug, PartialEq, Eq)]
+enum BrowserConfirmationResponse {
+    Resolved,
+    FollowUp(BrowserConfirmationDetails),
+}
+
+fn browser_confirmation_response(
     response: &serde_json::Value,
     approve: bool,
-) -> bool {
+) -> Option<BrowserConfirmationResponse> {
     if response.get("success").and_then(|value| value.as_bool()) != Some(true) {
-        return false;
+        return None;
     }
-    let Some(data) = response.get("data") else { return false };
+    let data = response.get("data")?;
     if !approve {
-        return data.get("denied").and_then(|value| value.as_bool()) == Some(true);
+        return (data.get("denied").and_then(|value| value.as_bool()) == Some(true))
+            .then_some(BrowserConfirmationResponse::Resolved);
     }
-    data.get("confirmed").and_then(|value| value.as_bool()) == Some(true)
-        && data.pointer("/result/success").and_then(|value| value.as_bool()) == Some(true)
-        && data.get("result").and_then(browser_json_confirmation).is_none()
+    if data.get("confirmed").and_then(|value| value.as_bool()) != Some(true)
+        || data.pointer("/result/success").and_then(|value| value.as_bool()) != Some(true) {
+        return None;
+    }
+    Some(match data.get("result").and_then(browser_json_confirmation) {
+        Some(details) => BrowserConfirmationResponse::FollowUp(details),
+        None => BrowserConfirmationResponse::Resolved,
+    })
 }
 
 fn run_browser_confirmation_decision(
@@ -3501,7 +3534,7 @@ fn run_browser_confirmation_decision(
     pending: &PendingBrowserConfirmation,
     id: &str,
     approve: bool,
-) -> Result<BrowserPidRecord, String> {
+) -> Result<(BrowserPidRecord, BrowserConfirmationResponse), String> {
     require_owned_browser_session(session)?;
     let current = live_owned_browser_record(session)
         .ok_or_else(|| "Could not verify the pending browser daemon".to_string())?;
@@ -3534,15 +3567,17 @@ fn run_browser_confirmation_decision(
     };
     let response: serde_json::Value = serde_json::from_slice(&output.stdout)
         .map_err(|_| "Browser confirmation returned an invalid response".to_string())?;
-    if !output.status.success() || !browser_confirmation_response_accepted(&response, approve) {
+    if !output.status.success() {
         return Err("Browser confirmation expired or the action failed".into());
     }
+    let decision = browser_confirmation_response(&response, approve)
+        .ok_or("Browser confirmation expired or the action failed")?;
     let after = live_owned_browser_record(session)
         .ok_or_else(|| "Could not verify browser daemon after confirmation".to_string())?;
     if after != current {
         return Err("Browser daemon changed while confirmation was processed".into());
     }
-    Ok(after)
+    Ok((after, decision))
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -3876,7 +3911,8 @@ impl AgentBrowserManager {
             let sessions = self.sessions.lock().await;
             let stream = sessions.get(browser_id)
                 .ok_or_else(|| format!("Browser session {session} is not streaming"))?;
-            if !stream.running || !stream.browser_ready {
+            if !stream.running || !stream.browser_ready || stream.confirmation_pending
+                || stream.pending_confirmation.is_some() {
                 return Err(format!("Browser session {session} is not streaming"));
             }
             (stream.port, stream.stream_generation)
@@ -3887,7 +3923,9 @@ impl AgentBrowserManager {
         if let Some(identity) = test_identity {
             let sessions = self.sessions.lock().await;
             if identity.generation == generation && sessions.get(browser_id).is_some_and(|stream| {
-                stream.running && stream.browser_ready && stream.port == port && stream.stream_generation == generation
+                stream.running && stream.browser_ready && !stream.confirmation_pending
+                    && stream.pending_confirmation.is_none()
+                    && stream.port == port && stream.stream_generation == generation
             }) {
                 return Ok(identity);
             }
@@ -3914,7 +3952,9 @@ impl AgentBrowserManager {
         let mut sessions = self.sessions.lock().await;
         let stream = sessions.get_mut(browser_id)
             .ok_or_else(|| "Browser session closed during ownership check".to_string())?;
-        if !stream.running || !stream.browser_ready || stream.port != port || stream.stream_generation != generation {
+        if !stream.running || !stream.browser_ready || stream.confirmation_pending
+            || stream.pending_confirmation.is_some()
+            || stream.port != port || stream.stream_generation != generation {
             return Err("Browser session changed during ownership check".into());
         }
         Ok(refresh_stream_session_identity(stream, &record))
@@ -3972,7 +4012,7 @@ impl AgentBrowserManager {
             .map(|pending| pending.details.clone()))
     }
 
-    pub async fn respond_confirmation(&self, browser_id: &str, id: &str, approve: bool) -> Result<(), String> {
+    pub async fn respond_confirmation(&self, browser_id: &str, id: &str, approve: bool) -> Result<Option<BrowserPendingConfirmation>, String> {
         let session = session_name(browser_id).to_owned();
         validate_session_name(&session)?;
         if safe_confirmation_id(id).as_deref() != Some(id) {
@@ -3986,7 +4026,7 @@ impl AgentBrowserManager {
         }).await
     }
 
-    async fn respond_confirmation_locked(&self, browser_id: &str, id: &str, approve: bool) -> Result<(), String> {
+    async fn respond_confirmation_locked(&self, browser_id: &str, id: &str, approve: bool) -> Result<Option<BrowserPendingConfirmation>, String> {
         let session = session_name(browser_id).to_owned();
         self.clear_expired_confirmation(browser_id).await;
         let (port, pending) = {
@@ -4009,13 +4049,32 @@ impl AgentBrowserManager {
         if entry.pending_confirmation.as_ref().is_none_or(|current| current.daemon != pending.daemon || current.details.id.as_deref() != Some(id)) {
             return Err("Browser confirmation changed while it was processed".into());
         }
-        let record = result?;
-        entry.confirmation_pending = false;
-        entry.pending_confirmation = None;
+        let (record, decision) = result?;
+        Ok(Self::finish_confirmation_decision(entry, record, decision))
+    }
+
+    fn finish_confirmation_decision(
+        entry: &mut StreamSession,
+        record: BrowserPidRecord,
+        decision: BrowserConfirmationResponse,
+    ) -> Option<BrowserPendingConfirmation> {
         entry.browser_ready = false;
         entry.running = true;
         refresh_stream_session_identity(entry, &record);
-        Ok(())
+        match decision {
+            BrowserConfirmationResponse::Resolved => {
+                entry.confirmation_pending = false;
+                entry.pending_confirmation = None;
+                None
+            }
+            BrowserConfirmationResponse::FollowUp(details) => {
+                let next = PendingBrowserConfirmation::new(details, Some(record));
+                let public = next.details.clone();
+                entry.confirmation_pending = true;
+                entry.pending_confirmation = Some(next);
+                Some(public)
+            }
+        }
     }
 
     /// Reconcile a provisional `running` flag with the verified daemon after
@@ -4283,6 +4342,44 @@ impl AgentBrowserManager {
         }
     }
 
+    #[cfg(not(windows))]
+    async fn settle_provisional_action(
+        &self,
+        browser_id: &str,
+        session: &str,
+        action: &str,
+        result: &Result<(BrowserAutomationResult, BrowserActionOutcome), BrowserActionFailure>,
+    ) {
+        // A first CLI command may return before its daemon publishes a PID.
+        // Keep the session gate until the bounded late tracker has finished;
+        // only an allocation with no prior verified daemon can be retired.
+        let provisional = self.sessions.lock().await.get(browser_id).is_some_and(|entry| {
+            entry.running && entry.pid.is_none() && !entry.browser_ready && !entry.confirmation_pending
+        });
+        if !provisional {
+            return;
+        }
+        if !wait_for_late_browser_daemon_tracking(session).await {
+            return;
+        }
+        self.reconcile_action_result(browser_id, session, action, result).await;
+        let lookup_session = session.to_owned();
+        let confirmed_absent = tokio::task::spawn_blocking(move || {
+            live_owned_browser_record(&lookup_session).is_none()
+                && read_agent_browser_daemon_pid(&lookup_session).is_none()
+                && run_dir_for_session(&lookup_session)
+                    .is_some_and(|dir| !browser_control_endpoint_ready(&lookup_session, &dir))
+        }).await.unwrap_or(false);
+        if confirmed_absent {
+            let mut sessions = self.sessions.lock().await;
+            if sessions.get(browser_id).is_some_and(|entry| {
+                entry.pid.is_none() && !entry.browser_ready && !entry.confirmation_pending
+            }) {
+                sessions.remove(browser_id);
+            }
+        }
+    }
+
     pub async fn run_command(&self, browser_id: &str, action: &str, params: serde_json::Value) -> Result<BrowserAutomationResult, String> {
         let session = session_name(browser_id).to_string();
         validate_session_name(&session)?;
@@ -4377,8 +4474,8 @@ impl AgentBrowserManager {
         // The agent-facing "close" goes through run_command (not close()),
         // so completed attempts must reset its state before the next open.
         let before_launch = result.as_ref().err().is_some_and(|error| !error.may_have_launched);
-        if before_launch {
-            if !was_running && !viewport_may_have_launched {
+        if before_launch && !viewport_may_have_launched {
+            if !was_running {
                 let mut sessions = self.sessions.lock().await;
                 if let Some(entry) = sessions.get_mut(browser_id) {
                     if entry.pid.is_none() && !entry.browser_ready && !entry.confirmation_pending {
@@ -4388,6 +4485,10 @@ impl AgentBrowserManager {
             }
         } else {
             self.reconcile_action_result(browser_id, session, action, result).await;
+            #[cfg(not(windows))]
+            if !was_running && action != "close" {
+                self.settle_provisional_action(browser_id, session, action, result).await;
+            }
         }
     }
 
@@ -4624,10 +4725,11 @@ impl AgentBrowserManager {
                 let mut sessions = self.sessions.lock().await;
                 let stream = sessions.get_mut(browser_id)
                     .ok_or_else(|| format!("Browser session {session} closed during attachment check"))?;
+                if stream.confirmation_pending || stream.pending_confirmation.is_some() {
+                    return Err(format!("Browser confirmation is pending for session {session}"));
+                }
                 stream.running = true;
                 stream.browser_ready = true;
-                stream.confirmation_pending = false;
-                stream.pending_confirmation = None;
                 Ok(true)
             }
             BrowserAttachment::Unattached => {
@@ -6980,6 +7082,23 @@ mod tests {
         clear_session_pid(&session);
     }
 
+    #[cfg(not(windows))]
+    #[tokio::test]
+    async fn failed_first_command_without_daemon_releases_provisional_port_for_pane_retry() {
+        let manager = AgentBrowserManager::new();
+        let session = format!("browser-no-daemon-{}", uuid::Uuid::new_v4().simple());
+        let first_port = manager.allocate_port(&session).await.unwrap();
+        let was_running = manager.note_action_start(&session, "open").await;
+        assert!(!was_running);
+        let result = Err(BrowserActionFailure::after_launch("browser launch failed".into()));
+        manager.reconcile_action_attempt(&session, &session, "open", was_running, false, &result).await;
+
+        assert!(manager.get_port(&session).await.is_none());
+        let retry_port = manager.allocate_port(&session).await.unwrap();
+        assert_ne!(retry_port, first_port);
+        assert!(!manager.note_action_start(&session, "open").await);
+    }
+
     #[test]
     fn confirmation_response_does_not_complete_a_browser_action() {
         assert!(!browser_action_completed(true, "Confirmation required:\n  Navigate to example.com\n  Run: agent-browser confirm c1\n  Or:  agent-browser deny c1\n"));
@@ -7010,26 +7129,36 @@ mod tests {
         assert_eq!(browser_confirmation_details(
             r#"{"success":true,"data":{"confirmation_required":true,"confirmation_id":"bad id","description":"Open example.com"}}"#,
         ).unwrap().id, None);
-        assert!(browser_confirmation_response_accepted(
+        assert_eq!(browser_confirmation_response(
             &serde_json::json!({"success":true,"data":{"confirmed":true,"result":{"success":true,"data":{"url":"about:blank"}}}}),
             true,
-        ));
-        assert!(!browser_confirmation_response_accepted(
+        ), Some(BrowserConfirmationResponse::Resolved));
+        assert_eq!(browser_confirmation_response(
             &serde_json::json!({"success":true,"data":{"confirmed":true,"result":{"success":false,"error":"navigation failed"}}}),
             true,
-        ));
-        assert!(!browser_confirmation_response_accepted(
+        ), None);
+        assert_eq!(browser_confirmation_response(
+            &serde_json::json!({"success":true,"data":{"confirmed":true,"result":{"success":true,"data":{"confirmation_required":true,"confirmation_id":"c_456","description":"Approve plugin action"}}}}),
+            true,
+        ), Some(BrowserConfirmationResponse::FollowUp(BrowserConfirmationDetails {
+            id: Some("c_456".into()),
+            description: "Approve plugin action".into(),
+        })));
+        assert_eq!(browser_confirmation_response(
             &serde_json::json!({"success":true,"data":{"confirmed":true,"result":{"success":true,"data":{"confirmation_required":true}}}}),
             true,
-        ));
-        assert!(browser_confirmation_response_accepted(
+        ), Some(BrowserConfirmationResponse::FollowUp(BrowserConfirmationDetails {
+            id: None,
+            description: "Browser action requires confirmation".into(),
+        })));
+        assert_eq!(browser_confirmation_response(
             &serde_json::json!({"success":true,"data":{"denied":true}}),
             false,
-        ));
-        assert!(!browser_confirmation_response_accepted(
+        ), Some(BrowserConfirmationResponse::Resolved));
+        assert_eq!(browser_confirmation_response(
             &serde_json::json!({"success":false,"error":"No pending confirmation"}),
             false,
-        ));
+        ), None);
     }
 
     #[cfg(unix)]
@@ -7162,6 +7291,59 @@ mod tests {
         let entry = sessions.get(&session).unwrap();
         assert!(!entry.confirmation_pending);
         assert!(entry.pending_confirmation.is_none());
+    }
+
+    #[tokio::test]
+    async fn follow_up_confirmation_replaces_spent_id_and_keeps_bridge_closed() {
+        let manager = AgentBrowserManager::new();
+        let session = format!("browser-follow-up-{}", uuid::Uuid::new_v4().simple());
+        manager.allocate_port(&session).await.unwrap();
+        let pid = std::process::id();
+        let start_time = process_start_time(pid).unwrap();
+        let record = BrowserPidRecord {
+            pid,
+            start_time,
+            token: browser_owner_token().into(),
+            owner_pid: pid,
+            owner_start_time: start_time,
+            native_start: true,
+        };
+        {
+            let mut sessions = manager.sessions.lock().await;
+            let entry = sessions.get_mut(&session).unwrap();
+            entry.running = true;
+            entry.confirmation_pending = true;
+            entry.pending_confirmation = Some(PendingBrowserConfirmation::new(
+                BrowserConfirmationDetails { id: Some("c_first".into()), description: "Approve navigation".into() },
+                Some(record.clone()),
+            ));
+        }
+        let response = serde_json::json!({
+            "success": true,
+            "data": {"confirmed": true, "result": {"success": true, "data": {
+                "confirmation_required": true,
+                "confirmation_id": "c_second",
+                "description": "Approve plugin action"
+            }}}
+        });
+        let decision = browser_confirmation_response(&response, true).unwrap();
+        let next = {
+            let mut sessions = manager.sessions.lock().await;
+            AgentBrowserManager::finish_confirmation_decision(sessions.get_mut(&session).unwrap(), record.clone(), decision).unwrap()
+        };
+        assert_eq!(next.id.as_deref(), Some("c_second"));
+        assert_eq!(next.description, "Approve plugin action");
+        assert_eq!(manager.pending_confirmation(&session).await.unwrap().unwrap().id.as_deref(), Some("c_second"));
+        assert!(manager.verified_stream_identity(&session).await.is_err());
+        assert!(manager.respond_confirmation_locked(&session, "c_first", true).await.unwrap_err().contains("no longer matches"));
+
+        {
+            let mut sessions = manager.sessions.lock().await;
+            assert!(AgentBrowserManager::finish_confirmation_decision(
+                sessions.get_mut(&session).unwrap(), record, BrowserConfirmationResponse::Resolved,
+            ).is_none());
+        }
+        assert!(manager.pending_confirmation(&session).await.unwrap().is_none());
     }
 
     #[cfg(target_os = "linux")]
@@ -7555,7 +7737,9 @@ mod tests {
             owner_start_time: process_start_time(pid).unwrap(),
             native_start: true,
         };
-        manager.note_stream_open_confirmation_pending(&session, true, Some(record.clone()), None).await;
+        manager.note_stream_open_confirmation_pending(&session, true, Some(record.clone()), Some(
+            BrowserConfirmationDetails { id: Some("c_first".into()), description: "Approve navigation".into() },
+        )).await;
 
         let error = manager.reconcile_existing_stream_attachment(
             &session,
@@ -7572,15 +7756,30 @@ mod tests {
         assert_eq!(stream.pid_start_time, Some(record.start_time));
         drop(sessions);
 
-        assert!(manager.reconcile_existing_stream_attachment(
+        let error = manager.reconcile_existing_stream_attachment(
             &session,
             &session,
             BrowserAttachment::Attached,
-        ).await.unwrap());
+        ).await.unwrap_err();
+        assert!(error.contains("confirmation is pending"));
+        assert!(manager.verified_stream_identity(&session).await.is_err());
         let sessions = manager.sessions.lock().await;
         let stream = sessions.get(&session).unwrap();
-        assert!(stream.browser_ready);
-        assert!(!stream.confirmation_pending);
+        assert!(!stream.browser_ready);
+        assert!(stream.confirmation_pending);
+        assert_eq!(stream.pending_confirmation.as_ref().unwrap().details.id.as_deref(), Some("c_first"));
+        drop(sessions);
+
+        {
+            let mut sessions = manager.sessions.lock().await;
+            let stream = sessions.get_mut(&session).unwrap();
+            assert!(AgentBrowserManager::finish_confirmation_decision(
+                stream, record, BrowserConfirmationResponse::Resolved,
+            ).is_none());
+        }
+        assert!(manager.reconcile_existing_stream_attachment(
+            &session, &session, BrowserAttachment::Attached,
+        ).await.unwrap());
     }
 
     #[cfg(unix)]

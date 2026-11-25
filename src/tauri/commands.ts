@@ -1334,7 +1334,7 @@ export const agentBrowserPendingConfirmation = (browserId: string) =>
   invoke<BrowserPendingConfirmation | null>("agent_browser_pending_confirmation", { browserId });
 
 export const agentBrowserRespondConfirmation = (browserId: string, id: string, approve: boolean) =>
-  invoke<void>("agent_browser_respond_confirmation", { browserId, id, approve });
+  invoke<BrowserPendingConfirmation | null>("agent_browser_respond_confirmation", { browserId, id, approve });
 
 export const agentBrowserClose = (browserId: string) =>
   invoke("agent_browser_close", { browserId });
