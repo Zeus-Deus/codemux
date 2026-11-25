@@ -2676,6 +2676,8 @@ static BROWSER_DAEMON_START_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new((
 #[cfg(target_os = "windows")]
 struct NativeBrowserLaunchFailure {
     error: std::io::Error,
+    // True only while this call might still have a live daemon or publish a
+    // daemon PID after returning; a reaped direct daemon has no such path.
     may_have_launched: bool,
 }
 
@@ -2687,6 +2689,10 @@ impl NativeBrowserLaunchFailure {
 
     fn after_launch(error: std::io::Error) -> Self {
         Self { error, may_have_launched: true }
+    }
+
+    fn confirmed_stopped(error: std::io::Error) -> Self {
+        Self { error, may_have_launched: false }
     }
 }
 
@@ -2806,7 +2812,9 @@ fn ensure_owned_browser_daemon_with_status(
                 if let Some(dir) = run_dir_for_session(session) {
                     cleanup_stale_browser_lock_files_in(&dir, session, child.id());
                 }
-                return Err(NativeBrowserLaunchFailure::after_launch(std::io::Error::other(
+                // AGENT_BROWSER_DAEMON runs in this direct child. try_wait
+                // reaped it, so no daemon can publish a PID after this call.
+                return Err(NativeBrowserLaunchFailure::confirmed_stopped(std::io::Error::other(
                     format!("Browser daemon exited before control startup: {status}"),
                 )));
             }
@@ -2814,23 +2822,32 @@ fn ensure_owned_browser_daemon_with_status(
             Err(error) => {
                 let pid = child.id();
                 let _ = child.kill();
-                let _ = child.wait();
+                let reaped = child.wait().is_ok();
                 if let Some(dir) = run_dir_for_session(session) {
                     cleanup_stale_browser_lock_files_in(&dir, session, pid);
                 }
-                return Err(NativeBrowserLaunchFailure::after_launch(error));
+                return Err(if reaped {
+                    NativeBrowserLaunchFailure::confirmed_stopped(error)
+                } else {
+                    NativeBrowserLaunchFailure::after_launch(error)
+                });
             }
         }
         if started.elapsed() >= timeout {
             let pid = child.id();
             let _ = child.kill();
-            let _ = child.wait();
+            let reaped = child.wait().is_ok();
             if let Some(dir) = run_dir_for_session(session) {
                 cleanup_stale_browser_lock_files_in(&dir, session, pid);
             }
-            return Err(NativeBrowserLaunchFailure::after_launch(std::io::Error::new(
+            let error = std::io::Error::new(
                 std::io::ErrorKind::TimedOut, "Browser daemon control startup timed out",
-            )));
+            );
+            return Err(if reaped {
+                NativeBrowserLaunchFailure::confirmed_stopped(error)
+            } else {
+                NativeBrowserLaunchFailure::after_launch(error)
+            });
         }
         std::thread::sleep(Duration::from_millis(100));
     }
@@ -3627,6 +3644,7 @@ enum BrowserActionOutcome {
 
 struct BrowserActionFailure {
     message: String,
+    // A daemon may remain alive or publish its PID after this result.
     may_have_launched: bool,
 }
 
@@ -5359,6 +5377,28 @@ mod tests {
         let result = Err(BrowserActionFailure::before_launch(failure.error.to_string()));
         manager.reconcile_action_attempt(&session, &session, "open", was_running, false, &result).await;
         assert!(!manager.sessions.lock().await.get(&session).unwrap().running);
+
+        // A now-available executable gets a fresh launch attempt. It exits
+        // without publishing a browser control endpoint, which must also
+        // release the provisional state after the direct child is reaped.
+        let second_was_running = manager.note_action_start(&session, "open").await;
+        assert!(!second_was_running);
+        let available = std::path::PathBuf::from(std::env::var_os("SystemRoot").unwrap())
+            .join("System32")
+            .join("where.exe");
+        assert!(available.is_file());
+        let second_failure = run_agent_browser_native_with_status(
+            available.to_str().unwrap(),
+            &["open".into(), "about:blank".into(), "--session".into(), session.clone()],
+            &session,
+            port,
+            false,
+            Duration::from_secs(5),
+        ).unwrap_err();
+        assert!(second_failure.error.to_string().contains("exited before control startup"));
+        assert!(!second_failure.may_have_launched);
+        let second_result = Err(BrowserActionFailure::before_launch(second_failure.error.to_string()));
+        manager.reconcile_action_attempt(&session, &session, "open", second_was_running, false, &second_result).await;
         assert!(!manager.note_action_start(&session, "open").await);
     }
 
