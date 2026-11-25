@@ -1042,7 +1042,11 @@ export function RemoteAccessSection() {
   // A web-client rebind is settling (or has cut this device off): freeze the
   // listener controls so a second change can't stack on the in-flight one.
   const rebindBusy = rebindPhase !== null;
-  const primaryEndpoint = pickPrimaryEndpoint(endpoints);
+  const directEndpoints = useMemo(
+    () => browserPairingEndpoints(endpoints),
+    [endpoints],
+  );
+  const primaryEndpoint = pickPrimaryEndpoint(directEndpoints);
 
   /** After a change that (re)starts the listener, say so if it didn't come up. */
   const reportLanOutcome = useCallback(
@@ -1787,15 +1791,16 @@ export function RemoteAccessSection() {
                 {pairing ? (
                   <PairingPanel
                     pairing={pairing}
-                    endpoints={endpoints}
+                    endpoints={directEndpoints}
                     regenerating={pairingPending}
                     onRegenerate={handleCreatePairing}
                   />
                 ) : (
                   <div className="flex items-center justify-between gap-4">
                     <p className="text-body-sm leading-relaxed text-muted-foreground">
-                      Create a one-time link, then scan its QR code or open it
-                      on the other device.
+                      {primaryEndpoint?.kind === "loopback"
+                        ? "Create a one-time link to open on this device or through a local tunnel."
+                        : "Create a one-time link, then scan its QR code or open it on the other device."}
                     </p>
                     <Button
                       type="button"
@@ -1811,16 +1816,16 @@ export function RemoteAccessSection() {
                 )}
               </div>
 
-              {endpoints.length > 0 && (
+              {directEndpoints.length > 0 && (
                 <details className="group">
                   <summary className="flex w-fit cursor-pointer list-none items-center gap-1 text-label font-medium text-muted-foreground marker:content-none hover:text-foreground">
                     <span className="transition-transform duration-150 group-open:rotate-90">
                       ›
                     </span>
-                    Reachable at ({endpoints.length})
+                    Reachable at ({directEndpoints.length})
                   </summary>
                   <div className="mt-3">
-                    <GroupedEndpoints endpoints={endpoints} />
+                    <GroupedEndpoints endpoints={directEndpoints} />
                   </div>
                 </details>
               )}

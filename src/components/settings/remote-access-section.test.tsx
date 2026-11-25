@@ -448,6 +448,11 @@ describe("RemoteAccessSection — enabled", () => {
       },
     ]);
     render(<RemoteAccessSection />);
+    expect(
+      await screen.findByText(/create a one-time link to open on this device or through a local tunnel/i),
+    ).toBeInTheDocument();
+    const reachable = screen.getByText("Reachable at (1)").closest("details")!;
+    expect(within(reachable).queryByText("iroh://node-id")).toBeNull();
     await user.click(await screen.findByRole("button", { name: /create pairing link/i }));
 
     expect(await screen.findByText("http://127.0.0.1:4377/#pair=tok")).toBeInTheDocument();
