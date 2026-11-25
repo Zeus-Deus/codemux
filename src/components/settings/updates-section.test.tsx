@@ -176,6 +176,42 @@ describe("UpdatesSection", () => {
     expect(invoke).toHaveBeenCalledWith("provider_updates_device", { hostId: 2, force: true });
   });
 
+  it("keeps the agent installer error and retry visible when its status refresh also fails", async () => {
+    let checks = 0;
+    let finishRefresh!: () => void;
+    const refreshGate = new Promise<void>((resolve) => { finishRefresh = resolve; });
+    invoke.mockImplementation(async (cmd: string) => {
+      if (cmd === "provider_updates_local") return [];
+      if (cmd === "provider_updates_device") {
+        checks++;
+        if (checks === 1) {
+          return { host_id: 2, helper_version: "0.23.0", running_version: "0.23.0", serve_alive: true, app_version: "0.24.0", providers: [report("codex")], error: null };
+        }
+        await refreshGate;
+        return { host_id: 2, helper_version: null, running_version: null, serve_alive: null, app_version: "0.24.0", providers: null, error: "SSH connection timed out" };
+      }
+      if (cmd === "provider_update_device") throw new Error("npm failed (exit 1): permission denied");
+      throw new Error(`unexpected ${cmd}`);
+    });
+
+    render(<UpdatesSection />);
+    const row = (await screen.findByText("1.0.0 → 1.1.0 · npm")).closest("[data-settings-row]");
+    if (!(row instanceof HTMLElement)) throw new Error("agent row missing");
+
+    fireEvent.click(within(row).getByRole("button", { name: "Update" }));
+    await waitFor(() => expect(checks).toBe(2));
+    expect(within(row).getByText("npm failed (exit 1): permission denied")).toBeInTheDocument();
+    expect(within(row).getByRole("button", { name: "Try again" })).toBeInTheDocument();
+
+    finishRefresh();
+    await screen.findByText(/Status check failed: SSH connection timed out/);
+    expect(row).toBeInTheDocument();
+    expect(within(row).getByText("npm failed (exit 1): permission denied")).toBeInTheDocument();
+    expect(within(row).getByRole("button", { name: "Try again" })).toBeInTheDocument();
+    expect(screen.getByText(/Status check failed: SSH connection timed out/)).toBeInTheDocument();
+    expect(useUpdateAll.getState().machines["host:2"]?.helperVersion).toBe("0.23.0");
+  });
+
   it("names the device service in the update toast and completion summary", async () => {
     vi.mocked(toast.success).mockClear();
     invoke.mockImplementation(async (cmd: string) => {

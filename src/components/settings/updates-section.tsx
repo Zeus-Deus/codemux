@@ -177,6 +177,12 @@ export function UpdatesSection() {
             <SettingsCard className="p-0">
               <ul className="divide-y divide-border/40">
                 <HelperRow machine={key} state={state} />
+                {state?.error && state.helperVersion && (
+                  <li className="flex items-center gap-2 px-4 py-3 text-label text-destructive" role="alert">
+                    <CircleAlert className="size-4 shrink-0" aria-hidden />
+                    <span>Status check failed: {state.error}. Showing last known status.</span>
+                  </li>
+                )}
                 {state?.helperVersion && <ProviderRows machine={key} state={state} />}
               </ul>
             </SettingsCard>
@@ -312,7 +318,7 @@ function ProviderRows({ machine, state }: { machine: MachineKey; state: MachineS
   if (state.providers.length === 0) {
     return (
       <li className="px-4 py-3 text-body-sm text-subtle-foreground">
-        {state.error && machine === LOCAL ? state.error : "No coding agents installed."}
+        {state.error ? machine === LOCAL ? state.error : "Coding agent status unavailable." : "No coding agents installed."}
       </li>
     );
   }

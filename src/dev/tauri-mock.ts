@@ -4782,6 +4782,7 @@ const mockDeviceProviders = new Map<number, { helper: string; running: string; p
     mockReport("codex", "0.163.0", "0.163.0", "npm"),
   ] }],
 ]);
+const mockDeviceRefreshFailures = new Set<number>();
 
 const mockHostStatus = new Map<number, HostStatusView>([
   [1, {
@@ -6067,12 +6068,15 @@ const handlers: Record<string, Handler> = {
     if (new URLSearchParams(location.search).get("providerUpdate") === "error") throw new Error("Update failed: the package registry could not be reached. Check your connection and try again.");
     return { provider: a.provider, installed_version: "0.158.0", latest_version: "0.158.0", available: false, manager: "Omarchy · mise", can_update: true, message: null };
   },
-  // Settings → Updates. Synthetic per-machine inventories; `?updateAll=fail`
-  // makes one device update fail so the partial-failure summary shows.
+  // Settings → Updates. `?updateAll=doubleFail` makes an installer fail and
+  // its subsequent status check lose the connection.
   provider_updates_local: () => mockLocalProviders.map((p) => ({ ...p })),
   provider_updates_device: (a) => {
     const hostId = Number(a.hostId);
     const host = mockHosts.find((h) => h.id === hostId);
+    if (mockDeviceRefreshFailures.has(hostId)) {
+      return { host_id: hostId, helper_version: null, running_version: null, serve_alive: null, app_version: "0.24.0", providers: null, error: "SSH connection timed out" };
+    }
     if (!host || hostId === 1) {
       return { host_id: hostId, helper_version: null, running_version: null, serve_alive: null, app_version: "0.24.0", providers: null, error: `couldn't connect to ${host?.name ?? "the device"} over SSH` };
     }
@@ -6087,7 +6091,9 @@ const handlers: Record<string, Handler> = {
   },
   provider_update_device: async (a) => {
     await new Promise((resolve) => setTimeout(resolve, 1600));
-    if (new URLSearchParams(location.search).get("updateAll") === "fail" && a.provider === "opencode") {
+    const scenario = new URLSearchParams(location.search).get("updateAll");
+    if ((scenario === "fail" || scenario === "doubleFail") && a.provider === "opencode") {
+      if (scenario === "doubleFail") mockDeviceRefreshFailures.add(Number(a.hostId));
       throw new Error("npm exited with exit status: 1: EACCES: permission denied, rename '/usr/lib/node_modules/opencode-ai'");
     }
     const device = mockDeviceProviders.get(Number(a.hostId))!;

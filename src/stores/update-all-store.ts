@@ -212,18 +212,20 @@ export const useUpdateAll = create<Store>((set, get) => {
       try {
         const report = await invoke<DeviceProvidersReport>("provider_updates_device", { hostId, force });
         if (isLatest()) {
+          const previous = get().machines[key];
           patchMachine(key, {
-            providers: report.providers ?? [],
-            helperVersion: report.helper_version,
-            runningVersion: report.running_version,
-            serveAlive: report.serve_alive,
+            // A failed or partial check must not erase the last usable rows.
+            providers: report.providers ?? previous?.providers ?? [],
+            helperVersion: report.helper_version ?? previous?.helperVersion ?? null,
+            runningVersion: report.helper_version ? report.running_version : previous?.runningVersion ?? null,
+            serveAlive: report.helper_version ? report.serve_alive : previous?.serveAlive ?? null,
             appVersion: report.app_version,
             error: report.error,
-            checkedAt: Date.now(),
+            checkedAt: report.error ? previous?.checkedAt : Date.now(),
           });
         }
       } catch (error) {
-        if (isLatest()) patchMachine(key, { error: String(error), helperVersion: null, runningVersion: null, serveAlive: null });
+        if (isLatest()) patchMachine(key, { error: String(error) });
       } finally {
         if (isLatest()) patchMachine(key, { loading: false });
       }
@@ -253,14 +255,18 @@ export const useUpdateAll = create<Store>((set, get) => {
           patchItem(key, { phase: "updated" });
         } else {
           const hostId = Number(machine.slice(5));
+          let updated = false;
           try {
             replaceReport(machine, await invoke<ProviderUpdateReport>("provider_update_device", { hostId, provider: item }));
-          } finally {
-            // The provider command may upgrade the helper before the agent
-            // installer fails, so refresh its installed and running versions.
-            await get().refreshDevice(hostId, true);
+            patchItem(key, { phase: "updated" });
+            updated = true;
+          } catch (error) {
+            patchItem(key, { phase: "failed", message: error instanceof Error ? error.message : String(error) });
           }
-          patchItem(key, { phase: "updated" });
+          // The provider command may upgrade the helper before its installer
+          // fails. Its outcome stays visible while this status read runs.
+          await get().refreshDevice(hostId, true);
+          return updated;
         }
         return true;
       } catch (error) {
