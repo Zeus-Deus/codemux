@@ -1,5 +1,21 @@
 use serde::{Deserialize, Serialize};
+use std::fs::File;
+use std::io::{self, ErrorKind, Read};
 use std::path::{Path, PathBuf};
+
+#[cfg(unix)]
+mod unix;
+#[cfg(windows)]
+mod windows;
+#[cfg(unix)]
+use unix::ProjectSettingsDir;
+#[cfg(windows)]
+use windows::ProjectSettingsDir;
+
+const PROJECT_SCOPES: [(&str, &str); 2] = [
+    ("project", "settings.json"),
+    ("local", "settings.local.json"),
+];
 
 /// A single tool-permission rule, flattened across the three settings
 /// scopes the SDK reads (user, project-shared, project-local). The
@@ -16,6 +32,25 @@ pub struct PermissionRule {
     pub source_path: String,
 }
 
+#[derive(Serialize)]
+pub struct PermissionScopeError {
+    scope: &'static str,
+    message: String,
+}
+
+#[derive(Default, Serialize)]
+pub struct ToolPermissionList {
+    rules: Vec<PermissionRule>,
+    scope_errors: Vec<PermissionScopeError>,
+}
+
+#[derive(Serialize)]
+#[serde(untagged)]
+pub enum ToolPermissionListResponse {
+    Rules(Vec<PermissionRule>),
+    Scoped(ToolPermissionList),
+}
+
 /// Read all tool-permission rules visible to the current session.
 ///
 /// Order: user (~/.claude/settings.json) first, then project-shared
@@ -25,26 +60,65 @@ pub struct PermissionRule {
 #[tauri::command]
 pub async fn list_tool_permissions(
     project_root: Option<String>,
-) -> Result<Vec<PermissionRule>, String> {
-    let mut rules = Vec::new();
-
-    if let Some(home) = dirs::home_dir() {
-        let user_settings = home.join(".claude").join("settings.json");
-        if user_settings.exists() {
-            rules.extend(parse_settings_file(&user_settings, "user")?);
-        }
+    include_scope_errors: Option<bool>,
+) -> Result<ToolPermissionListResponse, String> {
+    let list = tokio::task::spawn_blocking(move || {
+        let user_settings = dirs::home_dir().map(|home| home.join(".claude/settings.json"));
+        collect_tool_permissions(user_settings.as_deref(), project_root.as_deref().map(Path::new))
+    })
+    .await
+    .map_err(|error| error.to_string())?;
+    if include_scope_errors.unwrap_or(false) {
+        Ok(ToolPermissionListResponse::Scoped(list))
+    } else if let Some(error) = list.scope_errors.into_iter().next() {
+        Err(error.message)
+    } else {
+        Ok(ToolPermissionListResponse::Rules(list.rules))
     }
+}
 
-    if let Some(root) = project_root.as_ref() {
-        for scope in ["project", "local"] {
-            let path = path_for_scope(scope, Some(root))?;
-            if let Some(settings) = contained_project_settings(Path::new(root), &path)? {
-                rules.extend(parse_settings_file(&settings, scope)?);
+fn collect_tool_permissions(user_settings: Option<&Path>, root: Option<&Path>) -> ToolPermissionList {
+    let mut list = ToolPermissionList::default();
+    if let Some(path) = user_settings {
+        list.add_scope("user", path, File::open(path));
+    }
+    if let Some(root) = root {
+        match ProjectSettingsDir::open(root) {
+            Ok(dir) => {
+                for (scope, name) in PROJECT_SCOPES {
+                    let path = root.join(".claude").join(name);
+                    list.add_scope(scope, &path, dir.open_file(name));
+                }
+            }
+            Err(error) if error.kind() == ErrorKind::NotFound => {}
+            Err(error) => {
+                let path = root.join(".claude");
+                for (scope, _) in PROJECT_SCOPES {
+                    list.scope_errors.push(PermissionScopeError {
+                        scope,
+                        message: format!("Failed to open {}: {error}", path.display()),
+                    });
+                }
             }
         }
     }
+    list
+}
 
-    Ok(rules)
+impl ToolPermissionList {
+    fn add_scope(&mut self, scope: &'static str, path: &Path, file: io::Result<File>) {
+        let content = match file {
+            Err(error) if error.kind() == ErrorKind::NotFound => return,
+            file => file.and_then(read_settings),
+        };
+        let rules = content
+            .map_err(|error| format!("Failed to read {}: {error}", path.display()))
+            .and_then(|content| parse_settings(&content, path, scope));
+        match rules {
+            Ok(rules) => self.rules.extend(rules),
+            Err(message) => self.scope_errors.push(PermissionScopeError { scope, message }),
+        }
+    }
 }
 
 /// Remove a single rule from whichever settings file owns it.
@@ -58,15 +132,24 @@ pub async fn remove_tool_permission(
     rule: PermissionRule,
     project_root: Option<String>,
 ) -> Result<(), String> {
-    let path = path_for_scope(&rule.scope, project_root.as_deref())?;
-    let path = match (rule.scope.as_str(), project_root.as_deref()) {
-        ("project" | "local", Some(root)) => contained_project_settings(Path::new(root), &path)?
-            .ok_or_else(|| format!("Settings file {} no longer exists", path.display()))?,
-        _ => path,
-    };
-
-    let content = tokio::fs::read_to_string(&path)
+    tokio::task::spawn_blocking(move || remove_permission(rule, project_root.as_deref()))
         .await
+        .map_err(|error| error.to_string())?
+}
+
+fn remove_permission(rule: PermissionRule, project_root: Option<&str>) -> Result<(), String> {
+    let path = path_for_scope(&rule.scope, project_root)?;
+    let name = path.file_name().and_then(|name| name.to_str()).expect("fixed settings filename");
+    let project = project_root
+        .filter(|_| matches!(rule.scope.as_str(), "project" | "local"))
+        .map(|root| ProjectSettingsDir::open(Path::new(root)))
+        .transpose()
+        .map_err(|error| format!("Failed to open project settings: {error}"))?;
+    let file = match &project {
+        Some(dir) => dir.open_file(name),
+        None => File::open(&path),
+    };
+    let content = file.and_then(read_settings)
         .map_err(|e| format!("Failed to read {}: {e}", path.display()))?;
 
     let mut settings: serde_json::Value = if content.trim().is_empty() {
@@ -102,38 +185,28 @@ pub async fn remove_tool_permission(
 
     let new_content = serde_json::to_string_pretty(&settings)
         .map_err(|e| format!("Failed to serialize settings: {e}"))?;
-    atomic_write(&path, content.as_bytes(), new_content.as_bytes())
-        .await
-        .map_err(|e| format!("Failed to write {}: {e}", path.display()))?;
+    let result = match project {
+        Some(dir) => dir.replace(name, content.as_bytes(), new_content.as_bytes()),
+        None => crate::config_file::replace_if_unchanged(&path, Some(content.as_bytes()), new_content.as_bytes()),
+    };
+    result.map_err(|e| format!("Failed to write {}: {e}", path.display()))
+}
 
+fn read_settings(mut file: File) -> io::Result<String> {
+    let mut content = String::new();
+    file.read_to_string(&mut content)?;
+    Ok(content)
+}
+
+fn validate_project_settings_name(name: &str) -> io::Result<()> {
+    if !PROJECT_SCOPES.iter().any(|(_, file)| *file == name) {
+        return Err(io::Error::new(ErrorKind::InvalidInput, "Invalid project settings filename"));
+    }
     Ok(())
 }
 
-async fn atomic_write(path: &Path, original: &[u8], content: &[u8]) -> std::io::Result<()> {
-    let (path, original, content) = (path.to_path_buf(), original.to_vec(), content.to_vec());
-    tokio::task::spawn_blocking(move || {
-        crate::config_file::replace_if_unchanged(&path, Some(&original), &content)
-    })
-    .await
-    .map_err(std::io::Error::other)?
-}
-
-fn contained_project_settings(root: &Path, path: &Path) -> Result<Option<PathBuf>, String> {
-    let resolved = match path.canonicalize() {
-        Ok(path) => path,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => return Err(format!("Failed to resolve {}: {error}", path.display())),
-    };
-    let root = root
-        .canonicalize()
-        .map_err(|error| format!("Failed to resolve project root: {error}"))?;
-    if !resolved.starts_with(&root) || !resolved.is_file() {
-        return Err(format!(
-            "{} must resolve to a file inside the project",
-            path.display()
-        ));
-    }
-    Ok(Some(resolved))
+fn settings_changed() -> io::Error {
+    io::Error::other("Settings changed while they were being updated")
 }
 
 fn path_for_scope(scope: &str, project_root: Option<&str>) -> Result<PathBuf, String> {
@@ -161,15 +234,12 @@ fn path_for_scope(scope: &str, project_root: Option<&str>) -> Result<PathBuf, St
 // with a hint like "settings.json contains comments — edit manually".
 // Same caveat applies to the writer below: `serde_json::to_string_pretty`
 // strips any comments that did manage to round-trip.
-fn parse_settings_file(path: &Path, scope: &str) -> Result<Vec<PermissionRule>, String> {
-    let content = std::fs::read_to_string(path)
-        .map_err(|e| format!("Failed to read {}: {e}", path.display()))?;
-
+fn parse_settings(content: &str, path: &Path, scope: &str) -> Result<Vec<PermissionRule>, String> {
     if content.trim().is_empty() {
         return Ok(Vec::new());
     }
 
-    let value: serde_json::Value = serde_json::from_str(&content)
+    let value: serde_json::Value = serde_json::from_str(content)
         .map_err(|e| format!("Failed to parse {}: {e}", path.display()))?;
 
     let Some(perms) = value.get("permissions").and_then(|v| v.as_object()) else {
@@ -265,6 +335,10 @@ mod tests {
     use std::fs;
     use tempfile::TempDir;
 
+    fn parse_settings_file(path: &Path, scope: &str) -> Result<Vec<PermissionRule>, String> {
+        parse_settings(&fs::read_to_string(path).unwrap(), path, scope)
+    }
+
     fn write_settings(dir: &Path, file: &str, contents: &str) -> PathBuf {
         let claude = dir.join(".claude");
         fs::create_dir_all(&claude).unwrap();
@@ -331,18 +405,32 @@ mod tests {
         assert!(parse_settings_file(&no_perms, "user").unwrap().is_empty());
     }
 
-    #[tokio::test]
-    async fn list_returns_empty_when_nothing_exists() {
+    #[test]
+    fn list_returns_empty_when_nothing_exists() {
         let tmp = TempDir::new().unwrap();
         let project = tmp.path().join("project");
         fs::create_dir_all(&project).unwrap();
-        // Pass a project_root that has no .claude dir — and we can't
-        // safely point at a real ~/.claude in a unit test, so this
-        // mainly verifies the no-project path returns Ok([]) cleanly
-        // when no files exist.
-        let result =
-            list_tool_permissions(Some(project.to_string_lossy().to_string())).await;
-        assert!(result.is_ok());
+        let result = collect_tool_permissions(Some(&tmp.path().join("missing")), Some(&project));
+        assert!(result.rules.is_empty());
+        assert!(result.scope_errors.is_empty());
+    }
+
+    #[test]
+    fn invalid_project_settings_keep_valid_user_and_local_rules() {
+        let user = TempDir::new().unwrap();
+        let project = TempDir::new().unwrap();
+        let user_file = write_settings(user.path(), "settings.json", r#"{"permissions":{"allow":["Read"]}}"#);
+        write_settings(project.path(), "settings.json", "invalid JSON");
+        write_settings(project.path(), "settings.local.json", r#"{"permissions":{"deny":["Write"]}}"#);
+
+        let result = collect_tool_permissions(Some(&user_file), Some(project.path()));
+        let scopes: Vec<_> = result.rules.iter().map(|rule| rule.scope.as_str()).collect();
+        assert_eq!(scopes, ["user", "local"]);
+        assert_eq!(result.scope_errors.len(), 1);
+        assert_eq!(result.scope_errors[0].scope, "project");
+        let response = serde_json::to_value(ToolPermissionListResponse::Scoped(result)).unwrap();
+        assert_eq!(response["scope_errors"][0]["scope"], "project");
+        assert_eq!(response["rules"].as_array().unwrap().len(), 2);
     }
 
     #[tokio::test]
@@ -416,12 +504,12 @@ mod tests {
         assert!(path.exists());
     }
 
-    #[tokio::test]
-    async fn atomic_write_replaces_target_in_place() {
+    #[test]
+    fn atomic_write_replaces_target_in_place() {
         let tmp = TempDir::new().unwrap();
         let path = tmp.path().join("settings.json");
         fs::write(&path, b"old").unwrap();
-        atomic_write(&path, b"old", b"new").await.unwrap();
+        crate::config_file::replace_if_unchanged(&path, Some(b"old"), b"new").unwrap();
         assert_eq!(fs::read_to_string(&path).unwrap(), "new");
 
         // No `.tmp` sidecar in the directory after success.
@@ -433,15 +521,15 @@ mod tests {
         assert_eq!(entries, vec!["settings.json".to_string()]);
     }
 
-    #[tokio::test]
-    async fn atomic_write_preserves_an_existing_sibling_file() {
+    #[test]
+    fn atomic_write_preserves_an_existing_sibling_file() {
         let tmp = TempDir::new().unwrap();
         let path = tmp.path().join("settings.json");
         let sibling = path.with_extension("json.tmp");
         fs::write(&path, b"old").unwrap();
         fs::write(&sibling, b"unrelated").unwrap();
 
-        atomic_write(&path, b"old", b"new").await.unwrap();
+        crate::config_file::replace_if_unchanged(&path, Some(b"old"), b"new").unwrap();
 
         assert_eq!(fs::read(&path).unwrap(), b"new");
         assert_eq!(fs::read(&sibling).unwrap(), b"unrelated");
@@ -456,13 +544,59 @@ mod tests {
         let linked_dir = project.path().join(".claude");
         std::os::unix::fs::symlink(settings.parent().unwrap(), &linked_dir).unwrap();
 
-        assert!(
-            contained_project_settings(project.path(), &linked_dir.join("settings.json")).is_err()
-        );
+        assert!(ProjectSettingsDir::open(project.path()).is_err());
     }
 
-    #[tokio::test]
-    async fn atomic_write_does_not_truncate_target_on_serialize() {
+    #[cfg(unix)]
+    #[test]
+    fn project_settings_leaf_must_be_a_regular_file() {
+        let project = TempDir::new().unwrap();
+        let directory = project.path().join(".claude");
+        fs::create_dir(&directory).unwrap();
+        fs::write(directory.join("shared.json"), "{}").unwrap();
+        std::os::unix::fs::symlink("shared.json", directory.join("settings.json")).unwrap();
+        let opened = ProjectSettingsDir::open(project.path()).unwrap();
+        assert!(opened.open_file("settings.json").is_err());
+        assert!(opened.replace("settings.json", b"{}", b"edited").is_err());
+        assert_eq!(fs::read_to_string(directory.join("shared.json")).unwrap(), "{}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn settings_edits_stay_with_the_open_project_directory() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let project = TempDir::new().unwrap();
+        let settings = write_settings(project.path(), "settings.json", "original");
+        fs::set_permissions(&settings, fs::Permissions::from_mode(0o640)).unwrap();
+        let directory = settings.parent().unwrap();
+        let opened = ProjectSettingsDir::open(project.path()).unwrap();
+        let moved = project.path().join("opened-settings");
+        fs::rename(directory, &moved).unwrap();
+        write_settings(project.path(), "settings.json", "original");
+
+        opened.replace("settings.json", b"original", b"updated").unwrap();
+        let updated = moved.join("settings.json");
+        assert_eq!(fs::read_to_string(&updated).unwrap(), "updated");
+        assert_eq!(fs::metadata(updated).unwrap().permissions().mode() & 0o777, 0o640);
+        assert_eq!(fs::read_to_string(settings).unwrap(), "original");
+    }
+
+    #[test]
+    fn settings_edit_refuses_stale_content_and_cleans_up() {
+        let project = TempDir::new().unwrap();
+        let settings = write_settings(project.path(), "settings.json", "updated outside the app");
+        let opened = ProjectSettingsDir::open(project.path()).unwrap();
+        assert!(opened.replace("settings.json", b"original", b"ours").is_err());
+        assert_eq!(fs::read_to_string(&settings).unwrap(), "updated outside the app");
+        let files: Vec<_> = fs::read_dir(settings.parent().unwrap()).unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        assert_eq!(files, ["settings.json"]);
+    }
+
+    #[test]
+    fn atomic_write_does_not_truncate_target_on_serialize() {
         // Regression guard for the "tokio::fs::write truncates first,
         // then writes" footgun: even if the writer crashes before any
         // bytes land, the target must remain intact. We can't crash
@@ -473,7 +607,7 @@ mod tests {
         let path = tmp.path().join("settings.json");
         fs::write(&path, b"original").unwrap();
 
-        atomic_write(&path, b"original", b"replacement").await.unwrap();
+        crate::config_file::replace_if_unchanged(&path, Some(b"original"), b"replacement").unwrap();
 
         assert_eq!(fs::read_to_string(&path).unwrap(), "replacement");
     }

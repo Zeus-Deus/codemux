@@ -14,7 +14,7 @@ import {
   AlertDialogTitle,
 } from "@/components/ui/alert-dialog";
 import { listToolPermissions, removeToolPermission } from "@/tauri/commands";
-import type { PermissionRule } from "@/tauri/commands";
+import type { PermissionRule, ToolPermissionList } from "@/tauri/commands";
 import { toast } from "@/lib/toast";
 import { cn } from "@/lib/utils";
 import { eyebrowVariants } from "@/components/ui/eyebrow";
@@ -45,7 +45,13 @@ interface Group {
  * their cached permission map until they restart.
  */
 export function PermissionsSection({ projectRoot }: Props) {
-  const [rules, setRules] = useState<PermissionRule[] | null>(null);
+  // A project's rules, outstanding reads, and removal dialog belong to
+  // the root that opened them.
+  return <PermissionRules key={projectRoot ?? undefined} projectRoot={projectRoot} />;
+}
+
+function PermissionRules({ projectRoot }: Props) {
+  const [list, setList] = useState<ToolPermissionList | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [pendingRemoval, setPendingRemoval] = useState<PermissionRule | null>(
     null,
@@ -55,9 +61,9 @@ export function PermissionsSection({ projectRoot }: Props) {
   const refresh = useCallback(() => {
     setError(null);
     listToolPermissions(projectRoot)
-      .then((list) => setRules(list))
+      .then(setList)
       .catch((err) => {
-        setRules([]);
+        setList({ rules: [], scope_errors: [] });
         setError(String(err));
       });
   }, [projectRoot]);
@@ -66,19 +72,10 @@ export function PermissionsSection({ projectRoot }: Props) {
     refresh();
   }, [refresh]);
 
-  // Workspace switch resets any in-progress removal: the rule's
-  // `scope` (e.g. "local") was resolved against the old project root,
-  // so confirming the dialog after a switch would target the wrong
-  // file. `refresh` already re-runs via the `[refresh]` dep; this
-  // effect just clears the dialog state.
-  useEffect(() => {
-    setPendingRemoval(null);
-  }, [projectRoot]);
-
-  const groups = useMemo<Group[]>(() => groupRules(rules ?? [], projectRoot), [
-    rules,
-    projectRoot,
-  ]);
+  const groups = useMemo<Group[]>(
+    () => groupRules(list?.rules ?? [], projectRoot),
+    [list?.rules, projectRoot],
+  );
 
   const handleConfirmRemove = async () => {
     if (!pendingRemoval) return;
@@ -88,7 +85,11 @@ export function PermissionsSection({ projectRoot }: Props) {
       // Optimistic local update; refetch from disk to stay in sync
       // with anything Claude CLI may have written concurrently.
       const removed = pendingRemoval;
-      setRules((cur) => (cur ? cur.filter((r) => !sameRule(r, removed)) : cur));
+      setList((cur) =>
+        cur
+          ? { ...cur, rules: cur.rules.filter((rule) => !sameRule(rule, removed)) }
+          : cur,
+      );
       toast.success("Rule removed", {
         description: "New sessions will use the updated rules.",
       });
@@ -131,7 +132,7 @@ export function PermissionsSection({ projectRoot }: Props) {
         </p>
       )}
 
-      {rules === null ? (
+      {list === null ? (
         <div className="flex items-center gap-2 py-6 text-body text-muted-foreground">
           <Spinner className="size-4" aria-hidden />
           Loading rules…
@@ -142,6 +143,10 @@ export function PermissionsSection({ projectRoot }: Props) {
             <RuleGroup
               key={group.scope}
               group={group}
+              error={
+                list.scope_errors.find((entry) => entry.scope === group.scope)
+                  ?.message
+              }
               onRemove={(rule) => setPendingRemoval(rule)}
             />
           ))}
@@ -183,13 +188,15 @@ export function PermissionsSection({ projectRoot }: Props) {
 
 function RuleGroup({
   group,
+  error,
   onRemove,
 }: {
   group: Group;
+  error?: string;
   onRemove: (rule: PermissionRule) => void;
 }) {
   return (
-    <section>
+    <section aria-label={group.heading}>
       <header className="mb-2">
         <h3 className={cn(eyebrowVariants())}>
           {group.heading}
@@ -198,7 +205,11 @@ function RuleGroup({
           {group.filename}
         </p>
       </header>
-      {group.rules.length === 0 ? (
+      {error ? (
+        <p role="status" className="text-label text-destructive">
+          {error}
+        </p>
+      ) : group.rules.length === 0 ? (
         <p className="text-label text-subtle-foreground italic">
           No rules in this scope.
         </p>

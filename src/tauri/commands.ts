@@ -2565,8 +2565,20 @@ export interface PermissionRule {
   source_path: string;
 }
 
-export const listToolPermissions = (projectRoot: string | null) =>
-  invoke<PermissionRule[]>("list_tool_permissions", { projectRoot });
+export interface ToolPermissionList {
+  rules: PermissionRule[];
+  scope_errors: { scope: PermissionRule["scope"]; message: string }[];
+}
+
+export const listToolPermissions = async (
+  projectRoot: string | null,
+): Promise<ToolPermissionList> => {
+  const result = await invoke<ToolPermissionList | PermissionRule[]>(
+    "list_tool_permissions",
+    { projectRoot, includeScopeErrors: true },
+  );
+  return Array.isArray(result) ? { rules: result, scope_errors: [] } : result;
+};
 
 export const removeToolPermission = (
   rule: PermissionRule,
