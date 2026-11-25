@@ -40,6 +40,21 @@ export interface AuthMethods {
   pairingCode: true;
 }
 
+function accountPairTransportOk(baseUrl: string): boolean {
+  try {
+    const { protocol, hostname } = new URL(baseUrl);
+    return protocol === "https:" || (
+      protocol === "http:" && (
+        hostname === "localhost" ||
+        hostname === "[::1]" ||
+        /^127(?:\.\d{1,3}){3}$/.test(hostname)
+      )
+    );
+  } catch {
+    return false;
+  }
+}
+
 /** Read `/api/health` and report the server version + whether account mode is
  *  on. Never throws — a probe failure degrades to "no account mode, unknown
  *  version" so the pairing-code path always still works. */
@@ -58,7 +73,7 @@ export async function fetchServerInfo(
     };
     return {
       version: typeof body.version === "string" ? body.version : null,
-      accountModeEnabled: body.account_mode_enabled === true,
+      accountModeEnabled: body.account_mode_enabled === true && accountPairTransportOk(baseUrl),
     };
   } catch {
     return { version: null, accountModeEnabled: false };
@@ -89,10 +104,14 @@ export function mapAccountPairError(
   switch (code) {
     case "account_mode_disabled":
       return "Account sign-in isn't enabled on this desktop. Turn on Account access in Remote Access settings, or pair with a code.";
+    case "account_secure_transport_required":
+      return "Account sign-in requires HTTPS or an explicit HTTP opt-in on the desktop. Use a pairing code or connect through From anywhere.";
     case "account_signed_out":
       return "Sign in to your Codemux account on the desktop first, then try again.";
     case "account_mismatch":
       return "That account isn't the one signed in on this desktop. Sign in with the desktop's account.";
+    case "account_session_changed":
+      return "The desktop’s sign-in changed. Try signing in again.";
     case "account_auth_failed":
       return "That email or password is incorrect.";
     case "origin_mismatch":
@@ -123,11 +142,15 @@ export async function pairAccount(
   password: string,
   fetchImpl: typeof fetch = fetch,
 ): Promise<AccountPairResult> {
+  if (!accountPairTransportOk(baseUrl)) {
+    throw new Error(mapAccountPairError(403, "account_secure_transport_required"));
+  }
   const authSecret = await deriveAuthSecret(password, email);
   const res = await fetchImpl(`${baseUrl}/api/pair-account`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     credentials: "include",
+    redirect: "error",
     body: JSON.stringify({
       email: email.trim(),
       auth_secret: authSecret,

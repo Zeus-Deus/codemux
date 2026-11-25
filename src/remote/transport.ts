@@ -54,6 +54,8 @@ export interface TransportHooks {
   onEvent(event: string, payload: unknown): void;
   /** Connection state changed (drives the reconnecting banner). */
   onStatusChange(status: ConnectionStatus): void;
+  /** The current socket confirmed or lost permission to carry secrets. */
+  onSecretSubmissionChange?(allowed: boolean): void;
   /** The session is no longer valid (revoked / rejected). */
   onUnauthorized(): void;
 }
@@ -114,6 +116,17 @@ const MAX_RECONNECT_MS = 16000;
  * iroh path doesn't carry them, so a probe has to be an ordinary frame.
  */
 const LIVENESS_PROBE_CMD = "__codemux_ping";
+/** The server answers using the same per-socket policy as the secret command. */
+const SECRET_SUBMISSION_PROBE_CMD = "__codemux_can_submit_secrets";
+
+function canCarrySecrets(baseUrl: string): boolean {
+  const { protocol, hostname } = new URL(baseUrl);
+  if (protocol === "https:") return true;
+  // Even a positive response over network HTTP would be untrustworthy.
+  // Local HTTP still needs the host's explicit opt-in to receive secrets.
+  return protocol === "http:"
+    && (hostname === "localhost" || hostname === "[::1]" || /^127(?:\.\d{1,3}){3}$/.test(hostname));
+}
 /** Silence after which the transport probes the socket. */
 const IDLE_PROBE_MS = 25_000;
 /** How long a probe may go without any inbound frame before the socket is
@@ -306,6 +319,7 @@ export class RemoteTransport {
 
   private ws: WebSocketLike | null = null;
   private socketOpen = false;
+  private secretSubmissionAllowed = false;
   private closed = false;
 
   /** Inbound-compression state; reset for every socket (see `FrameInflater`). */
@@ -382,6 +396,7 @@ export class RemoteTransport {
       this.reconnectTimer = null;
     }
     this.socketOpen = false;
+    this.setSecretSubmissionAllowed(false);
     this.detachSocket();
   }
 
@@ -391,6 +406,12 @@ export class RemoteTransport {
       return Promise.reject(
         new Error(`web-remote: not connected (cannot invoke "${cmd}")`),
       );
+    }
+    if (cmd === "agent_secret_request_answer" && !this.secretSubmissionAllowed) {
+      const answer = args.answer;
+      if (!answer || typeof answer !== "object" || !("type" in answer) || answer.type !== "decline") {
+        return Promise.reject("This connection cannot accept secrets.");
+      }
     }
     const id = this.nextInvokeId++;
     return new Promise<unknown>((resolve, reject) => {
@@ -463,7 +484,11 @@ export class RemoteTransport {
     this.inflater.reset();
     ws.binaryType = "arraybuffer";
     ws.onopen = () => this.handleOpen();
-    ws.onmessage = (ev) => this.handleMessage(ev.data);
+    ws.onmessage = (ev) => {
+      // Once a replacement is installed, the old socket cannot answer its
+      // invokes, including capability queries.
+      if (!this.ws || this.ws === ws) this.handleMessage(ev.data);
+    };
     ws.onactivity = () => this.noteActivity();
     ws.onclose = () => this.handleClose();
     ws.onerror = () => {
@@ -543,6 +568,16 @@ export class RemoteTransport {
     for (const event of this.subscriptions) {
       this.ws?.send(JSON.stringify({ t: "listen", event }));
     }
+    const ws = this.ws;
+    if (ws && this.hooks.onSecretSubmissionChange && canCarrySecrets(this.baseUrl)) {
+      void this.invoke(SECRET_SUBMISSION_PROBE_CMD).then((allowed) => {
+        if (allowed === true && this.ws === ws && this.socketOpen) {
+          this.setSecretSubmissionAllowed(true);
+        }
+      }).catch(() => {
+        // Hosts without this capability stay locked, including during upgrades.
+      });
+    }
     this.hooks.onStatusChange("connected");
     if (this.firstConnectResolve) {
       this.firstConnectResolve();
@@ -553,6 +588,7 @@ export class RemoteTransport {
   private handleClose(): void {
     const wasOpen = this.socketOpen;
     this.socketOpen = false;
+    this.setSecretSubmissionAllowed(false);
     this.ws = null;
     this.clearOpenTimer();
     this.stopLiveness();
@@ -565,6 +601,12 @@ export class RemoteTransport {
     if (this.closed) return;
     if (wasOpen) this.hooks.onStatusChange("reconnecting");
     this.scheduleReconnect();
+  }
+
+  private setSecretSubmissionAllowed(allowed: boolean): void {
+    if (allowed === this.secretSubmissionAllowed) return;
+    this.secretSubmissionAllowed = allowed;
+    this.hooks.onSecretSubmissionChange?.(allowed);
   }
 
   /**

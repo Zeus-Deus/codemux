@@ -24,7 +24,7 @@
 //! `?compress=deflate` — see [`super::compress`].
 
 use std::collections::HashMap;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -60,6 +60,8 @@ const PING_INTERVAL_SECS: u64 = 30;
 /// in `src/remote/transport.ts`). Answered in [`handle_text_frame`], never
 /// dispatched.
 const LIVENESS_PROBE_CMD: &str = "__codemux_ping";
+/// Per-socket confirmation needed before the browser can send a secret.
+const SECRET_SUBMISSION_PROBE_CMD: &str = "__codemux_can_submit_secrets";
 
 /// Most outbound bytes one connection may have queued but not yet written.
 ///
@@ -223,8 +225,7 @@ struct ConnInfo {
 pub struct ConnectionRegistry {
     conns: Mutex<HashMap<u64, ConnInfo>>,
     next: AtomicU64,
-    /// LAN sockets from peers other than this machine, whose traffic may
-    /// cross the network unencrypted ([`super::endpoints::is_local_peer`]).
+    /// WebSockets whose transport did not qualify for secret submission.
     plaintext: Mutex<std::collections::HashSet<u64>>,
 }
 
@@ -293,9 +294,13 @@ impl ConnectionRegistry {
         self.plaintext.lock().unwrap().insert(id);
     }
 
-    /// Whether the socket's traffic crosses the network unencrypted.
-    pub(super) fn is_plaintext(&self, id: u64) -> bool {
-        self.plaintext.lock().unwrap().contains(&id)
+    /// Whether this live, approved socket can carry secrets.
+    pub(super) fn allows_secret_submission(&self, id: u64) -> bool {
+        let conns = self.conns.lock().unwrap();
+        conns
+            .get(&id)
+            .is_some_and(|conn| conn.out.is_some() && !*conn.close.borrow())
+            && !self.plaintext.lock().unwrap().contains(&id)
     }
 
     pub(super) fn session_for_connection(&self, id: u64) -> Option<String> {
@@ -431,13 +436,17 @@ fn compression_layer() -> CompressionLayer {
 
 // ── HTTP handlers ───────────────────────────────────────────────────
 
-async fn health<R: Runtime>(State(app): State<AppHandle<R>>) -> Response {
+async fn health<R: Runtime>(
+    State(app): State<AppHandle<R>>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+) -> Response {
     let version = app.package_info().version.to_string();
     // Advertise whether account mode is on so the pre-app bootstrap knows to
     // offer the "sign in with your Codemux account" screen alongside the
     // paste-a-code path. Public + non-sensitive: it only says which admission
     // methods this server accepts, never anything about the account itself.
-    let account_mode_enabled = app
+    let account_mode_enabled = account_transport(peer, &headers) != AccountTransport::Insecure && app
         .state::<WebRemoteState>()
         .shared()
         .config
@@ -450,6 +459,129 @@ async fn health<R: Runtime>(State(app): State<AppHandle<R>>) -> Response {
         "account_mode_enabled": account_mode_enabled,
     }))
     .into_response()
+}
+
+const TLS_PROXY_TOKEN_ENV: &str = "CODEMUX_WEB_REMOTE_TLS_PROXY_TOKEN";
+const ALLOW_HTTP_ACCOUNT_PAIRING_ENV: &str = "CODEMUX_WEB_REMOTE_ALLOW_HTTP_ACCOUNT_PAIRING";
+pub(crate) const TLS_PROXY_TOKEN_HEADER: &str = "x-codemux-proxy-token";
+const TLS_PROXY_CLIENT_IP_HEADER: &str = "x-codemux-client-ip";
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AccountTransport {
+    Insecure,
+    Loopback,
+    HttpsProxy(IpAddr),
+}
+
+impl AccountTransport {
+    fn pairing_ip(self, peer: IpAddr) -> IpAddr {
+        match self {
+            Self::HttpsProxy(client_ip) => client_ip,
+            Self::Loopback | Self::Insecure => peer.to_canonical(),
+        }
+    }
+}
+
+fn single_header<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
+    let mut values = headers.get_all(name).iter();
+    let value = values.next()?.to_str().ok()?;
+    values.next().is_none().then_some(value)
+}
+
+fn classify_account_transport(
+    peer: SocketAddr,
+    headers: &HeaderMap,
+    proxy_token: Option<&str>,
+    allow_loopback_http: bool,
+) -> AccountTransport {
+    use AccountTransport::*;
+    if !super::endpoints::is_local_peer(peer.ip()) {
+        return Insecure;
+    }
+    let origin = single_header(headers, "origin");
+    if headers.contains_key(header::ORIGIN) && (origin.is_none() || !auth::origin_ok(headers)) {
+        return Insecure;
+    }
+
+    if let Some(expected) = proxy_token {
+        // Configuring a proxy makes this listener's account routes require
+        // proof from that proxy, including requests with a loopback Host.
+        let proxy_is_authenticated = expected.len() == 64
+            && expected.bytes().all(|byte| byte.is_ascii_hexdigit())
+            && single_header(headers, TLS_PROXY_TOKEN_HEADER).is_some_and(|provided| {
+                auth::constant_time_eq(expected.as_bytes(), provided.as_bytes())
+            });
+        if !proxy_is_authenticated
+            || single_header(headers, "x-forwarded-proto") != Some("https")
+            || origin.is_some_and(|value| !value.starts_with("https://"))
+        {
+            return Insecure;
+        }
+        return single_header(headers, TLS_PROXY_CLIENT_IP_HEADER)
+            .and_then(|value| value.parse::<IpAddr>().ok())
+            .map(|ip| ip.to_canonical())
+            .filter(|ip| {
+                !ip.is_unspecified()
+                    && !ip.is_multicast()
+                    && *ip != IpAddr::V4(std::net::Ipv4Addr::BROADCAST)
+            })
+            .map_or(Insecure, HttpsProxy);
+    }
+
+    // HTTP loopback is an explicit exception. Forwarded requests require
+    // authenticated ingress even when their appearance is that of loopback.
+    if !allow_loopback_http
+        || [
+            "forwarded", "via", "x-forwarded-for", "x-forwarded-host",
+            "x-forwarded-proto", "x-real-ip", TLS_PROXY_TOKEN_HEADER,
+            TLS_PROXY_CLIENT_IP_HEADER,
+        ]
+        .into_iter()
+        .any(|header| headers.contains_key(header))
+        || origin.is_some_and(|value| !value.starts_with("http://"))
+    {
+        return Insecure;
+    }
+    let Some(authority) = single_header(headers, "host")
+        .and_then(|host| host.parse::<axum::http::uri::Authority>().ok())
+    else {
+        return Insecure;
+    };
+    let host = authority.host();
+    if host.eq_ignore_ascii_case("localhost")
+        || host.trim_start_matches('[').trim_end_matches(']').parse::<std::net::IpAddr>()
+            .is_ok_and(super::endpoints::is_local_peer)
+    {
+        Loopback
+    } else {
+        Insecure
+    }
+}
+
+fn account_transport(peer: SocketAddr, headers: &HeaderMap) -> AccountTransport {
+    static CONFIG: std::sync::OnceLock<(Option<String>, bool)> = std::sync::OnceLock::new();
+    let (token, allow_loopback_http) = CONFIG.get_or_init(|| {
+        let token = std::env::var_os(TLS_PROXY_TOKEN_ENV)
+            .map(|value| value.to_string_lossy().into_owned());
+        let allow_loopback_http = std::env::var(ALLOW_HTTP_ACCOUNT_PAIRING_ENV).as_deref() == Ok("1");
+        (token, allow_loopback_http)
+    });
+    classify_account_transport(peer, headers, token.as_deref(), *allow_loopback_http)
+}
+
+fn pairing_response_headers(transport: AccountTransport, session_token: &str) -> HeaderMap {
+    let secure = if matches!(transport, AccountTransport::HttpsProxy(_)) {
+        "; Secure"
+    } else {
+        ""
+    };
+    let cookie = format!("{SESSION_COOKIE}={session_token}; HttpOnly; SameSite=Strict; Path=/{secure}");
+    let mut out = HeaderMap::new();
+    if let Ok(value) = cookie.parse() {
+        out.insert(header::SET_COOKIE, value);
+    }
+    out.insert(header::CACHE_CONTROL, axum::http::HeaderValue::from_static("no-store"));
+    out
 }
 
 #[derive(Deserialize)]
@@ -469,8 +601,9 @@ async fn pair<R: Runtime>(
         return error(StatusCode::FORBIDDEN, "origin_mismatch");
     }
     let shared = app.state::<WebRemoteState>().shared();
+    let transport = account_transport(peer, &headers);
 
-    if !shared.rate.check_and_record(peer.ip()) {
+    if !shared.rate.check_and_record(transport.pairing_ip(peer.ip())) {
         return error(StatusCode::TOO_MANY_REQUESTS, "rate_limited");
     }
     let consume = shared.pairing.consume_named(&body.token);
@@ -516,11 +649,7 @@ async fn pair<R: Runtime>(
 
     // HttpOnly so JS can't read it; SameSite=Strict so a cross-site page
     // can't drive authed asset GETs with the stored cookie.
-    let cookie = format!("{SESSION_COOKIE}={session_token}; HttpOnly; SameSite=Strict; Path=/");
-    let mut out_headers = HeaderMap::new();
-    if let Ok(v) = cookie.parse() {
-        out_headers.insert(header::SET_COOKIE, v);
-    }
+    let out_headers = pairing_response_headers(transport, &session_token);
     (
         StatusCode::OK,
         out_headers,
@@ -557,11 +686,15 @@ async fn pair_account<R: Runtime>(
     if !auth::origin_ok(&headers) {
         return error(StatusCode::FORBIDDEN, "origin_mismatch");
     }
+    let transport = account_transport(peer, &headers);
+    if transport == AccountTransport::Insecure || !headers.contains_key(header::ORIGIN) {
+        return error(StatusCode::FORBIDDEN, "account_secure_transport_required");
+    }
     let shared = app.state::<WebRemoteState>().shared();
 
     // Same per-IP limiter the pairing path uses — an account attempt is a
     // credential attempt and must not be a brute-force oracle.
-    if !shared.rate.check_and_record(peer.ip()) {
+    if !shared.rate.check_and_record(transport.pairing_ip(peer.ip())) {
         return error(StatusCode::TOO_MANY_REQUESTS, "rate_limited");
     }
 
@@ -593,14 +726,7 @@ async fn pair_account<R: Runtime>(
 
     // HttpOnly + SameSite=Strict cookie, identical to /api/pair, so authed
     // asset/`<img>` GETs work for account sessions too.
-    let cookie = format!(
-        "{SESSION_COOKIE}={}; HttpOnly; SameSite=Strict; Path=/",
-        outcome.session_token
-    );
-    let mut out_headers = HeaderMap::new();
-    if let Ok(v) = cookie.parse() {
-        out_headers.insert(header::SET_COOKIE, v);
-    }
+    let out_headers = pairing_response_headers(transport, &outcome.session_token);
     (
         StatusCode::OK,
         out_headers,
@@ -624,6 +750,7 @@ fn account_pair_error_response(err: super::account::AccountPairError) -> Respons
         E::DesktopSignedOut => error(StatusCode::FORBIDDEN, "account_signed_out"),
         E::AuthFailed => error(StatusCode::UNAUTHORIZED, "account_auth_failed"),
         E::Mismatch => error(StatusCode::FORBIDDEN, "account_mismatch"),
+        E::SessionChanged => error(StatusCode::CONFLICT, "account_session_changed"),
         E::Internal(reason) => {
             // Surface the concrete cause in the server log (never to the client)
             // so a failed mint is diagnosable without leaking internals.
@@ -654,7 +781,7 @@ async fn ws_ticket<R: Runtime>(State(app): State<AppHandle<R>>, headers: HeaderM
         .web_remote_touch_session(&session.id);
 
     let ticket = app.state::<WebRemoteState>().shared().tickets.issue(&session.id);
-    Json(json!({ "ticket": ticket })).into_response()
+    ([(header::CACHE_CONTROL, "no-store")], Json(json!({ "ticket": ticket }))).into_response()
 }
 
 /// A browser still waiting for approval withdraws its own request (it
@@ -717,8 +844,9 @@ async fn ws_upgrade<R: Runtime>(
     }
 
     let app_for_socket = app.clone();
+    let plaintext = !headers.contains_key(header::ORIGIN)
+        || account_transport(peer, &headers) == AccountTransport::Insecure;
     ws.on_upgrade(move |socket| {
-        let plaintext = !super::endpoints::is_local_peer(peer.ip());
         handle_socket(app_for_socket, session_id, socket, compress_frames, plaintext)
     })
 }
@@ -996,6 +1124,13 @@ pub(super) fn handle_text_frame<R: Runtime>(
                 let _ = out.send(Message::Text(json!({ "t": "ok", "id": id, "data": null }).to_string()));
                 return;
             }
+            if cmd == SECRET_SUBMISSION_PROBE_CMD {
+                let allowed = shared.connections.allows_secret_submission(conn_id);
+                let _ = out.send(Message::Text(
+                    json!({ "t": "ok", "id": id, "data": allowed }).to_string(),
+                ));
+                return;
+            }
             // Ordered commands (terminal input) go through the per-connection
             // serial lane so their client-send order is preserved; the send
             // is synchronous here, inside the in-order reader loop, so frames
@@ -1120,6 +1255,101 @@ pub(super) fn require_session<R: Runtime>(
 mod tests {
     use super::*;
     use tokio::sync::mpsc;
+
+    #[test]
+    fn direct_http_account_pairing_requires_an_explicit_loopback_opt_in() {
+        use AccountTransport::*;
+        let local: SocketAddr = "127.0.0.1:12345".parse().unwrap();
+        let lan: SocketAddr = "192.0.2.12:12345".parse().unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert(header::HOST, "[::1]:4377".parse().unwrap());
+        assert_eq!(classify_account_transport(local, &headers, None, false), Insecure);
+        assert_eq!(classify_account_transport(local, &headers, None, true), Loopback);
+        assert_eq!(classify_account_transport(lan, &headers, None, true), Insecure);
+        let token = "a".repeat(64);
+        assert_eq!(classify_account_transport(local, &headers, Some(&token), true), Insecure);
+
+        // A client-supplied address never changes a direct pairing-code quota.
+        headers.insert(TLS_PROXY_CLIENT_IP_HEADER, "192.0.2.20".parse().unwrap());
+        let transport = classify_account_transport(local, &headers, None, true);
+        assert_eq!(transport, Insecure);
+        assert_eq!(transport.pairing_ip(local.ip()), local.ip());
+    }
+
+    #[test]
+    fn https_proxy_requires_authentication_and_one_valid_client_ip() {
+        use AccountTransport::*;
+        let local: SocketAddr = "127.0.0.1:12345".parse().unwrap();
+        let lan: SocketAddr = "192.0.2.12:12345".parse().unwrap();
+        let token = "a".repeat(64);
+        let ip: IpAddr = "192.0.2.20".parse().unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert(header::HOST, "remote.example".parse().unwrap());
+        headers.insert(header::ORIGIN, "https://remote.example".parse().unwrap());
+        headers.insert("x-forwarded-proto", "https".parse().unwrap());
+        headers.insert(TLS_PROXY_TOKEN_HEADER, token.parse().unwrap());
+        let classify = |headers: &HeaderMap| classify_account_transport(local, headers, Some(&token), false);
+        assert_eq!(classify(&headers), Insecure, "a proxy must assert a client address");
+
+        for invalid in ["not-an-address", "192.0.2.20, 192.0.2.21", "192.0.2.20:8000", "0.0.0.0", "ff02::1"] {
+            headers.insert(TLS_PROXY_CLIENT_IP_HEADER, invalid.parse().unwrap());
+            assert_eq!(classify(&headers), Insecure, "{invalid}");
+        }
+        headers.insert(TLS_PROXY_CLIENT_IP_HEADER, "::ffff:192.0.2.20".parse().unwrap());
+        headers.append(TLS_PROXY_CLIENT_IP_HEADER, "192.0.2.21".parse().unwrap());
+        assert_eq!(classify(&headers), Insecure, "duplicate address headers are ambiguous");
+        headers.insert(TLS_PROXY_CLIENT_IP_HEADER, "::ffff:192.0.2.20".parse().unwrap());
+        headers.insert(TLS_PROXY_TOKEN_HEADER, "untrusted".parse().unwrap());
+        assert_eq!(classify(&headers), Insecure);
+        headers.insert(TLS_PROXY_TOKEN_HEADER, token.parse().unwrap());
+        assert_eq!(classify_account_transport(local, &headers, None, true), Insecure);
+        assert_eq!(classify_account_transport(lan, &headers, Some(&token), false), Insecure);
+
+        let first = classify(&headers);
+        assert_eq!(first, HttpsProxy(ip));
+        let response = pairing_response_headers(first, "synthetic-session-token");
+        assert!(response[header::SET_COOKIE].to_str().unwrap().ends_with("; Secure"));
+        assert_eq!(response[header::CACHE_CONTROL], "no-store");
+
+        let quotas = auth::RateLimiter::default();
+        for _ in 0..auth::RATE_LIMIT_MAX {
+            assert!(quotas.check_and_record(first.pairing_ip(local.ip())));
+        }
+        headers.insert(TLS_PROXY_CLIENT_IP_HEADER, "192.0.2.20".parse().unwrap());
+        assert!(!quotas.check_and_record(classify(&headers).pairing_ip(local.ip())));
+        headers.insert(TLS_PROXY_CLIENT_IP_HEADER, "2001:db8::21".parse().unwrap());
+        assert!(quotas.check_and_record(classify(&headers).pairing_ip(local.ip())));
+        assert!(quotas.check_and_record(Insecure.pairing_ip(local.ip())));
+
+        headers.append("x-forwarded-proto", "http".parse().unwrap());
+        assert_eq!(classify(&headers), Insecure);
+        headers.insert("x-forwarded-proto", "https".parse().unwrap());
+        headers.insert(header::ORIGIN, "http://remote.example".parse().unwrap());
+        assert_eq!(classify(&headers), Insecure);
+    }
+
+    #[test]
+    fn secret_submission_probe_follows_the_live_socket_policy() {
+        let app = tauri::test::mock_app();
+        let shared = Arc::new(Shared::default());
+        let (out, mut replies) = test_outbound();
+        let (ordered, _ordered_rx) = mpsc::unbounded_channel();
+        let (close, _close_rx) = watch::channel(false);
+        let conn = shared.connections.register("fixture", Transport::Lan, out.clone(), close);
+        let probe = json!({ "t": "invoke", "cmd": SECRET_SUBMISSION_PROBE_CMD, "id": 1 }).to_string();
+        let mut secret_allowed = || {
+            handle_text_frame(app.handle(), &shared, conn, &out, &ordered, &probe);
+            let Message::Text(reply) = replies.try_recv().unwrap() else {
+                panic!("expected a capability response");
+            };
+            serde_json::from_str::<Value>(&reply).unwrap()["data"] == true
+        };
+        assert!(secret_allowed());
+        shared.connections.mark_plaintext(conn);
+        assert!(!secret_allowed());
+        shared.connections.unregister(conn);
+        assert!(!secret_allowed());
+    }
 
     #[test]
     fn connection_registry_close_session_signals_and_frames() {
@@ -1291,8 +1521,7 @@ mod tests {
     #[test]
     fn account_pair_errors_map_to_expected_http_status() {
         // The browser account-login screen keys its copy off these exact
-        // status/code pairs. Disabled/signed-out/mismatch are 403; a bad
-        // credential is 401 (non-enumerating); internal is 500.
+        // status/code pairs, including a retryable sign-in change.
         use super::super::account::AccountPairError as E;
         assert_eq!(
             account_pair_error_response(E::Disabled).status(),
@@ -1309,6 +1538,10 @@ mod tests {
         assert_eq!(
             account_pair_error_response(E::AuthFailed).status(),
             StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(
+            account_pair_error_response(E::SessionChanged).status(),
+            StatusCode::CONFLICT
         );
         assert_eq!(
             account_pair_error_response(E::Internal("x".into())).status(),

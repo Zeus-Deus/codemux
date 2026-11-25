@@ -43,15 +43,17 @@ function makeHooks(): { hooks: TransportHooks; rec: Recorder } {
 const live: RemoteTransport[] = [];
 
 function newTransport(overrides: {
+  baseUrl?: string;
   fetchImpl?: typeof fetch;
   getToken?: () => string | null;
+  onSecretSubmissionChange?: TransportHooks["onSecretSubmissionChange"];
 } = {}): { transport: RemoteTransport; rec: Recorder } {
   const { hooks, rec } = makeHooks();
   const fetch = overrides.fetchImpl ?? createFakeFetch().fetchImpl;
   const transport = new RemoteTransport({
-    baseUrl: "http://desktop.local:4377",
+    baseUrl: overrides.baseUrl ?? "http://desktop.local:4377",
     getToken: overrides.getToken ?? (() => "session-token"),
-    hooks,
+    hooks: { ...hooks, onSecretSubmissionChange: overrides.onSecretSubmissionChange },
     deps: {
       fetchImpl: fetch,
       wsFactory: (url) => new FakeWebSocket(url),
@@ -141,6 +143,74 @@ describe("invoke roundtrip", () => {
     const { transport } = newTransport();
     await expect(transport.invoke("x")).rejects.toThrow(/not connected/);
   });
+});
+
+describe("secret submission", () => {
+  const cmd = "agent_secret_request_answer";
+  const args = { requestId: "fixture", answer: { type: "save", secret: "fixture-secret" } };
+
+  it("sends no secret frame on loopback HTTP without explicit confirmation", async () => {
+    const report = vi.fn();
+    const { transport } = newTransport({
+      baseUrl: "http://127.0.0.1:4377",
+      onSecretSubmissionChange: report,
+    });
+    const ws = await connect(transport);
+    const probe = ws.lastSent();
+    expect(probe.cmd).toBe("__codemux_can_submit_secrets");
+    await expect(transport.invoke(cmd, args)).rejects.toBe("This connection cannot accept secrets.");
+
+    ws.recvText({ t: "ok", id: probe.id, data: false });
+    await expect(transport.invoke(cmd, args)).rejects.toBe("This connection cannot accept secrets.");
+    expect(ws.parsedSent()).toEqual([probe]);
+    expect(report).not.toHaveBeenCalled();
+
+    const decline = transport.invoke(cmd, { requestId: "fixture", answer: { type: "decline" } });
+    expect(ws.lastSent()).toMatchObject({ cmd, args: { answer: { type: "decline" } } });
+    ws.recvText({ t: "ok", id: ws.lastSent().id });
+    await expect(decline).resolves.toBeUndefined();
+  });
+
+  it("requires fresh confirmation on reconnect", async () => {
+    vi.useFakeTimers();
+    const report = vi.fn();
+    const { transport } = newTransport({
+      baseUrl: "https://desktop.example.test",
+      onSecretSubmissionChange: report,
+    });
+    const first = await connect(transport);
+    first.recvText({ t: "ok", id: first.lastSent().id, data: true });
+    await flushMicrotasks();
+    expect(report).toHaveBeenLastCalledWith(true);
+    const submitted = transport.invoke(cmd, args);
+    expect(first.lastSent()).toMatchObject({ cmd, args });
+    first.recvText({ t: "ok", id: first.lastSent().id });
+    await expect(submitted).resolves.toBeUndefined();
+
+    first.drop();
+    expect(report).toHaveBeenLastCalledWith(false);
+    await vi.advanceTimersByTimeAsync(1000);
+    const second = FakeWebSocket.instances[1];
+    second.open();
+    const probe = second.lastSent();
+    expect(probe.cmd).toBe("__codemux_can_submit_secrets");
+    first.recvText({ t: "ok", id: probe.id, data: true });
+    await flushMicrotasks();
+    await expect(transport.invoke(cmd, args)).rejects.toBe("This connection cannot accept secrets.");
+    expect(second.parsedSent()).toEqual([probe]);
+  });
+
+  it.each(["192.168.1.5", "100.101.102.104", "127.example.test"])(
+    "keeps plain network HTTP locked for %s", async (host) => {
+      const { transport } = newTransport({
+        baseUrl: `http://${host}`,
+        onSecretSubmissionChange: vi.fn(),
+      });
+      const ws = await connect(transport);
+      await expect(transport.invoke(cmd, args)).rejects.toBe("This connection cannot accept secrets.");
+      expect(ws.sent).toEqual([]);
+    },
+  );
 });
 
 describe("channel + event frame routing", () => {

@@ -27,6 +27,8 @@ interface RemoteConnectionState {
   host: string;
   /** Prominent copy for the `offline` state (revoked / session gone). */
   offlineMessage: string | null;
+  /** Only true after the active socket confirms that it can carry secrets. */
+  canSubmitSecrets: boolean;
   /**
    * Bumped each time a dropped connection comes back. The host drops a
    * socket's channel routes with it, so anything streaming over a `Channel`
@@ -46,6 +48,7 @@ export const useRemoteConnectionStore = create<RemoteConnectionState>((set) => (
   status: null,
   host: "",
   offlineMessage: null,
+  canSubmitSecrets: false,
   reconnectEpoch: 0,
   setConnected: (host) =>
     set((s) => ({

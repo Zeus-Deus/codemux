@@ -6074,15 +6074,48 @@ impl DatabaseStore {
         approved: bool,
         account_user_id: &str,
     ) -> Result<(), String> {
-        let conn = self.conn.lock().unwrap();
-        conn.execute(
+        self.insert_web_remote_account_session(
+            id, name, user_agent, token_hash, approved, account_user_id, None,
+        ).map(|_| ())
+    }
+
+    /// Bind admission to the exact sign-in record whose owner was verified.
+    /// SQLite evaluates the predicate and inserts together, including when a
+    /// different process is signing out or switching accounts.
+    pub(crate) fn web_remote_insert_account_session_if_unchanged(
+        &self,
+        id: &str,
+        name: Option<&str>,
+        user_agent: Option<&str>,
+        token_hash: &str,
+        approved: bool,
+        account_user_id: &str,
+        verified_auth: &[u8],
+    ) -> Result<bool, String> {
+        self.insert_web_remote_account_session(
+            id, name, user_agent, token_hash, approved, account_user_id, Some(verified_auth),
+        )
+    }
+
+    fn insert_web_remote_account_session(
+        &self,
+        id: &str,
+        name: Option<&str>,
+        user_agent: Option<&str>,
+        token_hash: &str,
+        approved: bool,
+        account_user_id: &str,
+        verified_auth: Option<&[u8]>,
+    ) -> Result<bool, String> {
+        self.conn.lock().unwrap().execute(
             "INSERT INTO web_remote_sessions
                 (id, name, user_agent, token_hash, created_at, last_seen_at, approved, revoked, source, account_user_id)
-             VALUES (?1, ?2, ?3, ?4, datetime('now'), datetime('now'), ?5, 0, 'account', ?6)",
-            params![id, name, user_agent, token_hash, approved as i64, account_user_id],
+             SELECT ?1, ?2, ?3, ?4, datetime('now'), datetime('now'), ?5, 0, 'account', ?6
+             WHERE ?7 IS NULL OR EXISTS (SELECT 1 FROM auth_tokens WHERE id = 1 AND encrypted_data = ?7)",
+            params![id, name, user_agent, token_hash, approved as i64, account_user_id, verified_auth],
         )
-        .map_err(|e| format!("Failed to insert web_remote account session: {e}"))?;
-        Ok(())
+        .map(|inserted| inserted == 1)
+        .map_err(|e| format!("Failed to insert web_remote account session: {e}"))
     }
 
     /// Fetch a single session by id, regardless of revoked/approved state.

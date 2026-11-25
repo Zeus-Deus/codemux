@@ -309,12 +309,12 @@ pub async fn dispatch_invoke<R: Runtime>(
         let _ = out.send(frame);
         return;
     }
-    // A secret typed into a card must not cross the network in the clear.
+    // Apply the same transport policy even if the client skipped the probe.
     if cmd == "agent_secret_request_answer"
         && args.pointer("/answer/type").and_then(Value::as_str) != Some("decline")
-        && app.state::<super::WebRemoteState>().shared().connections.is_plaintext(conn_id)
+        && !app.state::<super::WebRemoteState>().shared().connections.allows_secret_submission(conn_id)
     {
-        let _ = out.send(err_text(id, "This connection is not encrypted, so the secret was not sent. Enter it in the Codemux desktop app, or connect over HTTPS or the relay."));
+        let _ = out.send(err_text(id, "This connection cannot accept secrets. Enter the secret in the Codemux desktop app, or connect over HTTPS or the relay."));
         return;
     }
     if !super::policy::allowed(&cmd) {

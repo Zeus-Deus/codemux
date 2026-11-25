@@ -29,6 +29,7 @@ import {
   type TransportDeps,
 } from "./transport";
 import type { SnapshotSeed } from "./snapshot-seed";
+import { useRemoteConnectionStore } from "./remote-connection-store";
 
 type RawCallback = (payload: unknown) => void;
 type Args = Record<string, unknown>;
@@ -146,6 +147,11 @@ export function installShim(options: InstallShimOptions): ShimHandle {
         dispatchEvent(event, payload);
       },
       onStatusChange: handleStatusChange,
+      onSecretSubmissionChange: (canSubmitSecrets) => {
+        if (win.__TAURI_INTERNALS__ === internals) {
+          useRemoteConnectionStore.setState({ canSubmitSecrets });
+        }
+      },
       onUnauthorized: () => options.onUnauthorized?.(),
     },
   });
@@ -379,6 +385,7 @@ export function installShim(options: InstallShimOptions): ShimHandle {
     __CODEMUX_REMOTE__: boolean;
   };
   win.__TAURI_INTERNALS__ = internals;
+  useRemoteConnectionStore.setState({ canSubmitSecrets: false });
   win.__TAURI_EVENT_PLUGIN_INTERNALS__ = { unregisterListener: removeListener };
   // Set before the app mounts — other subsystems (e.g. the scrollback
   // serializer) key off this to opt out of desktop-only behavior.

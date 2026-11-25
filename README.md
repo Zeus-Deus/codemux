@@ -64,6 +64,18 @@ hl.window_rule({ match = { class = "^(xdg-desktop-portal-gtk)$" }, float = true,
 
 Split panes with keybinds, open a browser pane for testing, and use the changes panel to review diffs and commit when ready.
 
+## Browser remote access
+
+Browser account sign-in and secret submissions require either an authenticated HTTPS reverse proxy or explicit permission to use HTTP on the desktop's loopback address. To allow the loopback exception, launch Codemux with `CODEMUX_WEB_REMOTE_ALLOW_HTTP_ACCOUNT_PAIRING=1`. Account sign-in also requires enabling the account sign-in setting. Pairing links still work on direct HTTP, and **From anywhere** uses the encrypted relay.
+
+For HTTPS, bind **Remote Access** to loopback and start Codemux with `CODEMUX_WEB_REMOTE_TLS_PROXY_TOKEN` set to a random 64-character hexadecimal secret. Accept only HTTPS traffic at the proxy, preserve the public `Host` and `Origin`, and forward WebSocket upgrades. Overwrite these incoming headers on `/api/health`, `/api/pair`, `/api/pair-account`, and `/ws`:
+
+- `X-Codemux-Proxy-Token` with the server-side token.
+- `X-Forwarded-Proto` with `https`.
+- `X-Codemux-Client-IP` with the client's single IPv4 or IPv6 address as determined by your trusted proxy configuration. Discard any value supplied by the browser. Codemux uses this address for pairing rate limits.
+
+When the proxy token is configured, account sign-in and secret submissions require valid HTTPS proxy headers even when the backend socket is reached from loopback.
+
 ## Outside agents (MCP)
 
 Codemux is an MCP server. Claude Code, Codex, a Hermes chat bot, or any MCP client can drive it:

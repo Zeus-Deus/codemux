@@ -17,7 +17,7 @@
 //! every state-touching request so a page on another site cannot ride a
 //! browser's stored cookie.
 
-use std::collections::HashMap;
+use std::collections::{hash_map::Entry, HashMap};
 use std::net::IpAddr;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
@@ -208,20 +208,51 @@ impl TicketStore {
 
 // ── Pairing rate limiter ────────────────────────────────────────────
 
+const RATE_LIMIT_IP_CAP: usize = 4096;
+const RATE_LIMIT_PRUNE_INTERVAL: Duration = Duration::from_secs(5);
+
 #[derive(Default)]
 pub struct RateLimiter {
-    inner: Mutex<HashMap<IpAddr, Vec<Instant>>>,
+    inner: Mutex<RateLimitBuckets>,
 }
 
 impl RateLimiter {
-    /// Record an attempt from `ip` and report whether it is allowed
-    /// (≤ `RATE_LIMIT_MAX` within `RATE_LIMIT_WINDOW`). A rejected attempt
-    /// is *not* recorded, so a blocked client that backs off recovers.
+    /// Record an attempt from `ip` and report whether it is allowed. Rejected
+    /// attempts never extend the client's rate limit.
     pub fn check_and_record(&self, ip: IpAddr) -> bool {
-        let mut map = self.inner.lock().unwrap();
-        let now = Instant::now();
-        let hits = map.entry(ip).or_default();
-        hits.retain(|t| now.duration_since(*t) < RATE_LIMIT_WINDOW);
+        let mut buckets = self.inner.lock().unwrap();
+        buckets.check_and_record(ip, Instant::now())
+    }
+}
+
+#[derive(Default)]
+struct RateLimitBuckets {
+    hits: HashMap<IpAddr, Vec<Instant>>,
+    last_pruned: Option<Instant>,
+}
+
+impl RateLimitBuckets {
+    fn check_and_record(&mut self, ip: IpAddr, now: Instant) -> bool {
+        if self
+            .last_pruned
+            .is_none_or(|last| now.duration_since(last) >= RATE_LIMIT_PRUNE_INTERVAL)
+        {
+            self.hits.retain(|_, hits| {
+                hits.last()
+                    .is_some_and(|hit| now.duration_since(*hit) < RATE_LIMIT_WINDOW)
+            });
+            self.last_pruned = Some(now);
+        }
+
+        let full = self.hits.len() >= RATE_LIMIT_IP_CAP;
+        let hits = match self.hits.entry(ip) {
+            Entry::Occupied(entry) => entry.into_mut(),
+            // Preserve established quotas under load. An unseen address can
+            // retry after the next sweep frees capacity.
+            Entry::Vacant(_) if full => return false,
+            Entry::Vacant(entry) => entry.insert(Vec::new()),
+        };
+        hits.retain(|hit| now.duration_since(*hit) < RATE_LIMIT_WINDOW);
         if hits.len() >= RATE_LIMIT_MAX {
             return false;
         }
@@ -389,6 +420,32 @@ mod tests {
             );
         }
         assert!(store.consume(&ticket).is_none(), "expired ticket must be rejected");
+    }
+
+    #[test]
+    fn rate_limiter_caps_and_expires_ip_buckets_without_evicting_active_quotas() {
+        let start = Instant::now();
+        let first_ip = std::net::Ipv4Addr::new(198, 18, 0, 0).to_bits();
+        let ip = |n: usize| IpAddr::V4(std::net::Ipv4Addr::from_bits(first_ip + n as u32));
+        let mut buckets = RateLimitBuckets::default();
+
+        for i in 0..RATE_LIMIT_IP_CAP - 1 {
+            assert!(buckets.check_and_record(ip(i), start));
+        }
+        let active = ip(RATE_LIMIT_IP_CAP - 1);
+        for _ in 0..RATE_LIMIT_MAX {
+            assert!(buckets.check_and_record(active, start + RATE_LIMIT_PRUNE_INTERVAL));
+        }
+        let newcomer = ip(RATE_LIMIT_IP_CAP);
+        let before_expiry = start + RATE_LIMIT_PRUNE_INTERVAL * 2;
+        assert!(!buckets.check_and_record(newcomer, before_expiry));
+        assert!(!buckets.check_and_record(active, before_expiry));
+        assert_eq!(buckets.hits.len(), RATE_LIMIT_IP_CAP);
+
+        let after_expiry = start + RATE_LIMIT_WINDOW;
+        assert!(buckets.check_and_record(newcomer, after_expiry));
+        assert!(!buckets.check_and_record(active, after_expiry));
+        assert_eq!(buckets.hits.len(), 2);
     }
 
     #[test]

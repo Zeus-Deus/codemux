@@ -104,6 +104,7 @@ async fn receive<R: Runtime>(
         uri.query().unwrap_or_default(),
         headers
             .iter()
+            .filter(|(name, _)| name.as_str() != crate::web_remote::server::TLS_PROXY_TOKEN_HEADER)
             .filter_map(|(name, value)| Some((name.as_str(), value.to_str().ok()?))),
         body.to_vec(),
     );

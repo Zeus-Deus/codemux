@@ -1,12 +1,15 @@
 /// <reference types="@testing-library/jest-dom/vitest" />
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 
+import { isRemoteClient } from "@/components/remote/is-remote-client";
+import { useRemoteConnectionStore } from "@/remote/remote-connection-store";
 import { agentSecretRequestAnswer } from "@/tauri/commands";
 import type { SecretRequest } from "@/tauri/types";
-import { SecretRequestPanel, unencryptedConnection } from "./SecretRequestCard";
+import { SecretRequestPanel } from "./SecretRequestCard";
 
 vi.mock("@/tauri/commands", () => ({ agentSecretRequestAnswer: vi.fn() }));
+vi.mock("@/components/remote/is-remote-client", () => ({ isRemoteClient: vi.fn() }));
 
 const request = (id = "r1"): SecretRequest => ({
   id,
@@ -20,6 +23,8 @@ const request = (id = "r1"): SecretRequest => ({
 afterEach(cleanup);
 beforeEach(() => {
   vi.clearAllMocks();
+  vi.mocked(isRemoteClient).mockReturnValue(false);
+  useRemoteConnectionStore.setState({ canSubmitSecrets: false });
   vi.mocked(agentSecretRequestAnswer).mockResolvedValue(undefined);
 });
 
@@ -64,23 +69,23 @@ describe("secret request card", () => {
     expect(await screen.findByRole("alert")).toHaveTextContent("Could not save it. Try again.");
   });
 
-  it("blocks entry only on remote pages served as plain HTTP across the network", () => {
-    const at = (protocol: string, hostname: string) => ({ protocol, hostname });
-    expect(unencryptedConnection(false, at("http:", "192.168.1.5"))).toBe(false);
-    for (const [protocol, host] of [
-      ["https:", "app.codemux.org"],
-      ["https:", "192.168.1.5"],
-      ["http:", "localhost"],
-      ["http:", "127.0.0.1"],
-      ["http:", "[::1]"],
-      ["http:", "LocalHost."],
-      ["https:", "desk.tail1234.ts.net"],
-    ]) {
-      expect(unencryptedConnection(true, at(protocol, host)), host).toBe(false);
-    }
-    // Shared address space (any CGNAT or VPN network) proves no encryption.
-    for (const host of ["192.168.1.5", "10.0.0.2", "100.101.102.104", "desk.tail1234.ts.net", "[fd7a:115c:a1e0::1]"]) {
-      expect(unencryptedConnection(true, at("http:", host)), host).toBe(true);
-    }
+  it("keeps remote secret submission disabled until the current connection is approved", () => {
+    vi.mocked(isRemoteClient).mockReturnValue(true);
+    render(<SecretRequestPanel requests={[request()]} />);
+    const field = screen.getByLabelText("Fly.io API token");
+    const save = screen.getByRole("button", { name: "Save securely" });
+    expect(field).toBeDisabled();
+    expect(save).toBeDisabled();
+
+    act(() => useRemoteConnectionStore.setState({ canSubmitSecrets: true }));
+    expect(field).toBeEnabled();
+    fireEvent.change(field, { target: { value: "fixture-secret" } });
+    expect(save).toBeEnabled();
+
+    act(() => useRemoteConnectionStore.setState({ canSubmitSecrets: false }));
+    expect(field).toBeDisabled();
+    expect(save).toBeDisabled();
+    fireEvent.submit(field.closest("form")!);
+    expect(agentSecretRequestAnswer).not.toHaveBeenCalled();
   });
 });

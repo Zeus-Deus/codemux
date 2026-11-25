@@ -46,6 +46,8 @@ pub(crate) enum AccountPairError {
     /// The credentials authenticated, but to a *different* account than the one
     /// the desktop is signed into. → 403.
     Mismatch,
+    /// The verified desktop session changed while finishing pairing. → 409.
+    SessionChanged,
     /// An internal failure minting the session row. → 500.
     Internal(String),
 }
@@ -91,25 +93,18 @@ pub(crate) async fn verify_and_mint(
     device_name: Option<String>,
     user_agent: Option<String>,
 ) -> Result<AccountPairOutcome, AccountPairError> {
-    // Snapshot the config values up front so the non-Send `std::sync::Mutex`
-    // guard is never held across the `.await` below.
-    let (account_mode_enabled, approved) = {
-        let cfg = shared.config.lock().unwrap();
-        (
-            cfg.account_mode_enabled,
-            super::account_session_approved(&cfg),
-        )
-    };
-
     // 1. Master toggle. Off → refuse before touching the account at all.
-    if !account_mode_enabled {
+    if !shared.config.lock().unwrap().account_mode_enabled {
         return Err(AccountPairError::Disabled);
     }
 
     // 2. The desktop must be signed in — account mode verifies "same account"
     //    against the desktop's own cached user, and there's nothing to compare
     //    to when it's signed out.
-    let cached = crate::auth::load_cached_user(db).ok_or(AccountPairError::DesktopSignedOut)?;
+    let signed_in = db
+        .load_auth_token()
+        .and_then(|record| crate::auth::active_account_id_from_record(&record))
+        .ok_or(AccountPairError::DesktopSignedOut)?;
 
     // 3. Server-side sign-in with the client-derived secret. The typed
     //    `AuthSecret` boundary is preserved: a derived secret, never a raw
@@ -119,11 +114,19 @@ pub(crate) async fn verify_and_mint(
         .await
         .map_err(|_| AccountPairError::AuthFailed)?;
 
-    // 4. Same-account gate. Credentials for a *different* account get nothing —
-    //    a browser reaches only devices under its own account.
-    if resolved.user.id != cached.id {
+    // The owner or admission policy can change while verification is in flight.
+    let cfg = shared.config.lock().unwrap();
+    if !cfg.account_mode_enabled {
+        return Err(AccountPairError::Disabled);
+    }
+    if resolved.user.id != signed_in {
         return Err(AccountPairError::Mismatch);
     }
+    let current_auth = db.load_auth_token().ok_or(AccountPairError::DesktopSignedOut)?;
+    if crate::auth::active_account_id_from_record(&current_auth).as_deref() != Some(signed_in.as_str()) {
+        return Err(AccountPairError::SessionChanged);
+    }
+    let approved = super::account_session_approved(&cfg);
 
     // 5. Mint the session, tagged `source = "account"` + the verified user id,
     //    returning the plaintext token once (only its hash is stored).
@@ -131,15 +134,18 @@ pub(crate) async fn verify_and_mint(
     let session_token = super::auth::random_token();
     let token_hash = super::auth::sha256_hex(&session_token);
     let name = device_name.filter(|s| !s.trim().is_empty());
-    db.web_remote_insert_account_session(
+    let inserted = db.web_remote_insert_account_session_if_unchanged(
         &session_id,
         name.as_deref(),
         user_agent.as_deref(),
         &token_hash,
         approved,
-        &cached.id,
-    )
-    .map_err(AccountPairError::Internal)?;
+        &signed_in,
+        &current_auth,
+    ).map_err(AccountPairError::Internal)?;
+    if !inserted {
+        return Err(AccountPairError::SessionChanged);
+    }
 
     Ok(AccountPairOutcome {
         session_id,
@@ -199,6 +205,28 @@ mod tests {
             )
             .create_async()
             .await
+    }
+
+    #[test]
+    fn session_insert_rechecks_the_sign_in_used_for_verification() {
+        let db = init_test_database();
+        seed_cached_user(&db, "first");
+        let first_auth = db.load_auth_token().unwrap();
+
+        seed_cached_user(&db, "second");
+        let second_auth = db.load_auth_token().unwrap();
+        let insert = |id, owner, auth: &[u8]| {
+            db.web_remote_insert_account_session_if_unchanged(
+                id, None, None, &sha256_hex(id), true, owner, auth,
+            ).unwrap()
+        };
+        assert!(!insert("stale-owner", "first", &first_auth));
+        assert!(insert("current-owner", "second", &second_auth));
+
+        db.clear_auth_token();
+        assert!(!insert("signed-out", "second", &second_auth));
+        assert!(db.web_remote_get_session("stale-owner").is_none());
+        assert!(db.web_remote_get_session("signed-out").is_none());
     }
 
     #[tokio::test]
