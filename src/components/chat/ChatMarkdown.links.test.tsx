@@ -442,7 +442,7 @@ describe("ChatMarkdown non-web link destinations", () => {
 });
 
 describe("ChatMarkdown local image links", () => {
-  it("upgrades a labelled absolute PNG link to a clickable preview", () => {
+  it("upgrades a labelled absolute PNG link to a click-to-load preview", () => {
     const { container, getByRole } = render(
       <ChatMarkdown>
         {"[Terminal screenshot](/home/me/screenshots/terminal.png)"}
@@ -452,7 +452,7 @@ describe("ChatMarkdown local image links", () => {
     expect(container.querySelector("[data-chat-local-image]")).toBeInTheDocument();
     expect(container.querySelector("a")).toBeNull();
     expect(
-      getByRole("button", { name: "Open Terminal screenshot" }),
+      getByRole("button", { name: "Load Terminal screenshot" }),
     ).toBeInTheDocument();
   });
 
@@ -463,12 +463,12 @@ describe("ChatMarkdown local image links", () => {
 
     expect(container.querySelector("[data-chat-local-image]")).toBeInTheDocument();
     expect(
-      getByRole("button", { name: "Open Agent Chat unchanged" }),
+      getByRole("button", { name: "Load Agent Chat unchanged" }),
     ).toBeInTheDocument();
   });
 
-  // Parity cases for the backend's copy planner (`reply_images.rs`): it must
-  // keep every image rendered here (it may keep a few that are not).
+  // The path labels must still match the backend's retained-image planner,
+  // even though unverified originals now require a click before any read.
   const renderedCaptions = (markdown: string) => {
     const { container } = render(
       <TooltipProvider>
@@ -485,13 +485,13 @@ describe("ChatMarkdown local image links", () => {
       renderedCaptions(
         "- ```markdown\n  [Example](/tmp/example.png)\n  ```\n\n[Actual proof](/tmp/actual.png)",
       ),
-    ).toEqual(["Open Actual proof"]);
+    ).toEqual(["Load Actual proof"]);
   });
 
   it("renders links and images whose destination is on its own line", () => {
     expect(
       renderedCaptions("[Proof](\n/tmp/proof.png\n) and ![Shot](\n/tmp/shot.png\n)"),
-    ).toEqual(["Open Proof", "Open Shot"]);
+    ).toEqual(["Load Proof", "Load Shot"]);
   });
 
   it("renders autolinks, table cells and headings, but not reference links or raw HTML", () => {
@@ -503,7 +503,7 @@ describe("ChatMarkdown local image links", () => {
           "See [the mockup][m].\n\n[m]: /tmp/mockup.png\n\n" +
           '<a href="/tmp/html.png">h</a>',
       ),
-    ).toEqual(["Open file:///tmp/auto.png", "Open cell", "Open h"]);
+    ).toEqual(["Load file:///tmp/auto.png", "Load cell", "Load h"]);
   });
 
   it("renders only the inline image when reference links point at other blocks", () => {
@@ -511,7 +511,7 @@ describe("ChatMarkdown local image links", () => {
     const definitions = Array.from({ length: 8 }, (_, i) => `[r${i}]: /tmp/r${i}.png`).join("\n");
     expect(
       renderedCaptions(`See ${uses}.\n\n[Proof](/tmp/proof.png)\n\n${definitions}`),
-    ).toEqual(["Open Proof"]);
+    ).toEqual(["Load Proof"]);
   });
 
   it("renders an image after a code block holding deep indentation and markers", () => {
@@ -519,7 +519,7 @@ describe("ChatMarkdown local image links", () => {
       renderedCaptions(
         "```text\n" + " ".repeat(100) + "deeply indented\n" + "> ".repeat(20) + "\n```\n\n[Proof](/tmp/proof.png)",
       ),
-    ).toEqual(["Open Proof"]);
+    ).toEqual(["Load Proof"]);
   });
 
   const renderedPaths = (markdown: string) => {
@@ -528,8 +528,8 @@ describe("ChatMarkdown local image links", () => {
         <ChatMarkdown>{markdown}</ChatMarkdown>
       </TooltipProvider>,
     );
-    return [...container.querySelectorAll("[data-chat-local-image] img")].map((image) =>
-      image.getAttribute("src"),
+    return [...container.querySelectorAll("[data-chat-local-image-path]")].map((card) =>
+      card.getAttribute("data-chat-local-image-path"),
     );
   };
 
@@ -538,7 +538,7 @@ describe("ChatMarkdown local image links", () => {
       renderedCaptions(
         "```text\n" + " ".repeat(256) + "x\n" + "> ".repeat(40) + "\n" + " ".repeat(128) + "- yaml\n```\n\n[Proof](/tmp/proof.png)",
       ),
-    ).toEqual(["Open Proof"]);
+    ).toEqual(["Load Proof"]);
   });
 
   it("renders an image after a quoted code block with a deeply indented line", () => {
@@ -546,7 +546,7 @@ describe("ChatMarkdown local image links", () => {
       renderedCaptions(
         "> ```text\n> " + " ".repeat(100) + "example\n> ```\n>\n> [Proof](/tmp/proof.png)",
       ),
-    ).toEqual(["Open Proof"]);
+    ).toEqual(["Load Proof"]);
   });
 
   it("renders only the used footnote image among many unused ones", () => {
@@ -556,25 +556,25 @@ describe("ChatMarkdown local image links", () => {
     ).join("");
     expect(
       renderedCaptions(`> See [^used].\n>\n${unused}> [^used]: [Proof](/tmp/proof.png)`),
-    ).toEqual(["Open Proof"]);
+    ).toEqual(["Load Proof"]);
   });
 
   it("reads a bare carriage return as a line ending", () => {
     expect(
       renderedCaptions(" ".repeat(64) + "- x\r\r[Proof](/tmp/proof.png)"),
-    ).toEqual(["Open Proof"]);
+    ).toEqual(["Load Proof"]);
   });
 
   it("renders an image after deeply nested lists", () => {
     expect(
       renderedCaptions("- ".repeat(40) + "x\n\n\n[Proof](/tmp/proof.png)"),
-    ).toEqual(["Open Proof"]);
+    ).toEqual(["Load Proof"]);
   });
 
   it("renders a footnote image whose reference differs only in case folding", () => {
     expect(
       renderedCaptions("> See [^SS].\n>\n> [^ß]: [Proof](/tmp/proof.png)"),
-    ).toEqual(["Open Proof"]);
+    ).toEqual(["Load Proof"]);
   });
 
   it("names image paths as decodeURI does, keeping undecodable ones as written", () => {
