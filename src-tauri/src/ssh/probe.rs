@@ -14,7 +14,6 @@
 use serde::{Deserialize, Serialize};
 use std::process::Stdio;
 use std::time::Duration;
-use tokio::process::Command;
 use tokio::time::timeout;
 
 use crate::ssh::exec::codemux_remote_command;
@@ -131,7 +130,7 @@ fn probe_script() -> String {
 /// `ConnectTimeout`).
 pub async fn probe_host(opts: ProbeOptions<'_>) -> ProbeOutcome {
     let argv = build_probe_argv(opts.ssh_target, opts.timeout.as_secs());
-    let mut cmd = Command::new("ssh");
+    let mut cmd = crate::ssh_policy::checked_ssh_tokio();
     for arg in &argv {
         cmd.arg(arg);
     }

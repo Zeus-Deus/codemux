@@ -444,7 +444,7 @@ async fn probe_live_host_sessions(ssh_target: &str) -> Option<u64> {
     use std::process::Stdio;
     let cmd_str = live_sessions_script();
     let output = tokio::time::timeout(Duration::from_secs(12), async {
-        tokio::process::Command::new("ssh")
+        crate::ssh_policy::checked_ssh_tokio()
             .args(crate::ssh_policy::verified_command_args())
             .args([
                 "-o",

@@ -12,7 +12,6 @@ use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
 use serde::de::DeserializeOwned;
-use tokio::process::Command;
 use tokio::time::timeout;
 
 use crate::json_rpc_child::SpawnConfig;
@@ -153,7 +152,11 @@ pub fn stdio_spawn_config(
 ) -> Result<SpawnConfig, String> {
     validate_ssh_target(ssh_target)?;
     let script = remote_exec_script(program, args, env, cwd)?;
-    let mut ssh_args: Vec<String> = vec!["-e".into(), "none".into()];
+    let mut ssh_args: Vec<String> = crate::ssh_policy::checked_ssh_args()
+        .into_iter()
+        .map(str::to_owned)
+        .collect();
+    ssh_args.extend(["-e".into(), "none".into()]);
     ssh_args.extend(one_shot_args(15));
     ssh_args.extend([
         "-o".into(),
@@ -165,7 +168,7 @@ pub fn stdio_spawn_config(
         script,
     ]);
     Ok(SpawnConfig {
-        program: PathBuf::from("ssh"),
+        program: PathBuf::from("sh"),
         args: ssh_args,
         // Nothing to overlay on the local ssh client; the workspace env is
         // part of the remote script.
@@ -186,7 +189,7 @@ pub async fn run_remote(
 ) -> Result<String, String> {
     validate_ssh_target(ssh_target)?;
     let connect_timeout = budget.as_secs().clamp(1, 15);
-    let mut cmd = Command::new("ssh");
+    let mut cmd = crate::ssh_policy::checked_ssh_tokio();
     cmd.args(one_shot_args(connect_timeout))
         .arg("--")
         .arg(ssh_target)
@@ -555,7 +558,7 @@ mod tests {
             Duration::from_secs(20),
         )
         .unwrap();
-        assert_eq!(cfg.program, PathBuf::from("ssh"));
+        assert_eq!(cfg.program, PathBuf::from("sh"));
         assert!(cfg.cwd.is_none());
         let dd = cfg.args.iter().position(|a| a == "--").unwrap();
         assert_eq!(cfg.args[dd + 1], "deus@zeus");

@@ -89,7 +89,9 @@ fn fetch_origin_branch(repo_root: &Path, branch: &str) -> bool {
     cmd.arg("-C")
         .arg(repo_root)
         .args(["fetch", "--quiet", "--no-tags", "origin", branch]);
-    non_interactive(&mut cmd, Some(repo_root));
+    let Ok(_ssh) = crate::ssh_policy::unattended_git(&mut cmd) else {
+        return false;
+    };
     let Ok(mut child) = cmd
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
@@ -385,7 +387,8 @@ pub fn clone_repo(url: &str, target: &Path, timeout: Duration) -> Result<(), Str
     if let Some(parent) = target.parent() {
         cmd.current_dir(parent);
     }
-    non_interactive(&mut cmd, target.parent());
+    let _ssh = crate::ssh_policy::unattended_git(&mut cmd)
+        .map_err(|e| format!("couldn't prepare unattended Git SSH: {e}"))?;
     run_capped(cmd, timeout).map(|_| ())
 }
 
@@ -406,32 +409,10 @@ pub fn ensure_origin_head(repo_root: &Path) {
     cmd.arg("-C")
         .arg(repo_root)
         .args(["remote", "set-head", "origin", "--auto"]);
-    non_interactive(&mut cmd, Some(repo_root));
+    let Ok(_ssh) = crate::ssh_policy::unattended_git(&mut cmd) else {
+        return;
+    };
     let _ = run_capped(cmd, ORIGIN_HEAD_TIMEOUT);
-}
-
-/// Never prompt. The default SSH command requires the forge's verified host
-/// key on the machine running Git.
-/// A user's own ssh command (env, or `core.sshCommand` as seen from
-/// `config_dir`) wins, since `GIT_SSH_COMMAND` would override it.
-fn non_interactive(cmd: &mut Command, config_dir: Option<&Path>) {
-    cmd.env("GIT_TERMINAL_PROMPT", "0");
-    let user_ssh = std::env::var_os("GIT_SSH_COMMAND").is_some()
-        || std::env::var_os("GIT_SSH").is_some()
-        || {
-            let mut probe = crate::git::git_command();
-            if let Some(dir) = config_dir {
-                probe.current_dir(dir);
-            }
-            probe
-                .args(["config", "--get", "core.sshCommand"])
-                .output()
-                .map(|out| out.status.success() && !out.stdout.trim_ascii().is_empty())
-                .unwrap_or(false)
-        };
-    if !user_ssh {
-        cmd.env("GIT_SSH_COMMAND", crate::ssh_policy::verified_shell_command());
-    }
 }
 
 /// Run `cmd` to completion, or kill it (and anything it spawned, such as

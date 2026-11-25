@@ -797,7 +797,7 @@ pub async fn workspace_push_to_host<R: tauri::Runtime>(
                 let local_workspace_cwd =
                     std::path::PathBuf::from(&ws.cwd);
                 if !local_workspace_cwd.as_os_str().is_empty() {
-                    match tokio::process::Command::new("ssh")
+                    match crate::ssh_policy::checked_ssh_tokio()
                         .args(crate::ssh_policy::verified_command_args())
                         .arg("--")
                         .arg(&host.ssh_target)
@@ -1206,7 +1206,7 @@ pub async fn workspace_pull_back_impl<R: tauri::Runtime>(
                 let local_workspace_cwd =
                     std::path::PathBuf::from(&ws.cwd);
                 if !local_workspace_cwd.as_os_str().is_empty() {
-                    match tokio::process::Command::new("ssh")
+                    match crate::ssh_policy::checked_ssh_tokio()
                         .args(crate::ssh_policy::verified_command_args())
                         .arg("--")
                         .arg(&host.ssh_target)
@@ -1478,7 +1478,7 @@ async fn sync_claude_projects(
     // Step 3: ensure the remote dest dir exists. rsync creates the
     // LAST path component but not parents; mkdir -p covers the
     // ~/.claude/projects/<encoded>/ chain in one shot.
-    let mkdir = Command::new("ssh")
+    let mkdir = crate::ssh_policy::checked_ssh_tokio()
         .args(crate::ssh_policy::verified_command_args())
         .arg("--")
         .arg(ssh_target)
@@ -1570,7 +1570,7 @@ async fn pull_claude_projects(
 
     let remote_dir_name = crate::ssh::claude_project_dir_name(remote_cwd);
     // Check the remote dir exists first — if not, nothing to pull.
-    let probe = Command::new("ssh")
+    let probe = crate::ssh_policy::checked_ssh_tokio()
         .args(crate::ssh_policy::verified_command_args())
         .arg("--")
         .arg(ssh_target)

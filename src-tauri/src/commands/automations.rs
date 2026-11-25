@@ -569,24 +569,43 @@ pub async fn automations_check_repo_access(
         .find(|h| h.id == host_id)
         .ok_or_else(|| format!("Host not found: {host_id}"))?;
 
-    let probe = tokio::time::timeout(
-        std::time::Duration::from_secs(20),
-        tokio::process::Command::new("ssh")
-            .args(crate::ssh_policy::verified_command_args())
+    let script = crate::ssh_policy::unattended_git_script(&format!(
+        "git ls-remote --heads -- '{remote}' >/dev/null 2>&1 && echo {REPO_PROBE_MARKER}"
+    ));
+    let probe = tokio::time::timeout(std::time::Duration::from_secs(20), async {
+        use std::process::Stdio;
+        use tokio::io::AsyncWriteExt;
+
+        let mut command = crate::ssh_policy::checked_ssh_tokio();
+        command.args(crate::ssh_policy::verified_command_args())
             .arg("-o")
             .arg("ConnectTimeout=10")
             .arg("--")
             .arg(&host.ssh_target)
-            .arg(format!(
-                "GIT_TERMINAL_PROMPT=0 git ls-remote --heads '{remote}' \
-                 >/dev/null 2>&1 && echo {REPO_PROBE_MARKER}"
-            ))
-            .output(),
-    )
+            .arg("sh -s")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true);
+        #[cfg(windows)]
+        crate::ssh_policy::check_native_jumps(&command).await?;
+        let mut child = command.spawn()?;
+        let mut stdin = child.stdin.take().expect("piped SSH stdin");
+        let send = async move {
+            let result = stdin.write_all(script.as_bytes()).await;
+            drop(stdin);
+            result
+        };
+        let ((), output) = tokio::try_join!(send, child.wait_with_output())?;
+        Ok::<_, std::io::Error>(output)
+    })
     .await;
 
     match probe {
-        Ok(Ok(output)) if interpret_repo_probe(&String::from_utf8_lossy(&output.stdout)) => {
+        Ok(Ok(output))
+            if output.status.success()
+                && interpret_repo_probe(&String::from_utf8_lossy(&output.stdout)) =>
+        {
             Ok(RepoAccessResult {
                 ok: true,
                 message: format!("{} can reach this repository.", host.name),

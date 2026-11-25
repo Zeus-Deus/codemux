@@ -568,7 +568,9 @@ When you add a server under **Settings → Connections → Devices**, Codemux in
 
 Before adding a device, get its SSH host-key fingerprint from the device console or its administrator. On the computer running Codemux, connect in a terminal using the same SSH target or alias. Compare the fingerprint before accepting the key. Codemux uses the SSH client's `known_hosts` and other configured trust sources and refuses unknown or changed device keys. If the fingerprint changes, confirm the replacement before updating your SSH trust settings.
 
-For a configured jump host, verify its key wherever the SSH client handling that hop stores its trusted keys. For OpenSSH's `ProxyJump`, this is normally also the computer running Codemux. When `codemux-remote` clones or fetches a repository over SSH, it uses the `known_hosts` and SSH configuration of the account running the helper on the device. Verify the Git forge's key there, or use an HTTPS repository URL.
+For OpenSSH `ProxyJump`, verify each hop's key in the initiating client's trust store. Set `StrictHostKeyChecking yes`, `BatchMode yes`, `ForwardAgent no`, and `ControlPath none` for each hop in your SSH configuration. Codemux checks those settings before connecting. It uses any configured `ProxyCommand` as supplied. The command's own connections and trust policy are managed by its owner.
+
+When Codemux clones or fetches a repository on a device over SSH, its default SSH transport uses the same policy with that device account's configuration and `known_hosts`. Verify the Git forge's key on the device, or use an HTTPS repository URL. Explicit Git SSH overrides such as `core.sshCommand` retain Git's normal precedence and manage their own trust policy.
 
 `codemux-remote` writes no agent config on the server. Codemux chats and remote tasks that run Claude Code on the server, and Claude Code typed in a Codemux terminal on it, get that server's `codemux-remote mcp` per session. To use it from another agent there, add it yourself, for example `claude mcp add --scope user codemux -- ~/.local/bin/codemux-remote mcp`. A Vexis entry for it in `~/.vexis/mcp-servers.yaml` keeps working.
 

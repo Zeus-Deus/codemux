@@ -389,7 +389,7 @@ async fn upload_file(
     let data = tokio::fs::read(local)
         .await
         .map_err(|e| format!("read local bundle {}: {e}", local.display()))?;
-    let mut child = Command::new("ssh")
+    let mut child = crate::ssh_policy::checked_ssh_tokio()
         .args(crate::ssh_policy::verified_command_args())
         .arg("-o")
         .arg("ConnectTimeout=10")
@@ -427,7 +427,7 @@ async fn download_file(
     remote_path: &str,
     local: &Path,
 ) -> Result<(), String> {
-    let out = Command::new("ssh")
+    let out = crate::ssh_policy::checked_ssh_tokio()
         .args(crate::ssh_policy::verified_command_args())
         .arg("-o")
         .arg("ConnectTimeout=10")
@@ -455,7 +455,7 @@ async fn download_file(
 
 /// Best-effort remote `rm -f`.
 async fn run_remote_rm(ssh_target: &str, remote_path: &str) -> Result<(), String> {
-    let _ = Command::new("ssh")
+    let _ = crate::ssh_policy::checked_ssh_tokio()
         .args(crate::ssh_policy::verified_command_args())
         .arg("-o")
         .arg("ConnectTimeout=10")
@@ -475,7 +475,7 @@ async fn run_remote_login_script(
     ssh_target: &str,
     script: &str,
 ) -> Result<(bool, String), String> {
-    let mut child = Command::new("ssh")
+    let mut child = crate::ssh_policy::checked_ssh_tokio()
         .args(crate::ssh_policy::verified_command_args())
         .arg("-o")
         .arg("ConnectTimeout=10")

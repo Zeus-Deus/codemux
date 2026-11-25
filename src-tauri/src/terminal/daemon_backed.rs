@@ -1649,7 +1649,7 @@ async fn spawn_prepared_session<R: Runtime>(
                             "command -v {} >/dev/null 2>&1 && echo OK || echo MISSING",
                             crate::commands::hosts::shell_word_quote(&binary)
                         );
-                        let check = tokio::process::Command::new("ssh")
+                        let check = crate::ssh_policy::checked_ssh_tokio()
                             .args(crate::ssh_policy::verified_command_args())
                             .arg("-o")
                             .arg("ConnectTimeout=5")

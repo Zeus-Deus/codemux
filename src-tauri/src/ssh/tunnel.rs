@@ -24,7 +24,7 @@
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::Duration;
-use tokio::process::{Child, Command};
+use tokio::process::Child;
 use tokio::time::sleep;
 
 /// Live tunnel — the SSH process plus the local socket path the
@@ -162,7 +162,7 @@ pub async fn spawn_ssh_tunnel(
     spawn_timeout: Duration,
 ) -> Result<TunnelHandle, String> {
     let argv = build_tunnel_argv(&opts);
-    let mut cmd = Command::new("ssh");
+    let mut cmd = crate::ssh_policy::checked_ssh_tokio();
     for arg in &argv {
         cmd.arg(arg);
     }
