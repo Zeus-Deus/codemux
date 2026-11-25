@@ -6,6 +6,8 @@
 //! environment is never touched.
 
 use std::io::{BufRead, BufReader, Write};
+#[cfg(unix)]
+use std::os::unix::fs::{FileTypeExt, PermissionsExt};
 use std::path::Path;
 #[cfg(unix)]
 use std::path::PathBuf;
@@ -42,6 +44,10 @@ impl Server {
         ] {
             let path = root.join(dir);
             std::fs::create_dir_all(&path).unwrap();
+            #[cfg(unix)]
+            if key == "XDG_RUNTIME_DIR" {
+                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
+            }
             command.env(key, path);
         }
         command
@@ -269,6 +275,7 @@ impl SilentSocket {
         let name = if cfg!(debug_assertions) { "codemux-dev.sock" } else { "codemux.sock" };
         let path = runtime_dir.join(name);
         std::fs::create_dir_all(runtime_dir).unwrap();
+        std::fs::set_permissions(runtime_dir, std::fs::Permissions::from_mode(0o700)).unwrap();
         let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
         let stop = std::sync::Arc::new(AtomicBool::new(false));
         let (tx, requests) = mpsc::channel();
@@ -418,6 +425,9 @@ impl Serve {
         for (key, dir) in Self::DIRS {
             let path = root.join(dir);
             std::fs::create_dir_all(&path).unwrap();
+            if key == "XDG_RUNTIME_DIR" {
+                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
+            }
             env.push((key.to_owned(), path.display().to_string()));
         }
         env
@@ -455,6 +465,12 @@ impl Serve {
                 .output()
                 .unwrap();
             if serde_json::from_slice::<Value>(&status.stdout).is_ok_and(|reply| reply["ok"] == true) {
+                let name = if cfg!(debug_assertions) { "codemux-dev.sock" } else { "codemux.sock" };
+                let socket = serve.root.path().join("run").join(name);
+                assert!(
+                    std::fs::symlink_metadata(&socket).is_ok_and(|meta| meta.file_type().is_socket()),
+                    "serve answered outside its private runtime dir: {socket:?}"
+                );
                 return serve;
             }
             assert!(Instant::now() < deadline, "codemux serve never answered:\n{}", serve.log());

@@ -3,6 +3,7 @@
 #![cfg(target_os = "linux")]
 
 use serde_json::{json, Value};
+use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
@@ -76,6 +77,9 @@ fn fixture_command(program: &str, root: &Path) -> Command {
     ] {
         let dir = root.join(name);
         std::fs::create_dir_all(&dir).unwrap();
+        if key == "XDG_RUNTIME_DIR" {
+            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
         command.env(key, dir);
     }
     command

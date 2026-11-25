@@ -23,6 +23,8 @@
 
 #![cfg(unix)]
 
+use std::os::unix::fs::PermissionsExt;
+
 use codemux_lib::database::DatabaseStore;
 use codemux_lib::state::AppStateStore;
 use serde_json::{json, Value};
@@ -46,6 +48,10 @@ fn isolate_env(tmp: &std::path::Path) {
             tmp.join(sub)
         };
         std::fs::create_dir_all(&dir).expect("create isolated state dir");
+        if key == "XDG_RUNTIME_DIR" {
+            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))
+                .expect("make isolated runtime dir private");
+        }
         std::env::set_var(key, &dir);
     }
     std::env::set_var("CODEMUX_DISABLE_PTY_DAEMON", "1");

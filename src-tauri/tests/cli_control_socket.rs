@@ -10,7 +10,7 @@
 
 use serde_json::{json, Value};
 use std::io::{BufRead, BufReader, Write};
-use std::os::unix::fs::DirBuilderExt;
+use std::os::unix::fs::{DirBuilderExt, FileTypeExt};
 use std::os::unix::net::UnixListener;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Output, Stdio};
@@ -160,6 +160,11 @@ impl Serve {
             if self.log().contains("Press Ctrl-C (or send SIGTERM) to stop the server.")
                 && self.cli(&["json", "status"]).status.success()
             {
+                let socket = self.root.path().join("run").join(SOCKET);
+                assert!(
+                    std::fs::symlink_metadata(&socket).is_ok_and(|meta| meta.file_type().is_socket()),
+                    "serve answered outside its private runtime dir: {socket:?}"
+                );
                 return;
             }
             assert!(Instant::now() < deadline, "codemux serve never became ready:\n{}", self.log());

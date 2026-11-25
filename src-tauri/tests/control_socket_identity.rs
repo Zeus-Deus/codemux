@@ -13,6 +13,7 @@
 
 use serde_json::{json, Value};
 use std::io::{BufRead, BufReader, Write};
+use std::os::unix::fs::{FileTypeExt, PermissionsExt};
 use std::os::unix::net::UnixListener;
 use std::path::Path;
 use std::process::{Child, ChildStdin, Command, Stdio};
@@ -20,6 +21,7 @@ use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, Instant};
 
 const CODEMUX: &str = env!("CARGO_BIN_EXE_codemux");
+const SOCKET: &str = if cfg!(debug_assertions) { "codemux-dev.sock" } else { "codemux.sock" };
 const AGENT_PROCESS: &str = "CODEMUX_AGENT_PROCESS";
 const PROVIDER_ORIGIN: &str = "CODEMUX_MCP_PROVIDER_ORIGIN";
 const IDENTITY_VARS: [&str; 4] =
@@ -44,6 +46,9 @@ fn isolate(cmd: &mut Command, root: &Path) {
     ] {
         let dir = root.join(sub);
         std::fs::create_dir_all(&dir).unwrap();
+        if key == "XDG_RUNTIME_DIR" {
+            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
         cmd.env(key, dir);
     }
 }
@@ -84,6 +89,11 @@ impl Serve {
                 panic!("codemux serve exited early ({status}):\n{}", self.log());
             }
             if self.try_json("status", "{}", &[]).is_some_and(|reply| reply["ok"] == true) {
+                let socket = self.root.path().join("run").join(SOCKET);
+                assert!(
+                    std::fs::symlink_metadata(&socket).is_ok_and(|meta| meta.file_type().is_socket()),
+                    "serve answered outside its private runtime dir: {socket:?}"
+                );
                 return;
             }
             assert!(Instant::now() < deadline, "codemux serve never answered on its socket:\n{}", self.log());
