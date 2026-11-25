@@ -36,6 +36,10 @@ chmod +x Codemux-*.AppImage
 ./Codemux-*.AppImage
 ```
 
+### Upgrade note for OpenCode
+
+When upgrading to a build with authenticated local notifications, restart OpenCode in any terminal that was running it before the upgrade. OpenCode loads the updated notification plugin on restart and resumes updating the pane’s status.
+
 ### Requirements
 
 - Linux (X11 or Wayland)
