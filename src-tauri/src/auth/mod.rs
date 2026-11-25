@@ -59,6 +59,8 @@ pub struct AuthStatePayload {
     pub user: Option<AuthUser>,
     #[serde(rename = "storageError", skip_serializing_if = "Option::is_none")]
     pub storage_error: Option<String>,
+    #[serde(rename = "pendingVerification", skip_serializing_if = "Option::is_none")]
+    pub pending_verification: Option<bool>,
 }
 
 /// What the API returns from /desktop/verify
@@ -865,6 +867,7 @@ fn emit_callback_auth_state<R: tauri::Runtime>(
     app: &tauri::AppHandle<R>,
     user: Option<AuthUser>,
     auth_method: Option<String>,
+    pending_verification: bool,
 ) {
     let authenticated = user.is_some();
     let _ = app.emit(
@@ -873,6 +876,7 @@ fn emit_callback_auth_state<R: tauri::Runtime>(
             authenticated,
             user,
             storage_error: None,
+            pending_verification: pending_verification.then_some(true),
         },
     );
     let _ = app.emit(
@@ -948,7 +952,7 @@ fn complete_callback_verification<R: tauri::Runtime>(
                     return Ok(false);
                 }
                 auth_state.set_local_session(Some(&saved.stored));
-                emit_callback_auth_state(app, Some(user), saved.stored.auth_method);
+                emit_callback_auth_state(app, Some(user), saved.stored.auth_method, false);
                 Ok(true)
             })
             .unwrap_or(Ok(false))
@@ -961,7 +965,7 @@ fn complete_callback_verification<R: tauri::Runtime>(
             ),
         CallbackVerifyOutcome::Unauthorized => match auth_state.clear_session_if_current(
             &db, session_generation, &record, || {
-                emit_callback_auth_state(app, None, None)
+                emit_callback_auth_state(app, None, None, false)
             },
         ) {
             Ok(true) => CallbackCompletion::Rejected,
@@ -992,7 +996,7 @@ fn complete_callback_verification<R: tauri::Runtime>(
                 }
                 // Report pending identity so the frontend can retry remotely.
                 auth_state.set_local_session(Some(&record.stored));
-                emit_callback_auth_state(app, None, record.stored.auth_method);
+                emit_callback_auth_state(app, None, record.stored.auth_method, true);
                 true
             })
             .unwrap_or(false) {

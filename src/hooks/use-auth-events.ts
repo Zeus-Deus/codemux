@@ -50,7 +50,7 @@ export function useAuthEvents() {
         // lookup times out. Re-read local state so it becomes
         // `pending-verification`; App will retry verification only after the
         // login frame has painted. Definitive sign-out events skip this path.
-        if (oauthCallbackExpected) {
+        if (oauthCallbackExpected && payload.pendingVerification) {
           void useAuthStore.getState().bootstrapSession();
         }
       }

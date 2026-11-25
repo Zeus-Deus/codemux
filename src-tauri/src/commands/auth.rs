@@ -250,6 +250,7 @@ fn emit_signed_out_with_storage_error<R: tauri::Runtime>(
             authenticated: false,
             user: None,
             storage_error,
+            pending_verification: None,
         },
     );
     let _ = app.emit(
@@ -718,6 +719,7 @@ pub async fn signin_email<R: tauri::Runtime>(
             authenticated: true,
             user: Some(user.clone()),
             storage_error: None,
+            pending_verification: None,
         };
         let _ = app.emit("auth-state-changed", &payload);
         let _ = app.emit(

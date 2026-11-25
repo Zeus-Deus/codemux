@@ -38,15 +38,16 @@ import {
   OAUTH_TIMEOUT_MS,
   useAuthStore,
 } from "@/stores/auth-store";
-import { startOauthFlow } from "@/tauri/commands";
+import { bootstrapSession as bootstrapSessionCmd, startOauthFlow } from "@/tauri/commands";
 import { DEFAULT_SETTINGS, useSyncedSettingsStore } from "@/stores/synced-settings-store";
 
-const bootstrapSession = vi.fn();
+const storeBootstrapSession = useAuthStore.getState().bootstrapSession;
 
 /** The backend saved the callback's token but could not verify it yet. */
 const unverifiedCallback: AuthStatePayload = {
   authenticated: false,
   user: null,
+  pendingVerification: true,
 };
 
 function emitAuthState(payload: AuthStatePayload) {
@@ -57,6 +58,13 @@ beforeEach(() => {
   vi.useFakeTimers();
   vi.clearAllMocks();
   vi.mocked(startOauthFlow).mockResolvedValue(undefined);
+  vi.mocked(bootstrapSessionCmd).mockResolvedValue({
+    authenticated: false,
+    user: null,
+    settings: DEFAULT_SETTINGS,
+    authMethod: "github",
+    status: "pending-verification",
+  });
   useAuthStore.setState({
     isLoading: false,
     user: null,
@@ -64,7 +72,7 @@ beforeEach(() => {
     oauthPending: false,
     oauthCallbackExpected: false,
     error: null,
-    bootstrapSession,
+    bootstrapSession: storeBootstrapSession,
   });
   renderHook(() => useAuthEvents());
 });
@@ -81,7 +89,7 @@ describe("useAuthEvents GitHub callback", () => {
 
     emitAuthState(unverifiedCallback);
 
-    expect(bootstrapSession).toHaveBeenCalledTimes(1);
+    expect(bootstrapSessionCmd).toHaveBeenCalledTimes(1);
     expect(useAuthStore.getState().oauthPending).toBe(false);
     expect(useAuthStore.getState().oauthCallbackExpected).toBe(false);
   });
@@ -92,7 +100,7 @@ describe("useAuthEvents GitHub callback", () => {
 
     emitAuthState(unverifiedCallback);
 
-    expect(bootstrapSession).toHaveBeenCalledTimes(1);
+    expect(bootstrapSessionCmd).toHaveBeenCalledTimes(1);
   });
 
   it("still bootstraps a callback that trails the UI timeout", async () => {
@@ -102,7 +110,7 @@ describe("useAuthEvents GitHub callback", () => {
 
     emitAuthState(unverifiedCallback);
 
-    expect(bootstrapSession).toHaveBeenCalledTimes(1);
+    expect(bootstrapSessionCmd).toHaveBeenCalledTimes(1);
   });
 
   it("treats a sign-out event as definitive once no callback can arrive", async () => {
@@ -111,17 +119,18 @@ describe("useAuthEvents GitHub callback", () => {
 
     emitAuthState(unverifiedCallback);
 
-    expect(bootstrapSession).not.toHaveBeenCalled();
+    expect(bootstrapSessionCmd).not.toHaveBeenCalled();
   });
 
   it("does not bootstrap a sign-out event when GitHub was never started", () => {
     emitAuthState(unverifiedCallback);
 
-    expect(bootstrapSession).not.toHaveBeenCalled();
+    expect(bootstrapSessionCmd).not.toHaveBeenCalled();
   });
 
-  it("signs out and reports delayed local cleanup after a rejected session", () => {
+  it("keeps a rejected GitHub callback's cleanup warning until recovery", async () => {
     const warning = "Account access is disabled, but local sign-out cleanup could not be saved. Codemux will retry.";
+    await useAuthStore.getState().startOAuthFlow();
     useAuthStore.setState({
       user: { id: "u1", email: "u1@example.com", name: null, image: null },
       isAuthenticated: true,
@@ -140,6 +149,8 @@ describe("useAuthEvents GitHub callback", () => {
       sessionStatus: "signed-out",
       error: warning,
     });
+    expect(bootstrapSessionCmd).not.toHaveBeenCalled();
+    expect(useAuthStore.getState().oauthCallbackExpected).toBe(false);
     expect(useSyncedSettingsStore.getState().settings).toEqual(DEFAULT_SETTINGS);
     act(() => events.storageErrorClearedHandler?.(warning));
     expect(useAuthStore.getState().error).toBeNull();
@@ -152,7 +163,7 @@ describe("useAuthEvents GitHub callback", () => {
     act(() => events.storageErrorClearedHandler?.(warning));
     expect(useAuthStore.getState().oauthPending).toBe(true);
     expect(useAuthStore.getState().oauthCallbackExpected).toBe(true);
-    expect(bootstrapSession).not.toHaveBeenCalled();
+    expect(bootstrapSessionCmd).not.toHaveBeenCalled();
 
     useAuthStore.setState({ error: "A newer sign-in error" });
     act(() => events.storageErrorClearedHandler?.(warning));
