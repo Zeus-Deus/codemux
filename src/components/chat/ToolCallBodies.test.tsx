@@ -1,6 +1,7 @@
 /// <reference types="@testing-library/jest-dom/vitest" />
 import { afterEach, describe, expect, it } from "vitest";
-import { cleanup, fireEvent, render, screen } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
 
 import { TooltipProvider } from "@/components/ui/tooltip";
 import type { ToolCallItem } from "@/lib/agent-chat/types";
@@ -486,6 +487,23 @@ describe("GenericToolBody edge cases", () => {
 });
 
 describe("Tool result images", () => {
+  it("returns keyboard focus to the remote image control after Escape or Cancel", async () => {
+    render(<ToolCallBody item={makeTool({ result_content: [
+      { type: "image_url", image_url: { url: "https://private.example.test/proof.png" } },
+    ] })} />);
+
+    const trigger = screen.getByRole("button", { name: "Load remote image" });
+    trigger.focus();
+    await userEvent.keyboard("{Enter}");
+    await waitFor(() => expect(screen.getByRole("button", { name: "Cancel" })).toHaveFocus());
+    await userEvent.keyboard("{Escape}");
+    await waitFor(() => expect(trigger).toHaveFocus());
+
+    await userEvent.keyboard("{Enter}");
+    await userEvent.click(screen.getByRole("button", { name: "Cancel" }));
+    await waitFor(() => expect(trigger).toHaveFocus());
+  });
+
   it("keeps confirmation actions outside the scrollable long image address", () => {
     const url = `https://private.example.test/${"a".repeat(4096)}`;
     render(<ToolCallBody item={makeTool({ result_content: [

@@ -13,6 +13,7 @@ import {
   AlertDialogFooter,
   AlertDialogHeader,
   AlertDialogTitle,
+  AlertDialogTrigger,
 } from "@/components/ui/alert-dialog";
 
 import {
@@ -104,15 +105,16 @@ function ToolResultThumbnail({
         open={confirmationSrc === image.src}
         onOpenChange={(open) => setConfirmationSrc(open ? image.src : null)}
       >
-        <button
-          type="button"
-          onClick={() => setConfirmationSrc(image.src)}
-          className="flex h-20 w-28 cursor-pointer flex-col items-center justify-center gap-1 rounded-lg border border-hairline bg-surface-1 text-label text-muted-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-focus-ring"
-          aria-label="Load remote image"
-        >
-          <ImageIcon className="size-5" aria-hidden />
-          Load remote image
-        </button>
+        <AlertDialogTrigger asChild>
+          <button
+            type="button"
+            className="flex h-20 w-28 cursor-pointer flex-col items-center justify-center gap-1 rounded-lg border border-hairline bg-surface-1 text-label text-muted-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-focus-ring"
+            aria-label="Load remote image"
+          >
+            <ImageIcon className="size-5" aria-hidden />
+            Load remote image
+          </button>
+        </AlertDialogTrigger>
         <AlertDialogContent className="flex max-h-[calc(100dvh-2rem)] flex-col overflow-hidden">
           <div role="region" aria-label="Image confirmation details" className="thin-scrollbar min-h-0 space-y-4 overflow-y-auto" tabIndex={0}>
             <AlertDialogHeader>

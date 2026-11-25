@@ -61,7 +61,7 @@ describe("MarkdownLocalImage", () => {
       </RetainedImagesProvider>,
     );
 
-    expect(getByRole("button", { name: "Load Proof" })).toHaveTextContent("/tmp/new-proof.png");
+    expect(getByRole("button", { name: "Load Proof" })).toHaveAccessibleDescription("/tmp/new-proof.png");
     expect(container.querySelector("img")).toBeNull();
     expect(convertFileSrcMock).not.toHaveBeenCalled();
     expect(readChatImageMock).not.toHaveBeenCalled();
@@ -74,7 +74,12 @@ describe("MarkdownLocalImage", () => {
       <MarkdownLocalImage path={path} caption="Screenshot" />,
     );
 
-    expect(getByRole("button", { name: "Load Screenshot" })).toHaveTextContent(path);
+    const load = getByRole("button", { name: "Load Screenshot" });
+    expect(load).toHaveAccessibleDescription(path);
+    const pathDetails = getByRole("region", { name: "Original image path" });
+    expect(pathDetails).toHaveTextContent(path);
+    expect(pathDetails).toHaveAttribute("tabindex", "0");
+    expect(load).not.toContainElement(pathDetails);
     expect(container.querySelector("img")).toBeNull();
     expect(readLocalChatImageMock).not.toHaveBeenCalled();
     expect(convertFileSrcMock).not.toHaveBeenCalled();
@@ -95,7 +100,7 @@ describe("MarkdownLocalImage", () => {
     const { container, getByRole } = render(
       <MarkdownLocalImage path={path} caption="Proof" />,
     );
-    expect(getByRole("button", { name: "Load Proof" })).toHaveTextContent(path);
+    expect(getByRole("button", { name: "Load Proof" })).toHaveAccessibleDescription(path);
     expect(container.querySelector("img")).toBeNull();
     expect(readLocalChatImageMock).not.toHaveBeenCalled();
     expect(convertFileSrcMock).not.toHaveBeenCalled();
@@ -111,7 +116,7 @@ describe("MarkdownLocalImage", () => {
     );
 
     rerender(<MarkdownLocalImage path="/tmp/second.png" caption="Second" />);
-    expect(getByRole("button", { name: "Load Second" })).toHaveTextContent("/tmp/second.png");
+    expect(getByRole("button", { name: "Load Second" })).toHaveAccessibleDescription("/tmp/second.png");
     expect(container.querySelector("img")).toBeNull();
     expect(readLocalChatImageMock).not.toHaveBeenCalledWith("/tmp/second.png");
     expect(convertFileSrcMock).not.toHaveBeenCalledWith("/tmp/second.png");
@@ -164,7 +169,7 @@ describe("MarkdownLocalImage", () => {
     );
     fireEvent.error(container.querySelector("img")!);
     await waitFor(() =>
-      expect(getByRole("button", { name: "Load Proof" })).toHaveTextContent("/tmp/proof.png"),
+      expect(getByRole("button", { name: "Load Proof" })).toHaveAccessibleDescription("/tmp/proof.png"),
     );
     expect(readLocalChatImageMock).not.toHaveBeenCalled();
     expect(convertFileSrcMock).not.toHaveBeenCalledWith("/tmp/proof.png");
@@ -202,7 +207,7 @@ describe("MarkdownLocalImage", () => {
         <MarkdownLocalImage path="/tmp/a%20b.png" caption="Proof" />
       </RetainedImagesProvider>,
     );
-    expect(getByRole("button", { name: "Load Proof" })).toHaveTextContent("/tmp/a%20b.png");
+    expect(getByRole("button", { name: "Load Proof" })).toHaveAccessibleDescription("/tmp/a%20b.png");
     expect(container.querySelector("img")).toBeNull();
     expect(convertFileSrcMock).not.toHaveBeenCalled();
   });

@@ -3,6 +3,7 @@ import {
   useCallback,
   useContext,
   useEffect,
+  useId,
   useMemo,
   useRef,
   useState,
@@ -317,6 +318,7 @@ export function MarkdownLocalImage({
       ? rawCaption.trim()
       : basename(path);
   const [open, setOpen] = useState(false);
+  const pathDescriptionId = useId();
   const [approval, setApproval] = useState({ path, allowed: false });
   if (approval.path !== path) setApproval({ path, allowed: false });
   const loadOriginal = approval.path === path && approval.allowed;
@@ -336,6 +338,7 @@ export function MarkdownLocalImage({
         type="button"
         className="group block w-full cursor-zoom-in text-left focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-focus-ring"
         aria-label={`${offerLoad ? "Load" : "Open"} ${caption}`}
+        aria-describedby={offerLoad ? pathDescriptionId : undefined}
         onClick={() => {
           if (offerLoad) setApproval({ path, allowed: true });
           else setOpen(true);
@@ -365,11 +368,6 @@ export function MarkdownLocalImage({
             <span className="block truncate font-medium text-foreground">
               {children ?? caption}
             </span>
-            {offerLoad && (
-              <span className="mt-1 block max-h-24 overflow-auto break-all font-mono text-label text-muted-foreground">
-                {path}
-              </span>
-            )}
           </span>
           <span className="flex shrink-0 items-center gap-1 text-label text-muted-foreground">
             <Maximize2 className="size-3" aria-hidden />
@@ -377,6 +375,17 @@ export function MarkdownLocalImage({
           </span>
         </span>
       </button>
+      {offerLoad && (
+        <span
+          id={pathDescriptionId}
+          role="region"
+          aria-label="Original image path"
+          tabIndex={0}
+          className="thin-scrollbar block max-h-24 overflow-y-auto break-all border-t border-hairline px-3 py-2 font-mono text-label text-muted-foreground"
+        >
+          {path}
+        </span>
+      )}
 
       <ImageLightbox
         open={open}
