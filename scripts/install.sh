@@ -692,18 +692,19 @@ signature_tools_help() {
 }
 
 # Fetch <signature-url> and refuse to continue unless it signs <file> as <name>.
-verify_release_artifact() { # <file> <signature-url> <name>
+verify_release_artifact() { # <file> <signature-url> <signed-name> [display-name]
     step "Checking the release signature"
+    _va_display="${4:-$3}"
     if [ "$DRY_RUN" = "1" ]; then
-        printf '%b\n' "  ${C_DIM}would verify:${C_RESET} ${3} against $(display_source "$2")"
+        printf '%b\n' "  ${C_DIM}would verify:${C_RESET} ${_va_display} against $(display_source "$2")"
         return 0
     fi
     _va_dir="${WORKDIR}/verify"
     mkdir -p "$_va_dir"
     fetch_text "$2" > "${_va_dir}/artifact.sig" 2>/dev/null \
-        || die "could not download the signature for ${3}, so it cannot be verified. Nothing was installed."
+        || die "could not download the signature for ${_va_display}, so it cannot be verified. Nothing was installed."
     codemux_verify_signature "$1" "${_va_dir}/artifact.sig" "$3" "$_va_dir" \
-        || die "${3} does not match its release signature. It may have been tampered with. Nothing was installed. Please report this at ${CODEMUX_RELEASES_URL%/releases}/issues"
+        || die "${_va_display} does not match its release signature. It may have been tampered with. Nothing was installed. Please report this at ${CODEMUX_RELEASES_URL%/releases}/issues"
     ok "signed with the Codemux release key"
 }
 
@@ -1142,16 +1143,23 @@ main() {
                 # must sign it under its own file name. Only a file already on
                 # this machine is the user's own call.
                 require_signature_tools
-                # Name and the default <path>.sig come from the URL path. The
-                # package and any explicit signature URL are used as given.
+                # Keep the URL name only for the signed-name check. It may
+                # contain credentials, so neither the staging path nor output
+                # may include it.
                 _path=$(codemux_url_path "$CODEMUX_ARTIFACT")
                 _name=$(basename "$_path")
                 _signature_url="${CODEMUX_SIGNATURE_URL:-${_path}.sig}"
+                case "$METHOD" in
+                    deb) _staged_name="codemux-override.deb" ;;
+                    rpm) _staged_name="codemux-override.rpm" ;;
+                    appimage) _staged_name="codemux-override.AppImage" ;;
+                    *) die "unsupported install method: ${METHOD}" ;;
+                esac
                 step "Downloading the artifact you pointed at"
-                _artifact="${WORKDIR}/${_name}"
+                _artifact="${WORKDIR}/${_staged_name}"
                 download_to "$CODEMUX_ARTIFACT" "$_artifact"
                 say ""
-                verify_release_artifact "$_artifact" "$_signature_url" "$_name"
+                verify_release_artifact "$_artifact" "$_signature_url" "$_name" "<authenticated artifact>"
                 ;;
             *)
                 warn "CODEMUX_ARTIFACT is a local file, installed as given; its signature is not checked"

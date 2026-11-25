@@ -299,9 +299,15 @@ else
           run_dry "$UBUNTU" 'https://downloads.example/codemux_9.9.9_amd64.deb?key=artifact-secret')
     is "authenticated URL dry run succeeds" "$?" "0"
     contains "dry run shows the artifact download" "$OUT" "would download: <redacted URL>"
-    contains "dry run shows the signature check" "$OUT" "would verify: codemux_9.9.9_amd64.deb against <redacted URL>"
+    contains "dry run shows the signature check" "$OUT" "would verify: <authenticated artifact> against <redacted URL>"
     not_contains "dry run hides artifact credential" "$OUT" "artifact-secret"
     not_contains "dry run hides signature credential" "$OUT" "signature-secret"
+    for extension in deb AppImage; do
+        OUT=$(run_dry "$UBUNTU" "https://downloads.example/credential-in-filename.${extension}")
+        is "path credential ${extension} dry run succeeds" "$?" "0"
+        not_contains "path credential ${extension} stays out of the full plan" "$OUT" "credential-in-filename"
+        contains "path credential ${extension} uses a neutral staging name" "$OUT" "codemux-override.${extension}"
+    done
     OUT=$(run_dry "$UBUNTU" 'https://downloads.example/unknown.bin?key=unknown-secret')
     is "unknown authenticated artifact is rejected" "$?" "1"
     contains "unknown artifact error redacts its URL" "$OUT" "from its name: <redacted URL>"
