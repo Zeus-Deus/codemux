@@ -455,14 +455,15 @@ pub async fn hosts_bootstrap_install<R: tauri::Runtime>(
                     _ => String::new(),
                 };
 
-                // Always provision the headless `serve` daemon. Unlike
-                // the scheduler this needs no auth token or server id —
-                // it's a per-host local control plane. After this
+                // Enable and start the headless `serve` daemon without
+                // restarting an already-running service or its terminals.
+                // Unlike the scheduler this needs no auth token or server
+                // id — it's a per-host local control plane. After this
                 // returns successfully, an MCP-capable agent on the host
                 // that the user points at `codemux-remote mcp` can use it.
                 // Same best-effort contract: a failure logs and is
                 // surfaced in the result message, doesn't fail bootstrap.
-                let serve_note = match crate::ssh::bootstrap::provision_serve(
+                let serve_note = match crate::ssh::bootstrap::ensure_serve_running(
                     &host.ssh_target,
                     "~/.local/bin/codemux-remote",
                     std::time::Duration::from_secs(30),
@@ -527,6 +528,12 @@ pub struct HostBootstrapResult {
     pub message: String,
 }
 
+#[cfg(unix)]
+pub(crate) struct RemoteReinstallOutcome {
+    version: String,
+    serve_enabled: bool,
+}
+
 /// After a successful install the device is ready: show it online now,
 /// then read its facts and workspaces in the background.
 #[cfg(unix)]
@@ -540,16 +547,15 @@ fn mark_host_ready<R: tauri::Runtime>(app: &tauri::AppHandle<R>, host_id: i64) {
 }
 
 /// Force-reinstall `codemux-remote` on a host regardless of the version
-/// already installed there, and restart its pty-daemon so the fresh
-/// binary takes effect immediately.
+/// already installed there. Running terminal daemons keep serving their
+/// sessions and use the new binary when they next start.
 ///
 /// This is the dev-workflow escape hatch behind the "Reinstall agent on
 /// host" button in Settings → Hosts. Rebuilding `codemux-remote` from a
 /// branch keeps the version string the same, so the push-time version
 /// check (`ensure_remote_binary_current`) sees a match and skips the
 /// upgrade — leaving the host running a stale binary. This command always
-/// re-uploads the freshly built bits (and kills the running pty-daemon),
-/// so the next push uses them. No manual `scp` + `pkill` needed.
+/// re-uploads the freshly built bits while preserving live terminal sessions.
 ///
 /// Unix-only — the SSH bootstrap path is `#[cfg(unix)]`. On Windows we
 /// return a clear "not implemented" message.
@@ -568,13 +574,19 @@ pub async fn hosts_reinstall_remote<R: tauri::Runtime>(
     #[cfg(unix)]
     {
         Ok(match force_reinstall_remote_binary(&app, &host).await {
-            Ok(version) => {
+            Ok(outcome) => {
                 mark_host_ready(&app, host.id);
+                let serve_note = if outcome.serve_enabled {
+                    "Stopped headless services are started; running ones use the new binary after restart."
+                } else {
+                    "The headless service could not be enabled; see logs."
+                };
                 HostBootstrapResult {
                     ok: true,
                     message: format!(
-                        "codemux-remote v{version} reinstalled on {} — daemon restarted; \
-                         the next push uses the fresh binary.",
+                        "codemux-remote v{} reinstalled on {}. Active terminal daemons \
+                         keep running and use the new binary when they restart. {serve_note}",
+                        outcome.version,
                         host.name
                     ),
                 }
@@ -1604,10 +1616,9 @@ async fn pull_claude_projects(
 
 /// Probe the remote `codemux-remote` binary's version. If it
 /// doesn't match what we'd ship from this Codemux build, re-bootstrap
-/// (scp the current binary + chmod + verify) so the daemon spawn the
-/// supervisor's about to make uses the up-to-date binary. Also kills
-/// any running daemon on the remote so the next SSH `exec` can bind
-/// the same socket without an "address in use" conflict.
+/// (upload the current binary + verify) so newly started daemons use the
+/// up-to-date binary. Existing terminal daemons keep their sessions until
+/// they restart.
 ///
 /// Returns Ok on either "already current, nothing to do" or "updated
 /// successfully." Returns Err when the host can't be reached or the
@@ -1660,14 +1671,14 @@ pub(crate) async fn ensure_remote_binary_current<R: tauri::Runtime>(
         host.name
     );
 
-    // Missing or broken: nothing is running from it, so a full reinstall is
-    // safe. Shared with the manual "Set up again" (`hosts_reinstall_remote`),
-    // which runs the same steps without the version check above.
+    // A missing or broken binary on disk does not prove that an older daemon
+    // has stopped: its executable may still be open after replacement.
+    // Shared with manual "Set up again" (`hosts_reinstall_remote`).
     force_reinstall_remote_binary(app, host).await.map(|_| ())
 }
 
-/// Force a freshly built `codemux-remote` onto a host and restart it,
-/// *without* the version-skip check in `ensure_remote_binary_current`.
+/// Force a freshly built `codemux-remote` onto a host, *without* the
+/// version-skip check in `ensure_remote_binary_current`.
 ///
 /// This is the dev-workflow primitive behind the "Reinstall agent on
 /// host" button. Rebuilding `codemux-remote` from a branch keeps the
@@ -1676,14 +1687,14 @@ pub(crate) async fn ensure_remote_binary_current<R: tauri::Runtime>(
 /// stale binary. Forcing the reinstall is the only way to get freshly
 /// built bits onto the host during development.
 ///
-/// Steps: probe uname → kill the SSH-spawned pty-daemon → scp + chmod +
-/// verify the bundled binary → restart the headless `serve` daemon.
-/// Returns the reported version on success.
+/// Steps: probe uname → atomically upload and verify the bundled binary →
+/// enable and start the headless `serve` daemon if stopped. Running services
+/// and PTY daemons keep their sessions and use the new binary when restarted.
 #[cfg(unix)]
 pub(crate) async fn force_reinstall_remote_binary<R: tauri::Runtime>(
     app: &tauri::AppHandle<R>,
     host: &crate::database::HostRecord,
-) -> Result<String, String> {
+) -> Result<RemoteReinstallOutcome, String> {
     use crate::ssh::exec::run_remote;
     use std::time::Duration;
 
@@ -1707,21 +1718,8 @@ pub(crate) async fn force_reinstall_remote_binary<R: tauri::Runtime>(
         return Err("uname probe returned empty string".into());
     }
 
-    // Step 2: kill any running pty-daemon. Otherwise the freshly-bootstrapped
-    // binary won't actually be used until the next SSH-spawn cycle, and
-    // a stale daemon still bound to the workspace's Unix socket would
-    // make that next spawn fail with "address in use." The narrow `-f`
-    // pattern only matches the SSH-spawned pty-daemon — user-launched
-    // `codemux-remote mcp` or `serve` invocations are spared. `serve`
-    // is restarted via systemctl in step 4 instead.
-    let _ = run_remote(
-        &host.ssh_target,
-        "pkill -f 'codemux-remote pty-daemon' 2>/dev/null || true",
-        Duration::from_secs(20),
-    )
-    .await;
-
-    // Step 3: bootstrap (upload binary + verify version).
+    // Step 2: bootstrap replaces the path atomically. A running daemon keeps
+    // its old executable inode and live PTYs; a new daemon uses the new file.
     use crate::ssh::bootstrap::{bootstrap_remote, BootstrapOptions, BootstrapResult};
     let outcome = bootstrap_remote(
         BootstrapOptions::new(&host.ssh_target, &uname).with_app(app),
@@ -1748,36 +1746,27 @@ pub(crate) async fn force_reinstall_remote_binary<R: tauri::Runtime>(
         }
     };
 
-    // Step 4: re-provision the headless `serve` daemon. This is
-    // idempotent — it rewrites the systemd unit (so a unit-content
-    // change in this Codemux version takes effect immediately), runs
-    // daemon-reload, and **restarts** the unit (not just `enable
-    // --now` — restart kills the old process so the new binary on
-    // disk actually starts running). If we skipped this, an upgraded
-    // codemux-remote on disk would coexist with an old `serve`
-    // process in memory until the next host reboot, which would
-    // confuse anyone debugging "why doesn't my new MCP tool show up
-    // after I updated Codemux."
-    //
-    // Best-effort: a failure here doesn't fail the reinstall. The
-    // binary is current; the user can `systemctl --user restart
-    // codemux-remote` themselves if needed.
-    if let Err(error) = crate::ssh::bootstrap::provision_serve(
+    // Step 3: `enable --now` starts a stopped service, including a missing
+    // unit repaired by this install, but never restarts an active one. A
+    // failure is best-effort because the binary on disk is already current.
+    let serve_enabled = match crate::ssh::bootstrap::ensure_serve_running(
         &host.ssh_target,
         "~/.local/bin/codemux-remote",
         std::time::Duration::from_secs(30),
     )
     .await
     {
-        eprintln!(
-            "[hosts] re-provisioning serve on {} after reinstall failed (continuing): {error}",
-            host.name
-        );
-    } else {
-        eprintln!("[hosts] re-provisioned codemux-remote.service on {}", host.name);
-    }
+        Ok(()) => true,
+        Err(error) => {
+            eprintln!(
+                "[hosts] enabling serve on {} after reinstall failed (continuing): {error}",
+                host.name
+            );
+            false
+        }
+    };
 
-    Ok(reported_version)
+    Ok(RemoteReinstallOutcome { version: reported_version, serve_enabled })
 }
 
 /// Stash the synced OpenCode session id into the adapter captures of the

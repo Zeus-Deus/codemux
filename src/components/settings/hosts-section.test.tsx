@@ -511,9 +511,12 @@ describe("HostsSection — row actions", () => {
     await openMenu(user);
     await user.click(await screen.findByRole("menuitem", { name: "Set up again" }));
 
-    await waitFor(() => expect(toast.success).toHaveBeenCalledWith("zeus is ready"));
+    await waitFor(() => expect(toast.success).toHaveBeenCalledWith(
+      "zeus is ready",
+      { description: "installed" },
+    ));
     expect(mocked.hostsBootstrapInstall).toHaveBeenCalledWith(1, "Linux x86_64");
-    // The forced reinstall restarts the device's terminals.
+    // A missing helper follows the fresh install path.
     expect(mocked.hostsReinstallRemote).not.toHaveBeenCalled();
     expect(mocked.hostsTestConnection).toHaveBeenCalledTimes(2);
     expect(screen.getByText("Connected")).toBeInTheDocument();
@@ -536,7 +539,10 @@ describe("HostsSection — row actions", () => {
     await openMenu(user);
     await user.click(await screen.findByRole("menuitem", { name: "Set up again" }));
 
-    await waitFor(() => expect(toast.success).toHaveBeenCalledWith("zeus is ready"));
+    await waitFor(() => expect(toast.success).toHaveBeenCalledWith(
+      "zeus is ready",
+      { description: "installed" },
+    ));
     expect(mocked.hostsBootstrapInstall).toHaveBeenCalledWith(1, "Linux aarch64");
     expect(mocked.hostsReinstallRemote).not.toHaveBeenCalled();
   });
@@ -560,6 +566,26 @@ describe("HostsSection — row actions", () => {
     expect(mocked.hostsReinstallRemote).toHaveBeenCalledWith(1);
     expect(mocked.hostsBootstrapInstall).not.toHaveBeenCalled();
     expect(mocked.hostsTestConnection).toHaveBeenCalledTimes(1);
+  });
+
+  it("shows that a forced reinstall keeps active terminal daemons running", async () => {
+    backendHosts = [makeHost()];
+    mocked.hostsTestConnection.mockResolvedValue(READY);
+    mocked.hostsReinstallRemote.mockResolvedValue({
+      ok: true,
+      message: "Active terminal daemons keep running and use the new binary when they restart.",
+    });
+    const user = userEvent.setup();
+    render(<HostsSection />);
+
+    await openMenu(user);
+    await user.click(await screen.findByRole("menuitem", { name: "Set up again" }));
+
+    await waitFor(() => expect(toast.success).toHaveBeenCalledWith(
+      "zeus is ready",
+      { description: expect.stringContaining("Active terminal daemons keep running") },
+    ));
+    expect(mocked.hostsReinstallRemote).toHaveBeenCalledWith(1);
   });
 
   it("stops without installing when the device can't be reached", async () => {
