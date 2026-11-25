@@ -1708,19 +1708,6 @@ mod windows_key_security {
         options: u32,
         security: Option<&PrivateDacl>,
     ) -> Result<std::fs::File, i32> {
-        open_relative_with_reparse(parent, name, access, share, disposition, options, security, false)
-    }
-
-    fn open_relative_with_reparse(
-        parent: &std::fs::File,
-        name: &OsStr,
-        access: u32,
-        share: u32,
-        disposition: u32,
-        options: u32,
-        security: Option<&PrivateDacl>,
-        follow_reparse: bool,
-    ) -> Result<std::fs::File, i32> {
         let mut name: Vec<u16> = name.encode_wide().collect();
         if name.is_empty() || name == [b'.' as u16] || name == [b'.' as u16, b'.' as u16]
             || name.iter().any(|value| matches!(*value, 0 | 47 | 58 | 92))
@@ -1744,13 +1731,52 @@ mod windows_key_security {
             NtCreateFile(
                 &mut handle, access | SYNCHRONIZE, &attributes, &mut status_block,
                 null(), FILE_ATTRIBUTE_NORMAL, share, disposition,
-                options | FILE_SYNCHRONOUS_IO_NONALERT
-                    | if follow_reparse { 0 } else { FILE_OPEN_REPARSE_POINT },
+                options | FILE_OPEN_REPARSE_POINT | FILE_SYNCHRONOUS_IO_NONALERT,
                 null(), 0,
             )
         };
         if status < 0 {
             return Err(status);
+        }
+        Ok(unsafe { std::fs::File::from_raw_handle(handle) })
+    }
+
+    fn open_followed_alias(path: &Path) -> Result<std::fs::File, String> {
+        // This full-path open is only an identity check. All later key I/O
+        // uses the separately validated target handle after the IDs match.
+        // Use an extended path so long app-data paths work.
+        let mut components = path.components();
+        let prefix = match (components.next(), components.next()) {
+            (Some(Component::Prefix(prefix)), Some(Component::RootDir)) => prefix.kind(),
+            _ => return Err("iroh reparse alias is not an absolute Windows path".to_string()),
+        };
+        // The extended Win32 namespace does not translate '/' separators.
+        // Component names themselves cannot contain a slash.
+        let path_units: Vec<u16> = path.as_os_str().encode_wide()
+            .map(|unit| if unit == 47 { 92 } else { unit })
+            .collect();
+        let mut name = match prefix {
+            Prefix::Disk(_) => {
+                let mut name = vec![92, 92, 63, 92]; // \\?\
+                name.extend_from_slice(&path_units);
+                name
+            }
+            Prefix::UNC(_, _) if path_units.starts_with(&[92, 92]) => {
+                let mut name = vec![92, 92, 63, 92, 85, 78, 67, 92]; // \\?\UNC\
+                name.extend_from_slice(&path_units[2..]);
+                name
+            }
+            Prefix::VerbatimDisk(_) | Prefix::VerbatimUNC(_, _) | Prefix::Verbatim(_) => path_units,
+            _ => return Err("iroh reparse alias uses an unsupported Windows path prefix".to_string()),
+        };
+        name.push(0);
+        let handle = unsafe {
+            CreateFileW(name.as_ptr(), FILE_READ_ATTRIBUTES | READ_CONTROL | FILE_TRAVERSE,
+                FILE_SHARE_READ | FILE_SHARE_WRITE, null(), OPEN_EXISTING,
+                FILE_FLAG_BACKUP_SEMANTICS, null_mut())
+        };
+        if handle == INVALID_HANDLE_VALUE {
+            return Err(format!("follow iroh app directory alias: {}", std::io::Error::last_os_error()));
         }
         Ok(unsafe { std::fs::File::from_raw_handle(handle) })
     }
@@ -1907,8 +1933,24 @@ mod windows_key_security {
         }
         if relative {
             let relative = PathBuf::from(OsString::from_wide(&name));
-            let mut target = base.to_path_buf();
-            for component in relative.components() {
+            let mut components = relative.components().peekable();
+            let mut target = if matches!(components.peek(), Some(Component::RootDir)) {
+                // A leading backslash is relative to the opened drive/share,
+                // including when a junction's physical target is elsewhere.
+                components.next();
+                let mut base_components = base.components();
+                let (Some(Component::Prefix(prefix)), Some(Component::RootDir)) =
+                    (base_components.next(), base_components.next())
+                else {
+                    return Err("iroh app directory symlink has no volume root".to_string());
+                };
+                let mut root = PathBuf::from(prefix.as_os_str());
+                root.push("\\");
+                root
+            } else {
+                base.to_path_buf()
+            };
+            for component in components {
                 match component {
                     Component::CurDir => {}
                     Component::ParentDir if target.pop() => {}
@@ -1936,7 +1978,7 @@ mod windows_key_security {
         Ok(target)
     }
 
-    fn reparse_target(link: &std::fs::File, base: &Path) -> Result<PathBuf, String> {
+    fn reparse_target(link: &std::fs::File, base: &Path) -> Result<(PathBuf, bool), String> {
         // FSCTL_GET_REPARSE_POINT returns an 8-byte header followed by tag-
         // specific metadata and a UTF-16 path buffer.
         const FSCTL_GET_REPARSE_POINT: u32 = 0x0009_00a8;
@@ -1954,12 +1996,14 @@ mod windows_key_security {
         if returned > buffer.len() {
             return Err("iroh app directory reparse response is too long".to_string());
         }
-        parse_reparse_target(&buffer[..returned], base)
+        let target = parse_reparse_target(&buffer[..returned], base)?;
+        let symlink = u32::from_le_bytes(buffer[..4].try_into().unwrap()) == 0xa000_000c;
+        Ok((target, symlink))
     }
 
     struct PinnedDirectory {
         file: std::fs::File,
-        resolved_path: PathBuf,
+        opened_path: PathBuf,
     }
 
     fn open_app_root(root: &Path, create: bool, security: &PrivateDacl) -> Result<std::fs::File, String> {
@@ -2011,7 +2055,7 @@ mod windows_key_security {
         }
         let anchor = PinnedDirectory {
             file: unsafe { std::fs::File::from_raw_handle(handle) },
-            resolved_path: anchor_path,
+            opened_path: anchor_path,
         };
         validate_app_directory(&anchor.file, security, names.is_empty() && final_is_app_root, false)?;
         if names.is_empty() {
@@ -2036,16 +2080,13 @@ mod windows_key_security {
                 // A reparse point can change its target through a write to
                 // the link itself. Require a strict ACL before reading it.
                 validate_app_directory(&file, security, true, true)?;
-                let target_path = reparse_target(&file, &parent.resolved_path)?;
+                let alias = parent.opened_path.join(name);
+                let (target_path, symlink) = reparse_target(&file, &parent.opened_path)?;
                 let target = open_app_root_inner(
                     &target_path, false, security,
                     final_is_app_root && index + 1 == names.len(), hops + 1,
                 )?;
-                let followed = open_relative_with_reparse(
-                    &parent.file, name, FILE_READ_ATTRIBUTES | READ_CONTROL | FILE_TRAVERSE,
-                    FILE_SHARE_READ | FILE_SHARE_WRITE, FILE_OPEN,
-                    FILE_DIRECTORY_FILE, None, true,
-                ).map_err(|status| format!("follow iroh app directory reparse point: NTSTATUS {status:#010x}"))?;
+                let followed = open_followed_alias(&alias)?;
                 let walked_id = crate::windows_file_id::file_id(&target.file)
                     .map_err(|e| format!("identify iroh reparse target: {e}"))?;
                 let followed_id = crate::windows_file_id::file_id(&followed)
@@ -2054,14 +2095,17 @@ mod windows_key_security {
                     return Err("iroh app directory reparse target changed during validation".to_string());
                 }
                 links.push(file);
-                held.push(target);
+                // Mount points preserve the opened alias for later relative
+                // links; symbolic links replace that opened path.
+                let opened_path = if symlink { target.opened_path.clone() } else { alias };
+                held.push(PinnedDirectory { file: target.file, opened_path });
             } else {
                 validate_app_directory(
                     &file, security, final_is_app_root && index + 1 == names.len(), false,
                 )?;
-                let mut resolved_path = parent.resolved_path.clone();
-                resolved_path.push(name);
-                held.push(PinnedDirectory { file, resolved_path });
+                let mut opened_path = parent.opened_path.clone();
+                opened_path.push(name);
+                held.push(PinnedDirectory { file, opened_path });
             }
         }
         Ok(held.pop().unwrap())
@@ -2262,6 +2306,9 @@ mod windows_key_security {
 
             let relative = reparse_data(SYMLINK, 1, r"..\relocated");
             assert_eq!(parse_reparse_target(&relative, base).unwrap(), PathBuf::from(r"\\?\D:\real\relocated"));
+
+            let root_relative = reparse_data(SYMLINK, 1, r"\relocated");
+            assert_eq!(parse_reparse_target(&root_relative, base).unwrap(), PathBuf::from(r"\\?\D:\relocated"));
 
             let volume = r"\??\Volume{01234567-89ab-cdef-0123-456789abcdef}\relocated";
             let mounted = reparse_data(MOUNT, 0, volume);
@@ -3623,9 +3670,11 @@ mod tests {
     fn iroh_identity_key_resolves_relative_symlink_after_junction() {
         let temp = tempfile::tempdir().unwrap();
         let real = temp.path().join("one").join("real");
-        let target = temp.path().join("one").join("relocated");
+        let physical_target = temp.path().join("one").join("relocated");
+        let opened_target = temp.path().join("relocated");
         std::fs::create_dir_all(&real).unwrap();
-        std::fs::create_dir(&target).unwrap();
+        std::fs::create_dir(&physical_target).unwrap();
+        std::fs::create_dir(&opened_target).unwrap();
         let alias = temp.path().join("alias");
         let made = std::process::Command::new("cmd")
             .args(["/C", "mklink", "/J"])
@@ -3640,17 +3689,22 @@ mod tests {
             Err(error) if error.raw_os_error() == Some(1314) => return, // Symlink privilege is unavailable.
             Err(error) => panic!("create relative directory symlink: {error}"),
         }
-        for directory in [&alias, &link, &target] {
+        for directory in [&alias, &link, &physical_target, &opened_target] {
             windows_key_security::inherited_grant_fixture(directory, "GR").unwrap();
         }
 
         let key = SecretKey::generate();
         let node_id = key.public().to_string();
-        std::fs::write(target.join(KEY_FILE), crate::auth::encrypt_data(&key.to_bytes()).unwrap()).unwrap();
+        let legacy = alias.join("codemux").join(KEY_FILE);
+        let sealed = crate::auth::encrypt_data(&key.to_bytes()).unwrap();
+        std::fs::write(&legacy, &sealed).unwrap();
+        assert_eq!(std::fs::read(opened_target.join(KEY_FILE)).unwrap(), sealed);
+        assert!(!physical_target.join(KEY_FILE).exists());
         let path = alias.join("codemux").join(KEY_DIR).join(KEY_FILE);
         assert_eq!(load_or_create_secret_key_at(&path).unwrap().public(), key.public());
         assert_eq!(persisted_node_id_at(&path).as_deref(), Some(node_id.as_str()));
-        assert!(target.join(KEY_DIR).join(KEY_FILE).exists());
+        assert!(opened_target.join(KEY_DIR).join(KEY_FILE).exists());
+        assert!(!physical_target.join(KEY_DIR).exists());
     }
 
     #[cfg(windows)]
