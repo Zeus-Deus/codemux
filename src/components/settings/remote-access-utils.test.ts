@@ -12,6 +12,7 @@ import {
   BIND_SCOPE_OPTIONS,
   bindScopeLabel,
   bindScopeOf,
+  browserPairingEndpoints,
   classifyOriginHost,
   composePairUrl,
   connectedSessionCount,
@@ -155,6 +156,25 @@ describe("pairing URL composition", () => {
       ])?.host,
     ).toBe("127.0.0.1");
     expect(pickPrimaryEndpoint([])).toBeNull();
+  });
+
+  it("does not use a relay descriptor as a browser pairing address", () => {
+    const loopback = ep({
+      kind: "loopback",
+      group: "this_device",
+      host: "127.0.0.1",
+      url: "http://127.0.0.1:4377",
+    });
+    const relay = ep({
+      kind: "iroh",
+      group: "from_anywhere",
+      host: "node-id",
+      url: "iroh://node-id",
+      recommended: true,
+    });
+    expect(browserPairingEndpoints([loopback, relay])).toEqual([loopback]);
+    expect(pickPrimaryEndpoint([loopback, relay])).toEqual(loopback);
+    expect(pickPrimaryEndpoint([relay])).toBeNull();
   });
 });
 

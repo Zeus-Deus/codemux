@@ -610,14 +610,24 @@ fn filter_endpoints_for_scope(
     endpoints: Vec<endpoints::Endpoint>,
     scope: &str,
 ) -> Vec<endpoints::Endpoint> {
-    endpoints
+    let has_ipv4_tailnet = endpoints.iter().any(|endpoint| {
+        endpoint.kind == "tailnet" && matches!(endpoint.host.parse::<IpAddr>(), Ok(IpAddr::V4(_)))
+    });
+    let mut filtered: Vec<_> = endpoints
         .into_iter()
         .filter(|endpoint| match scope {
-            BIND_SCOPE_ALL => true,
+            // `all` binds 0.0.0.0, not [::]. IPv6 literals would be dead links.
+            BIND_SCOPE_ALL => {
+                !matches!(endpoint.host.parse::<IpAddr>(), Ok(IpAddr::V6(_)))
+                    && (endpoint.kind != "magicdns" || has_ipv4_tailnet)
+            }
             BIND_SCOPE_TAILSCALE => matches!(endpoint.kind.as_str(), "loopback" | "tailnet" | "magicdns"),
             _ => endpoint.kind == "loopback",
         })
-        .collect()
+        .collect();
+    // The raw list may have recommended an address the listener cannot serve.
+    endpoints::mark_recommended(&mut filtered);
+    filtered
 }
 
 /// The recommended reachable endpoint at the configured scope, falling back
@@ -2054,15 +2064,25 @@ mod tests {
 
     #[test]
     fn endpoint_list_only_advertises_bound_scope() {
-        let endpoint = |kind: &str| endpoints::Endpoint {
-            kind: kind.to_string(),
-            group: kind.to_string(),
-            host: kind.to_string(),
-            port: DEFAULT_PORT,
-            url: format!("http://{kind}:{}", DEFAULT_PORT),
-            secure: kind == "loopback",
-            recommended: false,
-            label: kind.to_string(),
+        let endpoint = |kind: &str| {
+            let host = match kind {
+                "loopback" => "127.0.0.1",
+                "lan" => "192.168.1.5",
+                "public" => "203.0.114.9",
+                "tailnet" => "100.64.0.1",
+                "magicdns" => "box.ts.net",
+                _ => unreachable!(),
+            };
+            endpoints::Endpoint {
+                kind: kind.to_string(),
+                group: kind.to_string(),
+                host: host.to_string(),
+                port: DEFAULT_PORT,
+                url: format!("http://{host}:{}", DEFAULT_PORT),
+                secure: kind == "loopback",
+                recommended: false,
+                label: kind.to_string(),
+            }
         };
         let all = vec![endpoint("loopback"), endpoint("lan"), endpoint("public"), endpoint("tailnet"), endpoint("magicdns")];
         let kinds = |scope| filter_endpoints_for_scope(all.clone(), scope)
@@ -2073,6 +2093,43 @@ mod tests {
         assert_eq!(kinds(BIND_SCOPE_TAILSCALE), ["loopback", "tailnet", "magicdns"]);
         assert_eq!(kinds(BIND_SCOPE_ALL), ["loopback", "lan", "public", "tailnet", "magicdns"]);
         assert_eq!(kinds("unknown"), ["loopback"]);
+    }
+
+    #[test]
+    fn all_scope_omits_ipv6_and_recommends_a_reachable_ipv4_address() {
+        let endpoint = |kind: &str, group: &str, host: &str, recommended: bool| endpoints::Endpoint {
+            kind: kind.into(),
+            group: group.into(),
+            host: host.into(),
+            port: DEFAULT_PORT,
+            url: format!("http://{host}:{DEFAULT_PORT}"),
+            secure: kind == "loopback",
+            recommended,
+            label: String::new(),
+        };
+        let candidates = vec![
+            endpoint("loopback", "this_device", "127.0.0.1", false),
+            endpoint("public", "public_internet", "2001:db8::1", true),
+            endpoint("tailnet", "tailscale", "fd7a::1", false),
+            endpoint("magicdns", "tailscale", "box.ts.net", false),
+            endpoint("lan", "local_network", "192.168.1.5", false),
+        ];
+        let all = filter_endpoints_for_scope(candidates.clone(), BIND_SCOPE_ALL);
+        assert_eq!(
+            all.iter().map(|e| e.host.as_str()).collect::<Vec<_>>(),
+            ["127.0.0.1", "192.168.1.5"]
+        );
+        assert_eq!(
+            all.iter()
+                .filter(|e| e.recommended)
+                .map(|e| e.host.as_str())
+                .collect::<Vec<_>>(),
+            ["192.168.1.5"]
+        );
+
+        // The tailnet-only listener also binds IPv6, so it may advertise it.
+        let tailnet = filter_endpoints_for_scope(candidates, BIND_SCOPE_TAILSCALE);
+        assert!(tailnet.iter().any(|e| e.host == "fd7a::1"));
     }
 
     #[test]

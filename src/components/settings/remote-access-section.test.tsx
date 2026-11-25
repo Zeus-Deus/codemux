@@ -429,6 +429,32 @@ describe("RemoteAccessSection — enabled", () => {
       expect(screen.getByText("http://192.168.1.42:4377/#pair=tok")).toBeInTheDocument(),
     );
     expect(screen.getByLabelText(/pairing QR code/i)).toBeInTheDocument();
+    expect(screen.getByText(/network observers can read this pairing secret/i)).toBeInTheDocument();
+  });
+
+  it("keeps relay descriptors out of a loopback-only pairing link", async () => {
+    const user = userEvent.setup();
+    cmds.webRemoteListEndpoints.mockResolvedValue([
+      endpoints()[0],
+      {
+        kind: "iroh",
+        group: "from_anywhere",
+        host: "node-id",
+        port: 0,
+        url: "iroh://node-id",
+        secure: true,
+        recommended: false,
+        label: "Relay",
+      },
+    ]);
+    render(<RemoteAccessSection />);
+    await user.click(await screen.findByRole("button", { name: /create pairing link/i }));
+
+    expect(await screen.findByText("http://127.0.0.1:4377/#pair=tok")).toBeInTheDocument();
+    expect(screen.getByText("Open this link here")).toBeInTheDocument();
+    expect(screen.getByText(/another device cannot scan it directly/i)).toBeInTheDocument();
+    expect(screen.queryByLabelText(/pairing QR code/i)).toBeNull();
+    expect(screen.queryByText("iroh://node-id/#pair=tok")).toBeNull();
   });
 
   it("defaults the access scope to This device only and switches to Tailscale only", async () => {

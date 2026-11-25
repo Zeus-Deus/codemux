@@ -386,22 +386,30 @@ export function composePairUrl(
   return `${endpoint.url}${pairing.url_path}`;
 }
 
+/** Relay descriptors are not browser origins and cannot open pairing links. */
+export function browserPairingEndpoints(
+  endpoints: WebRemoteEndpoint[],
+): WebRemoteEndpoint[] {
+  return endpoints.filter(
+    (endpoint) =>
+      endpoint.url.startsWith("http://") ||
+      endpoint.url.startsWith("https://"),
+  );
+}
+
 /**
- * The endpoint a QR code / primary pairing link should target. A QR is
- * meant to be scanned from a *phone*, so loopback (`127.0.0.1`, only
- * reachable from the desktop itself) is the worst choice. Prefer the
- * backend's `recommended` endpoint (the best "from anywhere" option), then
- * the first reachable network endpoint, falling back to loopback only when
- * that is all that exists.
+ * Choose a browser endpoint for a pairing link. Prefer the backend's
+ * recommended address, then an off-device address, then local loopback.
  */
 export function pickPrimaryEndpoint(
   endpoints: WebRemoteEndpoint[],
 ): WebRemoteEndpoint | null {
-  if (endpoints.length === 0) return null;
-  const recommended = endpoints.find((e) => e.recommended);
+  const browserEndpoints = browserPairingEndpoints(endpoints);
+  if (browserEndpoints.length === 0) return null;
+  const recommended = browserEndpoints.find((e) => e.recommended);
   if (recommended) return recommended;
-  const networked = endpoints.find((e) => e.kind !== "loopback");
-  return networked ?? endpoints[0];
+  const networked = browserEndpoints.find((e) => e.kind !== "loopback");
+  return networked ?? browserEndpoints[0];
 }
 
 // ── Session partitioning ─────────────────────────────────────────────

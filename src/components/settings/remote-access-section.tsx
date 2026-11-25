@@ -68,6 +68,7 @@ import { SectionHeader } from "./settings-primitives";
 import {
   approvedSessions,
   BIND_SCOPE_OPTIONS,
+  browserPairingEndpoints,
   bindScopeLabel,
   bindScopeOf,
   composePairUrl,
@@ -279,8 +280,12 @@ function PairingPanel({
   onRegenerate: () => void;
   regenerating: boolean;
 }) {
+  const browserEndpoints = useMemo(
+    () => browserPairingEndpoints(endpoints),
+    [endpoints],
+  );
   const [selectedHost, setSelectedHost] = useState<string | null>(
-    () => pickPrimaryEndpoint(endpoints)?.host ?? null,
+    () => pickPrimaryEndpoint(browserEndpoints)?.host ?? null,
   );
   const [remainingMs, setRemainingMs] = useState(() =>
     msUntil(pairing.expires_at),
@@ -289,10 +294,10 @@ function PairingPanel({
   // Re-pick a sensible default whenever the endpoint set changes (e.g. the
   // server just came up and enumerated its interfaces).
   useEffect(() => {
-    if (!endpoints.some((e) => e.host === selectedHost)) {
-      setSelectedHost(pickPrimaryEndpoint(endpoints)?.host ?? null);
+    if (!browserEndpoints.some((e) => e.host === selectedHost)) {
+      setSelectedHost(pickPrimaryEndpoint(browserEndpoints)?.host ?? null);
     }
-  }, [endpoints, selectedHost]);
+  }, [browserEndpoints, selectedHost]);
 
   // 1 Hz countdown.
   useEffect(() => {
@@ -304,16 +309,20 @@ function PairingPanel({
   }, [pairing.expires_at]);
 
   const selected =
-    endpoints.find((e) => e.host === selectedHost) ??
-    pickPrimaryEndpoint(endpoints);
+    browserEndpoints.find((e) => e.host === selectedHost) ??
+    pickPrimaryEndpoint(browserEndpoints);
   const fullUrl = selected ? composePairUrl(selected, pairing) : null;
-  const qrSvg = useQrSvg(fullUrl);
+  const localOnly = selected?.kind === "loopback";
+  const qrSvg = useQrSvg(localOnly ? null : fullUrl);
   const expired = remainingMs <= 0;
 
   // Same curated grouping as the "Reachable at" list: real endpoints inline,
   // stray "other" addresses collapsed behind a disclosure. Docker/virtual
   // interfaces never reach the frontend, so they can't appear here either.
-  const grouped = useMemo(() => groupEndpoints(endpoints), [endpoints]);
+  const grouped = useMemo(
+    () => groupEndpoints(browserEndpoints),
+    [browserEndpoints],
+  );
   const inlineEndpoints = grouped
     .filter((g) => !g.collapsible)
     .flatMap((g) => g.endpoints);
@@ -340,33 +349,35 @@ function PairingPanel({
   return (
     <div className="rounded-lg border border-border/60 bg-muted/30 p-4">
       <div className="flex flex-col gap-4 sm:flex-row">
-        {/* QR plate — always dark-on-white for camera scannability. */}
-        <div className="shrink-0 self-center sm:self-start">
-          <div
-            className={cn(
-              "flex h-[168px] w-[168px] items-center justify-center rounded-lg bg-white p-2.5 shadow-sm ring-1 ring-black/5",
-              expired && "opacity-30",
-            )}
-          >
-            {qrSvg ? (
-              <div
-                className="h-full w-full [&>svg]:h-full [&>svg]:w-full"
-                // Self-generated, trusted SVG string.
-                dangerouslySetInnerHTML={{ __html: qrSvg }}
-                aria-label="Pairing QR code"
-                role="img"
-              />
-            ) : (
-              <span className="text-label text-muted-foreground">No endpoint</span>
-            )}
+        {/* A loopback QR cannot be opened by another device. */}
+        {!localOnly && (
+          <div className="shrink-0 self-center sm:self-start">
+            <div
+              className={cn(
+                "flex h-[168px] w-[168px] items-center justify-center rounded-lg bg-white p-2.5 shadow-sm ring-1 ring-black/5",
+                expired && "opacity-30",
+              )}
+            >
+              {qrSvg ? (
+                <div
+                  className="h-full w-full [&>svg]:h-full [&>svg]:w-full"
+                  // Self-generated, trusted SVG string.
+                  dangerouslySetInnerHTML={{ __html: qrSvg }}
+                  aria-label="Pairing QR code"
+                  role="img"
+                />
+              ) : (
+                <span className="text-label text-muted-foreground">No endpoint</span>
+              )}
+            </div>
           </div>
-        </div>
+        )}
 
         <div className="min-w-0 flex-1 space-y-3">
           <div>
             <div className="flex items-center justify-between gap-2">
               <p className="text-body font-semibold text-foreground">
-                Scan or share this link
+                {localOnly ? "Open this link here" : "Scan or share this link"}
               </p>
               <span
                 className={cn(
@@ -378,16 +389,22 @@ function PairingPanel({
               </span>
             </div>
             <p className="mt-1 text-body-sm leading-relaxed text-subtle-foreground">
-              One-time link — it pairs a single device, then can't be reused.
-              Open it on your phone or laptop to connect.
+              {localOnly
+                ? "This address works only on this device or through a local tunnel. Open the link here; another device cannot scan it directly."
+                : "One-time link — it pairs a single device, then can't be reused. Open it on your phone or laptop to connect."}
             </p>
+            {selected && !selected.secure && (
+              <p className="mt-1 text-body-sm leading-relaxed text-status-attention">
+                Network observers can read this pairing secret and session traffic over plain HTTP. Use a trusted network or HTTPS.
+              </p>
+            )}
           </div>
 
           {/* Endpoint chooser — a QR is scanned from a phone, so it should
               target a reachable network address, not loopback. Grouped the
               same way as "Reachable at": inline chips for the useful
               endpoints, an "Other addresses" disclosure for the rest. */}
-          {endpoints.length > 1 && (
+          {browserEndpoints.length > 1 && (
             <div className="space-y-1.5">
               {inlineEndpoints.length > 0 && (
                 <div className="flex flex-wrap gap-1.5">
