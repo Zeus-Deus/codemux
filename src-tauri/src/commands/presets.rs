@@ -1074,6 +1074,39 @@ mod tests {
         assert!(bash.starts_with("cmx_file=$("), "{bash}");
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn fresh_remote_tabs_and_splits_render_for_bash_on_a_fish_desktop() {
+        const TEST: &str = "commands::presets::tests::fresh_remote_tabs_and_splits_render_for_bash_on_a_fish_desktop";
+        if crate::test_isolation::isolated(TEST) {
+            return;
+        }
+        std::env::set_var("SHELL", "/usr/bin/fish");
+        let state = AppStateStore::default();
+        let workspace = state.create_remote_attach_workspace(
+            "remote-svc".into(),
+            7,
+            "/srv/agent/work/svc".into(),
+            None,
+            None,
+            None,
+            None,
+        );
+        let (_, tab_session) = state.create_tab(&workspace.0, crate::state::TabKind::Terminal).unwrap();
+        let pane = active_pane_for_workspace(&state, &workspace.0).unwrap();
+        let split_session = state
+            .split_pane_with_selection(&pane, crate::state::SplitDirection::Horizontal, true)
+            .unwrap();
+
+        for session in [tab_session.unwrap().0, split_session.0] {
+            let snapshot = state.snapshot();
+            let shell = snapshot.terminal_sessions.iter().find(|terminal| terminal.session_id.0 == session).unwrap();
+            assert_eq!(shell.shell.as_deref(), Some("bash"));
+            let command = render_preset_command_for_session(&state, &workspace.0, &session, "gemini --yolo");
+            assert!(command.starts_with("cmx_file=$("), "{command}");
+        }
+    }
+
     #[test]
     fn test_write_command_to_pty_immediate() {
         let sessions = make_sessions();
