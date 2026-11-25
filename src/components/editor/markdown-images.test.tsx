@@ -22,9 +22,11 @@ afterEach(() => {
 });
 
 describe("embedded images in rendered markdown", () => {
-  it("renders inline at a readable cap rather than at the file's own size", () => {
+  it("renders inline at a readable cap rather than at the file's own size", async () => {
     render(<MarkdownRendered content={DOC} filePath="/tmp/a/README.md" inline />);
 
+    expect(screen.queryByTestId("markdown-image")).not.toBeInTheDocument();
+    await userEvent.setup().click(screen.getByTestId("markdown-image-load"));
     const img = screen.getByTestId("markdown-image");
     expect(img).toHaveAttribute("src", SHOT);
     expect(img).toHaveAttribute("alt", "before and after");
@@ -39,6 +41,7 @@ describe("embedded images in rendered markdown", () => {
 
     expect(screen.queryByTestId("image-lightbox")).not.toBeInTheDocument();
 
+    await user.click(screen.getByTestId("markdown-image-load"));
     await user.click(screen.getByTestId("markdown-image"));
 
     const overlay = screen.getByTestId("image-lightbox");
@@ -53,6 +56,7 @@ describe("embedded images in rendered markdown", () => {
     const user = userEvent.setup();
     render(<MarkdownRendered content={DOC} filePath="/tmp/a/README.md" inline />);
 
+    await user.click(screen.getByTestId("markdown-image-load"));
     await user.click(screen.getByTestId("markdown-image"));
     // Clicking the picture is looking closer, not leaving.
     await user.click(screen.getByTestId("image-lightbox-image"));
@@ -66,6 +70,7 @@ describe("embedded images in rendered markdown", () => {
     const user = userEvent.setup();
     render(<MarkdownRendered content={"![shot](./shot.png)"} filePath="/tmp/a/README.md" inline />);
 
+    await user.click(screen.getByTestId("markdown-image-load"));
     await user.click(screen.getByTestId("markdown-image"));
     expect(screen.getByTestId("image-lightbox")).toBeInTheDocument();
     expect(

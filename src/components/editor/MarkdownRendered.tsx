@@ -1,4 +1,4 @@
-import { memo, useCallback, useMemo, useState } from "react";
+import { memo, useCallback, useMemo, useRef, useState, type ComponentProps } from "react";
 import { convertFileSrc, isTauri } from "@tauri-apps/api/core";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import { ExternalLink } from "lucide-react";
@@ -8,7 +8,7 @@ import rehypeSanitize, { defaultSchema, type Options as SanitizeSchema } from "r
 import remarkGfm from "remark-gfm";
 import type { PluggableList } from "unified";
 
-import { isAbsoluteFsPath, isRemoteOrDataUrl, resolveAssetSrc } from "@/lib/asset-url";
+import { dirname, isAbsoluteFsPath, isRemoteOrDataUrl, joinPath, resolveAssetSrc } from "@/lib/asset-url";
 import { openExternalUrl } from "@/lib/open-url";
 import { toast } from "@/lib/toast";
 import {
@@ -115,8 +115,93 @@ function isLocalAssetImageSrc(src: string): boolean {
   }
 }
 
+/** Inspect URL-encoded and literal separators before the asset handler can
+ * resolve a document-supplied path into a network share or device namespace. */
+function isNetworkOrDeviceImagePath(value: string): boolean {
+  let path = value.trimStart();
+  for (let depth = 0; depth < 6; depth += 1) {
+    const slashes = path.replace(/\\/g, "/");
+    if (slashes.startsWith("//") || slashes.startsWith("/??/")) return true;
+    let decoded: string;
+    try {
+      decoded = decodeURIComponent(path);
+    } catch {
+      return false;
+    }
+    if (decoded === path) return false;
+    path = decoded;
+  }
+  return true;
+}
+
+/** The path portion is kept raw until the network-prefix check above, since
+ * URL parsing may normalize leading separators before the native handler. */
+function nativeAssetPath(src: string): string | null {
+  const match = /^(?:(?:asset|tauri):\/\/localhost|http:\/\/asset\.localhost)(\/[^?#]*)/i.exec(src);
+  return match?.[1] ?? null;
+}
+
+function InertImageReference({ src, alt }: { src: string; alt: string }) {
+  return <span title={src}>{alt || "Image reference"}</span>;
+}
+
+/** A document path can traverse a mapped drive, mount, junction, or symlink.
+ * Do not hand it to the asset handler until the reader asks to load it. */
+function DeferredLocalImage({
+  src,
+  alt,
+  displayPath,
+  originalHref,
+  onZoom,
+  ...rest
+}: ComponentProps<"img"> & {
+  src: string;
+  displayPath: string;
+  originalHref: string | null;
+  onZoom: (src: string, alt: string, href: string | null) => void;
+}) {
+  const [loaded, setLoaded] = useState(false);
+  if (!loaded) {
+    return (
+      <button
+        type="button"
+        data-testid="markdown-image-load"
+        className="my-2 flex max-w-full flex-col items-start gap-1 break-all text-left text-primary underline"
+        onClick={(event) => {
+          event.preventDefault();
+          event.stopPropagation();
+          setLoaded(true);
+        }}
+        onAuxClick={(event) => {
+          event.preventDefault();
+          event.stopPropagation();
+        }}
+      >
+        <span>{alt ? `Load local image: ${alt}` : "Load local image"}</span>
+        <span className="font-mono text-xs text-muted-foreground">{displayPath}</span>
+      </button>
+    );
+  }
+  return (
+    <img
+      {...rest}
+      src={src}
+      alt={alt}
+      loading="lazy"
+      data-testid="markdown-image"
+      className="my-2 max-h-[360px] w-auto max-w-full cursor-zoom-in rounded-md border border-border/60 object-contain"
+      onClick={(event) => {
+        event.preventDefault();
+        event.stopPropagation();
+        onZoom(src, alt ?? "", originalHref);
+      }}
+    />
+  );
+}
+
 function RemoteImageReference({ src, alt }: { src: string; alt: string }) {
   const [confirmationOpen, setConfirmationOpen] = useState(false);
+  const triggerRef = useRef<HTMLButtonElement>(null);
   const openConfirmedImage = () => {
     void openUrl(src).catch((error) => {
       toast.error("Could not open the image", {
@@ -128,6 +213,7 @@ function RemoteImageReference({ src, alt }: { src: string; alt: string }) {
   return (
     <AlertDialog open={confirmationOpen} onOpenChange={setConfirmationOpen}>
       <button
+        ref={triggerRef}
         type="button"
         className="my-2 inline-flex max-w-full items-center gap-1.5 break-all text-left text-primary underline"
         onClick={(event) => {
@@ -144,6 +230,10 @@ function RemoteImageReference({ src, alt }: { src: string; alt: string }) {
         {alt ? `Open remote image: ${alt}` : "Open remote image"}
       </button>
       <AlertDialogContent
+        onCloseAutoFocus={(event) => {
+          event.preventDefault();
+          triggerRef.current?.focus();
+        }}
         onClick={(event) => event.stopPropagation()}
         onAuxClick={(event) => event.stopPropagation()}
         overlayProps={{
@@ -285,7 +375,7 @@ function MarkdownRenderedImpl({
         const label = alt ?? "";
         if (untrusted) return label || "Image";
         let imagePath = src;
-        if (src && !isRemoteOrDataUrl(src) && (filePath || isAbsoluteFsPath(src))) {
+        if (src && !isRemoteOrDataUrl(src)) {
           // Markdown destinations are URLs, but the asset protocol expects a
           // filesystem path and encodes it again. Decode only the destination,
           // leaving the base file's literal directory names intact.
@@ -304,23 +394,87 @@ function MarkdownRenderedImpl({
           const url = webUrl(imagePath.startsWith("//") ? `https:${imagePath}` : imagePath);
           return url ? <RemoteImageReference src={url.href} alt={label} /> : label || "Image";
         }
-        const resolved = resolveAssetSrc(imagePath, filePath);
+        if (!imagePath) return label || "Image";
+
+        const zoom = (resolved: string, alt: string, href: string | null) => {
+          setZoomed({ src: resolved, alt, href });
+        };
+        // Embedded data and existing Blob URLs do not ask the filesystem or
+        // network to resolve a document-supplied path.
+        if (/^(?:data|blob):/i.test(imagePath)) {
+          return (
+            <img
+              {...rest}
+              src={imagePath}
+              alt={label}
+              loading="lazy"
+              data-testid="markdown-image"
+              className="my-2 max-h-[360px] w-auto max-w-full cursor-zoom-in rounded-md border border-border/60 object-contain"
+              onClick={(event) => {
+                event.preventDefault();
+                event.stopPropagation();
+                zoom(imagePath, label, src ?? null);
+              }}
+            />
+          );
+        }
+
+        // An asset URL is still a filesystem path. Its registered origin is
+        // not proof that the decoded target is local or that a mapped drive
+        // cannot reach a share. Keep it out of <img> until a deliberate click.
+        const assetPath = nativeAssetPath(imagePath);
+        if (assetPath !== null) {
+          if (isNetworkOrDeviceImagePath(assetPath)) {
+            return <InertImageReference src={imagePath} alt={label} />;
+          }
+          if (/^(?:asset|tauri):/i.test(imagePath)) {
+            let registered = false;
+            try {
+              const scheme = imagePath.slice(0, imagePath.indexOf(":")).toLowerCase();
+              registered = isTauri() && convertFileSrc("/__codemux_asset_probe__")
+                .toLowerCase().startsWith(`${scheme}://localhost/`);
+            } catch {
+              // No registered asset endpoint in this webview.
+            }
+            if (!registered) return <InertImageReference src={imagePath} alt={label} />;
+          } else if (!isLocalAssetImageSrc(imagePath)) {
+            return <InertImageReference src={imagePath} alt={label} />;
+          }
+          return (
+            <DeferredLocalImage
+              key={imagePath}
+              {...rest}
+              src={imagePath}
+              alt={label}
+              displayPath={imagePath}
+              originalHref={src ?? null}
+              onZoom={zoom}
+            />
+          );
+        }
+        if (/^[a-z][a-z\d+.-]*:/i.test(imagePath) && !/^[a-z]:[\\/]/i.test(imagePath)) {
+          return <InertImageReference src={imagePath} alt={label} />;
+        }
+        // A relative reference without a file location could become a browser
+        // request to the app's own origin; it has no stable local target.
+        const localPath = isAbsoluteFsPath(imagePath)
+          ? imagePath
+          : filePath ? joinPath(dirname(filePath), imagePath) : null;
+        if (!localPath || isNetworkOrDeviceImagePath(imagePath)
+            || isNetworkOrDeviceImagePath(localPath)) {
+          return <InertImageReference src={imagePath} alt={label} />;
+        }
+        const resolved = resolveAssetSrc(localPath, null);
+        if (!resolved) return <InertImageReference src={imagePath} alt={label} />;
         return (
-          <img
+          <DeferredLocalImage
+            key={resolved}
             {...rest}
             src={resolved}
             alt={label}
-            loading="lazy"
-            data-testid="markdown-image"
-            className="my-2 max-h-[360px] w-auto max-w-full cursor-zoom-in rounded-md border border-border/60 object-contain"
-            onClick={() => {
-              if (!resolved) return;
-              setZoomed({
-                src: resolved,
-                alt: label,
-                href: src ?? null,
-              });
-            }}
+            displayPath={localPath}
+            originalHref={src ?? null}
+            onZoom={zoom}
           />
         );
       },
