@@ -91,8 +91,10 @@ import {
   useVisibleSidebarDraftCount,
 } from "./sidebar-draft-block";
 import { Eyebrow } from "@/components/ui/eyebrow";
+import { Button } from "@/components/ui/button";
 import { PresenceList, PresenceRow } from "@/components/ui/presence";
 import { useRemoteWorkspaces } from "@/environments/remote-workspaces";
+import { retryEnvironmentConnection } from "@/environments/runtime";
 import { useEnvironmentsStore } from "@/environments/store";
 import { SidebarEmptyState } from "./sidebar-empty-state";
 import { SidebarHeaderActions } from "./sidebar-action-row";
@@ -847,17 +849,35 @@ function activeRowIn(root: HTMLElement | null, workspaceId: string): HTMLElement
 }
 
 function EnvironmentApprovalRequests() {
-  const pending = useEnvironmentsStore(useShallow((state) =>
-    Object.values(state.environments).filter((view) => view.status === "pending-approval"),
+  const requests = useEnvironmentsStore(useShallow((state) =>
+    Object.values(state.environments).filter((view) =>
+      view.status === "pending-approval" || view.status === "revoked"),
   ));
-  if (pending.length === 0) return null;
+  if (requests.length === 0) return null;
   return (
     <ul className="space-y-1 px-1 pb-2" aria-label="Environment access requests">
-      {pending.map(({ device, pendingBrowserLabel }) => (
+      {requests.map(({ device, status, pendingBrowserLabel }) => (
         <li key={device.deviceId} className="rounded-md border border-status-working/30 px-2.5 py-2">
-          <p className="break-words text-label font-medium text-status-working">
-            Waiting for approval on {device.name}
-          </p>
+          {status === "revoked" ? (
+            <div className="flex items-start justify-between gap-2">
+              <p className="min-w-0 break-words text-label font-medium text-foreground">
+                Access revoked on {device.name}
+              </p>
+              <Button
+                type="button"
+                size="sm"
+                variant="outline"
+                aria-label={`Retry access to ${device.name}`}
+                onClick={() => retryEnvironmentConnection(device.deviceId)}
+              >
+                Retry
+              </Button>
+            </div>
+          ) : (
+            <p className="break-words text-label font-medium text-status-working">
+              Waiting for approval on {device.name}
+            </p>
+          )}
           {pendingBrowserLabel && (
             <p className="mt-0.5 text-body-sm text-muted-foreground">{pendingBrowserLabel}</p>
           )}

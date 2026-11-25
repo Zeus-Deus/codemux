@@ -7,6 +7,7 @@ import type { IrohByteStream, IrohDialer } from "@/remote/iroh-transport";
 import type { AppStateSnapshot, PaneStatus, RevisionedDelta, WorkspaceSnapshot } from "@/tauri/types";
 
 import { openEnvironmentConnection } from "./connection";
+import { retryEnvironmentConnection, startEnvironmentRuntime } from "./runtime";
 import { useEnvironmentsStore, type EnvironmentView } from "./store";
 
 const enc = new TextEncoder();
@@ -421,9 +422,9 @@ describe("openEnvironmentConnection", () => {
   });
 
   it.each([
-    ["session_revoked", "This machine revoked access for this client."],
-    ["client_update_required", "Update Codemux and try again."],
-  ])("reports relay refusal %s separately from account sign-in", async (reason, error) => {
+    ["session_revoked", "revoked", "This machine revoked access for this client."],
+    ["client_update_required", "unauthorized", "Update Codemux and try again."],
+  ])("reports relay refusal %s separately from account sign-in", async (reason, status, error) => {
     const machine = new FakeMachine((frame) =>
       frame.t === "hello-account" ? { t: "unauthorized", reason } : null,
     );
@@ -435,8 +436,75 @@ describe("openEnvironmentConnection", () => {
       onUpdate,
     });
     await settle();
-    expect(patches[patches.length - 1]).toEqual({ status: "unauthorized", error });
+    expect(patches[patches.length - 1]).toEqual({ status, error });
     connection.close();
+  });
+
+  it("manually retries a revoked environment with its saved browser key and reconnects after approval", async () => {
+    vi.useFakeTimers();
+    const remote = { ...device, deviceId: "env-retry", nodeId: "node-retry", lastSeenAt: new Date().toISOString() };
+    const storageKey = `codemux.iroh.browser-key.v1.${remote.nodeId}`;
+    const browserKey = "a1".repeat(32);
+    const browserLabel = "Relay browser 1234ABCD";
+    window.localStorage.setItem(storageKey, browserKey);
+
+    let ownerDecision: "revoked" | "pending" | "approved" = "revoked";
+    const hellos: Array<Record<string, unknown>> = [];
+    const dial = vi.fn(async (_target: Parameters<IrohDialer["dial"]>[0]) => new FakeMachine((frame) => {
+      if (frame.t === "hello-account") {
+        hellos.push(frame);
+        switch (ownerDecision) {
+          case "revoked": return { t: "unauthorized", reason: "session_revoked" };
+          case "pending": return { t: "unauthorized", reason: "pending_approval", browser_label: browserLabel };
+          case "approved": return { t: "welcome", session_id: "approved-session" };
+        }
+      }
+      if (frame.t === "invoke" && frame.cmd === "get_app_state") {
+        return { t: "ok", id: frame.id, data: snapshot(1, ["approved workspace"]) };
+      }
+      return null;
+    }));
+    const connectDevice = vi.fn(async (_deviceId: string) => ({ ...grant, nodeId: remote.nodeId }));
+    const listDevices = vi.fn(async () => [remote]);
+    const runtime = startEnvironmentRuntime({
+      registry: { listDevices, connectDevice },
+      dialer: { dial },
+      selfId: null,
+    });
+    const environment = () => useEnvironmentsStore.getState().environments[remote.deviceId];
+
+    try {
+      await runtime.refresh();
+      await vi.advanceTimersByTimeAsync(0);
+      expect(environment().status).toBe("revoked");
+
+      ownerDecision = "pending";
+      listDevices.mockResolvedValueOnce([{ ...remote, lastSeenAt: null }]);
+      await vi.advanceTimersByTimeAsync(60_000);
+      expect(environment().status).toBe("revoked");
+      await vi.advanceTimersByTimeAsync(60_000);
+      expect(listDevices).toHaveBeenCalledTimes(3);
+      expect(connectDevice).toHaveBeenCalledTimes(1);
+      expect(dial).toHaveBeenCalledTimes(1);
+      expect(environment().status).toBe("revoked");
+
+      retryEnvironmentConnection(remote.deviceId);
+      await vi.advanceTimersByTimeAsync(0);
+      expect(dial).toHaveBeenCalledTimes(2);
+      expect(environment()).toMatchObject({ status: "pending-approval", pendingBrowserLabel: browserLabel });
+
+      ownerDecision = "approved";
+      await vi.advanceTimersByTimeAsync(1_000);
+      expect(environment()).toMatchObject({ status: "connected", pendingBrowserLabel: null, error: null });
+      expect(environment().appState?.workspaces[0].title).toBe("approved workspace");
+      expect(hellos.map((frame) => frame.browser_key)).toEqual([browserKey, browserKey, browserKey]);
+      expect(new Set(hellos.map((frame) => frame.nonce)).size).toBe(3);
+      expect(connectDevice.mock.calls.map(([id]) => id)).toEqual([remote.id, remote.id, remote.id]);
+      expect(dial.mock.calls.map(([target]) => target.nodeId)).toEqual([remote.nodeId, remote.nodeId, remote.nodeId]);
+    } finally {
+      runtime.stop();
+      window.localStorage.removeItem(storageKey);
+    }
   });
 
   it("reports an offline machine and stops reporting once closed", async () => {

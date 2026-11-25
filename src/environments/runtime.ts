@@ -17,6 +17,11 @@ import { useEnvironmentsStore } from "./store";
 const CATALOG_REFRESH_MS = 60_000;
 /** Three missed registration refreshes: the machine is off or not sharing. */
 const STALE_AFTER_MS = 15 * 60_000;
+let retryActiveConnection: ((id: string) => void) | undefined;
+
+export function retryEnvironmentConnection(id: string): void {
+  retryActiveConnection?.(id);
+}
 
 export interface EnvironmentRuntimeOptions {
   registry: Pick<DeviceRegistry, "listDevices" | "connectDevice">;
@@ -48,6 +53,31 @@ export function startEnvironmentRuntime(opts: EnvironmentRuntimeOptions): Enviro
     connections.delete(id);
   };
 
+  const connect = (device: RegisteredDevice) => {
+    const id = device.deviceId;
+    disconnect(id);
+    useEnvironmentsStore.getState().update(id, { status: "connecting", error: null });
+    connections.set(id, {
+      device,
+      connection: openEnvironmentConnection({
+        device,
+        registry: opts.registry,
+        dialer: opts.dialer,
+        onUpdate: (patch) => useEnvironmentsStore.getState().update(id, patch),
+      }),
+    });
+  };
+
+  const retry = (id: string) => {
+    const view = useEnvironmentsStore.getState().environments[id];
+    const existing = connections.get(id)?.device;
+    if (!stopped && view?.status === "revoked"
+      && existing?.id === view.device.id && existing.nodeId === view.device.nodeId) {
+      connect(view.device);
+    }
+  };
+  retryActiveConnection = retry;
+
   const refreshCatalog = async () => {
     let devices: RegisteredDevice[];
     try {
@@ -67,28 +97,18 @@ export function startEnvironmentRuntime(opts: EnvironmentRuntimeOptions): Enviro
 
     const wanted = new Set<string>();
     for (const device of others) {
-      if (!isRecentlySeen(device, now())) {
+      const existing = connections.get(device.deviceId);
+      const sameConnection = existing?.device.nodeId === device.nodeId && existing.device.id === device.id;
+      const revoked = useEnvironmentsStore.getState().environments[device.deviceId]?.status === "revoked";
+      // A stale registration must not turn revocation into an automatic dial.
+      if (!isRecentlySeen(device, now()) && !(sameConnection && revoked)) {
         disconnect(device.deviceId);
         useEnvironmentsStore.getState().update(device.deviceId, { status: "offline" });
         continue;
       }
       wanted.add(device.deviceId);
-      const existing = connections.get(device.deviceId);
       // A re-registration with a new address needs a fresh connection.
-      if (existing && existing.device.nodeId === device.nodeId && existing.device.id === device.id) {
-        continue;
-      }
-      disconnect(device.deviceId);
-      useEnvironmentsStore.getState().update(device.deviceId, { status: "connecting", error: null });
-      connections.set(device.deviceId, {
-        device,
-        connection: openEnvironmentConnection({
-          device,
-          registry: opts.registry,
-          dialer: opts.dialer,
-          onUpdate: (patch) => useEnvironmentsStore.getState().update(device.deviceId, patch),
-        }),
-      });
+      if (!sameConnection) connect(device);
     }
     for (const id of [...connections.keys()]) {
       if (!wanted.has(id)) disconnect(id);
@@ -113,6 +133,7 @@ export function startEnvironmentRuntime(opts: EnvironmentRuntimeOptions): Enviro
     stop: () => {
       if (stopped) return;
       stopped = true;
+      if (retryActiveConnection === retry) retryActiveConnection = undefined;
       clearInterval(timer);
       for (const id of [...connections.keys()]) disconnect(id);
       useEnvironmentsStore.getState().reset();

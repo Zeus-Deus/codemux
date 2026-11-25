@@ -64,7 +64,7 @@ export function openEnvironmentConnection(
   let fetching = false;
   let fetchEpoch = 0;
   let requiredRevision = 0;
-  let browserRejection: string | undefined;
+  let browserRejected = false;
 
   const clearGap = () => {
     clearTimeout(gapTimer);
@@ -163,10 +163,10 @@ export function openEnvironmentConnection(
     onPending: (browserLabel) =>
       update({ status: "pending-approval", pendingBrowserLabel: browserLabel ?? null, error: null }),
     onBrowserRejected: (reason) => {
-      browserRejection = reason === "session_revoked"
-        ? "This machine revoked access for this client."
-        : "Update Codemux and try again.";
-      update({ status: "unauthorized", error: browserRejection });
+      browserRejected = true;
+      update(reason === "session_revoked"
+        ? { status: "revoked", error: "This machine revoked access for this client." }
+        : { status: "unauthorized", error: "Update Codemux and try again." });
     },
     onMintError: (error) => {
       if (error.kind === "unauthorized" || error.kind === "not_found") return;
@@ -200,7 +200,7 @@ export function openEnvironmentConnection(
         if (connected) resync();
       },
       onUnauthorized: () => {
-        if (!browserRejection) {
+        if (!browserRejected) {
           update({ status: "unauthorized", error: "Sign in again to reach this machine." });
         }
       },

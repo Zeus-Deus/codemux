@@ -16,7 +16,8 @@ export interface EnvironmentDescriptor {
  * Where a connection to another environment stands.
  * - `pending-approval`: the machine has not yet approved this device.
  * - `offline`: the machine is unreachable; the client keeps retrying.
- * - `unauthorized`: the account session ended or the machine refused this client.
+ * - `revoked`: the machine blocked this browser; Retry is a requester action.
+ * - `unauthorized`: the account session ended or the client must be updated.
  */
 export type EnvironmentStatus =
   | "connecting"
@@ -24,6 +25,7 @@ export type EnvironmentStatus =
   | "reconnecting"
   | "pending-approval"
   | "offline"
+  | "revoked"
   | "unauthorized";
 
 /** One of the account's other machines, live. */
