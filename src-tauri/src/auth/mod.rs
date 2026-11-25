@@ -84,11 +84,11 @@ struct ApiSession {
 
 /// Stored on disk (encrypted)
 #[derive(Debug, Serialize, Deserialize)]
-struct StoredAuth {
-    token: String,
-    expires_at: String,
+pub(crate) struct StoredAuth {
+    pub(crate) token: String,
+    pub(crate) expires_at: String,
     #[serde(default)]
-    user: Option<AuthUser>,
+    pub(crate) user: Option<AuthUser>,
     /// `"email"` or `"github"`. Persisted so a cold start can
     /// restore which signin path produced this session — the
     /// Settings → Sync section needs it to choose between the
@@ -98,7 +98,35 @@ struct StoredAuth {
     /// written before this field existed; `#[serde(default)]`
     /// means a missing field deserializes to `None`.
     #[serde(default)]
-    auth_method: Option<String>,
+    pub(crate) auth_method: Option<String>,
+}
+
+/// One persisted session and the exact bytes needed to conditionally update it.
+pub(crate) struct AuthRecord {
+    encrypted: Vec<u8>,
+    pub(crate) stored: StoredAuth,
+}
+
+impl AuthRecord {
+    pub(crate) fn is_current(&self, db: &DatabaseStore) -> bool {
+        db.load_auth_token().as_deref() == Some(self.encrypted.as_slice())
+    }
+
+    pub(crate) fn save_verified_user(
+        self,
+        db: &DatabaseStore,
+        user: &AuthUser,
+    ) -> Result<Option<Self>, String> {
+        let stored = StoredAuth {
+            user: Some(user.clone()),
+            ..self.stored
+        };
+        let encrypted = encode_record(&stored)?;
+        if !db.save_auth_token_if_current(&self.encrypted, &encrypted, Some(&user.id))? {
+            return Ok(None);
+        }
+        Ok(Some(Self { encrypted, stored }))
+    }
 }
 
 // ── Auth State (managed by Tauri) ────────────────────────────────
@@ -228,22 +256,61 @@ impl AuthState {
         (assigned_generation, replace())
     }
 
-    /// Conditionally replace the current session and advance its generation.
-    /// This is the definitive-clear counterpart to
-    /// [`Self::commit_if_session_current`]: expiry/401 handling must invalidate
-    /// other remote work launched for the token it just removed.
-    pub fn replace_session_if_current<T>(
+    /// Advance the generation only once the local replacement has succeeded.
+    pub(crate) fn try_replace_session<T>(
+        &self,
+        replace: impl FnOnce() -> Result<T, String>,
+    ) -> Result<T, String> {
+        let mut generation = self.session_generation.lock().unwrap();
+        let result = replace()?;
+        *generation = generation.saturating_add(1);
+        Ok(result)
+    }
+
+    /// Advance the generation only if the expected session was replaced.
+    fn replace_session_if_current<T>(
         &self,
         expected_generation: u64,
-        replace: impl FnOnce() -> T,
-    ) -> Option<(u64, T)> {
+        replace: impl FnOnce() -> Result<Option<T>, String>,
+    ) -> Result<Option<(u64, T)>, String> {
         let mut generation = self.session_generation.lock().unwrap();
         if *generation != expected_generation {
-            return None;
+            return Ok(None);
         }
+        let Some(result) = replace()? else {
+            return Ok(None);
+        };
         *generation = generation.saturating_add(1);
-        let assigned_generation = *generation;
-        Some((assigned_generation, replace()))
+        Ok(Some((*generation, result)))
+    }
+
+    pub(crate) fn clear_local_session(&self) {
+        crate::settings_sync::clear_cache();
+        self.set_local_session(None);
+    }
+
+    pub(crate) fn set_local_session(&self, stored: Option<&StoredAuth>) {
+        let user = stored.and_then(|stored| stored.user.as_ref());
+        crate::settings_sync::set_cache_owner(user.map(|user| user.id.as_str()));
+        self.set_auth_method(stored.and_then(|stored| stored.auth_method.as_deref()));
+    }
+
+    pub(crate) fn clear_session_if_current(
+        &self,
+        db: &DatabaseStore,
+        generation: u64,
+        record: &AuthRecord,
+        on_clear: impl FnOnce(),
+    ) -> Result<bool, String> {
+        self.replace_session_if_current(generation, || {
+            if !db.clear_auth_token_if_current(&record.encrypted)? {
+                return Ok(None);
+            }
+            self.clear_local_session();
+            on_clear();
+            Ok(Some(()))
+        })
+        .map(|cleared| cleared.is_some())
     }
 }
 
@@ -272,6 +339,7 @@ pub(crate) fn clear_token_for_sign_out(db: &DatabaseStore) -> Result<(), String>
 }
 
 fn clear_token_for_sign_out_at(db: &DatabaseStore, path: &Path) -> Result<(), String> {
+    db.require_persistent_auth_storage()?;
     clear_token(db)?;
     if let Err(error) = remove_legacy_token_file_at(path) {
         eprintln!("[auth] Signed out, but could not remove legacy token file: {error}");
@@ -381,24 +449,45 @@ pub fn save_auth(
     expires_at: &str,
     user: Option<&AuthUser>,
 ) -> Result<(), String> {
-    // Preserve any previously-persisted auth_method across token
-    // refreshes (signin → check_auth verify success → save_auth)
-    // so the value set by the signin path doesn't get clobbered.
-    // Callers that intend to set a new auth_method should follow
-    // this with `save_stored_auth_method`.
-    let existing_auth_method = load_stored_auth_method(db);
+    let method = load_stored_auth_method(db);
+    save_auth_with_method(db, token, expires_at, user, method.as_deref()).map(|_| ())
+}
+
+pub(crate) fn save_auth_with_method(
+    db: &DatabaseStore,
+    token: &str,
+    expires_at: &str,
+    user: Option<&AuthUser>,
+    method: Option<&str>,
+) -> Result<AuthRecord, String> {
     let stored = StoredAuth {
         token: token.to_string(),
         expires_at: expires_at.to_string(),
         user: user.cloned(),
-        auth_method: existing_auth_method,
+        auth_method: method.map(str::to_owned),
     };
-    let json = serde_json::to_vec(&stored).map_err(|e| format!("serialize: {e}"))?;
-    let encrypted = encrypt_data(&json)?;
+    let encrypted = encode_record(&stored)?;
     match user {
-        Some(user) => db.save_auth_token_for_account(&encrypted, &user.id),
-        None => db.save_auth_token(&encrypted),
+        Some(user) => db.save_auth_token_for_account(&encrypted, &user.id)?,
+        None => db.save_auth_token(&encrypted)?,
     }
+    Ok(AuthRecord { encrypted, stored })
+}
+
+fn encode_record(stored: &StoredAuth) -> Result<Vec<u8>, String> {
+    let json = serde_json::to_vec(stored).map_err(|e| format!("serialize: {e}"))?;
+    encrypt_data(&json)
+}
+
+fn decode_record(encrypted: &[u8]) -> Option<StoredAuth> {
+    let decrypted = decrypt_data(encrypted).ok()?;
+    serde_json::from_slice(&decrypted).ok()
+}
+
+pub(crate) fn load_auth_record(db: &DatabaseStore) -> Option<AuthRecord> {
+    let encrypted = db.load_auth_token()?;
+    let stored = decode_record(&encrypted)?;
+    Some(AuthRecord { encrypted, stored })
 }
 
 /// Dev/test-only: seed an offline auth session so an automated end-to-end
@@ -433,51 +522,35 @@ pub fn seed_dev_offline_login(db: &DatabaseStore) {
     }
 }
 
-/// Update only the `auth_method` field of the stored auth record,
-/// preserving token/expires_at/user. Called by the signin paths
-/// (email, github) and by `setup_sync_password` so the value
-/// survives a cold-start `check_auth` and the frontend can choose
-/// between SetupSyncPasswordForm and ProvidePasswordForm correctly.
+/// Update the sign-in method without modifying a concurrent replacement.
 pub fn save_stored_auth_method(db: &DatabaseStore, method: Option<&str>) -> Result<(), String> {
-    let data = db
-        .load_auth_token()
-        .ok_or_else(|| "no stored auth".to_string())?;
-    let decrypted = decrypt_data(&data).map_err(|e| format!("decrypt: {e}"))?;
-    let mut stored: StoredAuth =
-        serde_json::from_slice(&decrypted).map_err(|e| format!("parse stored auth: {e}"))?;
-    stored.auth_method = method.map(|s| s.to_string());
-    let json = serde_json::to_vec(&stored).map_err(|e| format!("serialize: {e}"))?;
-    let encrypted = encrypt_data(&json)?;
-    db.save_auth_token(&encrypted)
+    let mut record = load_auth_record(db).ok_or_else(|| "No stored session".to_string())?;
+    record.stored.auth_method = method.map(str::to_owned);
+    let encrypted = encode_record(&record.stored)?;
+    if db.save_auth_token_if_current(&record.encrypted, &encrypted, None)? {
+        Ok(())
+    } else {
+        Err("Authentication changed before the sign-in method update".into())
+    }
 }
 
 pub fn load_token(db: &DatabaseStore) -> Option<(String, String)> {
-    let data = db.load_auth_token()?;
-    let decrypted = decrypt_data(&data).ok()?;
-    let stored: StoredAuth = serde_json::from_slice(&decrypted).ok()?;
+    let stored = load_auth_record(db)?.stored;
     Some((stored.token, stored.expires_at))
 }
 
 pub fn load_cached_user(db: &DatabaseStore) -> Option<AuthUser> {
-    let data = db.load_auth_token()?;
-    let decrypted = decrypt_data(&data).ok()?;
-    let stored: StoredAuth = serde_json::from_slice(&decrypted).ok()?;
-    stored.user
+    load_auth_record(db)?.stored.user
 }
 
 /// Identity eligible to admit account-based remote sessions.
-pub(crate) fn load_active_account_id(db: &DatabaseStore) -> Option<String> {
-    let data = db.load_auth_token()?;
-    let decrypted = decrypt_data(&data).ok()?;
-    let stored: StoredAuth = serde_json::from_slice(&decrypted).ok()?;
+pub(crate) fn active_account_id_from_record(record: &[u8]) -> Option<String> {
+    let stored = decode_record(record)?;
     (!is_token_expired(&stored.expires_at)).then_some(stored.user?.id)
 }
 
 pub fn load_stored_auth_method(db: &DatabaseStore) -> Option<String> {
-    let data = db.load_auth_token()?;
-    let decrypted = decrypt_data(&data).ok()?;
-    let stored: StoredAuth = serde_json::from_slice(&decrypted).ok()?;
-    stored.auth_method
+    load_auth_record(db)?.stored.auth_method
 }
 
 pub fn clear_token(db: &DatabaseStore) -> Result<(), String> {
@@ -586,44 +659,48 @@ pub fn start_callback_server<R: tauri::Runtime>(
                         };
 
                         let db: tauri::State<'_, DatabaseStore> = handle_clone.state();
-                        // OAuth is a complete account replacement. Advance the
-                        // same generation used by after-paint verification
-                        // before writing anything, so a response launched for
-                        // the previous account cannot commit over this token.
-                        let Some((oauth_generation, replacement)) = auth_state_local
-                            .replace_session_if_current(oauth_launch_generation, || {
-                                // The new token has no trusted identity until the
-                                // verify response arrives. Hide the previous
-                                // account's settings during that interval.
-                                crate::settings_sync::set_cache_owner(None);
-                                save_token(&db, token, expires_at)?;
-                                auth_state_local.set_auth_method(Some("github"));
-                                save_stored_auth_method(&db, Some("github"))
-                            })
-                        else {
-                            let body = r#"{"error":"Authentication changed before callback"}"#;
-                            let resp = format!(
-                                "HTTP/1.1 409 Conflict\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
-                                body.len(),
-                                body
-                            );
-                            let _ = stream.write_all(resp.as_bytes());
-                            break;
+                        let replacement = auth_state_local.replace_session_if_current(
+                            oauth_launch_generation,
+                            || {
+                                let record = save_auth_with_method(
+                                    &db,
+                                    token,
+                                    expires_at,
+                                    None,
+                                    Some("github"),
+                                )?;
+                                // Keep the previous account's settings hidden while
+                                // the callback token awaits identity verification.
+                                auth_state_local.set_local_session(Some(&record.stored));
+                                Ok(Some(record))
+                            },
+                        );
+                        let (oauth_generation, record) = match replacement {
+                            Ok(Some(replacement)) => replacement,
+                            Ok(None) => {
+                                let body = r#"{"error":"Authentication changed before callback"}"#;
+                                let resp = format!(
+                                    "HTTP/1.1 409 Conflict\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+                                    body.len(),
+                                    body
+                                );
+                                let _ = stream.write_all(resp.as_bytes());
+                                break;
+                            }
+                            Err(e) => {
+                                eprintln!("[auth] Failed to persist OAuth callback: {e}");
+                                let body = r#"{"error":"Failed to persist session"}"#;
+                                let resp = format!(
+                                    "HTTP/1.1 500 Internal Server Error\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+                                    body.len(),
+                                    body
+                                );
+                                let _ = stream.write_all(resp.as_bytes());
+                                continue;
+                            }
                         };
-                        if let Err(e) = replacement {
-                            eprintln!("[auth] Failed to persist OAuth callback: {e}");
-                            let body = r#"{"error":"Failed to persist session"}"#;
-                            let resp = format!(
-                                "HTTP/1.1 500 Internal Server Error\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
-                                body.len(),
-                                body
-                            );
-                            let _ = stream.write_all(resp.as_bytes());
-                            continue;
-                        }
 
-                        // Emit auth event to frontend
-                        emit_auth_state(&handle_clone, token, expires_at, oauth_generation);
+                        emit_auth_state(&handle_clone, record, oauth_generation);
 
                         let html = SUCCESS_HTML;
                         let resp = format!(
@@ -704,11 +781,12 @@ fn emit_callback_auth_state<R: tauri::Runtime>(
 
 fn emit_auth_state<R: tauri::Runtime>(
     app: &tauri::AppHandle<R>,
-    token: &str,
-    expires_at: &str,
+    record: AuthRecord,
     session_generation: u64,
 ) {
     let auth_state: tauri::State<'_, AuthState> = app.state();
+    let db: tauri::State<'_, DatabaseStore> = app.state();
+    let token = &record.stored.token;
     // Fetch user data from API to populate the event
     let base = api_base_url();
     let url = format!("{base}/api/auth/desktop/verify");
@@ -743,48 +821,44 @@ fn emit_auth_state<R: tauri::Runtime>(
         Err(_) => CallbackVerifyOutcome::Offline,
     };
 
-    // Cache and emit only if this is still the OAuth session that launched
-    // the verify request. Sign-out or a subsequent sign-in advances the
-    // generation and makes this stale callback a no-op.
+    // The generation orders callbacks and sign-out in this process. SQLite
+    // also checks the record so CLI changes invalidate outstanding callbacks.
     let committed = match outcome {
         CallbackVerifyOutcome::Verified(user) => auth_state
             .commit_if_session_current(session_generation, || {
-                let db: tauri::State<'_, DatabaseStore> = app.state();
-                if let Err(error) = save_auth(&db, token, expires_at, Some(&user)) {
-                    eprintln!("[auth] Failed to cache verified OAuth user: {error}");
-                    crate::settings_sync::set_cache_owner(None);
-                    emit_callback_auth_state(app, None, Some("github".into()));
-                    return;
+                let Some(saved) = record.save_verified_user(&db, &user)? else {
+                    return Ok(false);
+                };
+                if !saved.is_current(&db) {
+                    return Ok(false);
                 }
-                crate::settings_sync::set_cache_owner(Some(&user.id));
-                emit_callback_auth_state(app, Some(user), Some("github".into()));
+                auth_state.set_local_session(Some(&saved.stored));
+                emit_callback_auth_state(app, Some(user), saved.stored.auth_method);
+                Ok(true)
             })
-            .is_some(),
-        CallbackVerifyOutcome::Unauthorized => auth_state
-            .replace_session_if_current(session_generation, || {
-                let db: tauri::State<'_, DatabaseStore> = app.state();
-                if let Err(error) = clear_token(&db) {
-                    eprintln!("[auth] Could not remove invalid token: {error}");
-                }
-                crate::settings_sync::clear_cache();
-                crate::settings_sync::set_cache_owner(None);
-                auth_state.set_auth_method(None);
-                emit_callback_auth_state(app, None, None);
+            .unwrap_or(Ok(false)),
+        CallbackVerifyOutcome::Unauthorized => {
+            auth_state.clear_session_if_current(&db, session_generation, &record, || {
+                emit_callback_auth_state(app, None, None)
             })
-            .is_some(),
-        CallbackVerifyOutcome::Offline => auth_state
+        }
+        CallbackVerifyOutcome::Offline => Ok(auth_state
             .commit_if_session_current(session_generation, || {
-                // Keep the locally valid token pending for a bounded retry
-                // after the login frame paints, but expose neither identity
-                // nor account settings until verification succeeds.
-                crate::settings_sync::set_cache_owner(None);
-                emit_callback_auth_state(app, None, Some("github".into()));
+                if !record.is_current(&db) {
+                    return false;
+                }
+                // Report pending identity so the frontend can retry remotely.
+                auth_state.set_local_session(Some(&record.stored));
+                emit_callback_auth_state(app, None, record.stored.auth_method);
+                true
             })
-            .is_some(),
+            .unwrap_or(false)),
     };
 
-    if !committed {
-        eprintln!("[auth] Ignoring stale OAuth verification result");
+    match committed {
+        Ok(true) => {}
+        Ok(false) => eprintln!("[auth] Ignoring stale OAuth verification result"),
+        Err(error) => eprintln!("[auth] Failed to persist OAuth verification result: {error}"),
     }
 }
 
@@ -875,7 +949,8 @@ mod tests {
 
     #[test]
     fn legacy_cleanup_failure_does_not_keep_account_sessions_active() {
-        let db = test_db();
+        let dir = tempfile::tempdir().unwrap();
+        let db = DatabaseStore::test_file(&dir.path().join("auth.sqlite"));
         db.save_auth_token(b"cached session").unwrap();
         db.web_remote_insert_account_session(
             "account-browser",
@@ -886,12 +961,89 @@ mod tests {
             "account-1",
         )
         .unwrap();
-        let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("auth-token.enc");
         fs::create_dir(&path).unwrap();
 
         clear_token_for_sign_out_at(&db, &path).unwrap();
         assert!(db.load_auth_token().is_none());
+        assert!(db.web_remote_get_session("account-browser").unwrap().revoked);
+    }
+
+    #[test]
+    fn in_memory_fallback_cannot_claim_durable_sign_out() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("auth.sqlite");
+        let disk = DatabaseStore::test_file(&db_path);
+        disk.save_auth_token(b"disk session").unwrap();
+        disk.web_remote_insert_account_session(
+            "account-browser", None, None, "hash", true, "account-1",
+        ).unwrap();
+        drop(disk);
+
+        let fallback = DatabaseStore::new_in_memory();
+        let legacy_path = dir.path().join("auth-token.enc");
+        assert!(clear_token_for_sign_out_at(&fallback, &legacy_path).is_err());
+
+        let disk = DatabaseStore::test_file(&db_path);
+        assert_eq!(disk.load_auth_token().as_deref(), Some(&b"disk session"[..]));
+        assert!(!disk.web_remote_get_session("account-browser").unwrap().revoked);
+    }
+
+    #[test]
+    fn unauthorized_clear_write_failure_keeps_the_session_active() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("auth.sqlite");
+        let db = DatabaseStore::test_file(&db_path);
+        let user = AuthUser {
+            id: "account-1".into(),
+            email: "test@example.com".into(),
+            name: None,
+            image: None,
+        };
+        let record = save_auth_with_method(
+            &db, "invalid-token", "2099-01-01T00:00:00Z", Some(&user), Some("email"),
+        ).unwrap();
+        let browser_token = "browser-token";
+        let browser_hash = crate::web_remote::auth::sha256_hex(browser_token);
+        db.web_remote_insert_account_session(
+            "account-browser", None, None, &browser_hash, true, &user.id,
+        ).unwrap();
+        assert!(crate::web_remote::auth::authenticate(&db, browser_token).is_some());
+        rusqlite::Connection::open(&db_path).unwrap().execute_batch(
+            "CREATE TRIGGER reject_auth_clear BEFORE DELETE ON auth_tokens
+             BEGIN SELECT RAISE(ABORT, 'fixture rejected clear'); END;",
+        ).unwrap();
+
+        let state = AuthState::default();
+        state.set_local_session(Some(&record.stored));
+        let (generation, _) = state.session_snapshot(|| ());
+        let mut emitted_signed_out = false;
+        let error = state.clear_session_if_current(&db, generation, &record, || {
+            emitted_signed_out = true;
+        }).unwrap_err();
+
+        assert!(error.contains("fixture rejected clear"));
+        assert!(!emitted_signed_out);
+        assert_eq!(state.session_snapshot(|| ()).0, generation);
+        assert_eq!(state.auth_method().as_deref(), Some("email"));
+        assert!(load_token(&db).is_none());
+        assert!(crate::web_remote::auth::authenticate(&db, browser_token).is_none());
+        assert!(!db.web_remote_insert_account_session_if_unchanged(
+            "new-browser", None, None, "new-hash", true, &user.id, &record.encrypted,
+        ).unwrap());
+        let persisted: Vec<u8> = rusqlite::Connection::open(&db_path).unwrap().query_row(
+            "SELECT encrypted_data FROM auth_tokens WHERE id = 1", [], |row| row.get(0),
+        ).unwrap();
+        assert_eq!(persisted, record.encrypted);
+        assert!(!db.web_remote_get_session("account-browser").unwrap().revoked);
+
+        rusqlite::Connection::open(&db_path).unwrap()
+            .execute_batch("DROP TRIGGER reject_auth_clear")
+            .unwrap();
+        save_auth_with_method(
+            &db, "new-token", "2099-01-01T00:00:00Z", Some(&user), Some("email"),
+        ).unwrap();
+        assert_eq!(load_token(&db).unwrap().0, "new-token");
         assert!(db.web_remote_get_session("account-browser").unwrap().revoked);
     }
 
@@ -920,14 +1072,19 @@ mod tests {
         // through to ProvidePasswordForm for a brand-new OAuth user
         // who has never set up sync.
         let db = test_db();
-        save_token(&db, "tok-1", "2099-01-01T00:00:00Z").unwrap();
-        assert!(load_stored_auth_method(&db).is_none());
-
-        save_stored_auth_method(&db, Some("github")).unwrap();
+        let pending =
+            save_auth_with_method(&db, "tok-1", "2099-01-01T00:00:00Z", None, Some("github"))
+                .unwrap();
         assert_eq!(load_stored_auth_method(&db).as_deref(), Some("github"));
 
-        // save_auth on token refresh must NOT clobber auth_method.
-        save_auth(&db, "tok-2", "2099-02-02T00:00:00Z", None).unwrap();
+        let user = AuthUser {
+            id: "u1".into(),
+            email: "u1@example.com".into(),
+            name: None,
+            image: None,
+        };
+        let verified = pending.save_verified_user(&db, &user).unwrap().unwrap();
+        assert!(verified.is_current(&db));
         assert_eq!(load_stored_auth_method(&db).as_deref(), Some("github"));
 
         save_stored_auth_method(&db, Some("email")).unwrap();
@@ -936,6 +1093,35 @@ mod tests {
         // Clearing the token wipes everything including auth_method.
         clear_token(&db).unwrap();
         assert!(load_stored_auth_method(&db).is_none());
+    }
+
+    #[test]
+    fn stale_auth_verification_cannot_recreate_a_cleared_record_or_clear_a_replacement() {
+        let db = test_db();
+        let state = AuthState::default();
+        let (generation, ()) = state.session_snapshot(|| ());
+        let expiry = "2099-01-01T00:00:00Z";
+        let user = AuthUser {
+            id: "old-account".into(),
+            email: "old@example.test".into(),
+            name: None,
+            image: None,
+        };
+        let pending = save_auth_with_method(&db, "old", expiry, None, Some("github")).unwrap();
+        let stale = load_auth_record(&db).unwrap();
+        clear_token(&db).unwrap();
+        assert!(pending.save_verified_user(&db, &user).unwrap().is_none());
+        assert!(db.load_auth_token().is_none());
+
+        let replacement = save_auth_with_method(&db, "new", expiry, None, Some("email")).unwrap();
+        assert!(!state
+            .clear_session_if_current(&db, generation, &stale, || {
+                panic!("stale verification must not publish sign-out");
+            })
+            .unwrap());
+        assert!(replacement.is_current(&db));
+        assert_eq!(load_stored_auth_method(&db).as_deref(), Some("email"));
+        assert_eq!(state.session_snapshot(|| ()).0, generation);
     }
 
     #[test]
@@ -963,7 +1149,8 @@ mod tests {
             .consume_csrf_state(&token)
             .expect("the CSRF state itself remains valid");
         assert!(state
-            .replace_session_if_current(launch_generation, || "stale-oauth-callback")
+            .replace_session_if_current(launch_generation, || Ok(Some("stale-oauth-callback")))
+            .unwrap()
             .is_none());
     }
 
@@ -1013,7 +1200,8 @@ mod tests {
         );
 
         let (cleared_generation, cleared) = state
-            .replace_session_if_current(replacement_generation, || "signed-out")
+            .replace_session_if_current(replacement_generation, || Ok(Some("signed-out")))
+            .unwrap()
             .expect("the current session can be definitively cleared");
         assert_eq!(cleared, "signed-out");
         assert_eq!(cleared_generation, replacement_generation + 1);

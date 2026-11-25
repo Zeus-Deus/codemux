@@ -17,8 +17,7 @@
 //! |-----------------------------------------|-----|-----|
 //! | `derive_auth_secret(password, email)`   | yes | yes |
 //! | POST `/api/auth/desktop/signin`         | yes | yes |
-//! | `save_auth(db, token, expires, user)`   | yes | yes |
-//! | `save_stored_auth_method(db, "email")`  | yes | yes |
+//! | Persist token, cached user, and auth method | yes | yes |
 //! | `AuthState::set_auth_method` (in-memory)| yes | n/a — no live app |
 //! | `auth-state-changed` / `sync-state-changed` events | yes | n/a — no webview |
 //!
@@ -38,10 +37,11 @@ use std::io::{BufRead, IsTerminal, Write};
 use serde::Deserialize;
 
 use crate::auth::{
-    api_base_url, derive_auth_secret, is_token_expired, load_cached_user,
-    load_stored_auth_method, load_token, login_email_api, save_auth, save_stored_auth_method,
-    AuthUser,
+    api_base_url, derive_auth_secret, is_token_expired, load_auth_record,
+    login_email_api, save_auth_with_method, AuthUser,
 };
+#[cfg(test)]
+use crate::auth::{load_cached_user, load_stored_auth_method, load_token, save_auth};
 use crate::database::DatabaseStore;
 
 /// Environment variable accepted in place of an interactive prompt. Meant
@@ -150,15 +150,14 @@ pub(crate) async fn sign_in(
         image: api_resp.user.image.clone(),
     };
 
-    save_auth(db, &api_resp.token, &api_resp.expires_at, Some(&user))
-        .map_err(|e| LoginError::Local(format!("Could not persist the session: {e}")))?;
-    // Matches the GUI ordering: `save_auth` preserves any prior
-    // auth_method, so the new value is stamped right after. Non-fatal for
-    // the same reason it is in `signin_email` — the session itself is
-    // already stored, and `auth_method` only tailors Settings copy.
-    if let Err(err) = save_stored_auth_method(db, Some("email")) {
-        eprintln!("[codemux login] persisting auth_method=email failed: {err}");
-    }
+    save_auth_with_method(
+        db,
+        &api_resp.token,
+        &api_resp.expires_at,
+        Some(&user),
+        Some("email"),
+    )
+    .map_err(|e| LoginError::Local(format!("Could not persist the session: {e}")))?;
 
     Ok(user)
 }
@@ -251,16 +250,8 @@ pub(crate) async fn sign_in_with_token(
 
     let (user, expires_at) = verify_bearer(token).await?;
 
-    save_auth(db, token, &expires_at, Some(&user))
+    save_auth_with_method(db, token, &expires_at, Some(&user), Some("token"))
         .map_err(|e| LoginError::Local(format!("Could not persist the session: {e}")))?;
-    // `"token"` rather than `"email"`/`"github"`: the Settings → Sync
-    // section keys off this to decide which password form to offer, and a
-    // pasted bearer says nothing about whether the account has a sync
-    // password. An unrecognised value makes it fall through to the
-    // conservative branch, which is the correct answer here.
-    if let Err(err) = save_stored_auth_method(db, Some("token")) {
-        eprintln!("[codemux login] persisting auth_method=token failed: {err}");
-    }
 
     Ok(user)
 }
@@ -284,17 +275,19 @@ pub(crate) enum AuthStatusReport {
 }
 
 pub(crate) fn auth_status(db: &DatabaseStore) -> AuthStatusReport {
-    let (_token, expires_at) = match load_token(db) {
-        Some(pair) => pair,
-        None => return AuthStatusReport::SignedOut,
+    let Some(record) = load_auth_record(db) else {
+        return AuthStatusReport::SignedOut;
     };
-    if is_token_expired(&expires_at) {
-        return AuthStatusReport::Expired { expires_at };
+    let stored = record.stored;
+    if is_token_expired(&stored.expires_at) {
+        return AuthStatusReport::Expired {
+            expires_at: stored.expires_at,
+        };
     }
     AuthStatusReport::SignedIn {
-        user: load_cached_user(db),
-        expires_at,
-        method: load_stored_auth_method(db),
+        user: stored.user,
+        expires_at: stored.expires_at,
+        method: stored.auth_method,
     }
 }
 
@@ -351,7 +344,7 @@ pub(crate) fn status_exit_code(report: &AuthStatusReport) -> i32 {
 /// resolves through `dirs::data_dir()` with no test seam, so calling it
 /// from a unit test would clobber the running developer's cache.
 pub(crate) fn clear_session_record(db: &DatabaseStore) -> Result<bool, String> {
-    let had_session = load_token(db).is_some();
+    let had_session = db.load_auth_token().is_some();
     crate::auth::clear_token_for_sign_out(db)?;
     Ok(had_session)
 }
@@ -1034,7 +1027,8 @@ mod tests {
             .await;
         let _guard = ApiUrlGuard::set(&server.url());
 
-        let db = test_db();
+        let dir = tempfile::tempdir().unwrap();
+        let db = DatabaseStore::test_file(&dir.path().join("auth.sqlite"));
         sign_in(&db, email, "pw".to_string()).await.unwrap();
         assert!(load_token(&db).is_some());
 
@@ -1057,6 +1051,25 @@ mod tests {
         );
     }
 
+    #[test]
+    fn logout_reports_database_failure_and_retains_the_session() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("auth.sqlite");
+        let db = DatabaseStore::test_file(&path);
+        save_auth(&db, "tok", "2099-01-01T00:00:00Z", None).unwrap();
+        rusqlite::Connection::open(&path)
+            .unwrap()
+            .execute_batch(
+                "CREATE TRIGGER prevent_fixture_logout BEFORE DELETE ON auth_tokens
+                 BEGIN SELECT RAISE(ABORT, 'fixture rejected logout'); END;",
+            )
+            .unwrap();
+
+        let error = clear_session_record(&db).unwrap_err();
+        assert!(error.contains("fixture rejected logout"));
+        assert_eq!(load_token(&db).unwrap().0, "tok");
+    }
+
     // ── Status / whoami ──────────────────────────────────────────
 
     #[test]
@@ -1077,8 +1090,14 @@ mod tests {
             name: Some("Who Ami".to_string()),
             image: None,
         };
-        save_auth(&db, "tok", "2099-03-04T05:06:07Z", Some(&user)).unwrap();
-        save_stored_auth_method(&db, Some("email")).unwrap();
+        save_auth_with_method(
+            &db,
+            "tok",
+            "2099-03-04T05:06:07Z",
+            Some(&user),
+            Some("email"),
+        )
+        .unwrap();
 
         let report = auth_status(&db);
         assert_eq!(status_exit_code(&report), 0);

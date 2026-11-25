@@ -970,28 +970,27 @@ fn build_core_app<R: tauri::Runtime>(
                 // bootstrap happens later and must not be the first owner
                 // initialization point.
                 let auth_state: tauri::State<'_, auth::AuthState> = app.handle().state();
-                match auth::load_token(&db) {
-                    Some((_token, expires_at)) if auth::is_token_expired(&expires_at) => {
-                        auth_state.replace_session(|| {
-                            if let Err(error) = auth::clear_token(&db) {
-                                eprintln!("[auth] Could not remove expired token: {error}");
+                loop {
+                    let (generation, record) = auth_state.session_snapshot(|| auth::load_auth_record(&db));
+                    match record {
+                        Some(record) if auth::is_token_expired(&record.stored.expires_at) => {
+                            match auth_state.clear_session_if_current(&db, generation, &record, || ()) {
+                                Ok(true) => break,
+                                Ok(false) => continue,
+                                Err(error) => {
+                                    eprintln!("[auth] Failed to clear expired session at startup: {error}");
+                                    auth_state.set_local_session(None);
+                                    break;
+                                }
                             }
-                            settings_sync::clear_cache();
-                            settings_sync::set_cache_owner(None);
-                            auth_state.set_auth_method(None);
-                        });
-                    }
-                    Some(_) => {
-                        let user = auth::load_cached_user(&db);
-                        settings_sync::set_cache_owner(
-                            user.as_ref().map(|cached| cached.id.as_str()),
-                        );
-                        let method = auth::load_stored_auth_method(&db);
-                        auth_state.set_auth_method(method.as_deref());
-                    }
-                    None => {
-                        settings_sync::set_cache_owner(None);
-                        auth_state.set_auth_method(None);
+                        }
+                        record => {
+                            if auth_state.commit_if_session_current(generation, || {
+                                auth_state.set_local_session(record.as_ref().map(|record| &record.stored));
+                            }).is_some() {
+                                break;
+                            }
+                        }
                     }
                 }
             }

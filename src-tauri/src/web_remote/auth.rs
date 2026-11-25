@@ -262,20 +262,43 @@ pub fn authenticate(db: &DatabaseStore, token: &str) -> Option<AuthedSession> {
     Some(AuthedSession { id: session.id, approved: session.approved })
 }
 
+pub(super) enum SessionStatus {
+    Active(WebRemoteSessionRecord),
+    Suspended,
+    Gone,
+}
+
+impl SessionStatus {
+    pub(super) fn is_approved(&self) -> bool {
+        matches!(self, Self::Active(session) if session.approved)
+    }
+}
+
 /// A host-paired browser is independent of the account on this host. Account
 /// browsers must still belong to its current, unexpired account.
-pub(super) fn active_session(db: &DatabaseStore, session_id: &str) -> Option<WebRemoteSessionRecord> {
-    let session = db.web_remote_get_session(session_id)?;
-    if session.revoked {
-        return None;
-    }
-    if session.source == "account" {
-        let current = crate::auth::load_active_account_id(db)?;
-        if session.account_user_id.as_deref() != Some(current.as_str()) {
-            return None;
+pub(super) fn session_status(db: &DatabaseStore, session_id: &str) -> SessionStatus {
+    match db.try_web_remote_session_with_auth(session_id) {
+        Ok(None) => SessionStatus::Gone,
+        Ok(Some((session, _))) if session.revoked => SessionStatus::Gone,
+        Ok(Some((session, record))) => {
+            if session.source == "account" {
+                let owner = record.as_deref().and_then(crate::auth::active_account_id_from_record);
+                if owner.is_none() || session.account_user_id.as_deref() != owner.as_deref() {
+                    return SessionStatus::Suspended;
+                }
+            }
+            SessionStatus::Active(session)
         }
+        // Fail closed during a read error while preserving push subscriptions.
+        Err(_) => SessionStatus::Suspended,
     }
-    Some(session)
+}
+
+pub(super) fn active_session(db: &DatabaseStore, session_id: &str) -> Option<WebRemoteSessionRecord> {
+    match session_status(db, session_id) {
+        SessionStatus::Active(session) => Some(session),
+        SessionStatus::Suspended | SessionStatus::Gone => None,
+    }
 }
 
 pub(super) struct AccountSessionGuard<'a> {

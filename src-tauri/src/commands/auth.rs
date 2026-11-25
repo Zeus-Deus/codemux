@@ -2,9 +2,9 @@ use std::time::Instant;
 use tauri::{Emitter, State};
 
 use crate::auth::{
-    api_base_url, clear_token, derive_auth_secret, is_token_expired, load_cached_user,
-    load_stored_auth_method, load_token, login_email_api, save_auth, save_stored_auth_method,
-    signup_email_api, AuthResponse, AuthState, AuthStatePayload, AuthUser,
+    api_base_url, derive_auth_secret, is_token_expired, load_auth_record,
+    login_email_api, save_auth_with_method, signup_email_api, AuthResponse, AuthState,
+    AuthStatePayload, AuthUser,
 };
 use crate::database::DatabaseStore;
 
@@ -45,12 +45,6 @@ pub struct SessionRefresh {
 }
 
 const AUTH_REMOTE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
-
-fn discard_invalid_token(db: &DatabaseStore) {
-    if let Err(error) = clear_token(db) {
-        eprintln!("[auth] Could not remove invalid token: {error}");
-    }
-}
 
 enum VerifyOutcome {
     Verified(AuthUser),
@@ -143,40 +137,31 @@ fn unreachable_verify_refresh(
     }
 }
 
-/// Re-read whichever local account is current after a stale remote operation.
-/// The session-generation guard is held while the token/user/cache owner are
-/// paired, so an old refresh can never return user A with user B's settings.
+/// Re-read the current persisted account after a stale remote operation.
 fn current_local_refresh(db: &DatabaseStore, auth_state: &AuthState) -> SessionRefresh {
-    let (_, refresh) = auth_state.session_snapshot(|| {
-        let Some((_token, expires_at)) = load_token(db) else {
-            crate::settings_sync::set_cache_owner(None);
-            auth_state.set_auth_method(None);
-            return signed_out_refresh();
-        };
-        if is_token_expired(&expires_at) {
-            crate::settings_sync::set_cache_owner(None);
-            auth_state.set_auth_method(None);
-            return signed_out_refresh();
-        }
-        let user = load_cached_user(db);
-        crate::settings_sync::set_cache_owner(user.as_ref().map(|user| user.id.as_str()));
-        let auth_method = load_stored_auth_method(db);
-        auth_state.set_auth_method(auth_method.as_deref());
-        // A valid token with no cached user has not established identity
-        // yet; report it pending so post-paint verification keeps retrying.
-        SessionRefresh {
-            authenticated: user.is_some(),
-            settings: crate::settings_sync::load_cache().unwrap_or_default(),
-            status: if user.is_some() {
-                "local"
-            } else {
-                "pending-verification"
-            },
-            user,
-            auth_method,
-        }
-    });
-    refresh
+    auth_state
+        .session_snapshot(|| {
+            let record =
+                load_auth_record(db).filter(|record| !is_token_expired(&record.stored.expires_at));
+            let Some(record) = record else {
+                auth_state.set_local_session(None);
+                return signed_out_refresh();
+            };
+            auth_state.set_local_session(Some(&record.stored));
+            let user = record.stored.user;
+            SessionRefresh {
+                authenticated: user.is_some(),
+                settings: crate::settings_sync::load_cache().unwrap_or_default(),
+                status: if user.is_some() {
+                    "local"
+                } else {
+                    "pending-verification"
+                },
+                user,
+                auth_method: record.stored.auth_method,
+            }
+        })
+        .1
 }
 
 /// Local-only first-stage startup. No socket, subprocess, or remote request is
@@ -185,83 +170,53 @@ fn current_local_refresh(db: &DatabaseStore, auth_state: &AuthState) -> SessionR
 pub fn bootstrap_session(
     db: State<'_, DatabaseStore>,
     auth_state: State<'_, AuthState>,
-) -> SessionBootstrap {
+) -> Result<SessionBootstrap, String> {
     let auth_started = Instant::now();
     loop {
-        let (session_generation, stored_token) =
-            auth_state.session_snapshot(|| load_token(&db));
-        let bootstrap = match stored_token {
-            None => auth_state.commit_if_session_current(session_generation, || {
-                crate::settings_sync::set_cache_owner(None);
-                auth_state.set_auth_method(None);
-                let settings_started = Instant::now();
-                let settings = crate::settings_sync::load_cache().unwrap_or_default();
-                crate::diagnostics::record_perf_timing(
-                    "settings.local-cache-load",
-                    settings_started.elapsed(),
-                );
-                SessionBootstrap {
-                    authenticated: false,
-                    user: None,
-                    settings,
-                    auth_method: None,
-                    status: "signed-out",
-                }
-            }),
-            Some((_token, expires_at)) if is_token_expired(&expires_at) => auth_state
-                .replace_session_if_current(session_generation, || {
-                    discard_invalid_token(&db);
-                    crate::settings_sync::clear_cache();
-                    crate::settings_sync::set_cache_owner(None);
-                    auth_state.set_auth_method(None);
-                    SessionBootstrap {
-                        authenticated: false,
-                        user: None,
-                        settings: Default::default(),
-                        auth_method: None,
-                        status: "signed-out",
-                    }
-                })
-                .map(|(_, bootstrap)| bootstrap),
-            Some(_) => auth_state.commit_if_session_current(session_generation, || {
-                // Pair identity, owner scope, auth method, and cached settings
-                // while the same generation guard is held. A concurrent
-                // sign-out/sign-in cannot make bootstrap return user A with
-                // account B's settings or reset the global cache owner to A.
-                let user = load_cached_user(&db);
-                crate::settings_sync::set_cache_owner(
-                    user.as_ref().map(|user| user.id.as_str()),
-                );
-                let auth_method = load_stored_auth_method(&db);
-                auth_state.set_auth_method(auth_method.as_deref());
-                let settings_started = Instant::now();
-                let settings = crate::settings_sync::load_cache().unwrap_or_default();
-                crate::diagnostics::record_perf_timing(
-                    "settings.local-cache-load",
-                    settings_started.elapsed(),
-                );
-                SessionBootstrap {
-                    authenticated: user.is_some(),
-                    status: if user.is_some() {
-                        "local"
-                    } else {
-                        "pending-verification"
-                    },
-                    user,
-                    settings,
-                    auth_method,
-                }
-            }),
-        };
-        if let Some(bootstrap) = bootstrap {
-            crate::diagnostics::record_perf_timing(
-                "auth.local-bootstrap",
-                auth_started.elapsed(),
-            );
-            return bootstrap;
+        let (session_generation, record) = auth_state.session_snapshot(|| load_auth_record(&db));
+        if let Some(record) = record
+            .as_ref()
+            .filter(|r| is_token_expired(&r.stored.expires_at))
+        {
+            if !auth_state.clear_session_if_current(&db, session_generation, record, || ())? {
+                continue;
+            }
+            crate::diagnostics::record_perf_timing("auth.local-bootstrap", auth_started.elapsed());
+            return Ok(SessionBootstrap {
+                authenticated: false,
+                user: None,
+                settings: Default::default(),
+                auth_method: None,
+                status: "signed-out",
+            });
         }
-        // The account changed between the token read and the guarded commit.
-        // Re-read the new generation instead of publishing mixed local state.
+        let bootstrap = auth_state.commit_if_session_current(session_generation, || {
+            let stored = record.map(|record| record.stored);
+            auth_state.set_local_session(stored.as_ref());
+            let settings_started = Instant::now();
+            let settings = crate::settings_sync::load_cache().unwrap_or_default();
+            crate::diagnostics::record_perf_timing(
+                "settings.local-cache-load",
+                settings_started.elapsed(),
+            );
+            let status = match &stored {
+                Some(stored) if stored.user.is_some() => "local",
+                Some(_) => "pending-verification",
+                None => "signed-out",
+            };
+            let user = stored.as_ref().and_then(|stored| stored.user.clone());
+            SessionBootstrap {
+                authenticated: user.is_some(),
+                user,
+                settings,
+                auth_method: stored.and_then(|stored| stored.auth_method),
+                status,
+            }
+        });
+        if let Some(bootstrap) = bootstrap {
+            crate::diagnostics::record_perf_timing("auth.local-bootstrap", auth_started.elapsed());
+            return Ok(bootstrap);
+        }
     }
 }
 
@@ -273,71 +228,69 @@ pub async fn refresh_session<R: tauri::Runtime>(
     db: State<'_, DatabaseStore>,
     auth_state: State<'_, AuthState>,
 ) -> Result<SessionRefresh, String> {
-    let (session_generation, (stored_token, auth_method)) =
-        auth_state.session_snapshot(|| (load_token(&db), load_stored_auth_method(&db)));
-    let Some((token, expires_at)) = stored_token else {
-        return Ok(auth_state
-            .commit_if_session_current(session_generation, || {
-                crate::settings_sync::set_cache_owner(None);
-                auth_state.set_auth_method(None);
-                signed_out_refresh()
-            })
-            .unwrap_or_else(|| current_local_refresh(&db, &auth_state)));
+    let (session_generation, record) = auth_state.session_snapshot(|| load_auth_record(&db));
+    let Some(record) = record else {
+        return Ok(current_local_refresh(&db, &auth_state));
     };
-    if is_token_expired(&expires_at) {
-        let cleared = auth_state.replace_session_if_current(session_generation, || {
-            discard_invalid_token(&db);
-            crate::settings_sync::clear_cache();
-            crate::settings_sync::set_cache_owner(None);
-            auth_state.set_auth_method(None);
-            emit_signed_out(&app);
-            signed_out_refresh()
-        });
-        return Ok(cleared
-            .map(|(_, refresh)| refresh)
-            .unwrap_or_else(|| current_local_refresh(&db, &auth_state)));
-    }
-    let verify_started = Instant::now();
-    let verify_outcome = verify_token(&token).await;
-    crate::diagnostics::record_perf_timing("auth.remote-verify", verify_started.elapsed());
+    let verify_outcome = if is_token_expired(&record.stored.expires_at) {
+        VerifyOutcome::Unauthorized
+    } else {
+        let verify_started = Instant::now();
+        let outcome = verify_token(&record.stored.token).await;
+        crate::diagnostics::record_perf_timing("auth.remote-verify", verify_started.elapsed());
+        if is_token_expired(&record.stored.expires_at) {
+            VerifyOutcome::Unauthorized
+        } else {
+            outcome
+        }
+    };
 
     match verify_outcome {
         VerifyOutcome::Verified(user) => {
-            let committed = auth_state.commit_if_session_current(session_generation, || {
-                // Remote verification is authoritative. A transient local
-                // DB/keyring write failure must not sign out a session the
-                // server just accepted; log it and proceed verified.
-                if let Err(err) = save_auth(&db, &token, &expires_at, Some(&user)) {
-                    eprintln!("[refresh_session] persist verified session failed: {err}");
-                }
-                crate::settings_sync::set_cache_owner(Some(&user.id));
-            });
-            if committed.is_none() {
+            let saved = auth_state
+                .commit_if_session_current(session_generation, || {
+                    let Some(saved) = record.save_verified_user(&db, &user)? else {
+                        return Ok::<_, String>(None);
+                    };
+                    if !saved.is_current(&db) {
+                        return Ok(None);
+                    }
+                    auth_state.set_local_session(Some(&saved.stored));
+                    Ok(Some(saved))
+                })
+                .transpose()?
+                .flatten();
+            let Some(saved) = saved else {
                 return Ok(current_local_refresh(&db, &auth_state));
-            }
+            };
             let settings_sync_started = Instant::now();
             let settings_result =
-                crate::settings_sync::sync_settings_for_owner(&token, &user.id).await;
+                crate::settings_sync::sync_settings_for_owner(&saved.stored.token, &user.id).await;
             crate::diagnostics::record_perf_timing(
                 "settings.remote-sync",
                 settings_sync_started.elapsed(),
             );
-            let (settings, status, settings_synced) = match settings_result {
-                Ok(settings) => (settings, "verified", true),
-                Err(_) => (
-                    crate::settings_sync::load_cache().unwrap_or_default(),
-                    "degraded",
-                    false,
-                ),
-            };
-            Ok(auth_state
+            let refresh = auth_state
                 .commit_if_session_current(session_generation, || {
-                    if settings_synced {
-                        let _ = app.emit(
-                            "settings-synced",
-                            &crate::settings_sync::SettingsPersistence::synced(settings.clone()),
-                        );
+                    if !saved.is_current(&db) || is_token_expired(&saved.stored.expires_at) {
+                        return None;
                     }
+                    let (settings, status) = match settings_result {
+                        Ok(settings) => {
+                            let _ = app.emit(
+                                "settings-synced",
+                                &crate::settings_sync::SettingsPersistence::synced(
+                                    settings.clone(),
+                                ),
+                            );
+                            (settings, "verified")
+                        }
+                        Err(_) => (
+                            crate::settings_sync::load_cache().unwrap_or_default(),
+                            "degraded",
+                        ),
+                    };
+                    let auth_method = saved.stored.auth_method;
                     let _ = app.emit(
                         "sync-state-changed",
                         &SyncStatus {
@@ -345,38 +298,42 @@ pub async fn refresh_session<R: tauri::Runtime>(
                             auth_method: auth_method.clone(),
                         },
                     );
-                    SessionRefresh {
+                    Some(SessionRefresh {
                         authenticated: true,
                         user: Some(user),
                         settings,
                         auth_method,
                         status,
-                    }
+                    })
                 })
-                .unwrap_or_else(|| current_local_refresh(&db, &auth_state)))
+                .flatten();
+            Ok(refresh.unwrap_or_else(|| current_local_refresh(&db, &auth_state)))
         }
-        VerifyOutcome::Unauthorized => Ok(auth_state
-            .replace_session_if_current(session_generation, || {
-                discard_invalid_token(&db);
-                crate::settings_sync::clear_cache();
-                crate::settings_sync::set_cache_owner(None);
-                auth_state.set_auth_method(None);
+        VerifyOutcome::Unauthorized => {
+            if auth_state.clear_session_if_current(&db, session_generation, &record, || {
                 emit_signed_out(&app);
-                signed_out_refresh()
-            })
-            .map(|(_, refresh)| refresh)
-            .unwrap_or_else(|| current_local_refresh(&db, &auth_state))),
-        VerifyOutcome::Offline => Ok(auth_state
-            .commit_if_session_current(session_generation, || {
-                let user = load_cached_user(&db);
-                crate::settings_sync::set_cache_owner(user.as_ref().map(|user| user.id.as_str()));
-                unreachable_verify_refresh(
-                    user,
-                    crate::settings_sync::load_cache().unwrap_or_default(),
-                    auth_method,
-                )
-            })
-            .unwrap_or_else(|| current_local_refresh(&db, &auth_state))),
+            })? {
+                Ok(signed_out_refresh())
+            } else {
+                Ok(current_local_refresh(&db, &auth_state))
+            }
+        }
+        VerifyOutcome::Offline => {
+            let refresh = auth_state
+                .commit_if_session_current(session_generation, || {
+                    if !record.is_current(&db) || is_token_expired(&record.stored.expires_at) {
+                        return None;
+                    }
+                    auth_state.set_local_session(Some(&record.stored));
+                    Some(unreachable_verify_refresh(
+                        record.stored.user,
+                        crate::settings_sync::load_cache().unwrap_or_default(),
+                        record.stored.auth_method,
+                    ))
+                })
+                .flatten();
+            Ok(refresh.unwrap_or_else(|| current_local_refresh(&db, &auth_state)))
+        }
     }
 }
 
@@ -440,40 +397,33 @@ pub async fn signin_email<R: tauri::Runtime>(
         image: api_resp.user.image.clone(),
     };
 
-    auth_state.replace_session(|| -> Result<(), String> {
-        save_auth(&db, &api_resp.token, &api_resp.expires_at, Some(&user))?;
-        crate::settings_sync::set_cache_owner(Some(&user.id));
-        // Persist auth_method so a cold-start `check_auth` can restore it
-        // and keep the value going through `sync-state-changed` in sync
-        // with the persisted record.
-        auth_state.set_auth_method(Some("email"));
-        if let Err(err) = save_stored_auth_method(&db, Some("email")) {
-            eprintln!("[signin_email] persist auth_method=email failed: {err}");
-        }
-        Ok(())
-    })?;
-
-    let auth_response = AuthResponse {
-        token: api_resp.token.clone(),
-        expires_at: api_resp.expires_at.clone(),
-        user: user.clone(),
-    };
-
-    let payload = AuthStatePayload {
-        authenticated: true,
-        user: Some(auth_response.user.clone()),
-    };
-    let _ = app.emit("auth-state-changed", &payload);
-    // Signed in → skills sync is available (server-side, no key).
-    let _ = app.emit(
-        "sync-state-changed",
-        &SyncStatus {
-            sync_available: true,
-            auth_method: auth_state.auth_method(),
-        },
-    );
-
-    Ok(auth_response)
+    auth_state.try_replace_session(|| {
+        let record = save_auth_with_method(
+            &db,
+            &api_resp.token,
+            &api_resp.expires_at,
+            Some(&user),
+            Some("email"),
+        )?;
+        auth_state.set_local_session(Some(&record.stored));
+        let payload = AuthStatePayload {
+            authenticated: true,
+            user: Some(user.clone()),
+        };
+        let _ = app.emit("auth-state-changed", &payload);
+        let _ = app.emit(
+            "sync-state-changed",
+            &SyncStatus {
+                sync_available: true,
+                auth_method: record.stored.auth_method,
+            },
+        );
+        Ok(AuthResponse {
+            token: api_resp.token,
+            expires_at: api_resp.expires_at,
+            user,
+        })
+    })
 }
 
 #[tauri::command]
@@ -572,37 +522,18 @@ pub fn sign_out<R: tauri::Runtime>(
     db: State<'_, DatabaseStore>,
     auth_state: State<'_, AuthState>,
 ) -> Result<(), String> {
-    auth_state.replace_session(|| {
+    auth_state.try_replace_session(|| {
         crate::auth::clear_token_for_sign_out(&db)?;
-        crate::settings_sync::clear_cache();
-        crate::settings_sync::set_cache_owner(None);
-
-        // Clear the session's provider tag alongside auth.
-        auth_state.set_auth_method(None);
-        Ok::<(), String>(())
-    })?;
-
-    // Reset frontend settings store to defaults before auth-state-changed
-    let _ = app.emit(
-        "settings-synced",
-        &crate::settings_sync::SettingsPersistence::synced(
-            crate::settings_sync::UserSettings::default(),
-        ),
-    );
-
-    let payload = AuthStatePayload {
-        authenticated: false,
-        user: None,
-    };
-    let _ = app.emit("auth-state-changed", &payload);
-    let _ = app.emit(
-        "sync-state-changed",
-        &SyncStatus {
-            sync_available: false,
-            auth_method: None,
-        },
-    );
-    Ok(())
+        auth_state.clear_local_session();
+        let _ = app.emit(
+            "settings-synced",
+            &crate::settings_sync::SettingsPersistence::synced(
+                crate::settings_sync::UserSettings::default(),
+            ),
+        );
+        emit_signed_out(&app);
+        Ok(())
+    })
 }
 
 #[tauri::command]
@@ -611,26 +542,17 @@ pub fn get_auth_token(
     auth_state: State<'_, AuthState>,
 ) -> Result<Option<String>, String> {
     loop {
-        let (session_generation, stored_token) = auth_state.session_snapshot(|| load_token(&db));
-        match stored_token {
-            Some((_token, expires_at)) if is_token_expired(&expires_at) => {
-                if auth_state
-                    .replace_session_if_current(session_generation, || {
-                        discard_invalid_token(&db);
-                        crate::settings_sync::clear_cache();
-                        crate::settings_sync::set_cache_owner(None);
-                        auth_state.set_auth_method(None);
-                    })
-                    .is_some()
-                {
-                    return Ok(None);
-                }
-                // A signin replaced the expired record after our snapshot.
-                // Re-read instead of clearing or returning the old account.
-            }
-            Some((token, _)) => return Ok(Some(token)),
-            None => return Ok(None),
+        let (session_generation, record) = auth_state.session_snapshot(|| load_auth_record(&db));
+        let Some(record) = record else {
+            return Ok(None);
+        };
+        if !is_token_expired(&record.stored.expires_at) {
+            return Ok(Some(record.stored.token));
         }
+        if auth_state.clear_session_if_current(&db, session_generation, &record, || ())? {
+            return Ok(None);
+        }
+        // A separate sign-in or sign-out replaced the expired record.
     }
 }
 
@@ -647,12 +569,16 @@ pub fn get_sync_status(
     db: State<'_, DatabaseStore>,
     auth_state: State<'_, AuthState>,
 ) -> SyncStatus {
-    let signed_in =
-        matches!(load_token(&db), Some((_t, ref expires)) if !is_token_expired(expires));
-    SyncStatus {
-        sync_available: signed_in,
-        auth_method: auth_state.auth_method(),
-    }
+    auth_state
+        .session_snapshot(|| {
+            let record =
+                load_auth_record(&db).filter(|record| !is_token_expired(&record.stored.expires_at));
+            SyncStatus {
+                sync_available: record.is_some(),
+                auth_method: record.and_then(|record| record.stored.auth_method),
+            }
+        })
+        .1
 }
 
 // ── Internal types for API deserialization ────────────────────────

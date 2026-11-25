@@ -868,15 +868,13 @@ impl DatabaseStore {
 mod tests {
     use super::*;
     use serde_json::json;
-    use std::sync::{Arc, Barrier, Mutex};
+    use std::sync::{Arc, Barrier};
     fn reopen(path: &std::path::Path) -> DatabaseStore {
         let conn = Connection::open(path).unwrap();
         conn.execute_batch("PRAGMA foreign_keys=ON;PRAGMA journal_mode=WAL;")
             .unwrap();
         crate::database::create_schema(&conn).unwrap();
-        DatabaseStore {
-            conn: Mutex::new(conn),
-        }
+        DatabaseStore::from_connection(conn)
     }
     fn task(id: &str, child: &str) -> TaskRecord {
         let mut t = TaskRecord::new(

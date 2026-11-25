@@ -624,6 +624,7 @@ fn account_pair_error_response(err: super::account::AccountPairError) -> Respons
         E::DesktopSignedOut => error(StatusCode::FORBIDDEN, "account_signed_out"),
         E::AuthFailed => error(StatusCode::UNAUTHORIZED, "account_auth_failed"),
         E::Mismatch => error(StatusCode::FORBIDDEN, "account_mismatch"),
+        E::SessionChanged => error(StatusCode::CONFLICT, "account_session_changed"),
         E::Internal(reason) => {
             // Surface the concrete cause in the server log (never to the client)
             // so a failed mint is diagnosable without leaking internals.
@@ -1301,7 +1302,8 @@ mod tests {
     fn account_pair_errors_map_to_expected_http_status() {
         // The browser account-login screen keys its copy off these exact
         // status/code pairs. Disabled/signed-out/mismatch are 403; a bad
-        // credential is 401 (non-enumerating); internal is 500.
+        // credential is 401, a changed desktop session is 409, and an
+        // internal failure is 500.
         use super::super::account::AccountPairError as E;
         assert_eq!(
             account_pair_error_response(E::Disabled).status(),
@@ -1318,6 +1320,10 @@ mod tests {
         assert_eq!(
             account_pair_error_response(E::AuthFailed).status(),
             StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(
+            account_pair_error_response(E::SessionChanged).status(),
+            StatusCode::CONFLICT
         );
         assert_eq!(
             account_pair_error_response(E::Internal("x".into())).status(),
