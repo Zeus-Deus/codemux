@@ -563,23 +563,26 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn settings_edits_stay_with_the_open_project_directory() {
+    fn settings_edits_refuse_a_relocated_project_directory() {
         use std::os::unix::fs::PermissionsExt;
 
         let project = TempDir::new().unwrap();
+        let outside = TempDir::new().unwrap();
         let settings = write_settings(project.path(), "settings.json", "original");
         fs::set_permissions(&settings, fs::Permissions::from_mode(0o640)).unwrap();
         let directory = settings.parent().unwrap();
         let opened = ProjectSettingsDir::open(project.path()).unwrap();
-        let moved = project.path().join("opened-settings");
-        fs::rename(directory, &moved).unwrap();
-        write_settings(project.path(), "settings.json", "original");
-
         opened.replace("settings.json", b"original", b"updated").unwrap();
-        let updated = moved.join("settings.json");
-        assert_eq!(fs::read_to_string(&updated).unwrap(), "updated");
-        assert_eq!(fs::metadata(updated).unwrap().permissions().mode() & 0o777, 0o640);
-        assert_eq!(fs::read_to_string(settings).unwrap(), "original");
+        assert_eq!(fs::metadata(&settings).unwrap().permissions().mode() & 0o777, 0o640);
+
+        let moved = outside.path().join("opened-settings");
+        fs::rename(directory, &moved).unwrap();
+        write_settings(project.path(), "settings.json", "updated");
+
+        assert!(opened.replace("settings.json", b"updated", b"new").is_err());
+        assert_eq!(fs::read_to_string(moved.join("settings.json")).unwrap(), "updated");
+        assert_eq!(fs::read_to_string(settings).unwrap(), "updated");
+        assert_eq!(fs::read_dir(moved).unwrap().count(), 1);
     }
 
     #[test]
