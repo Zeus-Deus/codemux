@@ -145,7 +145,10 @@ fn hook_clearing_its_marker_cannot_claim_control_socket_owner() {
     };
     assert_eq!(std::fs::read_to_string(marker_file).unwrap(), "unset");
     let caller = resolve_socket_caller(None, Some(hook_pid));
-    assert!(matches!(&caller, SocketCaller::Agent { .. }), "cleared hook marker became owner: {caller:?}");
+    assert!(
+        matches!(&caller, SocketCaller::Agent { kind, .. } if kind == "process-tree"),
+        "cleared hook marker was not traced to its marked Git ancestor: {caller:?}"
+    );
     assert_eq!(caller.permits("web_remote_enable", Access::Admin).unwrap_err().code, ErrorCode::AdminRefused);
     drop(release);
     let output = run.join().unwrap().unwrap();
