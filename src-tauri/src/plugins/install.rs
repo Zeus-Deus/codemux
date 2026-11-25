@@ -139,26 +139,39 @@ fn stop_git_tree(child: &mut Child, #[cfg(windows)] job: &super::platform_runtim
     let _ = child.wait();
 }
 
-fn directory_budget_exceeded(root: &Path, limit: u64) -> bool {
+fn directory_budget_exceeded(root: &Path, limit: u64) -> Result<bool, String> {
     let mut pending = vec![root.to_path_buf()];
     let mut bytes = 0u64;
     let mut entries_seen = 0;
     while let Some(dir) = pending.pop() {
-        let Ok(entries) = std::fs::read_dir(dir) else { return true; };
+        let entries = match std::fs::read_dir(&dir) {
+            Ok(entries) => entries,
+            Err(error) if dir != root && error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(format!("Cannot inspect plugin verification files: {error}")),
+        };
         for entry in entries {
             entries_seen += 1;
-            if entries_seen > 10_000 { return true; }
-            let Ok(entry) = entry else { return true; };
-            let Ok(meta) = entry.metadata() else { return true; };
+            if entries_seen > 10_000 { return Ok(true); }
+            let entry = match entry {
+                Ok(entry) => entry,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) => return Err(format!("Cannot inspect plugin verification files: {error}")),
+            };
+            let meta = match entry.metadata() {
+                Ok(meta) => meta,
+                // Git atomically renames temporary pack files during a fetch.
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) => return Err(format!("Cannot inspect plugin verification files: {error}")),
+            };
             if meta.is_dir() {
                 pending.push(entry.path());
             } else {
                 bytes = bytes.saturating_add(meta.len());
-                if bytes > limit { return true; }
+                if bytes > limit { return Ok(true); }
             }
         }
     }
-    false
+    Ok(false)
 }
 
 impl Git {
@@ -291,6 +304,7 @@ impl Git {
             buf
         });
         let mut next_disk_check = Instant::now();
+        let mut child_reaped = false;
         let status = loop {
             if Instant::now() >= deadline {
                 break Err(GIT_DEADLINE.to_string());
@@ -300,25 +314,35 @@ impl Git {
             }
             if let Some(limit) = disk_limit {
                 if Instant::now() >= next_disk_check {
-                    if directory_budget_exceeded(self.dir.path(), limit) {
-                        break Err(GIT_DISK_LIMIT.into());
+                    match directory_budget_exceeded(self.dir.path(), limit) {
+                        Ok(true) => break Err(GIT_DISK_LIMIT.into()),
+                        Ok(false) => {}
+                        Err(error) => break Err(error),
                     }
                     next_disk_check = Instant::now() + Duration::from_millis(50);
                 }
             }
             match child.try_wait() {
                 Ok(Some(status)) => {
-                    if disk_limit.is_some_and(|limit| directory_budget_exceeded(self.dir.path(), limit)) {
-                        break Err(GIT_DISK_LIMIT.into());
+                    child_reaped = true;
+                    if let Some(limit) = disk_limit {
+                        match directory_budget_exceeded(self.dir.path(), limit) {
+                            Ok(true) => break Err(GIT_DISK_LIMIT.into()),
+                            Ok(false) => {}
+                            Err(error) => break Err(error),
+                        }
                     }
                     break Ok(status);
                 }
                 Ok(None) => {}
-                Err(error) => break Err(error.to_string()),
+                Err(error) => {
+                    child_reaped = true;
+                    break Err(error.to_string());
+                }
             }
             std::thread::sleep(Duration::from_millis(20));
         };
-        if status.is_err() {
+        if status.is_err() && !child_reaped {
             stop_git_tree(&mut child, #[cfg(windows)] &job);
         }
         let out = out.join().unwrap_or_default();
