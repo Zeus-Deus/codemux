@@ -187,7 +187,7 @@ function HtmlRenderDocument({
         }}
       />
       <AlertDialog open={pendingUrl !== null} onOpenChange={(open) => !open && dismissLink()}>
-        <AlertDialogContent className="flex max-h-[calc(100dvh-2rem)] flex-col overflow-hidden">
+        <AlertDialogContent className="flex max-h-[calc(100dvh-2rem)] flex-col gap-2 overflow-hidden">
           <AlertDialogHeader className="min-h-0 overflow-y-auto">
             <AlertDialogMedia>
               <ExternalLink aria-hidden="true" />
@@ -197,16 +197,29 @@ function HtmlRenderDocument({
               This page asked to open a link. Check the address before continuing.
             </AlertDialogDescription>
           </AlertDialogHeader>
-          <div className="min-h-0 overflow-y-auto rounded-lg bg-muted px-3 py-2 text-label">
-            <div className="text-muted-foreground">Destination</div>
-            <bdi dir="ltr" className="block select-text break-all font-mono text-foreground [unicode-bidi:isolate]">
+          <div className="shrink-0 rounded-lg bg-muted px-3 py-1.5 text-label">
+            <div className="text-muted-foreground">Destination origin</div>
+            <bdi
+              dir="ltr"
+              role="region"
+              aria-label="Destination origin"
+              tabIndex={0}
+              className="block max-h-12 select-text overflow-y-auto break-all font-mono text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-focus-ring [unicode-bidi:isolate]"
+            >
               {pendingUrl === null ? null : new URL(pendingUrl).origin}
             </bdi>
+          </div>
+          <div
+            role="region"
+            aria-label="Full destination address"
+            tabIndex={0}
+            className="min-h-12 basis-0 flex-1 overflow-y-auto rounded-lg bg-muted px-3 py-2 text-label focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-focus-ring"
+          >
             <bdi dir="ltr" className="mt-1 block select-text break-all font-mono text-muted-foreground [unicode-bidi:isolate]">
               {pendingUrl}
             </bdi>
           </div>
-          <AlertDialogFooter className="shrink-0">
+          <AlertDialogFooter className="shrink-0 py-2">
             <AlertDialogCancel>Cancel</AlertDialogCancel>
             <AlertDialogAction
               onClick={() => {

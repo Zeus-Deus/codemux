@@ -1,5 +1,6 @@
 /// <reference types="@testing-library/jest-dom/vitest" />
 import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import type { ToolCallItem } from "@/lib/agent-chat/types";
@@ -132,7 +133,7 @@ describe("HtmlRenderFrame", () => {
     await waitFor(() => expect(mocks.openExternalUrl).toHaveBeenCalledWith("https://example.com/review"));
   });
 
-  it("keeps actions visible while a long address scrolls in a short viewport", () => {
+  it("keeps the origin and actions visible while keyboard users inspect a long address", async () => {
     const previousHeight = window.innerHeight;
     Object.defineProperty(window, "innerHeight", { configurable: true, value: 240 });
     try {
@@ -142,7 +143,15 @@ describe("HtmlRenderFrame", () => {
       postLink(frame, `https://example.com/${"x".repeat(7000)}`);
       const dialog = screen.getByRole("alertdialog");
       expect(dialog.className).toContain("max-h-[calc(100dvh-2rem)]");
-      expect(dialog.querySelector(".overflow-y-auto")).not.toBeNull();
+      const origin = screen.getByRole("region", { name: "Destination origin" });
+      const address = screen.getByRole("region", { name: "Full destination address" });
+      expect(origin).toHaveTextContent("https://example.com");
+      expect(address).toHaveAttribute("tabindex", "0");
+      expect(address.className).toContain("overflow-y-auto");
+      expect(address.className).toContain("focus-visible:ring-2");
+      origin.focus();
+      await userEvent.tab();
+      expect(address).toHaveFocus();
       expect(screen.getByRole("button", { name: "Cancel" })).toBeVisible();
       expect(screen.getByRole("button", { name: "Open link" })).toBeVisible();
       fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
