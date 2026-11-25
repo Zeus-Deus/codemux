@@ -305,12 +305,20 @@ mod ancestry {
         let roots = ROOTS.lock().unwrap_or_else(PoisonError::into_inner);
         let own = std::process::id();
         let mut current = pid;
+        let mut child_start = None;
         for _ in 0..MAX_HOPS {
             if current == own { return Some(false); }
             // pid 1 is launchd on macOS; pid 4 is System on Windows.
             if current == 1 || (cfg!(windows) && current == 4) { return Some(false); }
             let process = system.process(Pid::from_u32(current))?;
+            let start = process.start_time();
+            // A live process in a parent's reused PID slot cannot be the
+            // ancestor of a child that started before it.
+            if start == 0 || child_start.is_some_and(|child| start > child) {
+                return None;
+            }
             if roots.get(&current) == Some(&process.start_time()) { return Some(true); }
+            child_start = Some(start);
             current = process.parent()?.as_u32();
         }
         // Excessive depth or an incomplete process snapshot is unverified.
