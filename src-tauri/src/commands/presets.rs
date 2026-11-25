@@ -717,6 +717,37 @@ fn set_preset_tab_metadata(
     state.set_tab_icon(workspace_id, tab_id, icon.clone())
 }
 
+/// A previously confirmed tab can close while a later terminal is starting.
+fn surviving_confirmed_tab_ids(
+    state: &AppStateStore,
+    workspace_id: &str,
+    confirmed_tabs: &[(String, String)],
+) -> Vec<String> {
+    let snapshot = state.snapshot();
+    let Some(workspace) = snapshot
+        .workspaces
+        .iter()
+        .find(|workspace| workspace.workspace_id.0 == workspace_id)
+    else {
+        return Vec::new();
+    };
+    confirmed_tabs
+        .iter()
+        .filter_map(|(tab_id, session_id)| {
+            let tab = workspace.tabs.iter().find(|tab| &tab.tab_id == tab_id)?;
+            let surface_id = tab.surface_id.as_ref()?;
+            let surface = workspace
+                .surfaces
+                .iter()
+                .find(|surface| &surface.surface_id == surface_id)?;
+            crate::state::collect_terminal_sessions(std::slice::from_ref(surface))
+                .iter()
+                .any(|current| current == session_id)
+                .then(|| tab_id.clone())
+        })
+        .collect()
+}
+
 /// Reuse the caller's exact tab for the first command and open one tab per
 /// remaining command. A confirmed write precedes metadata and success.
 #[allow(clippy::too_many_arguments)]
@@ -733,7 +764,7 @@ fn launch_fresh_terminal_preset(
     mut report_prompt: impl FnMut(&str),
 ) -> Result<Option<PartialPresetLaunch>, String> {
     let first = current_terminal_target(state, workspace_id, Some(target_tab_id))?;
-    let mut confirmed_tab_ids = Vec::new();
+    let mut confirmed_tabs = Vec::new();
     for (index, command) in commands.iter().enumerate() {
         let step = (|| -> Result<(), String> {
             let (session_id, tab_id) = if index == 0 {
@@ -757,7 +788,7 @@ fn launch_fresh_terminal_preset(
             }
             set_preset_tab_metadata(state, workspace_id, &tab_id, preset_name, preset_icon)?;
             if !command.is_empty() {
-                confirmed_tab_ids.push(tab_id.clone());
+                confirmed_tabs.push((tab_id.clone(), session_id.clone()));
             }
             if prompt_requires_manual_entry {
                 report_prompt(&session_id);
@@ -765,6 +796,8 @@ fn launch_fresh_terminal_preset(
             Ok(())
         })();
         if let Err(error) = step {
+            let confirmed_tab_ids =
+                surviving_confirmed_tab_ids(state, workspace_id, &confirmed_tabs);
             if confirmed_tab_ids.is_empty() {
                 return Err(error);
             }
@@ -772,6 +805,19 @@ fn launch_fresh_terminal_preset(
                 confirmed_tab_ids,
                 total_commands: commands.len(),
                 error,
+            }));
+        }
+    }
+    if !confirmed_tabs.is_empty() {
+        let confirmed_tab_ids = surviving_confirmed_tab_ids(state, workspace_id, &confirmed_tabs);
+        if confirmed_tab_ids.len() != confirmed_tabs.len() {
+            if confirmed_tab_ids.is_empty() {
+                return Err("Preset terminals closed before launch confirmation".to_string());
+            }
+            return Ok(Some(PartialPresetLaunch {
+                confirmed_tab_ids,
+                total_commands: commands.len(),
+                error: "A launched terminal closed before the preset finished".to_string(),
             }));
         }
     }
@@ -1281,13 +1327,19 @@ mod tests {
         state: std::sync::Arc<AppStateStore>,
         workspace_id: String,
         tab_id: String,
+        calls: std::sync::Arc<std::sync::Mutex<Vec<Vec<u8>>>>,
+        fail: bool,
     }
 
     impl Write for CloseTabOnWrite {
         fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.calls.lock().unwrap().push(buf.to_vec());
             self.state
                 .close_tab(&self.workspace_id, &self.tab_id)
                 .map_err(std::io::Error::other)?;
+            if self.fail {
+                return Err(std::io::Error::other("later terminal rejected the write"));
+            }
             Ok(buf.len())
         }
 
@@ -1779,6 +1831,8 @@ mod tests {
             state: state.clone(),
             workspace_id: workspace.0.clone(),
             tab_id: target.clone(),
+            calls: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+            fail: false,
         }));
         runtime.pending_output.push_back(b"$ ".to_vec());
         sessions.lock().unwrap().insert(session_id, runtime);
@@ -1806,6 +1860,87 @@ mod tests {
             .unwrap()
             .tabs
             .is_empty());
+    }
+
+    #[test]
+    fn closed_earlier_tab_is_not_offered_after_a_later_write() {
+        for fail_later_write in [false, true] {
+            let state = std::sync::Arc::new(AppStateStore::default());
+            let workspace = state.create_workspace_at_path(std::path::PathBuf::from("/tmp"));
+            let first_tab = state
+                .snapshot()
+                .workspaces
+                .iter()
+                .find(|item| item.workspace_id.0 == workspace.0)
+                .unwrap()
+                .tabs[0]
+                .tab_id
+                .clone();
+            let (first_session, _) =
+                current_terminal_target(&state, &workspace.0, Some(&first_tab)).unwrap();
+            let sessions = make_sessions();
+            let first_calls = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+            let second_calls = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+            let mut first_runtime = SessionRuntime::new(&first_session);
+            first_runtime.writer = Some(Box::new(RecordingWriter {
+                calls: first_calls.clone(),
+            }));
+            first_runtime.pending_output.push_back(b"$ ".to_vec());
+            sessions
+                .lock()
+                .unwrap()
+                .insert(first_session, first_runtime);
+
+            let result = launch_fresh_terminal_preset(
+                &state,
+                &sessions,
+                &workspace.0,
+                &first_tab,
+                &["agent-one".into(), "agent-two".into()],
+                Some("never send $(id) to the PTY"),
+                "Agent",
+                &None,
+                |session_id| {
+                    let mut runtime = SessionRuntime::new(&session_id);
+                    runtime.writer = Some(Box::new(CloseTabOnWrite {
+                        state: state.clone(),
+                        workspace_id: workspace.0.clone(),
+                        tab_id: first_tab.clone(),
+                        calls: second_calls.clone(),
+                        fail: fail_later_write,
+                    }));
+                    runtime.pending_output.push_back(b"$ ".to_vec());
+                    sessions.lock().unwrap().insert(session_id, runtime);
+                },
+                |_| {},
+            );
+
+            let snapshot = state.snapshot();
+            let tabs = &snapshot
+                .workspaces
+                .iter()
+                .find(|item| item.workspace_id.0 == workspace.0)
+                .unwrap()
+                .tabs;
+            assert_eq!(tabs.len(), 1);
+            assert_ne!(tabs[0].tab_id, first_tab);
+            assert_eq!(*first_calls.lock().unwrap(), vec![b"agent-one\r".to_vec()]);
+            assert_eq!(*second_calls.lock().unwrap(), vec![b"agent-two\r".to_vec()]);
+
+            if fail_later_write {
+                let error = result.expect_err("no live tab received a confirmed command");
+                assert!(error.contains("later terminal rejected the write"));
+                assert_ne!(tabs[0].title, "Agent");
+            } else {
+                let partial = result
+                    .expect("a later tab received a confirmed command")
+                    .expect("the first tab closed during the later write");
+                assert_eq!(partial.confirmed_tab_ids, vec![tabs[0].tab_id.clone()]);
+                assert_eq!(partial.total_commands, 2);
+                assert!(partial.error.contains("closed"));
+                assert_eq!(tabs[0].title, "Agent");
+            }
+        }
     }
 
     #[test]

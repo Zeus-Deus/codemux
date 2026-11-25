@@ -45,7 +45,10 @@ vi.mock("@/tauri/commands", () => ({
       useAppStore.getState().appState ?? {
         schema_version: 1,
         active_workspace_id: "",
-        workspaces: [],
+        workspaces: [{
+          workspace_id: "ws-project",
+          tabs: [{ tab_id: "tab-cli", kind: "terminal" }],
+        }],
       },
     ),
   ),

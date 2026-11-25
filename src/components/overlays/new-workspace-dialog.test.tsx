@@ -51,6 +51,9 @@ vi.mock("@/tauri/commands", () => ({
   importWorktreeWorkspace: vi.fn().mockResolvedValue("ws-new"),
   activateWorkspace: vi.fn().mockResolvedValue(undefined),
   activateTab: vi.fn().mockResolvedValue(undefined),
+  getAppState: vi.fn().mockResolvedValue({
+    workspaces: [{ workspace_id: "ws-new", tabs: [{ tab_id: "tab-default", kind: "terminal" }] }],
+  }),
   renameWorkspace: vi.fn().mockResolvedValue(undefined),
   applyPreset: vi.fn().mockResolvedValue(undefined),
   dbAddRecentProject: vi.fn().mockResolvedValue(undefined),
@@ -130,6 +133,7 @@ import {
   createWorktreeWorkspaceResult,
   activateWorkspace,
   activateTab,
+  getAppState,
   renameWorkspace,
   generateBranchName,
   generateRandomBranchName,
@@ -632,7 +636,7 @@ describe("Submit flow", () => {
     fireEvent.click(within(dialog).getByRole("button", { name: /Create/i }));
 
     await waitFor(() => expect(toast.warning).toHaveBeenCalledWith(
-      expect.stringContaining("could not start"),
+      expect.stringContaining("could not be confirmed open"),
       expect.objectContaining({ action: expect.objectContaining({ label: "Copy prompt" }) }),
     ));
     expect((createWorktreeWorkspaceResult as Mock).mock.calls[0][6]).toBeNull();
@@ -674,6 +678,37 @@ describe("Submit flow", () => {
     expect(saved.manualPromptRequired).toBe(true);
     expect(toast.success).not.toHaveBeenCalled();
     expect(applyPreset).toHaveBeenCalledTimes(1);
+  });
+
+  it("keeps a partial prompt without an agent link if its confirmed tab closed", async () => {
+    setAppState("/path/to/project");
+    (getAppState as Mock).mockResolvedValueOnce({
+      workspaces: [{ workspace_id: "ws-new", tabs: [] }],
+    });
+    (applyPreset as Mock).mockRejectedValueOnce(new PartialPresetLaunchError({
+      confirmed_tab_ids: ["tab-default"],
+      total_commands: 2,
+      error: "second terminal rejected the write",
+    }));
+    renderDialog(true);
+
+    const dialog = await screen.findByRole("dialog");
+    fireEvent.change(within(dialog).getByPlaceholderText("What do you want to do?"), {
+      target: { value: "Fix the login bug" },
+    });
+    fireEvent.click(within(dialog).getByRole("button", { name: /Create/i }));
+
+    await waitFor(() => expect(toast.warning).toHaveBeenCalledWith(
+      expect.stringContaining("could not be confirmed open"),
+      expect.objectContaining({ action: expect.objectContaining({ label: "Copy prompt" }) }),
+    ));
+    const options = (toast.warning as Mock).mock.calls[0][1];
+    expect(options.cancel).toBeUndefined();
+    expect(activateTab).not.toHaveBeenCalled();
+    expect(toast.success).not.toHaveBeenCalled();
+    const saved = Object.values(useChatDraftStore.getState().draftsById)[0];
+    expect(saved.inputDraft).toBe("Fix the login bug");
+    expect(saved.manualPromptRequired).toBe(false);
   });
 
   it("threads a remembered model selection through to the confirmed preset launch", async () => {
@@ -1805,7 +1840,7 @@ describe("Non-git project", () => {
     fireEvent.click(within(dialog).getByRole("button", { name: /Create/i }));
 
     await waitFor(() => expect(toast.warning).toHaveBeenCalledWith(
-      expect.stringContaining("could not start"),
+      expect.stringContaining("could not be confirmed open"),
       expect.objectContaining({ action: expect.objectContaining({ label: "Copy prompt" }) }),
     ));
     expect(toast.success).not.toHaveBeenCalled();

@@ -21,6 +21,7 @@ import {
   getPresets,
 } from "@/tauri/commands";
 import { PartialPresetLaunchError } from "@/lib/partial-preset-launch";
+import { focusConfirmedPresetTab } from "@/lib/confirmed-preset-tabs";
 import type { ModelSelection, TerminalPreset, WorkspaceSnapshot } from "@/tauri/types";
 import { activateWorkspaceInteraction } from "@/lib/perf/instrumented-activate";
 import { useAppStore } from "@/stores/app-store";
@@ -380,6 +381,7 @@ export async function handOffToAgent(req: HandoffRequest): Promise<HandoffOutcom
     workspaceId: string,
     threadTabId: string | null,
     partial?: PartialPresetLaunchError,
+    openTabCount?: number,
   ): HandoffOutcome => {
     const title = workspaceById(workspaceId)?.title ?? pr.head_branch ?? "a new workspace";
     const where =
@@ -394,7 +396,7 @@ export async function handOffToAgent(req: HandoffRequest): Promise<HandoffOutcom
       prompt,
       true,
       partial
-        ? `${presetName} opened ${partial.confirmedTabIds.length} of ${partial.totalCommands} tabs; another command failed.`
+        ? `${presetName} opened ${openTabCount ?? partial.confirmedTabIds.length} of ${partial.totalCommands} tabs; another tab failed or closed.`
         : `${presetName} opened ${where} without the PR task. Copy the prompt to start it.`,
       partial ? "warning" : "success",
       partial && threadTabId
@@ -414,13 +416,12 @@ export async function handOffToAgent(req: HandoffRequest): Promise<HandoffOutcom
       tabId = originalTabId ?? await createTab(workspaceId, "terminal");
       await applyPreset(workspaceId, presetId, "current_terminal", null, modelSelection, true, tabId);
     } catch (error) {
-      if (error instanceof PartialPresetLaunchError && error.confirmedTabIds[0]) {
-        const confirmedTabId = error.confirmedTabIds[0];
-        await activateTab(workspaceId, confirmedTabId).catch(() => {});
-        return finish(route, workspaceId, confirmedTabId, error);
+      if (error instanceof PartialPresetLaunchError) {
+        const { tabId, openTabCount } = await focusConfirmedPresetTab(workspaceId, error.confirmedTabIds);
+        if (tabId) return finish(route, workspaceId, tabId, error, openTabCount);
       }
       useChatDraftStore.getState().saveWorkspacePrompt(workspaceId, prompt, false);
-      throw new Error(`Workspace opened, but ${presetName} did not open. The PR task is saved in Drafts. ${String(error)}`);
+      throw new Error(`Workspace opened, but no ${presetName} tab could be confirmed. The PR task is saved in Drafts. ${String(error)}`);
     }
     return finish(route, workspaceId, tabId);
   };

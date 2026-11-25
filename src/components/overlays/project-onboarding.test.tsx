@@ -25,6 +25,9 @@ vi.mock("@/tauri/commands", () => ({
   importWorktreeWorkspace: vi.fn().mockResolvedValue("ws-new"),
   activateWorkspace: vi.fn().mockResolvedValue(undefined),
   activateTab: vi.fn().mockResolvedValue(undefined),
+  getAppState: vi.fn().mockResolvedValue({
+    workspaces: [{ workspace_id: "ws-new", tabs: [{ tab_id: "tab-default", kind: "terminal" }] }],
+  }),
   closeWorkspace: vi.fn().mockResolvedValue(undefined),
   detectPackageManager: vi.fn().mockResolvedValue([]),
   setProjectScripts: vi.fn().mockResolvedValue(undefined),
@@ -179,7 +182,7 @@ describe("ProjectOnboarding — task and agent", () => {
     expect(saved.inputDraft).toBe("Add dark mode");
     expect(saved.manualPromptRequired).toBe(false);
     expect(vi.mocked(toast.warning)).toHaveBeenCalledWith(
-      expect.stringContaining("could not start"),
+      expect.stringContaining("could not be confirmed open"),
       expect.objectContaining({ action: expect.objectContaining({ label: "Copy prompt" }) }),
     );
     expect(toast.success).not.toHaveBeenCalled();

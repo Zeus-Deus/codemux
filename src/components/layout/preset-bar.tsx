@@ -351,7 +351,7 @@ function PresetBarImpl({
         toast.error(`${preset.name}: ${result.error ?? "Send failed"}`);
       } else if (result.partialPreset) {
         const partial = result.partialPreset;
-        toast.warning(`${preset.name} opened ${partial.confirmedCommands} of ${partial.totalCommands} tabs. Another command failed.${result.manualPromptRequired ? " The prompt remains in Drafts." : ""}`, {
+        toast.warning(`${preset.name} opened ${partial.confirmedCommands} of ${partial.totalCommands} tabs. Another tab failed or closed.${result.manualPromptRequired ? " The prompt remains in Drafts." : ""}`, {
           action: {
             label: "Open agent",
             onClick: () => {

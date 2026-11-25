@@ -5,7 +5,6 @@ import {
   agentChatSendTurn,
   agentChatStartSession,
   applyPreset,
-  activateTab,
   createTab,
   createEmptyWorkspace,
   createWorkspaceOnHost,
@@ -25,6 +24,7 @@ import type { ChatDraft, DraftId } from "@/stores/chat-draft-store";
 import type { TerminalPreset } from "@/tauri/types";
 import { randomUUID } from "@/lib/uuid";
 import { PartialPresetLaunchError } from "@/lib/partial-preset-launch";
+import { focusConfirmedPresetTab } from "@/lib/confirmed-preset-tabs";
 
 import {
   deriveTitleFromFirstMessage,
@@ -753,27 +753,28 @@ export async function materializeWithPreset(
       tabId,
     );
   } catch (err) {
-    if (err instanceof PartialPresetLaunchError && err.confirmedTabIds[0]) {
-      const confirmedTabId = err.confirmedTabIds[0];
-      await activateTab(workspaceId, confirmedTabId).catch(() => {});
-      if (prompt.length > 0) actions.markManualPromptRequired(draft.draftId);
-      else actions.markPromoted(draft.draftId, {
-        workspaceId,
-        paneId: "cli-preset",
-        threadId: draft.threadId,
-      });
-      return {
-        success: true,
-        workspaceId,
-        paneId: "cli-preset",
-        threadId: draft.threadId,
-        ...(prompt.length > 0 ? { manualPromptRequired: true } : {}),
-        partialPreset: {
-          confirmedTabId,
-          confirmedCommands: err.confirmedTabIds.length,
-          totalCommands: err.totalCommands,
-        },
-      };
+    if (err instanceof PartialPresetLaunchError) {
+      const { tabId, openTabCount } = await focusConfirmedPresetTab(workspaceId, err.confirmedTabIds);
+      if (tabId) {
+        if (prompt.length > 0) actions.markManualPromptRequired(draft.draftId);
+        else actions.markPromoted(draft.draftId, {
+          workspaceId,
+          paneId: "cli-preset",
+          threadId: draft.threadId,
+        });
+        return {
+          success: true,
+          workspaceId,
+          paneId: "cli-preset",
+          threadId: draft.threadId,
+          ...(prompt.length > 0 ? { manualPromptRequired: true } : {}),
+          partialPreset: {
+            confirmedTabId: tabId,
+            confirmedCommands: openTabCount,
+            totalCommands: err.totalCommands,
+          },
+        };
+      }
     }
     const message = errorMessage(err);
     actions.markSendFailed(draft.draftId, message);

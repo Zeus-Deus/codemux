@@ -1453,9 +1453,9 @@ export const applyPreset = async (
   if (isRemoteClient()) {
     try {
       await refreshRemoteWorkspaceView(workspaceId, undefined, undefined, sequence);
-    } catch (error) {
-      // A failed refresh cannot erase tabs whose PTY writes were confirmed.
-      if (!partial) throw error;
+    } catch {
+      // Refresh can fail after the preset command reached its PTY. The
+      // backend launch result remains authoritative for caller guidance.
     }
   }
   if (partial) throw new PartialPresetLaunchError(partial);

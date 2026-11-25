@@ -100,4 +100,15 @@ describe("fresh preset launch IPC", () => {
       });
     expect(invoke).toHaveBeenCalledWith("get_app_state");
   });
+
+  it("keeps confirmed success when the remote view refresh fails", async () => {
+    (window as { __CODEMUX_REMOTE__?: boolean }).__CODEMUX_REMOTE__ = true;
+    invoke
+      .mockResolvedValueOnce(null)
+      .mockRejectedValueOnce(new Error("remote refresh unavailable"));
+
+    await expect(applyPreset("ws-new", "preset", "current_terminal", null, null, true, "tab-original"))
+      .resolves.toBeUndefined();
+    expect(invoke).toHaveBeenCalledWith("get_app_state");
+  });
 });

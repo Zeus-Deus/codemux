@@ -70,6 +70,7 @@ import { utilitySelectionFromStores } from "@/lib/utility-agent";
 import { toast, errorMessage } from "@/lib/toast";
 import { saveWorkspacePrompt } from "@/lib/workspace-prompt-handoff";
 import { PartialPresetLaunchError } from "@/lib/partial-preset-launch";
+import { focusConfirmedPresetTab } from "@/lib/confirmed-preset-tabs";
 import { initialTerminalTabId } from "@/lib/terminal-preset-target";
 import { Eyebrow } from "@/components/ui/eyebrow";
 import { PresetIcon } from "@/components/icons/preset-icon";
@@ -364,15 +365,21 @@ export function ProjectOnboarding({ projectDir, tempWorkspaceId, onComplete, onC
         let launchError: string | null = null;
         let partialLaunch: PartialPresetLaunchError | null = null;
         let confirmedTabId: string | null = null;
+        let openTabCount = 0;
         if (!created.adopted && selectedAgentId) {
           try {
             const tabId = initialTerminalTabId(created);
             await applyPreset(created.workspaceId, selectedAgentId, "current_terminal", null, null, true, tabId);
           } catch (error) {
-            if (error instanceof PartialPresetLaunchError && error.confirmedTabIds[0]) {
-              partialLaunch = error;
-              confirmedTabId = error.confirmedTabIds[0];
-              await activateTab(created.workspaceId, confirmedTabId).catch(() => {});
+            if (error instanceof PartialPresetLaunchError) {
+              const open = await focusConfirmedPresetTab(created.workspaceId, error.confirmedTabIds);
+              if (open.tabId) {
+                partialLaunch = error;
+                confirmedTabId = open.tabId;
+                openTabCount = open.openTabCount;
+              } else {
+                launchError = "No open agent tab could be confirmed after the preset partly started";
+              }
             } else {
               launchError = errorMessage(error);
             }
@@ -391,9 +398,9 @@ export function ProjectOnboarding({ projectDir, tempWorkspaceId, onComplete, onC
             prompt,
             agentOpened,
             partialLaunch
-              ? `${selectedAgent?.name ?? "Agent"} opened ${partialLaunch.confirmedTabIds.length} of ${partialLaunch.totalCommands} tabs. Another command failed. Copy the task into an open agent.`
+              ? `${selectedAgent?.name ?? "Agent"} opened ${openTabCount} of ${partialLaunch.totalCommands} tabs; another tab failed or closed.`
               : launchError
-              ? `Workspace opened, but ${selectedAgent?.name ?? "Agent"} could not start. The task is saved in Drafts.`
+              ? `Workspace opened, but ${selectedAgent?.name ?? "Agent"} could not be confirmed open. The task is saved in Drafts.`
               : agentOpened
               ? `${selectedAgent?.name ?? "Agent"} opened without this task. Copy the prompt to start it.`
               : "Workspace opened without sending this task. It is saved for later.",
@@ -401,9 +408,9 @@ export function ProjectOnboarding({ projectDir, tempWorkspaceId, onComplete, onC
             openConfirmedTab,
           );
         } else if (partialLaunch) {
-          toast.warning(`${selectedAgent?.name ?? "Agent"} opened ${partialLaunch.confirmedTabIds.length} of ${partialLaunch.totalCommands} tabs. Another command failed.`);
+          toast.warning(`${selectedAgent?.name ?? "Agent"} opened ${openTabCount} of ${partialLaunch.totalCommands} tabs; another tab failed or closed.`);
         } else if (launchError) {
-          toast.error(`Workspace opened, but ${selectedAgent?.name ?? "Agent"} could not start: ${launchError}`);
+          toast.error(`Workspace opened, but ${selectedAgent?.name ?? "Agent"} could not be confirmed open: ${launchError}`);
         }
         // Title the new workspace from the task, separately from its branch.
         if (!created.adopted && task.trim()) {
