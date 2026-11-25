@@ -239,7 +239,7 @@ fn provenance_search_is_bounded_and_says_when_it_gave_up() {
 }
 
 #[test]
-fn provenance_checks_the_default_branch_before_large_unrelated_refs_and_caps_all_packs() {
+fn provenance_searches_older_default_pin_before_large_unrelated_refs() {
     let f = fixture();
     let origin = PathBuf::from(f.url.strip_prefix("file://").unwrap());
     let work = origin.parent().unwrap().join("work");
@@ -263,8 +263,14 @@ fn provenance_checks_the_default_branch_before_large_unrelated_refs_and_caps_all
     git(&work, &["commit", "-q", "--allow-empty", "-F", message_file.to_str().unwrap()]);
     git(&work, &["push", "-q", origin, "zlarge"]);
 
+    // The pinned commit is deeper than the first round on main. Searching
+    // unrelated refs first would hit the large branch and exhaust the budget.
+    git(&work, &["checkout", "-q", "main"]);
+    commits(&work, 5);
+    git(&work, &["push", "-q", origin, "main"]);
+
     let verifier = test_git();
-    verifier.check_on_branch_or_tag_with_budget(&f.url, &f.first, &[2], 1024 * 1024).unwrap();
+    verifier.check_on_branch_or_tag_with_budget(&f.url, &f.first, &[2, 16], 1024 * 1024).unwrap();
 
     // A deleted ref leaves a fetchable object, but no named ref proves it.
     // The large branch must exhaust the shared disk budget and fail closed.

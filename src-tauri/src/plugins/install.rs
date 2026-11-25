@@ -26,6 +26,8 @@ pub(crate) const PROVENANCE_UNCONFIRMED: &str = "Could not confirm commit";
 pub const MAX_FILES: usize = 64;
 pub const MAX_TOTAL_BYTES: u64 = 32 * 1024 * 1024;
 const GIT_TIMEOUT: Duration = Duration::from_secs(90);
+// Checked during and after each fetch. This is a sampled guard, not a
+// filesystem quota: an in-flight pack can briefly exceed this amount.
 const MAX_PROVENANCE_BYTES: u64 = 64 * 1024 * 1024;
 const GIT_DISK_LIMIT: &str = "Git provenance download exceeded its disk limit";
 const GIT_DEADLINE: &str = "Git took too long; check your connection and try again";
@@ -502,19 +504,37 @@ impl Git {
             ).map(drop).map_err(&limit_error)
         };
         fetch("1", &format!("+{sha}:refs/codemux/want"))?;
+        let search_ref = |remote_ref: &str, depth: u32| -> Result<bool, String> {
+            let local_ref = remote_ref.replacen("refs/", "refs/codemux/", 1);
+            fetch(&depth.to_string(), &format!("+{remote_ref}:{local_ref}"))?;
+            let out = check.run_by(
+                &["for-each-ref", "--count=1", "--contains", sha, "--format=%(refname)",
+                  "refs/codemux/heads/", "refs/codemux/tags/"],
+                None,
+                4096,
+                deadline,
+            ).map_err(&limit_error)?;
+            Ok(!String::from_utf8_lossy(&out).trim().is_empty())
+        };
+
+        // Give the default branch two depth rounds before any unrelated ref.
+        // This lets a common older pin be proven without spending the shared
+        // download budget on a large tag or branch first.
+        let default_ref = default_head.as_ref().filter(|head| refs.contains(head));
+        if let Some(default_ref) = default_ref {
+            for depth in depths.iter().take(2) {
+                if search_ref(default_ref, *depth)? {
+                    return Ok(());
+                }
+            }
+        }
         let mut searched = 0;
-        for depth in depths {
+        for (round, depth) in depths.iter().enumerate() {
             for remote_ref in &refs {
-                let local_ref = remote_ref.replacen("refs/", "refs/codemux/", 1);
-                fetch(&depth.to_string(), &format!("+{remote_ref}:{local_ref}"))?;
-                let out = check.run_by(
-                    &["for-each-ref", "--count=1", "--contains", sha, "--format=%(refname)",
-                      "refs/codemux/heads/", "refs/codemux/tags/"],
-                    None,
-                    4096,
-                    deadline,
-                ).map_err(&limit_error)?;
-                if !String::from_utf8_lossy(&out).trim().is_empty() {
+                if round < 2 && default_ref == Some(remote_ref) {
+                    continue;
+                }
+                if search_ref(remote_ref, *depth)? {
                     return Ok(());
                 }
             }
