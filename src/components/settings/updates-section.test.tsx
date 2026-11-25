@@ -129,6 +129,7 @@ describe("UpdatesSection", () => {
     expect((options as { description: string }).description).toBe("buildbox · Agent discovery: Error: SSH timed out");
     expect(screen.getByRole("status")).toHaveTextContent("1 updated, 1 failed. See details below.");
     expect(screen.getByText(/Status check failed: Error: SSH timed out/)).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Status unavailable" })).toBeDisabled();
     expect(useUpdateAll.getState().items["host:2/helper"]?.phase).toBe("updated");
   });
 
@@ -139,6 +140,20 @@ describe("UpdatesSection", () => {
       if (cmd === "provider_updates_local") return [];
       if (cmd === "provider_updates_device") {
         return { host_id: 2, helper_version: installedVersion, running_version: runningVersion, serve_alive: true, app_version: "0.24.0", providers: [], error: null };
+      }
+      throw new Error(`unexpected ${cmd}`);
+    });
+
+    render(<UpdatesSection />);
+    expect(await screen.findByText("v0.24.0 installed · v0.23.0 running · Restart required")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Restart required" })).toBeDisabled();
+  });
+
+  it("keeps a known restart warning ahead of an unavailable device status", async () => {
+    invoke.mockImplementation(async (cmd: string) => {
+      if (cmd === "provider_updates_local") return [];
+      if (cmd === "provider_updates_device") {
+        return { host_id: 2, helper_version: "0.24.0", running_version: "0.23.0", serve_alive: true, app_version: "0.24.0", providers: null, error: "Could not check agents" };
       }
       throw new Error(`unexpected ${cmd}`);
     });

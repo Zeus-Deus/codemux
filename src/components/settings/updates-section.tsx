@@ -96,6 +96,7 @@ export function UpdatesSection() {
   const appPending = app.available;
   const total = plan.items.length + (appPending ? 1 : 0);
   const restartRequired = Object.values(known).some(helperNeedsRestart);
+  const statusUnavailable = hostIds.some((id) => !!known[hostKey(id)]?.error);
   const restartNotice = (current: Partial<Record<MachineKey, MachineState>>) => {
     const devices = hosts.filter((host) => helperNeedsRestart(current[hostKey(host.id)]));
     if (devices.length === 0) return "Running chats weren't interrupted.";
@@ -146,7 +147,7 @@ export function UpdatesSection() {
               onClick={() => setConfirming(plan)}
             >
               {running && <Spinner className="size-3.5" aria-hidden />}
-              {running ? "Updating…" : total ? `Update all (${total})` : restartRequired ? "Restart required" : "Up to date"}
+              {running ? "Updating…" : total ? `Update all (${total})` : restartRequired ? "Restart required" : statusUnavailable ? "Status unavailable" : "Up to date"}
             </Button>
           </>
         }
