@@ -1075,8 +1075,10 @@ pub(crate) async fn create_worktree_checked<R: tauri::Runtime>(
                     if needs_pty_injection {
                         if let Some(ref prompt) = initial_prompt {
                             super::presets::write_prompt_when_agent_ready(
+                                app.clone(),
                                 sessions_arc.clone(),
                                 session_id,
+                                command,
                                 prompt,
                             );
                         }

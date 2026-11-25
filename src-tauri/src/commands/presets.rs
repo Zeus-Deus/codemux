@@ -434,8 +434,10 @@ pub fn apply_preset<R: tauri::Runtime>(
                     if needs_pty_injection {
                         if let Some(ref prompt) = initial_prompt {
                             write_prompt_when_agent_ready(
+                                app.clone(),
                                 sessions_arc.clone(),
                                 session_id.clone(),
+                                command,
                                 prompt,
                             );
                         }
@@ -731,27 +733,79 @@ fn wait_and_write_command(
 
 /// Type an agent's initial prompt into its TUI once the agent has started.
 ///
-/// The prompt can hold untrusted text (PR comments, CI logs, issue bodies), so
-/// control characters are stripped first, and nothing is written unless a
-/// foreground job (the agent) provably owns the terminal. Otherwise the agent
-/// exited or never started, or ownership can't be checked (Windows, remote
-/// panes), and every prompt line could run as a shell command.
-pub(crate) fn write_prompt_when_agent_ready(
+/// Only for presets whose CLI has no prompt flag (see
+/// `branch_name::prepare_agent_command`). The prompt can hold untrusted text
+/// (PR comments, CI logs, issue bodies), so control characters are stripped
+/// first, and nothing is written unless `agent_command`'s program provably
+/// owns the terminal. Otherwise the agent exited or never started, a nested
+/// shell is in front, or ownership can't be checked (non-Linux hosts, remote
+/// panes), and every prompt line could run as a shell command. A prompt that
+/// isn't typed is reported to the user as a notification on the session.
+pub(crate) fn write_prompt_when_agent_ready<R: tauri::Runtime>(
+    app: tauri::AppHandle<R>,
     sessions: Arc<std::sync::Mutex<std::collections::HashMap<String, terminal::SessionRuntime>>>,
     session_id: String,
+    agent_command: &str,
     prompt: &str,
 ) {
     let prompt = crate::branch_name::sanitize_prompt_for_pty(prompt);
+    let agent = crate::branch_name::agent_binary_name(agent_command);
     std::thread::spawn(move || {
-        wait_and_write_guarded(
+        let outcome = wait_and_write_guarded(
             &sessions,
             &session_id,
             &prompt,
             AGENT_PROMPT_SETTLE_MS,
             PTY_COMMAND_TERMINATOR,
-            true,
+            Some(&agent),
         );
+        if outcome == WriteOutcome::AgentNotConfirmed {
+            report_prompt_not_sent(&app, &session_id, &agent);
+        }
     });
+}
+
+/// Tell the user an agent launch went ahead without its starting prompt.
+fn report_prompt_not_sent<R: tauri::Runtime>(
+    app: &tauri::AppHandle<R>,
+    session_id: &str,
+    agent: &str,
+) {
+    use tauri::Manager as _;
+    let message = format!(
+        "Codemux did not send the starting prompt to {agent}: it could not confirm \
+         {agent} was running in this terminal."
+    );
+    let state = app.state::<AppStateStore>();
+    if state
+        .add_notification(
+            Some(session_id.to_string()),
+            None,
+            message.clone(),
+            crate::state::NotificationLevel::Attention,
+        )
+        .is_err()
+    {
+        // The session may have closed while the agent started.
+        let _ = state.add_notification(
+            None,
+            None,
+            message,
+            crate::state::NotificationLevel::Attention,
+        );
+    }
+    crate::state::emit_app_state(app);
+}
+
+/// What `wait_and_write_guarded` did.
+#[derive(Debug, PartialEq, Eq)]
+enum WriteOutcome {
+    /// The payload was handed to the PTY (or the write itself failed).
+    Written,
+    /// Nothing to write, or the PTY never became ready.
+    Skipped,
+    /// An agent prompt was withheld: the agent did not provably own the terminal.
+    AgentNotConfirmed,
 }
 
 /// Quiet period before typing a prompt into an agent TUI, long enough for the
@@ -796,19 +850,19 @@ fn wait_and_write(
     settle_ms: u64,
     terminator: &[u8],
 ) {
-    wait_and_write_guarded(sessions, session_id, command, settle_ms, terminator, false);
+    wait_and_write_guarded(sessions, session_id, command, settle_ms, terminator, None);
 }
 
-/// `wait_and_write`; with `needs_foreground_job`, skips the write when the
-/// shell itself is verifiably at its prompt (see `write_prompt_when_agent_ready`).
+/// `wait_and_write`; with `agent`, writes only while that program owns the
+/// terminal (see `write_prompt_when_agent_ready`).
 fn wait_and_write_guarded(
     sessions: &Arc<std::sync::Mutex<std::collections::HashMap<String, terminal::SessionRuntime>>>,
     session_id: &str,
     command: &str,
     settle_ms: u64,
     terminator: &[u8],
-    needs_foreground_job: bool,
-) {
+    agent: Option<&str>,
+) -> WriteOutcome {
     // Phase 1: poll until the PTY writer is available (shell process spawned).
     //
     // This used to share a single 5-second budget with Phase 2's quiet-
@@ -861,7 +915,7 @@ fn wait_and_write_guarded(
              after {:?}",
             writer_poll_start.elapsed()
         );
-        return;
+        return WriteOutcome::Skipped;
     }
 
     let command_to_write = {
@@ -888,7 +942,7 @@ fn wait_and_write_guarded(
     };
 
     if command_to_write.is_empty() {
-        return;
+        return WriteOutcome::Skipped;
     }
 
     // Phase 2: wait for shell output to arrive and then go quiet.
@@ -953,14 +1007,14 @@ fn wait_and_write_guarded(
         writer_poll_start.elapsed()
     );
 
-    let command_to_write = if needs_foreground_job {
-        if !terminal::session_job_owns_terminal(sessions, session_id) {
+    let command_to_write = if let Some(agent) = agent {
+        if !terminal::session_agent_owns_terminal(sessions, session_id, agent) {
             eprintln!(
                 "[codemux::presets] not typing the prompt into {session_id}: \
-                 cannot confirm the agent owns the terminal (shell at its prompt, \
-                 remote pane, or no /proc)"
+                 cannot confirm {agent:?} owns the terminal (shell or nested shell \
+                 in front, remote pane, or no /proc)"
             );
-            return;
+            return WriteOutcome::AgentNotConfirmed;
         }
         let bracketed = {
             let guard = sessions.lock().unwrap_or_else(|e| e.into_inner());
@@ -988,6 +1042,7 @@ fn wait_and_write_guarded(
             eprintln!("[codemux::presets] cannot write command to {session_id}: {error}")
         }
     }
+    WriteOutcome::Written
 }
 
 /// Check whether a command's binary exists on `PATH` for the current user.
@@ -1235,12 +1290,13 @@ mod tests {
         assert_eq!(agent_prompt_payload("a\nb", true), "\x1b[200~a\nb\x1b[201~");
     }
 
-    /// An agent prompt reaches the PTY only while a job owns the terminal:
-    /// an idle shell, an unknown pid or a pid that can't be read gets nothing.
+    /// An agent prompt reaches the PTY only while the agent owns the
+    /// terminal: an idle shell, a nested shell, another program, an unknown
+    /// pid or a pid that can't be read gets nothing.
     #[test]
     #[serial_test::serial]
     #[cfg(target_os = "linux")]
-    fn agent_prompt_is_written_only_while_a_job_owns_the_terminal() {
+    fn agent_prompt_is_written_only_while_the_agent_owns_the_terminal() {
         use portable_pty::{native_pty_system, CommandBuilder, PtySize};
 
         fn spawn(cmd: CommandBuilder) -> (Box<dyn portable_pty::Child + Send + Sync>, u32) {
@@ -1281,8 +1337,26 @@ mod tests {
             sessions.lock().unwrap().insert(id.into(), runtime);
             calls
         };
-        let write = |id: &str| {
-            wait_and_write_guarded(&sessions, id, "fix\nit", 30, PTY_COMMAND_TERMINATOR, true)
+        let write = |id: &str, agent: &str| {
+            wait_and_write_guarded(&sessions, id, "fix\nit", 30, PTY_COMMAND_TERMINATOR, Some(agent))
+        };
+        // A job-control shell running `script`, once it has handed the
+        // terminal to that job.
+        let spawn_job = |script: &str| {
+            let mut cmd = CommandBuilder::new("sh");
+            cmd.arg("-c");
+            cmd.arg(format!("set -m; {script}"));
+            let (child, pid) = spawn(cmd);
+            let start = std::time::Instant::now();
+            while !matches!(
+                crate::terminal::read_pgrp_tpgid(pid),
+                Some((pgrp, tpgid)) if tpgid > 0 && tpgid != pgrp
+            ) && start.elapsed() < std::time::Duration::from_secs(5)
+            {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            (child, pid)
         };
 
         let (idle, idle_pid) = spawn(CommandBuilder::new("cat"));
@@ -1290,26 +1364,34 @@ mod tests {
         let idle_calls = insert("idle", Some(idle_pid));
         let no_pid_calls = insert("no-pid", None);
         let gone_calls = insert("gone", Some(u32::MAX));
-        write("idle");
-        write("no-pid");
-        write("gone");
+        let refused = WriteOutcome::AgentNotConfirmed;
+        assert_eq!(write("idle", "cat"), refused);
+        assert_eq!(write("no-pid", "cat"), refused);
+        assert_eq!(write("gone", "cat"), refused);
         stop(idle, idle_pid);
         assert!(idle_calls.lock().unwrap().is_empty(), "typed into an idle shell");
         assert!(no_pid_calls.lock().unwrap().is_empty());
         assert!(gone_calls.lock().unwrap().is_empty());
 
-        let mut cmd = CommandBuilder::new("sh");
-        cmd.arg("-c");
-        cmd.arg("set -m; sleep 3600");
-        let (busy, busy_pid) = spawn(cmd);
+        // The agent binary is missing inside a nested interactive shell
+        // (`nix develop`, `ssh`, an rc file starting `bash`): the nested
+        // shell owns the terminal and would run every prompt line.
+        let (nested, nested_pid) = spawn_job("bash --norc --noprofile -i");
+        let nested_calls = insert("nested", Some(nested_pid));
+        assert_eq!(write("nested", "gemini"), refused);
+        stop(nested, nested_pid);
+        assert!(nested_calls.lock().unwrap().is_empty(), "typed into a nested shell");
+
+        // Some other program in front is not the agent either.
+        let (other, other_pid) = spawn_job("sleep 3600");
+        let other_calls = insert("other", Some(other_pid));
+        assert_eq!(write("other", "droid"), refused);
+        stop(other, other_pid);
+        assert!(other_calls.lock().unwrap().is_empty());
+
+        let (busy, busy_pid) = spawn_job("sleep 3600");
         let busy_calls = insert("busy", Some(busy_pid));
-        let start = std::time::Instant::now();
-        while !terminal::session_job_owns_terminal(&sessions, "busy")
-            && start.elapsed() < std::time::Duration::from_secs(5)
-        {
-            std::thread::sleep(std::time::Duration::from_millis(20));
-        }
-        write("busy");
+        assert_eq!(write("busy", "sleep"), WriteOutcome::Written);
         stop(busy, busy_pid);
         assert_eq!(
             *busy_calls.lock().unwrap(),
