@@ -10,6 +10,7 @@
 
 use serde_json::{json, Value};
 use std::io::{BufRead, BufReader, Write};
+use std::os::unix::fs::DirBuilderExt;
 use std::os::unix::net::UnixListener;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Output, Stdio};
@@ -22,6 +23,18 @@ const FAKE_CURSOR: &str = env!("CARGO_BIN_EXE_fake_cursor_acp");
 /// name of their own).
 const SOCKET: &str = if cfg!(debug_assertions) { "codemux-dev.sock" } else { "codemux.sock" };
 
+fn fixture_runtime_dir(root: &Path) -> PathBuf {
+    let run = root.join("run");
+    // Match XDG_RUNTIME_DIR's private permissions so serve can recover
+    // a stale socket at the same path on restart, regardless of umask.
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(&run)
+        .unwrap();
+    run
+}
+
 /// Clears the env and points every state dir (and the control socket) into
 /// `root`. `<root>/bin` comes first on PATH: it holds the fake providers.
 fn isolate(cmd: &mut Command, root: &Path) {
@@ -33,12 +46,12 @@ fn isolate(cmd: &mut Command, root: &Path) {
         ("XDG_DATA_HOME", "data"),
         ("XDG_STATE_HOME", "state"),
         ("XDG_CACHE_HOME", "cache"),
-        ("XDG_RUNTIME_DIR", "run"),
     ] {
         let dir = root.join(sub);
         std::fs::create_dir_all(&dir).unwrap();
         cmd.env(key, dir);
     }
+    cmd.env("XDG_RUNTIME_DIR", fixture_runtime_dir(root));
 }
 
 /// Runs the CLI in `root`'s isolated env.
@@ -213,8 +226,7 @@ struct FakeApp {
 impl FakeApp {
     fn start(answer: impl Fn(&Value) -> Value + Send + Sync + 'static) -> Self {
         let root = tempfile::tempdir().unwrap();
-        let run = root.path().join("run");
-        std::fs::create_dir_all(&run).unwrap();
+        let run = fixture_runtime_dir(root.path());
         let listener = UnixListener::bind(run.join(SOCKET)).unwrap();
         let requests = Arc::new(Mutex::new(Vec::new()));
         let (seen, answer) = (Arc::clone(&requests), Arc::new(answer));
