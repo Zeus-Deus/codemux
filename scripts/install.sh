@@ -28,6 +28,8 @@
 #   CODEMUX_INSTALL_DIR        bin directory for the AppImage fallback
 #                              (default: /usr/local/bin, or ~/.local/bin non-root)
 #   CODEMUX_NO_DEPS=1          never touch the package manager for dependencies
+#   CODEMUX_OPENSSL            OpenSSL 3 binary for the signature check
+#                              (default: openssl, then openssl-3)
 #   CODEMUX_METHOD             force deb | rpm | appimage
 #   CODEMUX_OS_RELEASE_PATH    alternate os-release file (testing)
 #   CODEMUX_REPO_SLUG          alternate GitHub owner/repo (testing)
@@ -225,13 +227,51 @@ codemux_optional_packages() {
 #   base64(Ed25519 signature of (the 64 signature bytes + trusted comment))
 # and the key is base64("Ed" + 8-byte key id + 32-byte Ed25519 public key).
 # OpenSSL 3 can check all of that; older OpenSSL cannot verify raw Ed25519.
+#
+# Picks the OpenSSL to use into OPENSSL: CODEMUX_OPENSSL when set, otherwise
+# `openssl`, otherwise `openssl-3` (openSUSE Leap / SLES 15 ship OpenSSL 3
+# under that name next to an older `openssl`). On failure OPENSSL_PROBLEM says
+# why: missing | old | algorithms.
 codemux_can_verify_signatures() {
-    have openssl || return 1
+    if [ -n "${CODEMUX_OPENSSL:-}" ]; then
+        codemux_probe_openssl "$CODEMUX_OPENSSL"
+        return
+    fi
+    codemux_probe_openssl openssl && return 0
+    _cv_first="$OPENSSL_PROBLEM"
+    _cv_first_bin="$OPENSSL_PROBLEM_BIN"
+    codemux_probe_openssl openssl-3 && return 0
+    # Report the more telling of the two reasons.
+    if [ "$OPENSSL_PROBLEM" = "missing" ]; then
+        OPENSSL_PROBLEM="$_cv_first"
+        OPENSSL_PROBLEM_BIN="$_cv_first_bin"
+    fi
+    return 1
+}
+
+codemux_probe_openssl() { # <binary>
+    if ! have "$1"; then
+        OPENSSL_PROBLEM="missing"
+        return 1
+    fi
     # Captured rather than piped into `grep -q`, which can SIGPIPE openssl and
     # fail the pipeline under pipefail.
-    _cv_help=$(openssl pkeyutl -help 2>&1 || true)
-    case "$_cv_help" in *-rawin*) ;; *) return 1 ;; esac
-    printf '' | openssl dgst -blake2b512 >/dev/null 2>&1
+    _cv_help=$("$1" pkeyutl -help 2>&1 || true)
+    case "$_cv_help" in
+        *-rawin*) ;;
+        *) OPENSSL_PROBLEM="old"; OPENSSL_PROBLEM_BIN="$1"; return 1 ;;
+    esac
+    # A FIPS-only OpenSSL 3 can refuse BLAKE2b or Ed25519.
+    if ! printf '' | "$1" dgst -blake2b512 >/dev/null 2>&1 \
+        || ! "$1" genpkey -algorithm ED25519 >/dev/null 2>&1; then
+        OPENSSL_PROBLEM="algorithms"
+        OPENSSL_PROBLEM_BIN="$1"
+        return 1
+    fi
+    OPENSSL="$1"
+    OPENSSL_PROBLEM=""
+OPENSSL_PROBLEM_BIN=""
+    return 0
 }
 
 # Hex of <count> bytes of <file> starting at <offset>.
@@ -253,18 +293,18 @@ codemux_verify_signature() { # <file> <sig> <asset name> <scratch dir>
     _vs_dir="$4"
     _vs_tab=$(printf '\t')
 
-    printf '%s' "$CODEMUX_SIGNING_KEY" | openssl base64 -d -A > "${_vs_dir}/key.bin" 2>/dev/null || return 1
+    printf '%s' "$CODEMUX_SIGNING_KEY" | "$OPENSSL" base64 -d -A > "${_vs_dir}/key.bin" 2>/dev/null || return 1
     [ "$(codemux_size "${_vs_dir}/key.bin")" = "42" ] || return 1
     [ "$(codemux_hex "${_vs_dir}/key.bin" 0 2)" = "4564" ] || return 1
     # SubjectPublicKeyInfo DER header for an Ed25519 key, then the raw key.
-    { printf 'MCowBQYDK2VwAyEA' | openssl base64 -d -A \
+    { printf 'MCowBQYDK2VwAyEA' | "$OPENSSL" base64 -d -A \
         && dd if="${_vs_dir}/key.bin" bs=1 skip=10 count=32 2>/dev/null; } > "${_vs_dir}/key.der" || return 1
 
-    openssl base64 -d -A < "$2" > "${_vs_dir}/sig.txt" 2>/dev/null || return 1
+    "$OPENSSL" base64 -d -A < "$2" > "${_vs_dir}/sig.txt" 2>/dev/null || return 1
     _vs_trusted=$(sed -n '3s/^trusted comment: //p' "${_vs_dir}/sig.txt")
     [ -n "$_vs_trusted" ] || return 1
-    sed -n 2p "${_vs_dir}/sig.txt" | openssl base64 -d -A > "${_vs_dir}/sig.bin" 2>/dev/null || return 1
-    sed -n 4p "${_vs_dir}/sig.txt" | openssl base64 -d -A > "${_vs_dir}/global.sig" 2>/dev/null || return 1
+    sed -n 2p "${_vs_dir}/sig.txt" | "$OPENSSL" base64 -d -A > "${_vs_dir}/sig.bin" 2>/dev/null || return 1
+    sed -n 4p "${_vs_dir}/sig.txt" | "$OPENSSL" base64 -d -A > "${_vs_dir}/global.sig" 2>/dev/null || return 1
     [ "$(codemux_size "${_vs_dir}/sig.bin")" = "74" ] || return 1
     [ "$(codemux_size "${_vs_dir}/global.sig")" = "64" ] || return 1
     # "ED" (prehashed) and the same key id as the trusted key.
@@ -272,13 +312,13 @@ codemux_verify_signature() { # <file> <sig> <asset name> <scratch dir>
     [ "$(codemux_hex "${_vs_dir}/sig.bin" 2 8)" = "$(codemux_hex "${_vs_dir}/key.bin" 2 8)" ] || return 1
     dd if="${_vs_dir}/sig.bin" of="${_vs_dir}/sig.raw" bs=1 skip=10 count=64 2>/dev/null || return 1
 
-    openssl dgst -blake2b512 -binary "$_vs_file" > "${_vs_dir}/file.hash" || return 1
-    openssl pkeyutl -verify -pubin -keyform DER -inkey "${_vs_dir}/key.der" -rawin \
+    "$OPENSSL" dgst -blake2b512 -binary "$_vs_file" > "${_vs_dir}/file.hash" || return 1
+    "$OPENSSL" pkeyutl -verify -pubin -keyform DER -inkey "${_vs_dir}/key.der" -rawin \
         -in "${_vs_dir}/file.hash" -sigfile "${_vs_dir}/sig.raw" >/dev/null 2>&1 || return 1
 
     # The trusted comment is only trustworthy once its own signature holds.
     { cat "${_vs_dir}/sig.raw" && printf '%s' "$_vs_trusted"; } > "${_vs_dir}/global.msg" || return 1
-    openssl pkeyutl -verify -pubin -keyform DER -inkey "${_vs_dir}/key.der" -rawin \
+    "$OPENSSL" pkeyutl -verify -pubin -keyform DER -inkey "${_vs_dir}/key.der" -rawin \
         -in "${_vs_dir}/global.msg" -sigfile "${_vs_dir}/global.sig" >/dev/null 2>&1 || return 1
     case "$_vs_trusted" in
         "file:${_vs_name}"|*"${_vs_tab}file:${_vs_name}") return 0 ;;
@@ -290,6 +330,8 @@ codemux_verify_signature() { # <file> <sig> <asset name> <scratch dir>
 
 DRY_RUN=0
 WORKDIR=""
+OPENSSL="openssl"   # see codemux_can_verify_signatures
+OPENSSL_PROBLEM=""
 PRIV="none"          # root | sudo | none
 FAMILY="unknown"
 METHOD=""
@@ -320,6 +362,16 @@ as_root() {
         sudo) run sudo "$@" ;;
         *)    die "this step needs root: $*" ;;
     esac
+}
+
+# as_root with the command's own output hidden. Under --dry-run the plan line
+# still prints.
+as_root_quiet() {
+    if [ "$DRY_RUN" = "1" ]; then
+        as_root "$@"
+        return 0
+    fi
+    as_root "$@" >/dev/null 2>&1
 }
 
 have() { command -v "$1" >/dev/null 2>&1; }
@@ -559,29 +611,59 @@ download_to() {
 }
 
 require_signature_tools() {
-    [ "$DRY_RUN" = "1" ] && return 0
     codemux_can_verify_signatures && return 0
-    # Minimal container images often lack the openssl CLI; it is one small
-    # package everywhere, so fetch it the same way the runtime libraries are.
-    if [ "$PRIV" != "none" ] && [ "${CODEMUX_NO_DEPS:-0}" != "1" ] && ! have openssl; then
-        note "installing openssl to check the release signature"
+    # Minimal container images often lack the openssl CLI, and openSUSE Leap /
+    # SLES 15 keep OpenSSL 3 in a separate openssl-3 package; either is one
+    # small package, so fetch it the same way the runtime libraries are.
+    _rs_pkg=""
+    if [ "$PRIV" != "none" ] && [ "${CODEMUX_NO_DEPS:-0}" != "1" ] && [ -z "${CODEMUX_OPENSSL:-}" ]; then
+        case "${FAMILY}:${OPENSSL_PROBLEM}" in
+            suse:missing|suse:old) _rs_pkg="openssl-3" ;;
+            debian:missing|fedora:missing|arch:missing) _rs_pkg="openssl" ;;
+        esac
+    fi
+    if [ -n "$_rs_pkg" ]; then
+        note "installing ${_rs_pkg} to check the release signature"
         case "$FAMILY" in
             debian)
                 if have apt-get; then
-                    as_root env DEBIAN_FRONTEND=noninteractive apt-get update -qq >/dev/null 2>&1 || true
-                    as_root env DEBIAN_FRONTEND=noninteractive apt-get install -y openssl >/dev/null 2>&1
+                    as_root_quiet env DEBIAN_FRONTEND=noninteractive apt-get update -qq || true
+                    as_root_quiet env DEBIAN_FRONTEND=noninteractive apt-get install -y "$_rs_pkg"
                 fi ;;
-            fedora) { have dnf && as_root dnf install -y openssl >/dev/null 2>&1; } || { have yum && as_root yum install -y openssl >/dev/null 2>&1; } ;;
-            suse)   have zypper && as_root zypper --non-interactive install openssl >/dev/null 2>&1 ;;
-            arch)   have pacman && as_root pacman -S --needed --noconfirm openssl >/dev/null 2>&1 ;;
+            fedora) { have dnf && as_root_quiet dnf install -y "$_rs_pkg"; } || { have yum && as_root_quiet yum install -y "$_rs_pkg"; } ;;
+            suse)   have zypper && as_root_quiet zypper --non-interactive install "$_rs_pkg" ;;
+            arch)   have pacman && as_root_quiet pacman -S --needed --noconfirm "$_rs_pkg" ;;
         esac || true
+        [ "$DRY_RUN" = "1" ] && return 0
         codemux_can_verify_signatures && return 0
     fi
-    bad "the installer checks each release package's signature before installing it,"
-    bad "and that needs the OpenSSL 3 command-line tool, which was not found."
-    note "Install it (the package is called openssl on every major distro), then re-run:"
-    note "  sudo apt-get install openssl    # or: sudo dnf install openssl"
+    signature_tools_help
+    if [ "$DRY_RUN" = "1" ]; then
+        warn "dry run: a real run would stop here"
+        return 0
+    fi
     exit 1
+}
+
+# Why the signature check cannot run here, and the ways forward.
+signature_tools_help() {
+    bad "the installer checks each release package's signature before installing it,"
+    case "$OPENSSL_PROBLEM" in
+        old)
+            bad "and that needs OpenSSL 3 or newer, but ${OPENSSL_PROBLEM_BIN} is older ($("$OPENSSL_PROBLEM_BIN" version 2>/dev/null || true))."
+            note "Install OpenSSL 3 (on openSUSE Leap / SLES: sudo zypper install openssl-3), or point"
+            note "CODEMUX_OPENSSL at an OpenSSL 3 binary, then re-run." ;;
+        algorithms)
+            bad "and ${OPENSSL_PROBLEM_BIN} refuses BLAKE2b-512 or Ed25519 (FIPS-only mode does this)."
+            note "Point CODEMUX_OPENSSL at an OpenSSL 3 binary that allows them, then re-run." ;;
+        *)
+            bad "and that needs the OpenSSL 3 command-line tool, which was not found."
+            note "Install it, then re-run:"
+            note "  sudo apt-get install openssl    # or: sudo dnf install openssl, sudo zypper install openssl-3" ;;
+    esac
+    note "Or download the package and its .sig from ${CODEMUX_RELEASES_URL}, check it yourself,"
+    note "and install it without this check:"
+    note "  curl -fsSL https://get.codemux.org/install.sh | CODEMUX_ARTIFACT=/path/to/package sh"
 }
 
 # Fetch <url>.sig and refuse to continue unless it signs <file> as <name>.

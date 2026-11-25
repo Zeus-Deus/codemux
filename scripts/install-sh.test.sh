@@ -575,20 +575,26 @@ if [ -n "$out" ]; then cp "$src" "$out"; else cat "$src"; fi
 CURL
     chmod +x "${CURL_BIN}/curl"
 
-    run_release_install() ( # -> exit status; marker file when the manager ran
+    # -> exit status; marker file when an installer ran. Defaults to the deb
+    # on Ubuntu; <method> forces rpm or appimage.
+    run_release_install() ( # [os-release] [method]
         set -e
         rm -f "${SIGROOT}/installed"
         CODEMUX_SIGNING_KEY="$TEST_KEY"
         FIXTURE_DIR="$RELEASE_DIR"
         export FIXTURE_DIR
         PATH="${CURL_BIN}:${STUB_BIN}:${PATH}"
-        CODEMUX_OS_RELEASE_PATH="$UBUNTU"
+        CODEMUX_OS_RELEASE_PATH="${1:-$UBUNTU}"
         CODEMUX_INSTALL_VERSION=9.9.9
         CODEMUX_INSTALL_DIR="${TMPROOT}/opt/bin"
         # The installer's WORKDIR lands here, cleaned up with TMPROOT.
         TMPDIR="$SIGROOT"
         unset CODEMUX_ARTIFACT CODEMUX_METHOD
+        [ -z "${2:-}" ] || CODEMUX_METHOD="$2"
         install_native_package() { cp "$2" "${SIGROOT}/installed"; }
+        install_appimage() { cp "$1" "${SIGROOT}/installed"; }
+        install_dependencies() { :; }
+        verify_install() { :; }
         print_next_steps() { :; }
         main > "${SIGROOT}/release.log" 2>&1
     )
@@ -611,11 +617,124 @@ CURL
     is "missing signature fails" "$?" "1"
     is "missing signature installs nothing" "$(test ! -e "${SIGROOT}/installed" && echo yes)" "yes"
     contains "explains the missing signature" "$(cat "${SIGROOT}/release.log")" "cannot be verified"
+
+    # The same gate on the rpm (zypper --allow-unsigned-rpm) and AppImage paths.
+    SUSE_LEAP=$(mock_os_release leap 'ID="opensuse-leap"' 'ID_LIKE="suse opensuse"' 'VERSION_ID="15.6"')
+    for kind in rpm appimage; do
+        if [ "$kind" = "rpm" ]; then os="$SUSE_LEAP"; else os="$UBUNTU"; fi
+        name=$(codemux_artifact_name "$kind" 9.9.9)
+        rm -f "$RELEASE_DIR"/*
+        printf 'genuine %s\n' "$kind" > "${RELEASE_DIR}/${name}"
+        sign_fixture "${RELEASE_DIR}/${name}" "$name"
+        run_release_install "$os" "$kind"
+        is "signed ${kind} installs" "$?" "0"
+        is "the verified ${kind} is what gets installed" "$(cat "${SIGROOT}/installed" 2>/dev/null)" "genuine ${kind}"
+
+        printf 'trojaned %s\n' "$kind" > "${RELEASE_DIR}/${name}"
+        run_release_install "$os" "$kind"
+        is "replaced ${kind} fails" "$?" "1"
+        is "replaced ${kind} is never installed" "$(test ! -e "${SIGROOT}/installed" && echo yes)" "yes"
+
+        rm -f "${RELEASE_DIR}/${name}.sig"
+        run_release_install "$os" "$kind"
+        is "${kind} without a signature fails" "$?" "1"
+        is "${kind} without a signature installs nothing" "$(test ! -e "${SIGROOT}/installed" && echo yes)" "yes"
+    done
+
+    # A signature for one kind does not pass for another.
+    deb_name=$(codemux_artifact_name deb 9.9.9)
+    rpm_name=$(codemux_artifact_name rpm 9.9.9)
+    rm -f "$RELEASE_DIR"/*
+    printf 'genuine deb\n' > "${RELEASE_DIR}/${rpm_name}"
+    sign_fixture "${RELEASE_DIR}/${rpm_name}" "$deb_name"
+    run_release_install "$SUSE_LEAP" rpm
+    is "a deb signature does not pass an rpm" "$?" "1"
+    is "the mislabelled rpm is never installed" "$(test ! -e "${SIGROOT}/installed" && echo yes)" "yes"
+
+    # wget instead of curl downloads and checks the same way.
+    WGET_BIN="${SIGROOT}/wget-bin"
+    mkdir -p "$WGET_BIN"
+    cat > "${WGET_BIN}/wget" <<'WGET'
+#!/bin/sh
+# Serve <url> from $FIXTURE_DIR by its last path segment; -O - or -qO- is stdout.
+out="-"
+while [ $# -gt 1 ]; do
+    case "$1" in -O) out="$2"; shift ;; -qO-) out="-" ;; esac
+    shift
+done
+src="${FIXTURE_DIR}/${1##*/}"
+[ -f "$src" ] || exit 8
+if [ "$out" = "-" ]; then cat "$src"; else cp "$src" "$out"; fi
+WGET
+    chmod +x "${WGET_BIN}/wget"
+    # The real curl stays on PATH, so hide it for these runs.
+    have() { case "$1" in curl) return 1 ;; esac; command -v "$1" >/dev/null 2>&1; }
+    CURL_BIN="$WGET_BIN"
+    rm -f "$RELEASE_DIR"/*
+    cp "$PKG" "$PKG.sig" "$RELEASE_DIR/"
+    run_release_install
+    is "signed release installs via wget" "$?" "0"
+    is "wget path installs the verified file" "$(cat "${SIGROOT}/installed" 2>/dev/null)" "genuine package"
+    printf 'trojaned package\n' > "${RELEASE_DIR}/codemux_9.9.9_amd64.deb"
+    run_release_install
+    is "replaced asset via wget fails" "$?" "1"
+    is "replaced asset via wget is never installed" "$(test ! -e "${SIGROOT}/installed" && echo yes)" "yes"
+    have() { command -v "$1" >/dev/null 2>&1; }
 fi
+
+# ── which OpenSSL does the check ─────────────────────────────────────────────
+
+echo "openssl selection"
+OSSL="${TMPROOT}/openssl-fakes"
+mkdir -p "${OSSL}/old" "${OSSL}/fips" "${OSSL}/none" "${OSSL}/leap"
+# OpenSSL 1.1.1: pkeyutl has no -rawin.
+printf '#!/bin/sh\ncase "$1" in version) echo "OpenSSL 1.1.1w  11 Sep 2023" ;; pkeyutl) echo "Usage: pkeyutl [options] -in file" >&2 ;; esac\nexit 0\n' > "${OSSL}/old/openssl"
+# OpenSSL 3 in FIPS-only mode: -rawin exists, BLAKE2b is refused.
+printf '#!/bin/sh\ncase "$1" in pkeyutl) echo " -rawin  raw input" >&2; exit 0 ;; esac\nexit 1\n' > "${OSSL}/fips/openssl"
+chmod +x "${OSSL}/old/openssl" "${OSSL}/fips/openssl"
+cp "${OSSL}/old/openssl" "${OSSL}/leap/openssl"
+REAL_OPENSSL=$(command -v openssl || true)
+[ -z "$REAL_OPENSSL" ] || ln -s "$REAL_OPENSSL" "${OSSL}/leap/openssl-3"
+
+probe() { # <dir on PATH> [CODEMUX_OPENSSL] -> "<status> <OPENSSL> <problem>"
+    ( PATH="$1"; CODEMUX_OPENSSL="${2:-}"; OPENSSL=openssl
+      codemux_can_verify_signatures; printf '%s %s %s' "$?" "${OPENSSL##*/}" "$OPENSSL_PROBLEM" )
+}
+is "no openssl is missing"            "$(probe "${OSSL}/none")" "1 openssl missing"
+is "openssl 1.1.1 is old"             "$(probe "${OSSL}/old")"  "1 openssl old"
+is "FIPS-only openssl lacks algorithms" "$(probe "${OSSL}/fips")" "1 openssl algorithms"
+is "CODEMUX_OPENSSL is the only one tried" "$(probe "${OSSL}/none" "${OSSL}/old/openssl")" "1 openssl old"
+if [ -n "$REAL_OPENSSL" ] && codemux_can_verify_signatures; then
+    is "Leap's openssl-3 is used beside an old openssl" "$(probe "${OSSL}/leap")" "0 openssl-3 "
+    is "CODEMUX_OPENSSL picks a binary off PATH" "$(probe "${OSSL}/none" "$REAL_OPENSSL")" "0 openssl "
+fi
+
+tools_out() { # <family> <PATH dir> [priv] [dry run] -> output of require_signature_tools
+    ( DRY_RUN="${4:-1}" PRIV="${3:-sudo}" FAMILY="$1"
+      PATH="${2}:${STUB_BIN}"
+      fetch_text() { echo "network used" >&2; }
+      require_signature_tools; echo "status=$?" ) 2>&1 || echo "status=$?"
+}
+OUT=$(tools_out suse "${OSSL}/old")
+contains "Leap dry run plans openssl-3" "$OUT" "would run: sudo zypper --non-interactive install openssl-3"
+contains "Leap dry run carries on" "$OUT" "status=0"
+OUT=$(tools_out debian "${OSSL}/none")
+contains "dry run shows the apt-get update" "$OUT" "would run: sudo env DEBIAN_FRONTEND=noninteractive apt-get update -qq"
+contains "dry run shows the openssl install" "$OUT" "would run: sudo env DEBIAN_FRONTEND=noninteractive apt-get install -y openssl"
+OUT=$(tools_out debian "${OSSL}/old")
+not_contains "an old openssl on Debian is not reinstalled" "$OUT" "would run"
+contains "an old openssl is named as old" "$OUT" "needs OpenSSL 3 or newer"
+contains "the old version is shown" "$OUT" "OpenSSL 1.1.1w"
+not_contains "an old openssl is not called missing" "$OUT" "was not found"
+contains "dry run says a real run stops" "$OUT" "a real run would stop here"
+OUT=$(tools_out fedora "${OSSL}/fips" sudo 0)
+contains "FIPS-only openssl is explained" "$OUT" "refuses BLAKE2b-512 or Ed25519"
+contains "the workaround is named" "$OUT" "CODEMUX_ARTIFACT=/path/to/package"
+contains "a real run stops" "$OUT" "status=1"
 
 OUT=$( (
     DRY_RUN=0 PRIV=none
-    codemux_can_verify_signatures() { return 1; }
+    codemux_can_verify_signatures() { OPENSSL_PROBLEM=missing; return 1; }
     fetch_text() { echo "network used" >&2; }
     require_signature_tools
 ) 2>&1)
