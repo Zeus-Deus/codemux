@@ -1,5 +1,7 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+#[cfg(not(windows))]
+use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU16, Ordering};
 use std::sync::{Arc, OnceLock};
@@ -283,6 +285,50 @@ const MAX_STREAM_PORT: u16 = 9299;
 pub fn kill_stream_daemons() {
     for dir in browser_runtime_dirs() {
         kill_owned_browser_daemons_in(&dir);
+    }
+    // A detached Unix daemon may be alive before it publishes a PID file.
+    // Its inherited owner token still lets us verify and stop it on exit.
+    #[cfg(unix)]
+    kill_untracked_browser_daemons(None);
+}
+
+#[cfg(unix)]
+fn kill_untracked_browser_daemons(session_filter: Option<&str>) {
+    use sysinfo::{ProcessRefreshKind, ProcessesToUpdate, System, UpdateKind};
+
+    let owner = format!("CODEMUX_BROWSER_OWNER={}", browser_owner_token());
+    let mut system = System::new();
+    system.refresh_processes_specifics(
+        ProcessesToUpdate::All,
+        true,
+        ProcessRefreshKind::nothing()
+            .with_exe(UpdateKind::Always)
+            .with_environ(UpdateKind::Always),
+    );
+    for process in system.processes().values() {
+        let Some(session) = process
+            .environ()
+            .iter()
+            .find_map(|entry| entry.to_string_lossy().strip_prefix("CODEMUX_BROWSER_SESSION=").map(str::to_owned))
+        else {
+            continue;
+        };
+        if session_filter.is_some_and(|expected| expected != session.as_str())
+            || validate_session_name(&session).is_err()
+            || !process.environ().iter().any(|entry| entry.to_string_lossy() == owner)
+        {
+            continue;
+        }
+        let record = BrowserPidRecord {
+            pid: process.pid().as_u32(),
+            start_time: process.start_time(),
+            token: browser_owner_token().to_owned(),
+            owner_pid: 0,
+            owner_start_time: 0,
+        };
+        if browser_process_matches(&record, &session) {
+            kill_verified_browser_pid(&record, &session);
+        }
     }
 }
 
@@ -586,6 +632,8 @@ struct BrowserPidRecord {
     pid: u32,
     start_time: u64,
     token: String,
+    owner_pid: u32,
+    owner_start_time: u64,
 }
 
 fn browser_owner_token() -> &'static str {
@@ -634,15 +682,39 @@ fn read_browser_pid_record(path: &std::path::Path) -> Option<BrowserPidRecord> {
     let pid = fields.next()?.parse::<u32>().ok()?;
     let start_time = fields.next()?.parse::<u64>().ok()?;
     let token = fields.next()?;
+    let (owner_pid, owner_start_time) = match (fields.next(), fields.next()) {
+        (None, None) => (0, 0), // older records cannot prove the app owner exited
+        (Some(pid), Some(start_time)) => (pid.parse::<u32>().ok()?, start_time.parse::<u64>().ok()?),
+        _ => return None,
+    };
     if pid == 0
         || start_time == 0
         || token.len() != 32
         || !token.bytes().all(|byte| byte.is_ascii_hexdigit())
+        || (owner_pid == 0) != (owner_start_time == 0)
         || fields.next().is_some()
     {
         return None;
     }
-    Some(BrowserPidRecord { pid, start_time, token: token.to_owned() })
+    Some(BrowserPidRecord { pid, start_time, token: token.to_owned(), owner_pid, owner_start_time })
+}
+
+fn process_start_time(pid: u32) -> Option<u64> {
+    use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System};
+
+    let process_id = Pid::from_u32(pid);
+    let mut system = System::new();
+    system.refresh_processes_specifics(
+        ProcessesToUpdate::Some(&[process_id]),
+        true,
+        ProcessRefreshKind::nothing(),
+    );
+    system.process(process_id).map(|process| process.start_time())
+}
+
+fn current_app_process_identity() -> Option<(u32, u64)> {
+    let pid = std::process::id();
+    Some((pid, process_start_time(pid).filter(|start_time| *start_time > 0)?))
 }
 
 fn browser_process_start(pid: u32, session: &str, token: &str) -> Option<u64> {
@@ -675,10 +747,13 @@ fn browser_process_matches(record: &BrowserPidRecord, session: &str) -> bool {
 
 fn owned_browser_pid(session: &str, pid: u32) -> Option<BrowserPidRecord> {
     if let Some(start_time) = browser_process_start(pid, session, browser_owner_token()) {
+        let (owner_pid, owner_start_time) = current_app_process_identity()?;
         return Some(BrowserPidRecord {
             pid,
             start_time,
             token: browser_owner_token().to_owned(),
+            owner_pid,
+            owner_start_time,
         });
     }
     let path = session_pid_path(session)?;
@@ -890,7 +965,13 @@ fn write_session_pid(session_name: &str, record: &BrowserPidRecord) -> std::io::
 
     let path = session_pid_path(session_name)
         .ok_or_else(|| std::io::Error::other("Cannot prepare private browser PID path"))?;
-    let content = format!("{} {} {}\n", record.pid, record.start_time, record.token);
+    if record.owner_pid == 0 || record.owner_start_time == 0 {
+        return Err(std::io::Error::other("Browser owner process identity is missing"));
+    }
+    let content = format!(
+        "{} {} {} {} {}\n",
+        record.pid, record.start_time, record.token, record.owner_pid, record.owner_start_time
+    );
     #[cfg(windows)]
     let result = (|| -> std::io::Result<()> {
         let mut file = match clack_private_fs::create_new_file(&path) {
@@ -962,8 +1043,76 @@ fn output_capture_and_track_browser_daemon(
     let outcome = output_capture_with_timeout(command, timeout);
     // A first command may start the daemon before failing or timing out.
     // Persist its verified identity before the caller handles either result.
-    let _ = track_current_browser_daemon(session);
+    if track_current_browser_daemon(session).is_none() {
+        track_late_browser_daemon(session);
+    }
     outcome
+}
+
+#[cfg(not(windows))]
+fn track_late_browser_daemon(session: &str) {
+    static TRACKERS: OnceLock<std::sync::Mutex<HashSet<String>>> = OnceLock::new();
+    let trackers = TRACKERS.get_or_init(|| std::sync::Mutex::new(HashSet::new()));
+    let Ok(mut pending) = trackers.lock() else { return };
+    if !pending.insert(session.to_owned()) {
+        return;
+    }
+    drop(pending);
+
+    let session = session.to_owned();
+    let session_for_tracker = session.clone();
+    let result = std::thread::Builder::new()
+        .name("browser-daemon-tracker".to_owned())
+        .spawn(move || {
+            let started = Instant::now();
+            while started.elapsed() < Duration::from_secs(5) {
+                if track_current_browser_daemon(&session_for_tracker).is_some() {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            if let Ok(mut pending) = trackers.lock() {
+                pending.remove(&session_for_tracker);
+            }
+        });
+    if result.is_err() {
+        if let Ok(mut pending) = trackers.lock() {
+            pending.remove(session.as_str());
+        }
+    }
+}
+
+fn previous_app_has_exited(record: &BrowserPidRecord) -> bool {
+    if record.owner_pid == 0 || record.owner_start_time == 0 {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        let Ok(pid) = i32::try_from(record.owner_pid) else { return false };
+        if unsafe { libc::kill(pid, 0) } == -1 {
+            return std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH);
+        }
+        process_start_time(record.owner_pid)
+            .is_some_and(|start_time| start_time != record.owner_start_time)
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::io::FromRawHandle;
+        use windows_sys::Win32::Foundation::{GetLastError, ERROR_INVALID_PARAMETER, WAIT_OBJECT_0};
+        use windows_sys::Win32::System::Threading::{OpenProcess, WaitForSingleObject, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE};
+
+        let raw = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_SYNCHRONIZE, 0, record.owner_pid) };
+        if raw.is_null() {
+            return unsafe { GetLastError() } == ERROR_INVALID_PARAMETER;
+        }
+        let _handle = unsafe { std::os::windows::io::OwnedHandle::from_raw_handle(raw) };
+        process_creation_seconds(raw).is_some_and(|start_time| start_time != record.owner_start_time)
+            || unsafe { WaitForSingleObject(raw, 0) } == WAIT_OBJECT_0
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        false
+    }
 }
 
 fn stop_previous_browser_daemon_before_stream(session: &str, bin: &str) -> Result<(), String> {
@@ -972,8 +1121,8 @@ fn stop_previous_browser_daemon_before_stream(session: &str, bin: &str) -> Resul
         if pid_alive(pid) {
             let record = owned_browser_pid(session, pid)
                 .ok_or_else(|| format!("Browser session {session} is already used by another process"))?;
-            if record.token != browser_owner_token() {
-                return Err(format!("Browser session {session} belongs to another running app instance"));
+            if record.token != browser_owner_token() && !previous_app_has_exited(&record) {
+                return Err(format!("Browser session {session} belongs to another running or unverified app instance"));
             }
             stop_owned_browser_daemon(session, &record, bin);
             if pid_alive(pid) {
@@ -1174,9 +1323,6 @@ pub struct AgentBrowserManager {
     next_port: Arc<AtomicU16>,
     /// Per-session state keyed by session identifier (workspace_id or cli_session_name).
     sessions: Arc<Mutex<HashMap<String, StreamSession>>>,
-    /// Serializes start_stream calls to prevent concurrent daemon launches
-    /// from racing (e.g., React StrictMode double-mount, pane remount + agent action).
-    start_lock: Arc<Mutex<()>>,
 }
 
 fn session_name(browser_id: &str) -> &str {
@@ -1253,7 +1399,7 @@ fn browser_open_command(bin: &str, session: &str, port: u16) -> Result<std::proc
         std::process::Command::new(bin)
     };
     set_browser_owner_env(&mut cmd, session)?;
-    cmd.args(["open", "about:blank", "--headless", "--session", session])
+    cmd.args(["open", "about:blank", "--session", session])
         .env("AGENT_BROWSER_STREAM_PORT", port.to_string())
         .env("AGENT_BROWSER_ARGS", STEALTH_CHROMIUM_ARGS)
         .env("AGENT_BROWSER_USER_AGENT", stealth_user_agent());
@@ -2635,7 +2781,6 @@ impl AgentBrowserManager {
         Self {
             next_port: Arc::new(AtomicU16::new(DEFAULT_STREAM_PORT)),
             sessions: Arc::new(Mutex::new(HashMap::new())),
-            start_lock: Arc::new(Mutex::new(())),
         }
     }
 
@@ -2828,7 +2973,6 @@ impl AgentBrowserManager {
                 argv.extend([
                     "open".into(),
                     "about:blank".into(),
-                    "--headless".into(),
                     "--session".into(),
                     session.clone(),
                 ]);
@@ -3148,13 +3292,10 @@ impl AgentBrowserManager {
     async fn start_stream_locked(&self, browser_id: &str) -> Result<String, String> {
         let session = session_name(browser_id).to_string();
 
-        // Serialize start_stream calls. The old code held a single Mutex<bool>
-        // across the entire operation (including sleeps). Without this, concurrent
-        // callers (React StrictMode double-mount, pane remount + agent action)
-        // both see running=false and race to start/kill the daemon.
-        let _start_guard = self.start_lock.lock().await;
-
-        // Re-check running under the start_lock — a prior call may have finished.
+        // The per-session lifecycle gate serializes competing starts and
+        // commands for this session. A manager-wide gate would make starts
+        // for unrelated sessions wait after their callers were cancelled.
+        // Re-check running after acquiring that session gate.
         // A previously-marked-running session might still be live; verify with a
         // quick TCP probe so we don't return a URL pointing at a dead daemon.
         if let Some(port) = self.get_port(browser_id).await {
@@ -3240,7 +3381,6 @@ impl AgentBrowserManager {
                 argv.extend([
                     "open".into(),
                     "about:blank".into(),
-                    "--headless".into(),
                     "--session".into(),
                     session.clone(),
                 ]);
@@ -3390,6 +3530,11 @@ pub(crate) fn orphaned_ws_sessions(
 mod tests {
     use super::*;
 
+    fn test_browser_record(pid: u32, start_time: u64, token: String) -> BrowserPidRecord {
+        let (owner_pid, owner_start_time) = current_app_process_identity().unwrap();
+        BrowserPidRecord { pid, start_time, token, owner_pid, owner_start_time }
+    }
+
     #[cfg(unix)]
     #[test]
     fn browser_open_passes_session_as_one_argument_for_native_and_npx() {
@@ -3397,12 +3542,13 @@ mod tests {
         let native = browser_open_command("/tmp/my browser/agent-browser", session, 9223).unwrap();
         assert_eq!(native.get_program(), std::ffi::OsStr::new("/tmp/my browser/agent-browser"));
         let args: Vec<_> = native.get_args().map(|arg| arg.to_string_lossy().into_owned()).collect();
-        assert_eq!(args, ["open", "about:blank", "--headless", "--session", session]);
+        assert_eq!(args, ["open", "about:blank", "--session", session]);
 
         let npx = browser_open_command("npx agent-browser", session, 9223).unwrap();
         assert_eq!(npx.get_program(), std::ffi::OsStr::new("npx"));
         let args: Vec<_> = npx.get_args().map(|arg| arg.to_string_lossy().into_owned()).collect();
-        assert_eq!(args, ["agent-browser", "open", "about:blank", "--headless", "--session", session]);
+        assert_eq!(args, ["agent-browser", "open", "about:blank", "--session", session]);
+
     }
 
     struct TestBrowserPidFile(PathBuf);
@@ -3499,11 +3645,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn failed_open_never_rolls_back_a_foreign_or_preexisting_daemon() {
-        let own = BrowserPidRecord {
-            pid: 10,
-            start_time: 100,
-            token: browser_owner_token().to_owned(),
-        };
+        let own = test_browser_record(10, 100, browser_owner_token().to_owned());
         let foreign = BrowserPidRecord {
             token: uuid::Uuid::new_v4().simple().to_string(),
             ..own.clone()
@@ -3604,7 +3746,7 @@ mod tests {
             assert!(started_waiting.elapsed() < Duration::from_secs(3));
             std::thread::sleep(Duration::from_millis(25));
         };
-        let record = BrowserPidRecord { pid, start_time, token };
+        let record = test_browser_record(pid, start_time, token);
         let dir = run_dir_for_session(&session).unwrap();
         let pid_path = dir.join(format!("{session}.pid"));
         let own_record_path = session_pid_path(&session).unwrap();
@@ -3660,7 +3802,7 @@ mod tests {
             assert!(started_waiting.elapsed() < Duration::from_secs(3));
             std::thread::sleep(Duration::from_millis(25));
         };
-        let record = BrowserPidRecord { pid, start_time, token };
+        let record = test_browser_record(pid, start_time, token);
         let dir = run_dir_for_session(&session).unwrap();
         let pid_path = dir.join(format!("{session}.pid"));
         let own_record_path = session_pid_path(&session).unwrap();
@@ -3746,7 +3888,7 @@ mod tests {
             }
             std::thread::sleep(Duration::from_millis(25));
         };
-        let record = BrowserPidRecord { pid, start_time, token };
+        let record = test_browser_record(pid, start_time, token);
 
         let dir = run_dir().unwrap();
         let pid_path = dir.join(format!("{session}.pid"));
@@ -4734,11 +4876,7 @@ mod tests {
         // via session_pid_path (NOT the agent-browser-CLI's own PID
         // file). Use a unique name so parallel test runs don't collide.
         let name = format!("ws-roundtrip-{}", std::process::id());
-        let first = BrowserPidRecord {
-            pid: 12345,
-            start_time: 100,
-            token: "a".repeat(32),
-        };
+        let first = test_browser_record(12345, 100, "a".repeat(32));
         write_session_pid(&name, &first).unwrap();
         let path = session_pid_path(&name).expect("path resolves");
         let on_disk = read_browser_pid_record(&path).unwrap();
@@ -4762,11 +4900,7 @@ mod tests {
             let target = temp.path().join("outside.pid");
             std::fs::write(&target, b"keep").unwrap();
             symlink(&target, &path).unwrap();
-            let second = BrowserPidRecord {
-                pid: 54321,
-                start_time: 200,
-                token: "b".repeat(32),
-            };
+            let second = test_browser_record(54321, 200, "b".repeat(32));
             write_session_pid(&name, &second).unwrap();
             assert_eq!(std::fs::read(&target).unwrap(), b"keep");
             assert_eq!(read_browser_pid_record(&path).unwrap().pid, 54321);
@@ -4816,7 +4950,7 @@ mod tests {
             }
             std::thread::sleep(Duration::from_millis(25));
         };
-        let record = BrowserPidRecord { pid, start_time, token: token.clone() };
+        let record = test_browser_record(pid, start_time, token.clone());
         assert!(browser_process_matches(&record, session));
         assert!(!browser_process_matches(&record, "another-session"));
         assert!(!browser_process_matches(&BrowserPidRecord { token: "b".repeat(32), ..record.clone() }, session));
@@ -4863,11 +4997,7 @@ mod tests {
             }
             std::thread::sleep(Duration::from_millis(25));
         };
-        let record = BrowserPidRecord {
-            pid: child.id(),
-            start_time,
-            token: token.to_owned(),
-        };
+        let record = test_browser_record(child.id(), start_time, token.to_owned());
         (temp, child, record)
     }
 
@@ -4884,7 +5014,7 @@ mod tests {
         write_session_pid(&session, &record).unwrap();
 
         let start = stop_previous_browser_daemon_before_stream(&session, temp.path().join("agent-browser").to_str().unwrap());
-        assert!(start.as_ref().is_err_and(|error| error.contains("another running app instance")), "{start:?}");
+        assert!(start.as_ref().is_err_and(|error| error.contains("another running or unverified app instance")), "{start:?}");
         rollback_failed_unix_open(&session, None);
         let still_running = child.try_wait().unwrap().is_none();
 
@@ -4893,6 +5023,61 @@ mod tests {
         let _ = std::fs::remove_file(daemon_pid_path);
         clear_session_pid(&session);
         assert!(still_running, "failed open stopped another process's daemon");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn daemon_from_an_exited_app_can_be_reclaimed() {
+        let session = format!("browser-dead-owner-{}", uuid::Uuid::new_v4().simple());
+        let token = uuid::Uuid::new_v4().simple().to_string();
+        let (temp, mut daemon, mut record) = browser_identity_fixture(&session, &token);
+        let daemon_pid_path = run_dir_for_session(&session)
+            .unwrap()
+            .join(format!("{session}.pid"));
+        std::fs::write(&daemon_pid_path, daemon.id().to_string()).unwrap();
+
+        let mut prior_app = std::process::Command::new(which::which("sleep").unwrap())
+            .arg("30")
+            .spawn()
+            .unwrap();
+        record.owner_pid = prior_app.id();
+        let started = Instant::now();
+        record.owner_start_time = loop {
+            if let Some(start_time) = process_start_time(prior_app.id()) {
+                break start_time;
+            }
+            assert!(started.elapsed() < Duration::from_secs(3));
+            std::thread::sleep(Duration::from_millis(25));
+        };
+        write_session_pid(&session, &record).unwrap();
+        assert!(!previous_app_has_exited(&record));
+        prior_app.kill().unwrap();
+        prior_app.wait().unwrap();
+        assert!(previous_app_has_exited(&record));
+
+        let reaper = std::thread::spawn(move || {
+            let start = Instant::now();
+            loop {
+                if daemon.try_wait().unwrap().is_some() {
+                    return true;
+                }
+                if start.elapsed() >= Duration::from_secs(5) {
+                    let _ = daemon.kill();
+                    let _ = daemon.wait();
+                    return false;
+                }
+                std::thread::sleep(Duration::from_millis(25));
+            }
+        });
+        let reclaimed = stop_previous_browser_daemon_before_stream(
+            &session,
+            temp.path().join("agent-browser").to_str().unwrap(),
+        );
+        let stopped = reaper.join().unwrap();
+        let _ = std::fs::remove_file(daemon_pid_path);
+        clear_session_pid(&session);
+        assert!(reclaimed.is_ok(), "{reclaimed:?}");
+        assert!(stopped, "daemon survived reclaim from an exited app");
     }
 
     #[cfg(unix)]
@@ -4938,6 +5123,73 @@ mod tests {
         let _ = std::fs::remove_file(daemon_pid_path);
         clear_session_pid(&session);
         assert!(exited, "app exit cleanup missed the failed command's daemon");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn timed_out_command_tracks_daemon_after_late_pid_publication() {
+        let session = format!("browser-late-pid-{}", uuid::Uuid::new_v4().simple());
+        let (_temp, mut child, record) = browser_identity_fixture(&session, browser_owner_token());
+        let daemon_pid_path = run_dir_for_session(&session)
+            .unwrap()
+            .join(format!("{session}.pid"));
+        let tracked_path = session_pid_path(&session).unwrap();
+        let pid = child.id();
+        let path_for_writer = daemon_pid_path.clone();
+        let writer = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(300));
+            std::fs::write(path_for_writer, pid.to_string()).unwrap();
+        });
+
+        let mut timed_out = std::process::Command::new("sh");
+        timed_out.args(["-c", "sleep 30"]);
+        assert!(output_capture_and_track_browser_daemon(timed_out, Duration::from_millis(100), &session).is_err());
+        assert!(!tracked_path.exists(), "daemon was already tracked before its PID was published");
+        writer.join().unwrap();
+
+        let started = Instant::now();
+        while read_browser_pid_record(&tracked_path).is_none() && started.elapsed() < Duration::from_secs(3) {
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        assert_eq!(read_browser_pid_record(&tracked_path).map(|record| record.pid), Some(record.pid));
+
+        kill_verified_browser_pid(&record, &session);
+        let started = Instant::now();
+        while child.try_wait().unwrap().is_none() && started.elapsed() < Duration::from_secs(3) {
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        if child.try_wait().unwrap().is_none() {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("late-published daemon survived cleanup");
+        }
+        let _ = std::fs::remove_file(daemon_pid_path);
+        clear_session_pid(&session);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn app_exit_finds_owned_daemon_without_a_pid_file() {
+        let session = format!("browser-untracked-{}", uuid::Uuid::new_v4().simple());
+        let (_temp, mut child, _record) = browser_identity_fixture(&session, browser_owner_token());
+        assert!(read_agent_browser_daemon_pid(&session).is_none());
+
+        kill_untracked_browser_daemons(Some(&session));
+        let started = Instant::now();
+        let stopped = loop {
+            if child.try_wait().unwrap().is_some() {
+                break true;
+            }
+            if started.elapsed() >= Duration::from_secs(3) {
+                break false;
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        };
+        if !stopped {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        assert!(stopped, "app exit missed a daemon before PID publication");
     }
 
     #[cfg(unix)]
