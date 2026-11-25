@@ -357,7 +357,9 @@ fn private_runtime_run_dir(runtime_root: &std::path::Path) -> Option<PathBuf> {
     {
         return None;
     }
-    Some(runtime_root.join("codemux-browser"))
+    // Keep the path shorter than agent-browser's former default subdirectory
+    // so a 103-byte control socket still fits at the boundary.
+    Some(runtime_root.join("cmx-browser"))
 }
 
 #[cfg(unix)]
@@ -1836,6 +1838,23 @@ fn run_agent_browser_native_raw(
 }
 
 #[cfg(windows)]
+fn require_successful_browser_stream_open(
+    result: std::io::Result<std::process::Output>,
+    log_file: Option<std::fs::File>,
+) -> Result<(), String> {
+    use std::io::Write;
+
+    let output = result.map_err(|error| format!("Browser stream open failed: {error}"))?;
+    if let Some(mut log) = log_file {
+        let _ = log.write_all(&output.stderr);
+    }
+    if !output.status.success() {
+        return Err(format!("Browser stream open failed with status {}", output.status));
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
 fn connect_verified_browser_control(
     session: &str,
     record: &BrowserPidRecord,
@@ -1938,6 +1957,30 @@ struct VerifiedBrowserRelay {
 }
 
 #[cfg(windows)]
+fn bind_exclusive_browser_relay_listener(port: u16) -> std::io::Result<std::net::TcpListener> {
+    use std::os::windows::io::AsRawSocket;
+    use windows_sys::Win32::Networking::WinSock::{setsockopt, SO_EXCLUSIVEADDRUSE, SOL_SOCKET};
+
+    let socket = socket2::Socket::new(socket2::Domain::IPV4, socket2::Type::STREAM, Some(socket2::Protocol::TCP))?;
+    let enabled = 1i32;
+    let status = unsafe {
+        setsockopt(
+            socket.as_raw_socket() as usize,
+            SOL_SOCKET,
+            SO_EXCLUSIVEADDRUSE,
+            (&enabled as *const i32).cast(),
+            std::mem::size_of_val(&enabled) as i32,
+        )
+    };
+    if status != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    socket.bind(&socket2::SockAddr::from(std::net::SocketAddr::from(([127, 0, 0, 1], port))))?;
+    socket.listen(128)?;
+    Ok(socket.into())
+}
+
+#[cfg(windows)]
 impl VerifiedBrowserRelay {
     fn new(session: &str, record: BrowserPidRecord, timeout: Duration) -> std::io::Result<Self> {
         use std::io::{Read, Write};
@@ -1948,7 +1991,7 @@ impl VerifiedBrowserRelay {
         let (cli_session, listener) = (0..32).find_map(|_| {
             let alias = format!("relay-{}", uuid::Uuid::new_v4().simple());
             let port = browser_control_fallback_port(&alias);
-            std::net::TcpListener::bind(("127.0.0.1", port)).ok().map(|listener| (alias, listener))
+            bind_exclusive_browser_relay_listener(port).ok().map(|listener| (alias, listener))
         }).ok_or_else(|| std::io::Error::other("No free browser relay control port"))?;
         let path = base.join(format!("relay-{}", uuid::Uuid::new_v4().simple()));
         clack_private_fs::create_dir(&path)?;
@@ -2924,7 +2967,6 @@ impl AgentBrowserManager {
 
             #[cfg(target_os = "windows")]
             {
-                use std::io::Write;
                 let mut argv: Vec<String> = windows_executable_path_args();
                 argv.extend([
                     "open".into(),
@@ -2933,10 +2975,10 @@ impl AgentBrowserManager {
                     "--session".into(),
                     session.clone(),
                 ]);
-                let result = run_agent_browser_native(&bin, &argv, &session, port, false, OPEN_TIMEOUT);
-                if let (Some(mut log), Ok(output)) = (log_file, &result) {
-                    let _ = log.write_all(&output.stderr);
-                }
+                require_successful_browser_stream_open(
+                    run_agent_browser_native(&bin, &argv, &session, port, false, OPEN_TIMEOUT),
+                    log_file,
+                )?;
             }
             #[cfg(not(target_os = "windows"))]
             {
@@ -3077,6 +3119,34 @@ mod tests {
         drop(guard);
         worker.join().unwrap();
         assert_eq!(result.unwrap(), Err(std::io::ErrorKind::TimedOut));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn browser_relay_port_is_exclusive() {
+        let listener = bind_exclusive_browser_relay_listener(0).unwrap();
+        let address = listener.local_addr().unwrap();
+        let contender = socket2::Socket::new(socket2::Domain::IPV4, socket2::Type::STREAM, Some(socket2::Protocol::TCP)).unwrap();
+        contender.set_reuse_address(true).unwrap();
+        assert!(contender.bind(&socket2::SockAddr::from(address)).is_err());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn browser_stream_rejects_failed_open_with_owned_listener() {
+        use std::os::windows::process::ExitStatusExt;
+
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        assert!(listener_owned_by_pid(port, std::process::id()));
+
+        let output = std::process::Output {
+            status: std::process::ExitStatus::from_raw(1),
+            stdout: Vec::new(),
+            stderr: b"open failed".to_vec(),
+        };
+        assert!(require_successful_browser_stream_open(Ok(output), None).is_err());
+        assert!(require_successful_browser_stream_open(Err(std::io::Error::other("relay failed")), None).is_err());
     }
 
     #[cfg(windows)]
@@ -4012,7 +4082,7 @@ mod tests {
         assert!(!browser_socket_path_fits(&browser_run_dir_for(&home), session));
 
         let dir = run_dir_for_roots(Some(&home), Some(&runtime_root), session).unwrap();
-        assert_eq!(dir, runtime_root.join("codemux-browser"));
+        assert_eq!(dir, runtime_root.join("cmx-browser"));
         assert_eq!(run_dir_for_roots(None, Some(&runtime_root), session), Some(dir.clone()));
         assert!(browser_socket_path_fits(&dir, session));
         assert_eq!(std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777, 0o700);
@@ -4029,6 +4099,24 @@ mod tests {
             run_dir_for_roots(Some(&fallback_home), Some(&runtime_root), session),
             Some(browser_run_dir_for(&fallback_home))
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn short_runtime_dir_preserves_former_socket_path_boundary() {
+        use std::os::unix::ffi::OsStrExt;
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir_in("/tmp").unwrap();
+        let root_name_len = 19usize.checked_sub(temp.path().as_os_str().as_bytes().len() + 1).unwrap();
+        let runtime_root = temp.path().join("r".repeat(root_name_len));
+        std::fs::create_dir(&runtime_root).unwrap();
+        std::fs::set_permissions(&runtime_root, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let session = "s".repeat(64);
+        validate_session_name(&session).unwrap();
+        assert_eq!(runtime_root.join("agent-browser").join(format!("{session}.sock")).as_os_str().as_bytes().len(), 103);
+        let dir = private_runtime_run_dir(&runtime_root).unwrap();
+        assert!(browser_socket_path_fits(&dir, &session));
     }
 
     #[cfg(windows)]

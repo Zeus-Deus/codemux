@@ -214,6 +214,7 @@ gtk = "0.18"
 
 [target.'cfg(windows)'.dependencies]
 clack-private-fs = "1"
+socket2 = "0.6"
 winx = "0.36"
 # Web Push's ECE encryption uses OpenSSL. Bundle it on Windows instead of
 # requiring users/builders to provide a system OpenSSL installation.
