@@ -516,7 +516,7 @@ fn repo_access_probe_command(remote: &str) -> Option<String> {
     let script = crate::ssh_policy::unattended_git_script(&format!(
         "git ls-remote --heads '{remote}' >/dev/null 2>&1 && echo {REPO_PROBE_MARKER}"
     ));
-    Some(format!("exec sh -c {}", crate::ssh_policy::shell_quote(&script)))
+    Some(crate::ssh_policy::remote_sh_command(&script))
 }
 
 async fn run_repo_access_probe(
@@ -637,11 +637,11 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn repo_access_probe_rejects_options_and_works_with_ssh_stdin_disabled() {
+    async fn repo_access_probe_survives_ssh_login_shells_with_stdin_disabled() {
         use std::os::unix::fs::PermissionsExt;
 
         if crate::test_isolation::isolated(
-            "commands::automations::tests::repo_access_probe_rejects_options_and_works_with_ssh_stdin_disabled",
+            "commands::automations::tests::repo_access_probe_survives_ssh_login_shells_with_stdin_disabled",
         ) {
             return;
         }
@@ -664,10 +664,21 @@ mod tests {
             &ssh,
             r#"#!/bin/sh
 if [ "$1" = -G ]; then printf 'stdinnull yes\n'; exit 0; fi
-while [ "$#" -gt 0 ] && [ "$1" != -- ]; do shift; done
-[ "$#" -eq 3 ] && [ "$2" = no-stdin-device ] || exit 2
+strict=no
+while [ "$#" -gt 0 ] && [ "$1" != -- ] && [ "$1" != fixture.invalid ]; do
+    [ "$1" != StrictHostKeyChecking=yes ] || strict=yes
+    shift
+done
+[ "$strict" = yes ] || exit 2
+[ "$1" != -- ] || shift
+# An empty ref advertisement from the nested, verified Git SSH transport.
+if [ "$1" = fixture.invalid ]; then printf 0000; exit 0; fi
+[ "$#" -eq 2 ] && [ "$1" = no-stdin-device ] || exit 2
 cd "$CODEMUX_REPO_PROBE_FIXTURE" || exit 2
-exec /bin/sh -c "$3" </dev/null
+if [ "$CODEMUX_REPO_PROBE_SHELL" = fish ]; then
+    exec fish --no-config -c "$2" </dev/null
+fi
+exec /bin/sh -c "$2" </dev/null
 "#,
         )
         .unwrap();
@@ -680,12 +691,18 @@ exec /bin/sh -c "$3" </dev/null
         std::env::set_var("PATH", path);
         std::env::set_var("CODEMUX_REPO_PROBE_FIXTURE", root.path());
 
-        let command = repo_access_probe_command("./origin.git").unwrap();
-        let result = run_repo_access_probe("no-stdin-device", command)
-            .await
-            .unwrap();
-        assert!(result.status.success(), "{result:?}");
-        assert!(interpret_repo_probe(&String::from_utf8_lossy(&result.stdout)));
+        for shell in ["sh", "fish"] {
+            if shell == "fish" && which::which("fish").is_err() {
+                continue;
+            }
+            std::env::set_var("CODEMUX_REPO_PROBE_SHELL", shell);
+            for remote in ["./origin.git", "ssh://fixture.invalid/repo"] {
+                let command = repo_access_probe_command(remote).unwrap();
+                let result = run_repo_access_probe("no-stdin-device", command).await.unwrap();
+                assert!(result.status.success(), "{shell} {remote}: {result:?}");
+                assert!(interpret_repo_probe(&String::from_utf8_lossy(&result.stdout)));
+            }
+        }
     }
 
     fn input(trigger: Option<AutomationTrigger>) -> AutomationInput {

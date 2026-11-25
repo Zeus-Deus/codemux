@@ -141,7 +141,27 @@ pub(crate) fn verified_shell_command() -> String {
     )
 }
 
-pub(crate) fn shell_quote(value: &str) -> String {
+/// Single-quote a value for a POSIX or fish login shell. Write `'` and
+/// `\` outside quoted runs so fish preserves the same bytes as POSIX sh.
+pub fn sh_quote(value: &str) -> String {
+    let mut out = String::with_capacity(value.len() + 2);
+    out.push('\'');
+    for c in value.chars() {
+        match c {
+            '\'' => out.push_str(r"'\''"),
+            '\\' => out.push_str(r"'\\'"),
+            c => out.push(c),
+        }
+    }
+    out.push('\'');
+    out
+}
+
+pub(crate) fn remote_sh_command(script: &str) -> String {
+    format!("exec sh -c {}", sh_quote(script))
+}
+
+fn shell_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\\''"))
 }
 

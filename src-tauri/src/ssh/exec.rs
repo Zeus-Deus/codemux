@@ -15,6 +15,7 @@ use serde::de::DeserializeOwned;
 use tokio::time::timeout;
 
 use crate::json_rpc_child::SpawnConfig;
+pub use crate::ssh_policy::sh_quote;
 
 /// Where Codemux installs its helper binaries on a host.
 pub const REMOTE_BIN_DIR: &str = "~/.local/bin";
@@ -38,27 +39,6 @@ pub fn validate_ssh_target(target: &str) -> Result<(), String> {
         return Err("SSH target can't contain spaces or control characters".into());
     }
     Ok(())
-}
-
-/// Single-quote a value for a remote shell.
-///
-/// `'` and `\` are written outside the quotes (`\'`, `\\`), so no backslash
-/// ever sits inside a quoted run. POSIX shells and fish then read the result
-/// the same way — fish treats `\'` and `\\` as escapes even inside single
-/// quotes — which keeps nested quoting intact whatever the device's login
-/// shell is.
-pub fn sh_quote(value: &str) -> String {
-    let mut out = String::with_capacity(value.len() + 2);
-    out.push('\'');
-    for c in value.chars() {
-        match c {
-            '\'' => out.push_str(r"'\''"),
-            '\\' => out.push_str(r"'\\'"),
-            c => out.push(c),
-        }
-    }
-    out.push('\'');
-    out
 }
 
 /// Quote a host path, keeping a leading `~` expandable as `"$HOME"`.
@@ -193,7 +173,7 @@ pub async fn run_remote(
     cmd.args(one_shot_args(connect_timeout))
         .arg("--")
         .arg(ssh_target)
-        .arg(format!("exec sh -c {}", sh_quote(script)))
+        .arg(crate::ssh_policy::remote_sh_command(script))
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
