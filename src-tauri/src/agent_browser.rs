@@ -4411,8 +4411,12 @@ impl AgentBrowserManager {
         self.reconcile_action_result(browser_id, session, action, result).await;
         let lookup_session = session.to_owned();
         let confirmed_absent = tokio::task::spawn_blocking(move || {
+            let file_absent = |path: Option<PathBuf>| path.is_some_and(|path| {
+                matches!(std::fs::symlink_metadata(path), Err(error) if error.kind() == std::io::ErrorKind::NotFound)
+            });
             live_owned_browser_record(&lookup_session).is_none()
-                && read_agent_browser_daemon_pid(&lookup_session).is_none()
+                && file_absent(agent_browser_daemon_pid_path(&lookup_session))
+                && file_absent(session_pid_path(&lookup_session))
                 && run_dir_for_session(&lookup_session).is_some_and(|dir| {
                     probe_browser_control_endpoint(&lookup_session, &dir)
                         == BrowserControlEndpointProbe::Absent
@@ -6253,6 +6257,22 @@ mod tests {
         manager.allocate_port(&session).await.unwrap();
         assert!(!manager.note_action_start(&session, "open").await);
         assert!(manager.sessions.lock().await.get(&session).unwrap().running);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn malformed_daemon_pid_file_keeps_provisional_session() {
+        let session = format!("browser-malformed-pid-{}", uuid::Uuid::new_v4().simple());
+        let manager = AgentBrowserManager::new();
+        manager.allocate_port(&session).await.unwrap();
+        assert!(!manager.note_action_start(&session, "open").await);
+        let pid_path = agent_browser_daemon_pid_path(&session).unwrap();
+        std::fs::write(&pid_path, "still writing").unwrap();
+
+        let result = Err(BrowserActionFailure::after_launch("launcher failed".into()));
+        manager.settle_provisional_action(&session, &session, "open", &result).await;
+        assert!(manager.sessions.lock().await.get(&session).unwrap().running);
+        std::fs::remove_file(pid_path).unwrap();
     }
 
     #[cfg(unix)]
