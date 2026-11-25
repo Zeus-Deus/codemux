@@ -17,7 +17,7 @@ use std::time::Duration;
 use tokio::process::Command;
 use tokio::time::timeout;
 
-use crate::ssh::exec::codemux_remote_command;
+use crate::ssh::exec::{codemux_remote_command, one_shot_args};
 
 /// Outcome of a single probe attempt. Serializable so it can cross
 /// the Tauri IPC boundary for the "Test connection" button result.
@@ -86,24 +86,15 @@ impl<'a> ProbeOptions<'a> {
 /// cause the probe to hang on a password prompt and look like a
 /// timeout to the user).
 pub fn build_probe_argv(ssh_target: &str, timeout_secs: u64) -> Vec<String> {
-    vec![
-        "-o".into(),
-        "BatchMode=yes".into(),
-        "-o".into(),
-        format!("ConnectTimeout={timeout_secs}"),
-        // StrictHostKeyChecking=accept-new lets a first-time probe
-        // succeed without an interactive y/n prompt. The host gets
-        // added to known_hosts as usual. Subsequent probes against
-        // a changed key still fail closed, which is the right
-        // security default.
-        "-o".into(),
-        "StrictHostKeyChecking=accept-new".into(),
+    let mut args = one_shot_args(timeout_secs);
+    args.extend([
         // `--` ends option parsing, so a target that starts with `-`
         // (it can arrive via account sync) is a hostname, never a flag.
         "--".into(),
         ssh_target.into(),
         probe_script(),
-    ]
+    ]);
+    args
 }
 
 /// The probe's remote command: print `uname -sm`, then the version of the
@@ -231,12 +222,11 @@ mod tests {
     #[test]
     fn build_probe_argv_locks_in_batch_mode_and_timeout() {
         let argv = build_probe_argv("zeus@10.0.0.5", 8);
-        // Critical flags — losing any of these breaks the user
-        // experience (hangs on prompts, or interactive y/n on first
-        // probe).
+        // Probes never prompt or enroll keys.
         assert!(argv.iter().any(|a| a == "BatchMode=yes"));
         assert!(argv.iter().any(|a| a == "ConnectTimeout=8"));
-        assert!(argv.iter().any(|a| a == "StrictHostKeyChecking=accept-new"));
+        assert!(argv.iter().any(|a| a == "StrictHostKeyChecking=yes"));
+        assert!(argv.iter().any(|a| a == "ControlPath=none"));
         // The target follows `--` so it can never be read as an option.
         let dd = argv.iter().position(|a| a == "--").expect("`--` before the target");
         assert_eq!(argv[dd + 1], "zeus@10.0.0.5");

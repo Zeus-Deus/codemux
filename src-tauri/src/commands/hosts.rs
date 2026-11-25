@@ -353,7 +353,7 @@ pub async fn hosts_test_connection<R: tauri::Runtime>(
             }
             ProbeOutcome::Unreachable { reason } => HostTestResult {
                 ok: false,
-                message: reason,
+                message: device_connection_error(reason),
                 needs_install: false,
                 uname: None,
             },
@@ -370,6 +370,20 @@ pub async fn hosts_test_connection<R: tauri::Runtime>(
             needs_install: false,
             uname: None,
         })
+    }
+}
+
+#[cfg(unix)]
+fn device_connection_error(reason: String) -> String {
+    if reason.contains("Host key verification failed")
+        || reason.contains("REMOTE HOST IDENTIFICATION HAS CHANGED")
+    {
+        format!(
+            "SSH could not verify this device's host key. Confirm its fingerprint with the \
+             device administrator, then add the matching key to your SSH known_hosts and retry.\n{reason}"
+        )
+    } else {
+        reason
     }
 }
 
@@ -681,17 +695,11 @@ pub async fn workspace_push_to_host<R: tauri::Runtime>(
         // returns. Workaround: manually re-scp, or rebuild + clear
         // ~/.local/bin/codemux-remote on the remote so the version
         // probe sees MISSING and triggers a bootstrap.
-        if let Err(error) = ensure_remote_binary_current(&app, &host).await {
-            // Don't block the push on this — if the auto-update fails,
-            // the push may still work with the older binary. Log loudly
-            // so we know to look here next time something cwd-shaped
-            // misbehaves.
-            eprintln!(
-                "[hosts] auto-update of codemux-remote on {} failed (continuing \
-                 with existing binary): {error}",
-                host.name
-            );
-        }
+        ensure_remote_binary_current(&app, &host)
+            .await
+            .map_err(|error| {
+                device_connection_error(format!("Could not prepare {}: {error}", host.name))
+            })?;
 
         // Key the host landing path on project_uid so two different repos
         // sharing a basename don't clobber each other on the host. The exact
@@ -850,14 +858,14 @@ pub async fn workspace_push_to_host<R: tauri::Runtime>(
             }
             crate::ssh::PushResult::RsyncFailed { reason } => WorkspacePushOutcome {
                 ok: false,
-                message: format!("rsync failed: {reason}"),
+                message: device_connection_error(format!("rsync failed: {reason}")),
                 remote_path: None,
                 rsync_summary: None,
             },
             crate::ssh::PushResult::HostUnreachable { reason } => {
                 WorkspacePushOutcome {
                     ok: false,
-                    message: format!("Host unreachable: {reason}"),
+                    message: device_connection_error(format!("Host unreachable: {reason}")),
                     remote_path: None,
                     rsync_summary: None,
                 }
@@ -1100,14 +1108,14 @@ pub async fn workspace_pull_back_impl<R: tauri::Runtime>(
             crate::ssh::PullResult::RsyncFailed { reason } => {
                 WorkspacePullOutcome {
                     ok: false,
-                    message: format!("rsync failed: {reason}"),
+                    message: device_connection_error(format!("rsync failed: {reason}")),
                     rsync_summary: None,
                 }
             }
             crate::ssh::PullResult::HostUnreachable { reason } => {
                 WorkspacePullOutcome {
                     ok: false,
-                    message: format!("Host unreachable: {reason}"),
+                    message: device_connection_error(format!("Host unreachable: {reason}")),
                     rsync_summary: None,
                 }
             }
@@ -1263,7 +1271,8 @@ async fn sync_claude_projects(
     local_cwd: &std::path::Path,
     remote_cwd: &std::path::Path,
 ) -> Result<(), String> {
-    use crate::ssh::history_process::{output, rsync_transport, ssh_command};
+    use crate::ssh::exec::rsync_transport;
+    use crate::ssh::history_process::{output, ssh_command};
 
     // Step 1: figure out the laptop-side source dir. If no Claude
     // session has ever been started in this workspace, the dir
@@ -1367,7 +1376,8 @@ async fn pull_claude_projects(
     remote_cwd: &std::path::Path,
     local_cwd: &std::path::Path,
 ) -> Result<(), String> {
-    use crate::ssh::history_process::{output, rsync_transport, ssh_command};
+    use crate::ssh::exec::rsync_transport;
+    use crate::ssh::history_process::{output, ssh_command};
 
     let local_home = std::env::var("HOME")
         .map_err(|_| "HOME env var not set on laptop".to_string())?;
@@ -1440,8 +1450,7 @@ async fn pull_claude_projects(
 /// Returns Ok on either "already current, nothing to do" or "updated
 /// successfully." Returns Err when the host can't be reached or the
 /// bootstrap attempt itself failed (no bundled binary for the target
-/// uname, upload failed, etc.). Caller decides whether to propagate or
-/// warn-and-continue. Installs the binary on a host that lacks it, so
+/// uname, upload failed, etc.). Installs the binary on a host that lacks it, so
 /// call it only from flows the user started on that device.
 #[cfg(unix)]
 pub(crate) async fn ensure_remote_binary_current<R: tauri::Runtime>(
@@ -1477,9 +1486,10 @@ pub(crate) async fn ensure_remote_binary_current<R: tauri::Runtime>(
                 "[hosts] {} has codemux-remote {version}, upgrading to {our_version}",
                 host.name
             );
-            return crate::hosts_upgrade::upgrade_host(app, host)
-                .await
-                .map(|_| ());
+            return match crate::hosts_upgrade::upgrade_host(app, host).await? {
+                crate::hosts_upgrade::UpgradeOutcome::NotAttempted { reason } => Err(reason),
+                _ => Ok(()),
+            };
         }
         None => {}
     }

@@ -5,22 +5,8 @@ use std::process::{Output, Stdio};
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 use tokio::process::{Child, Command};
 
-const CONNECT_TIMEOUT: &str = "ConnectTimeout=10";
-
 pub(crate) fn ssh_command(target: &str) -> Command {
-    let mut command = crate::execution::host_command_tokio("ssh");
-    command
-        .args(super::tunnel_paths::verified_ssh_args())
-        .arg("-o")
-        .arg(CONNECT_TIMEOUT)
-        .arg("--")
-        .arg(target);
-    command
-}
-
-pub(crate) fn rsync_transport() -> String {
-    let options = super::tunnel_paths::verified_ssh_args().join(" ");
-    format!("ssh {options} -o {CONNECT_TIMEOUT}")
+    super::exec::verified_ssh_command(target, 10)
 }
 
 pub(crate) async fn within_deadline<T>(

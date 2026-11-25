@@ -15,6 +15,7 @@ use serde::de::DeserializeOwned;
 use tokio::process::Command;
 use tokio::time::timeout;
 
+use super::tunnel_paths::verified_ssh_args;
 use crate::json_rpc_child::SpawnConfig;
 
 /// Where Codemux installs its helper binaries on a host.
@@ -91,19 +92,30 @@ fn is_env_key(key: &str) -> bool {
         && chars.all(|c| c == '_' || c.is_ascii_alphanumeric())
 }
 
-/// Flags shared by every one-shot `ssh` call. `BatchMode` makes a missing
-/// key fail fast instead of hanging on a password prompt.
+/// Verify the saved host key for unattended device commands.
 pub fn one_shot_args(connect_timeout_secs: u64) -> Vec<String> {
-    vec![
+    let mut args: Vec<String> = verified_ssh_args().into_iter().map(String::from).collect();
+    args.extend([
         "-o".into(),
-        "BatchMode=yes".into(),
+        "ClearAllForwardings=yes".into(),
         "-o".into(),
         format!("ConnectTimeout={connect_timeout_secs}"),
         "-o".into(),
-        "StrictHostKeyChecking=accept-new".into(),
-        "-o".into(),
         "LogLevel=ERROR".into(),
-    ]
+    ]);
+    args
+}
+
+pub(crate) fn verified_ssh_command(target: &str, connect_timeout_secs: u64) -> Command {
+    let mut command = crate::execution::host_command_tokio("ssh");
+    command
+        .args(one_shot_args(connect_timeout_secs))
+        .args(["--", target]);
+    command
+}
+
+pub(crate) fn rsync_transport() -> String {
+    format!("ssh {}", one_shot_args(10).join(" "))
 }
 
 /// Build the remote command string that runs `program args` in `cwd` with
@@ -154,9 +166,10 @@ pub fn stdio_spawn_config(
 ) -> Result<SpawnConfig, String> {
     validate_ssh_target(ssh_target)?;
     let script = remote_exec_script(program, args, env, cwd)?;
-    let mut ssh_args: Vec<String> = vec!["-T".into(), "-e".into(), "none".into()];
-    ssh_args.extend(one_shot_args(15));
+    let mut ssh_args = one_shot_args(15);
     ssh_args.extend([
+        "-e".into(),
+        "none".into(),
         "-o".into(),
         "ServerAliveInterval=15".into(),
         "-o".into(),
@@ -187,16 +200,11 @@ pub async fn run_remote(
 ) -> Result<String, String> {
     validate_ssh_target(ssh_target)?;
     let connect_timeout = budget.as_secs().clamp(1, 15);
-    let mut cmd = Command::new("ssh");
-    cmd.args(one_shot_args(connect_timeout))
-        .arg("--")
-        .arg(ssh_target)
-        .arg(format!("exec sh -c {}", sh_quote(script)))
-        .stdin(Stdio::null())
+    let mut cmd = remote_command(ssh_target, script, connect_timeout);
+    cmd.stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
-    crate::execution::sanitize_appimage_env_tokio(&mut cmd);
     let output = timeout(budget, cmd.output())
         .await
         .map_err(|_| format!("timed out after {}s", budget.as_secs()))?
@@ -211,6 +219,12 @@ pub async fn run_remote(
         (Some(code), true) => format!("remote command exited with status {code}"),
         (None, true) => "remote command was terminated".into(),
     })
+}
+
+fn remote_command(ssh_target: &str, script: &str, connect_timeout_secs: u64) -> Command {
+    let mut command = verified_ssh_command(ssh_target, connect_timeout_secs);
+    command.arg(format!("exec sh -c {}", sh_quote(script)));
+    command
 }
 
 /// Run `script` and parse the last JSON object line it prints. Login shells
@@ -401,6 +415,17 @@ pub fn codemux_remote_command(args: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn device_version_probe_requires_a_verified_host_key() {
+        let command = remote_command("fixture", "$HOME/.local/bin/codemux-remote --version", 15);
+        let args: Vec<_> = command.as_std().get_args().collect();
+        let destination = args.iter().position(|arg| *arg == "--").unwrap();
+        assert!(args[..destination].contains(&std::ffi::OsStr::new("StrictHostKeyChecking=yes")));
+        assert!(args[..destination].contains(&std::ffi::OsStr::new("ControlPath=none")));
+        assert_eq!(args[destination + 1], "fixture");
+        assert!(args[destination + 2].to_string_lossy().contains("codemux-remote --version"));
+    }
 
     #[test]
     fn rejects_option_like_targets() {

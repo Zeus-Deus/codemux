@@ -30,6 +30,8 @@ use std::time::Duration;
 use tokio::process::Command;
 use tokio::time::timeout;
 
+use super::exec::{rsync_transport, validate_ssh_target, verified_ssh_command};
+
 /// Outcome of a push attempt. Serializable so it crosses the Tauri IPC
 /// boundary for the workspace push button.
 #[derive(Debug, Clone, Serialize)]
@@ -152,10 +154,9 @@ pub fn build_push_rsync_argv(opts: &PushOptions<'_>) -> Vec<String> {
         "--exclude=target/".into(),
         "--exclude=dist/".into(),
         "--exclude=.next/".into(),
-        // SSH transport: reuse the user's config + agent, with the same
-        // BatchMode guard as the probe so we never hang on a prompt.
+        // Require the same verified host key as the SSH preflight.
         "-e".into(),
-        "ssh -o BatchMode=yes -o ConnectTimeout=10".into(),
+        rsync_transport(),
         local,
         remote_spec,
     ]
@@ -180,7 +181,7 @@ pub fn build_pull_rsync_argv(opts: &PullOptions<'_>) -> Vec<String> {
         "--exclude=dist/".into(),
         "--exclude=.next/".into(),
         "-e".into(),
-        "ssh -o BatchMode=yes -o ConnectTimeout=10".into(),
+        rsync_transport(),
         remote_spec,
         local,
     ]
@@ -188,6 +189,9 @@ pub fn build_pull_rsync_argv(opts: &PullOptions<'_>) -> Vec<String> {
 
 /// Push the worktree to the remote host.
 pub async fn push_workspace(opts: PushOptions<'_>) -> PushResult {
+    if let Err(reason) = validate_ssh_target(opts.ssh_target) {
+        return PushResult::HostUnreachable { reason };
+    }
     if !opts.local_worktree.exists() {
         return PushResult::LocalNotFound {
             path: opts.local_worktree.display().to_string(),
@@ -197,12 +201,7 @@ pub async fn push_workspace(opts: PushOptions<'_>) -> PushResult {
     // Pre-create the remote directory so rsync's first transfer doesn't
     // race against a missing parent. mkdir -p is idempotent.
     let mkdir = run_with_timeout(
-        Command::new("ssh")
-            .arg("-o")
-            .arg("BatchMode=yes")
-            .arg("-o")
-            .arg("ConnectTimeout=10")
-            .arg(opts.ssh_target)
+        verified_ssh_command(opts.ssh_target, 10)
             .arg(format!("mkdir -p {}", shell_escape(opts.remote_path))),
         opts.step_timeout,
     )
@@ -263,6 +262,9 @@ pub async fn push_workspace(opts: PushOptions<'_>) -> PushResult {
 
 /// Pull the worktree back from the remote host.
 pub async fn pull_workspace_back(opts: PullOptions<'_>) -> PullResult {
+    if let Err(reason) = validate_ssh_target(opts.ssh_target) {
+        return PullResult::HostUnreachable { reason };
+    }
     if !opts.local_worktree.exists() {
         // The local target dir must exist for rsync to write into. Try
         // to create it; if that fails (permissions, disk full), surface
@@ -290,12 +292,7 @@ pub async fn pull_workspace_back(opts: PullOptions<'_>) -> PullResult {
     // before: a missing path was misreported as `HostUnreachable`). Only
     // a real SSH/transport failure yields a non-zero exit → `Err` here.
     let remote_check = run_capture_with_timeout(
-        Command::new("ssh")
-            .arg("-o")
-            .arg("BatchMode=yes")
-            .arg("-o")
-            .arg("ConnectTimeout=10")
-            .arg(opts.ssh_target)
+        verified_ssh_command(opts.ssh_target, 10)
             .arg(format!(
                 "if test -d {} ; then echo CMX_REMOTE_DIR_OK ; else echo CMX_REMOTE_DIR_MISSING ; fi",
                 shell_escape(opts.remote_path)
@@ -666,7 +663,7 @@ mod tests {
     }
 
     #[test]
-    fn push_rsync_argv_uses_ssh_with_batchmode() {
+    fn push_rsync_argv_requires_a_verified_host_key() {
         let local = PathBuf::from("/tmp/foo");
         let opts = PushOptions {
             ssh_target: "u@h",
@@ -678,6 +675,8 @@ mod tests {
         let e_idx = argv.iter().position(|a| a == "-e").expect("has -e");
         let spec = &argv[e_idx + 1];
         assert!(spec.contains("BatchMode=yes"), "spec={spec}");
+        assert!(spec.contains("StrictHostKeyChecking=yes"), "spec={spec}");
+        assert!(spec.contains("ControlPath=none"), "spec={spec}");
         assert!(spec.contains("ConnectTimeout"), "spec={spec}");
     }
 
@@ -721,6 +720,9 @@ mod tests {
             step_timeout: Duration::from_secs(60),
         };
         let argv = build_pull_rsync_argv(&opts);
+        let transport = &argv[argv.iter().position(|arg| arg == "-e").unwrap() + 1];
+        assert!(transport.contains("StrictHostKeyChecking=yes"));
+        assert!(transport.contains("ControlPath=none"));
         // The last two positional args must be remote-first, local-
         // second for pull (rsync convention: src then dst).
         let remote_pos = argv.iter().position(|a| a.contains("u@h:")).unwrap();
