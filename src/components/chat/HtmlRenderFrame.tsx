@@ -188,12 +188,12 @@ function HtmlRenderDocument({
       />
       <AlertDialog open={pendingUrl !== null} onOpenChange={(open) => !open && dismissLink()}>
         <AlertDialogContent className="flex max-h-[calc(100dvh-2rem)] flex-col gap-2 overflow-hidden">
-          <AlertDialogHeader className="min-h-0 overflow-y-auto">
-            <AlertDialogMedia>
+          <AlertDialogHeader className="min-h-0 overflow-y-auto [@media(max-height:320px)]:overflow-hidden">
+            <AlertDialogMedia className="[@media(max-height:320px)]:hidden">
               <ExternalLink aria-hidden="true" />
             </AlertDialogMedia>
             <AlertDialogTitle>Open external link?</AlertDialogTitle>
-            <AlertDialogDescription>
+            <AlertDialogDescription className="[@media(max-height:320px)]:hidden">
               This page asked to open a link. Check the address before continuing.
             </AlertDialogDescription>
           </AlertDialogHeader>
