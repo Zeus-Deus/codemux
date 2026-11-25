@@ -188,12 +188,17 @@ try {
   sessions.pop();
   await waitFor(() => !alive(chromePid), 'managed Chromium exit');
 
-  for (const flag of ['--remote-debugging-port=0', '--remote-debugging-pipe',
-    '--remote-debugging-io-pipes=1,2']) {
-    const result = await cli(`${sessionPrefix}-reject`, ['--executable-path', chrome,
+  for (const [index, flag] of ['--remote-debugging-port=0', '-remote-debugging-port=0',
+    '/remote-debugging-port=0', '--remote-debugging-pipe',
+    '--remote-debugging-io-pipes=1,2'].entries()) {
+    const rejected = `${sessionPrefix}-reject-${index}`;
+    sessions.push(rejected);
+    const result = await cli(rejected, ['--executable-path', chrome,
       '--profile', failedProfile, '--args', flag, 'open', 'about:blank']);
     assert(!result.ok && /Custom remote debugging arguments are unavailable/.test(
       `${result.stdout}\n${result.stderr}`), `Managed Chrome accepted ${flag}: ${result.stdout}\n${result.stderr}`);
+    requireSuccess(await cli(rejected, ['close']), `close rejected session ${index}`);
+    sessions.pop();
   }
   assert(!existsSync(join(failedProfile, 'DevToolsActivePort')));
 

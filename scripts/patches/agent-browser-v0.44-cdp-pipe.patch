@@ -262,7 +262,7 @@ index 27ef4d1..c1d5969 100644
  
      #[cfg(unix)]
 diff --git a/cli/src/native/cdp/chrome.rs b/cli/src/native/cdp/chrome.rs
-index bf572f9..3d61a50 100644
+index bf572f9..5be4864 100644
 --- a/cli/src/native/cdp/chrome.rs
 +++ b/cli/src/native/cdp/chrome.rs
 @@ -1,8 +1,13 @@
@@ -317,11 +317,12 @@ index bf572f9..3d61a50 100644
      temp_user_data_dir: Option<PathBuf>,
  }
  
-@@ -453,6 +470,11 @@ fn build_chrome_args(options: &LaunchOptions) -> Result<ChromeArgs, String> {
+@@ -453,6 +470,12 @@ fn build_chrome_args(options: &LaunchOptions) -> Result<ChromeArgs, String> {
      // resolves as disabled.
      let mut user_args: Vec<String> = Vec::new();
      for arg in &options.args {
-+        if arg.to_ascii_lowercase().starts_with("--remote-debugging-") {
++        let switch = arg.trim_start_matches(|ch| ch == '-' || ch == '/');
++        if switch.to_ascii_lowercase().starts_with("remote-debugging-") {
 +            return Err(
 +                "Custom remote debugging arguments are unavailable for managed Chrome".into(),
 +            );
@@ -329,7 +330,7 @@ index bf572f9..3d61a50 100644
          if let Some(values) = arg.strip_prefix("--enable-features=") {
              for feature in values.split(',').map(str::trim).filter(|f| !f.is_empty()) {
                  if !enable_features.iter().any(|f| f == feature) {
-@@ -465,7 +487,7 @@ fn build_chrome_args(options: &LaunchOptions) -> Result<ChromeArgs, String> {
+@@ -465,7 +488,7 @@ fn build_chrome_args(options: &LaunchOptions) -> Result<ChromeArgs, String> {
      }
  
      let mut args = vec![
@@ -338,7 +339,7 @@ index bf572f9..3d61a50 100644
          "--no-first-run".to_string(),
          "--no-default-browser-check".to_string(),
          "--disable-background-networking".to_string(),
-@@ -538,18 +560,17 @@ fn build_chrome_args(options: &LaunchOptions) -> Result<ChromeArgs, String> {
+@@ -538,18 +561,17 @@ fn build_chrome_args(options: &LaunchOptions) -> Result<ChromeArgs, String> {
          args.push(format!("--proxy-bypass-list={}", bypass));
      }
  
@@ -360,7 +361,7 @@ index bf572f9..3d61a50 100644
      };
  
      if options.ignore_https_errors {
-@@ -600,7 +621,6 @@ fn build_chrome_args(options: &LaunchOptions) -> Result<ChromeArgs, String> {
+@@ -600,7 +622,6 @@ fn build_chrome_args(options: &LaunchOptions) -> Result<ChromeArgs, String> {
  
      Ok(ChromeArgs {
          args,
@@ -368,7 +369,7 @@ index bf572f9..3d61a50 100644
          temp_user_data_dir,
      })
  }
-@@ -909,14 +929,9 @@ pub fn launch_chrome(options: &LaunchOptions) -> Result<ChromeProcess, String> {
+@@ -909,14 +930,9 @@ pub fn launch_chrome(options: &LaunchOptions) -> Result<ChromeProcess, String> {
  fn try_launch_chrome(chrome_path: &Path, options: &LaunchOptions) -> Result<ChromeProcess, String> {
      let ChromeArgs {
          args,
@@ -383,7 +384,7 @@ index bf572f9..3d61a50 100644
      let cleanup_temp_dir = |dir: &Option<PathBuf>| {
          if let Some(ref d) = dir {
              let _ = std::fs::remove_dir_all(d);
-@@ -937,6 +952,32 @@ fn try_launch_chrome(chrome_path: &Path, options: &LaunchOptions) -> Result<Chro
+@@ -937,6 +953,32 @@ fn try_launch_chrome(chrome_path: &Path, options: &LaunchOptions) -> Result<Chro
      #[cfg(target_os = "linux")]
      let xvfb = maybe_start_xvfb(options);
  
@@ -416,7 +417,7 @@ index bf572f9..3d61a50 100644
      #[cfg(not(windows))]
      let mut cmd = Command::new(chrome_path);
      #[cfg(not(windows))]
-@@ -969,11 +1010,21 @@ fn try_launch_chrome(chrome_path: &Path, options: &LaunchOptions) -> Result<Chro
+@@ -969,11 +1011,21 @@ fn try_launch_chrome(chrome_path: &Path, options: &LaunchOptions) -> Result<Chro
      #[cfg(unix)]
      {
          use std::os::unix::process::CommandExt;
@@ -441,7 +442,7 @@ index bf572f9..3d61a50 100644
                  Ok(())
              });
          }
-@@ -988,38 +1039,15 @@ fn try_launch_chrome(chrome_path: &Path, options: &LaunchOptions) -> Result<Chro
+@@ -988,38 +1040,15 @@ fn try_launch_chrome(chrome_path: &Path, options: &LaunchOptions) -> Result<Chro
          format!("Failed to launch Chrome at {:?}: {}", chrome_path, e)
      })?;
  
@@ -488,7 +489,7 @@ index bf572f9..3d61a50 100644
      if let Some(stderr) = child.stderr.take() {
          let _ = std::thread::Builder::new()
              .name("chrome-stderr-drain".into())
-@@ -1039,7 +1067,8 @@ fn try_launch_chrome(chrome_path: &Path, options: &LaunchOptions) -> Result<Chro
+@@ -1039,7 +1068,8 @@ fn try_launch_chrome(chrome_path: &Path, options: &LaunchOptions) -> Result<Chro
  
      Ok(ChromeProcess {
          child,
@@ -498,7 +499,7 @@ index bf572f9..3d61a50 100644
          temp_user_data_dir,
          temp_nss_home,
          #[cfg(unix)]
-@@ -1049,123 +1078,6 @@ fn try_launch_chrome(chrome_path: &Path, options: &LaunchOptions) -> Result<Chro
+@@ -1049,123 +1079,6 @@ fn try_launch_chrome(chrome_path: &Path, options: &LaunchOptions) -> Result<Chro
      })
  }
  
@@ -622,7 +623,7 @@ index bf572f9..3d61a50 100644
  /// Finds Chrome from the install cache, macOS Applications directories, or system paths.
  pub fn find_chrome() -> Option<PathBuf> {
      // 1. Check Chrome downloaded by `agent-browser install`
-@@ -1995,9 +1907,45 @@ mod tests {
+@@ -1995,9 +1908,49 @@ mod tests {
          ]));
      }
  
@@ -650,8 +651,12 @@ index bf572f9..3d61a50 100644
 +    fn managed_chrome_rejects_debugging_overrides() {
 +        for flag in [
 +            "--remote-debugging-port=0",
++            "-remote-debugging-port=0",
++            "/remote-debugging-port=0",
 +            "--remote-debugging-pipe",
++            "-REMOTE-DEBUGGING-PIPE",
 +            "--remote-debugging-io-pipes=1,2",
++            "/REMOTE-DEBUGGING-IO-PIPES=1,2",
 +            "--REMOTE-DEBUGGING-ADDRESS=0.0.0.0",
 +        ] {
 +            let options = LaunchOptions {
@@ -669,7 +674,7 @@ index bf572f9..3d61a50 100644
          use std::os::unix::fs::PermissionsExt;
  
          let fixture = tempfile::tempdir().unwrap();
-@@ -2009,7 +1957,6 @@ set -eu
+@@ -2009,7 +1962,6 @@ set -eu
  for arg do
      case "$arg" in --user-data-dir=*) profile="${arg#*=}" ;; esac
  done
@@ -677,7 +682,7 @@ index bf572f9..3d61a50 100644
  for round in 1 2; do
      while [ ! -f "$profile/request-$round" ]; do sleep 0.01; done
      printf '\377' >&2
-@@ -2027,10 +1974,7 @@ exec sleep 60
+@@ -2027,10 +1979,7 @@ exec sleep 60
          };
          let mut chrome = try_launch_chrome(&executable, &options).unwrap();
          let profile = chrome.temp_user_data_dir.clone().unwrap();
@@ -689,7 +694,7 @@ index bf572f9..3d61a50 100644
          for round in 1..=2 {
              std::fs::write(profile.join(format!("request-{round}")), b"").unwrap();
              let drained = profile.join(format!("drained-{round}"));
-@@ -2182,33 +2126,6 @@ exec sleep 60
+@@ -2182,33 +2131,6 @@ exec sleep 60
          assert!(!should_disable_sandbox(&args));
      }
  
@@ -723,7 +728,7 @@ index bf572f9..3d61a50 100644
      #[test]
      fn test_find_playwright_chromium_nonexistent() {
          let guard = EnvGuard::new(&["PLAYWRIGHT_BROWSERS_PATH", "HOME", "USERPROFILE"]);
-@@ -2703,7 +2620,8 @@ exec sleep 60
+@@ -2703,7 +2625,8 @@ exec sleep 60
              let child = spawn_noop_child();
              let _process = ChromeProcess {
                  child,
@@ -1663,7 +1668,7 @@ index 749a5b7..f0db2e2 100644
      let url_a = "data:text/html,gone-session-a";
      let url_b = "data:text/html,gone-session-b";
 diff --git a/cli/src/output.rs b/cli/src/output.rs
-index 5323fc7..0681f51 100644
+index 80f0140..4448b53 100644
 --- a/cli/src/output.rs
 +++ b/cli/src/output.rs
 @@ -3169,10 +3169,9 @@ Examples:
