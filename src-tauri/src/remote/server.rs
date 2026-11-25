@@ -161,6 +161,7 @@ fn error_status_code(kind: &str) -> u16 {
 
 #[cfg(test)]
 mod tests {
+    use crate::remote::config::private_test_dir;
     use super::*;
     use tempfile::TempDir;
 
@@ -193,7 +194,7 @@ mod tests {
 
     #[tokio::test]
     async fn health_is_unauthenticated() {
-        let dir = TempDir::new().unwrap();
+        let dir = private_test_dir();
         let state = build_state(&dir, "secret-abc");
         let url = boot(state).await;
 
@@ -206,7 +207,7 @@ mod tests {
 
     #[tokio::test]
     async fn missing_auth_returns_401() {
-        let dir = TempDir::new().unwrap();
+        let dir = private_test_dir();
         let state = build_state(&dir, "secret-abc");
         let url = boot(state).await;
         let client = reqwest::Client::new();
@@ -216,7 +217,7 @@ mod tests {
 
     #[tokio::test]
     async fn wrong_auth_returns_401() {
-        let dir = TempDir::new().unwrap();
+        let dir = private_test_dir();
         let state = build_state(&dir, "secret-abc");
         let url = boot(state).await;
         let client = reqwest::Client::new();
@@ -231,7 +232,7 @@ mod tests {
 
     #[tokio::test]
     async fn tools_list_returns_catalog() {
-        let dir = TempDir::new().unwrap();
+        let dir = private_test_dir();
         let state = build_state(&dir, "secret-abc");
         let url = boot(state).await;
         let client = reqwest::Client::new();
@@ -253,7 +254,7 @@ mod tests {
 
     #[tokio::test]
     async fn workspace_create_list_roundtrip_over_http() {
-        let dir = TempDir::new().unwrap();
+        let dir = private_test_dir();
         let state = build_state(&dir, "tok");
         let url = boot(state).await;
         let client = reqwest::Client::new();
@@ -291,7 +292,7 @@ mod tests {
 
     #[tokio::test]
     async fn invalid_input_returns_400() {
-        let dir = TempDir::new().unwrap();
+        let dir = private_test_dir();
         let state = build_state(&dir, "tok");
         let url = boot(state).await;
         let res = reqwest::Client::new()
@@ -306,7 +307,7 @@ mod tests {
 
     #[tokio::test]
     async fn unknown_tool_returns_404() {
-        let dir = TempDir::new().unwrap();
+        let dir = private_test_dir();
         let state = build_state(&dir, "tok");
         let url = boot(state).await;
         let res = reqwest::Client::new()

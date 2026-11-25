@@ -79,6 +79,13 @@ fn open_private_dir_with_default(
         Err(e) => return Err(e),
     }
 
+    // SQLite opens the registry and its WAL by pathname. A private leaf is
+    // insufficient if another user can replace an ancestor between this
+    // check and SQLite's open. Check the supplied path and its resolved
+    // target from the filesystem root, so symlinks are safe only when their
+    // entries and targets cannot be replaced by another user.
+    ensure_stable_ancestors(dir)?;
+
     // Check and, for the known default only, chmod the opened directory.
     // Resolve the final component relative to its parent without following
     // a symlink, including when the supplied path has a trailing separator.
@@ -120,6 +127,51 @@ fn open_private_dir_with_default(
     Ok(opened)
 }
 
+fn ensure_stable_ancestors(dir: &std::path::Path) -> std::io::Result<()> {
+    use std::io::{Error, ErrorKind};
+    use std::os::unix::fs::MetadataExt;
+    use std::path::{Component, Path};
+
+    let absolute = if dir.is_absolute() {
+        dir.to_path_buf()
+    } else {
+        std::env::current_dir()?.join(dir)
+    };
+    let resolved = std::fs::canonicalize(&absolute)?;
+    let uid = unsafe { libc::geteuid() };
+    for path in [&absolute, &resolved] {
+        let mut prefix = std::path::PathBuf::new();
+        for component in path.components() {
+            if matches!(component, Component::ParentDir) {
+                return Err(Error::new(
+                    ErrorKind::InvalidInput,
+                    "state directory path cannot contain '..'",
+                ));
+            }
+            prefix.push(component.as_os_str());
+            if prefix == Path::new("/") {
+                continue;
+            }
+            let meta = std::fs::symlink_metadata(&prefix)?;
+            if meta.uid() != uid && meta.uid() != 0 {
+                return Err(Error::new(
+                    ErrorKind::PermissionDenied,
+                    format!("state directory ancestor {} is owned by another user", prefix.display()),
+                ));
+            }
+            // A sticky directory protects an entry owned by this user (or
+            // root), as /tmp does for a user-owned temporary directory.
+            if meta.is_dir() && meta.mode() & 0o022 != 0 && meta.mode() & 0o1000 == 0 {
+                return Err(Error::new(
+                    ErrorKind::PermissionDenied,
+                    format!("state directory ancestor {} can be replaced by another user", prefix.display()),
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Manifest file inside a given state-dir.
 pub fn manifest_path(state_dir: &std::path::Path) -> PathBuf {
     state_dir.join("manifest.json")
@@ -146,6 +198,15 @@ pub fn serve_log_path(state_dir: &std::path::Path) -> PathBuf {
 /// because no daemon was up to own them.
 pub fn logs_dir(state_dir: &std::path::Path) -> PathBuf {
     state_dir.join("logs")
+}
+
+#[cfg(test)]
+pub(crate) fn private_test_dir() -> tempfile::TempDir {
+    use std::os::unix::fs::PermissionsExt;
+    tempfile::Builder::new()
+        .permissions(std::fs::Permissions::from_mode(0o700))
+        .tempdir()
+        .unwrap()
 }
 
 #[cfg(test)]
@@ -196,5 +257,36 @@ mod tests {
 
         assert!(ensure_private_dir_with_default(&link, &link).is_err());
         assert_eq!(mode(&shared), 0o755);
+    }
+
+    #[test]
+    fn private_leaf_under_replaceable_ancestor_is_rejected() {
+        let temp = tempfile::tempdir().unwrap();
+        let shared = temp.path().join("shared");
+        let state = shared.join("private");
+        std::fs::create_dir_all(&state).unwrap();
+        std::fs::set_permissions(&shared, std::fs::Permissions::from_mode(0o777)).unwrap();
+        std::fs::set_permissions(&state, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+        let error = ensure_private_dir_with_default(&state, &temp.path().join("default"))
+            .unwrap_err();
+        assert!(error.to_string().contains("can be replaced"), "{error}");
+        assert_eq!(mode(&state), 0o700);
+    }
+
+    #[test]
+    fn symlink_into_replaceable_ancestor_is_rejected() {
+        let temp = tempfile::tempdir().unwrap();
+        let shared = temp.path().join("shared");
+        let state = shared.join("private");
+        std::fs::create_dir_all(&state).unwrap();
+        std::fs::set_permissions(&shared, std::fs::Permissions::from_mode(0o777)).unwrap();
+        std::fs::set_permissions(&state, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let link = temp.path().join("linked-state");
+        std::os::unix::fs::symlink(&state, &link).unwrap();
+
+        let error = ensure_private_dir_with_default(&link, &temp.path().join("default"))
+            .unwrap_err();
+        assert!(error.to_string().contains("can be replaced"), "{error}");
     }
 }

@@ -171,10 +171,18 @@ pub fn current_host_id() -> String {
 mod tests {
     use super::*;
     use tempfile::TempDir;
+    use std::os::unix::fs::PermissionsExt;
+
+    fn private_tempdir() -> TempDir {
+        tempfile::Builder::new()
+            .permissions(std::fs::Permissions::from_mode(0o700))
+            .tempdir()
+            .unwrap()
+    }
 
     #[test]
     fn write_and_read_roundtrip() {
-        let dir = TempDir::new().unwrap();
+        let dir = private_tempdir();
         let path = dir.path().join("manifest.json");
         let manifest = Manifest::new("http://127.0.0.1:1234".into(), "test-host".into());
         write(&path, &manifest).unwrap();
@@ -188,14 +196,14 @@ mod tests {
 
     #[test]
     fn read_missing_returns_none() {
-        let dir = TempDir::new().unwrap();
+        let dir = private_tempdir();
         let path = dir.path().join("nope.json");
         assert!(read(&path).unwrap().is_none());
     }
 
     #[test]
     fn remove_idempotent() {
-        let dir = TempDir::new().unwrap();
+        let dir = private_tempdir();
         let path = dir.path().join("manifest.json");
         // Removing a non-existent manifest is fine.
         remove(&path).unwrap();
@@ -209,8 +217,7 @@ mod tests {
 
     #[test]
     fn manifest_file_mode_is_0600() {
-        use std::os::unix::fs::PermissionsExt;
-        let dir = TempDir::new().unwrap();
+        let dir = private_tempdir();
         let path = dir.path().join("manifest.json");
         let m = Manifest::new("http://127.0.0.1:1".into(), "h".into());
         write(&path, &m).unwrap();
@@ -220,8 +227,8 @@ mod tests {
 
     #[test]
     fn stale_temp_symlink_cannot_redirect_manifest_write() {
-        let state = TempDir::new().unwrap();
-        let outside = TempDir::new().unwrap();
+        let state = private_tempdir();
+        let outside = private_tempdir();
         let target = outside.path().join("unrelated.txt");
         std::fs::write(&target, b"keep this file").unwrap();
         let path = state.path().join("manifest.json");

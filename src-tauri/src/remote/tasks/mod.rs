@@ -480,10 +480,11 @@ pub async fn run(root: &Path, id: &str) -> Result<(), String> {
 
 #[cfg(test)]
 mod tests {
+    use crate::remote::config::private_test_dir;
     use super::*;
     #[test]
     fn detached_spawn_observes_durable_intent_and_retry_or_failure_never_respawns() {
-        let dir = tempfile::TempDir::new().unwrap();
+        let dir = private_test_dir();
         let store = TaskStore::open(dir.path()).unwrap();
         let request = request();
         let count = std::cell::Cell::new(0);
@@ -521,7 +522,7 @@ mod tests {
     #[tokio::test]
     async fn r2_validated_checkout_replacement_cannot_start_native_elsewhere() {
         use std::os::unix::fs::symlink;
-        let dir = tempfile::TempDir::new().unwrap();
+        let dir = private_test_dir();
         let a=dir.path().join("A"); let b=dir.path().join("B"); let current=dir.path().join("current");
         for path in [&a,&b] {std::fs::create_dir(path).unwrap();assert!(std::process::Command::new("git").args(["init","-q"]).arg(path).status().unwrap().success());}
         symlink(&a,&current).unwrap();
@@ -548,7 +549,7 @@ mod tests {
 
     #[tokio::test]
     async fn r2_native_startup_directory_handle_survives_name_replacement() {
-        let dir=tempfile::TempDir::new().unwrap();let a=dir.path().join("A");let moved=dir.path().join("moved-A");
+        let dir=private_test_dir();let a=dir.path().join("A");let moved=dir.path().join("moved-A");
         std::fs::create_dir(&a).unwrap(); assert!(std::process::Command::new("git").args(["init","-q"]).arg(&a).status().unwrap().success());
         let registry=super::super::workspace::WorkspaceStore::open(&super::super::config::database_path(dir.path()),"fixture".into(),dir.path().join("workspaces")).unwrap();
         let registered=registry.create(None,a.to_string_lossy().into(),None,None).unwrap();
@@ -577,7 +578,7 @@ mod tests {
     #[test]
     fn server_distribution_discovers_executable_sibling_sidecars() {
         use std::os::unix::fs::PermissionsExt;
-        let dir = tempfile::TempDir::new().unwrap();
+        let dir = private_test_dir();
         let executable = dir.path().join("codemux-remote");
         assert!(sibling_sidecar(&executable).is_none());
         let sidecar = dir.path().join("codemux-claude-sidecar");
@@ -646,7 +647,7 @@ mod tests {
     }
     #[test]
     fn launch_requires_registered_existing_checkout_and_live_model_mode_effort() {
-        let dir = tempfile::TempDir::new().unwrap();
+        let dir = private_test_dir();
         assert!(std::process::Command::new("git")
             .args(["init", "-q"])
             .arg(dir.path())

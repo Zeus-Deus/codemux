@@ -30,6 +30,14 @@ use std::time::{Duration, Instant};
 use serde_json::{json, Value};
 use tempfile::TempDir;
 
+fn private_tempdir() -> TempDir {
+    use std::os::unix::fs::PermissionsExt;
+    tempfile::Builder::new()
+        .permissions(std::fs::Permissions::from_mode(0o700))
+        .tempdir()
+        .unwrap()
+}
+
 fn binary_path() -> PathBuf {
     if let Ok(path) = std::env::var("CARGO_BIN_EXE_codemux-remote") {
         return PathBuf::from(path);
@@ -60,7 +68,7 @@ impl ServeFixture {
     /// developer's own Codemux app never decides who owns the `codemux`
     /// MCP name here.
     fn start_with_home(home: TempDir) -> Self {
-        Self::start_in(TempDir::new().expect("tempdir"), home)
+        Self::start_in(private_tempdir(), home)
     }
 
     /// Start the daemon on an existing state dir and `HOME`, as a restart
@@ -666,7 +674,7 @@ fn mcp_stdio_roundtrip() {
 #[test]
 fn mcp_without_a_daemon_still_answers_and_says_so() {
     let bin = binary_path();
-    let state_dir = TempDir::new().unwrap();
+    let state_dir = private_tempdir();
 
     let mut mcp = Command::new(&bin)
         .arg("mcp")
@@ -806,7 +814,7 @@ fn serve_status_reports_alive() {
 #[test]
 fn serve_status_reports_absent_when_no_manifest() {
     let bin = binary_path();
-    let state_dir = TempDir::new().unwrap();
+    let state_dir = private_tempdir();
     let out = Command::new(&bin)
         .arg("serve")
         .arg("status")
@@ -918,7 +926,7 @@ fn workspace_register_subcommand_registers_in_daemon() {
 #[test]
 fn workspace_register_fails_clean_without_daemon() {
     let bin = binary_path();
-    let state_dir = TempDir::new().unwrap();
+    let state_dir = private_tempdir();
 
     let out = Command::new(&bin)
         .arg("workspace")

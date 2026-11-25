@@ -710,6 +710,7 @@ pub fn _workspace_typename() -> &'static str {
 
 #[cfg(test)]
 mod tests {
+    use crate::remote::config::private_test_dir;
     use super::*;
     use serial_test::serial;
     use std::process::Command;
@@ -752,13 +753,13 @@ mod tests {
         // The handler resolves HOME via dirs::home_dir(); point it at a
         // temp dir for the duration of this (serialized) test so the
         // worktree lands somewhere disposable.
-        let home = TempDir::new().unwrap();
+        let home = private_test_dir();
         let prev_home = std::env::var_os("HOME");
         std::env::set_var("HOME", home.path());
 
-        let repo = TempDir::new().unwrap();
+        let repo = private_test_dir();
         init_repo(repo.path());
-        let store_dir = TempDir::new().unwrap();
+        let store_dir = private_test_dir();
         let store = open_store(&store_dir);
 
         let params = json!({
@@ -818,11 +819,11 @@ mod tests {
     #[test]
     #[serial]
     fn worktree_create_runs_setup_scripts_with_env_and_includes() {
-        let home = TempDir::new().unwrap();
+        let home = private_test_dir();
         let prev_home = std::env::var_os("HOME");
         std::env::set_var("HOME", home.path());
 
-        let repo = TempDir::new().unwrap();
+        let repo = private_test_dir();
         init_repo(repo.path());
         // Gitignored .env in the parent repo — the includes step must
         // copy it into the worktree (defaults cover `.env`).
@@ -838,7 +839,7 @@ mod tests {
         .unwrap();
         commit_all(repo.path(), "add provisioning config");
 
-        let store_dir = TempDir::new().unwrap();
+        let store_dir = private_test_dir();
         let store = open_store(&store_dir);
         let params = json!({
             "repo_path": repo.path().to_string_lossy(),
@@ -911,13 +912,13 @@ mod tests {
     #[test]
     #[serial]
     fn worktree_create_without_setup_config_is_graceful() {
-        let home = TempDir::new().unwrap();
+        let home = private_test_dir();
         let prev_home = std::env::var_os("HOME");
         std::env::set_var("HOME", home.path());
 
-        let repo = TempDir::new().unwrap();
+        let repo = private_test_dir();
         init_repo(repo.path());
-        let store_dir = TempDir::new().unwrap();
+        let store_dir = private_test_dir();
         let store = open_store(&store_dir);
         let params = json!({
             "repo_path": repo.path().to_string_lossy(),
@@ -941,11 +942,11 @@ mod tests {
     #[test]
     #[serial]
     fn worktree_create_with_failing_setup_still_succeeds() {
-        let home = TempDir::new().unwrap();
+        let home = private_test_dir();
         let prev_home = std::env::var_os("HOME");
         std::env::set_var("HOME", home.path());
 
-        let repo = TempDir::new().unwrap();
+        let repo = private_test_dir();
         init_repo(repo.path());
         std::fs::create_dir_all(repo.path().join(".codemux")).unwrap();
         std::fs::write(
@@ -955,7 +956,7 @@ mod tests {
         .unwrap();
         commit_all(repo.path(), "add failing setup");
 
-        let store_dir = TempDir::new().unwrap();
+        let store_dir = private_test_dir();
         let store = open_store(&store_dir);
         let params = json!({
             "repo_path": repo.path().to_string_lossy(),
@@ -978,13 +979,13 @@ mod tests {
     #[test]
     #[serial]
     fn worktree_create_again_reuses_the_worktree_and_its_row() {
-        let home = TempDir::new().unwrap();
+        let home = private_test_dir();
         let prev_home = std::env::var_os("HOME");
         std::env::set_var("HOME", home.path());
 
-        let repo = TempDir::new().unwrap();
+        let repo = private_test_dir();
         init_repo(repo.path());
-        let store_dir = TempDir::new().unwrap();
+        let store_dir = private_test_dir();
         let store = open_store(&store_dir);
         let params = json!({
             "repo_path": repo.path().to_string_lossy(),
@@ -1013,11 +1014,11 @@ mod tests {
     #[test]
     #[serial]
     fn detached_runner_starts_setup_in_its_own_session() {
-        let home = TempDir::new().unwrap();
+        let home = private_test_dir();
         let prev_home = std::env::var_os("HOME");
         std::env::set_var("HOME", home.path());
 
-        let repo = TempDir::new().unwrap();
+        let repo = private_test_dir();
         init_repo(repo.path());
         std::fs::create_dir_all(repo.path().join(".codemux")).unwrap();
         std::fs::write(repo.path().join(".codemux/config.json"), r#"{"setup": ["true"]}"#).unwrap();
@@ -1025,7 +1026,7 @@ mod tests {
 
         // Stand-in for codemux-remote: records its args and whether it
         // leads its own session (sid == pid after setsid).
-        let bin = TempDir::new().unwrap();
+        let bin = private_test_dir();
         let marker = bin.path().join("ran.txt");
         let exe = bin.path().join("fake-codemux-remote");
         std::fs::write(
@@ -1039,7 +1040,7 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o755)).unwrap();
 
-        let store_dir = TempDir::new().unwrap();
+        let store_dir = private_test_dir();
         let store = open_store(&store_dir);
         let log_dir = store_dir.path().join("logs");
         let runner = SetupRunner::Detached { exe, log_dir: log_dir.clone() };
@@ -1078,7 +1079,7 @@ mod tests {
     /// with the same env the daemon's thread uses.
     #[test]
     fn run_worktree_setup_runs_commands_synchronously() {
-        let repo = TempDir::new().unwrap();
+        let repo = private_test_dir();
         init_repo(repo.path());
         std::fs::create_dir_all(repo.path().join(".codemux")).unwrap();
         std::fs::write(
@@ -1100,12 +1101,12 @@ mod tests {
     #[test]
     #[serial]
     fn worktree_create_dispatch_rejects_non_repo() {
-        let home = TempDir::new().unwrap();
+        let home = private_test_dir();
         let prev_home = std::env::var_os("HOME");
         std::env::set_var("HOME", home.path());
 
-        let not_repo = TempDir::new().unwrap();
-        let store_dir = TempDir::new().unwrap();
+        let not_repo = private_test_dir();
+        let store_dir = private_test_dir();
         let store = open_store(&store_dir);
         let params = json!({ "repo_path": not_repo.path().to_string_lossy(), "branch": "x" });
         let err = worktree_create(&params, &store).unwrap_err();
@@ -1122,7 +1123,7 @@ mod tests {
     /// tool writes under `~/.codemux` lands somewhere disposable. Callers
     /// are `#[serial]`: the environment is process-wide.
     fn with_temp_home(body: impl FnOnce(&std::path::Path)) {
-        let home = TempDir::new().unwrap();
+        let home = private_test_dir();
         let prev_home = std::env::var_os("HOME");
         std::env::set_var("HOME", home.path());
         let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| body(home.path())));
@@ -1158,7 +1159,7 @@ mod tests {
 
     #[test]
     fn workspace_tools_accept_workspace_id_and_the_older_id() {
-        let dir = TempDir::new().unwrap();
+        let dir = private_test_dir();
         let store = open_store(&dir);
         let id = registered(&store);
 
@@ -1211,7 +1212,7 @@ mod tests {
 
     #[test]
     fn workspace_close_refuses_desktop_delete_flags() {
-        let dir = TempDir::new().unwrap();
+        let dir = private_test_dir();
         let store = open_store(&dir);
         let id = registered(&store);
 
@@ -1238,9 +1239,9 @@ mod tests {
     #[serial]
     fn tool_inputs_reject_unknown_fields() {
         with_temp_home(|home| {
-            let repo = TempDir::new().unwrap();
+            let repo = private_test_dir();
             init_repo(repo.path());
-            let dir = TempDir::new().unwrap();
+            let dir = private_test_dir();
             let store = open_store(&dir);
             let repo_path = repo.path().to_string_lossy().to_string();
 
@@ -1393,7 +1394,7 @@ mod tests {
 
     #[test]
     fn app_status_keeps_the_fields_vexis_detects() {
-        let dir = TempDir::new().unwrap();
+        let dir = private_test_dir();
         let store = open_store(&dir);
         let out = call("app_status", json!({}), &store).expect("app_status");
         assert_eq!(out["host_id"], json!("test-host"));
@@ -1409,9 +1410,9 @@ mod tests {
     #[serial]
     fn desktop_worktree_create_arguments_still_work() {
         with_temp_home(|_| {
-            let repo = TempDir::new().unwrap();
+            let repo = private_test_dir();
             init_repo(repo.path());
-            let dir = TempDir::new().unwrap();
+            let dir = private_test_dir();
             let store = open_store(&dir);
             for base in [None, Some("main")] {
                 let branch = format!("desktop-{}", base.unwrap_or("default"));

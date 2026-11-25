@@ -296,6 +296,7 @@ impl Daemon {
 
 #[cfg(test)]
 mod tests {
+    use crate::remote::config::private_test_dir;
     use super::*;
     use crate::remote::pty::PtyManager;
     use crate::remote::server::{self, DaemonState};
@@ -314,7 +315,7 @@ mod tests {
 
     impl TestDaemon {
         fn start(host_id: &str, secret: &str) -> Self {
-            let dir = TempDir::new().unwrap();
+            let dir = private_test_dir();
             let workspaces = WorkspaceStore::open(
                 &dir.path().join("codemux.db"),
                 host_id.into(),
@@ -361,7 +362,7 @@ mod tests {
 
     /// A state dir whose manifest names `daemon`, or none when `None`.
     fn state_dir(daemon: Option<&Manifest>) -> (TempDir, PathBuf) {
-        let dir = TempDir::new().unwrap();
+        let dir = private_test_dir();
         let path = config::manifest_path(dir.path());
         if let Some(manifest) = daemon {
             manifest::write(&path, manifest).unwrap();

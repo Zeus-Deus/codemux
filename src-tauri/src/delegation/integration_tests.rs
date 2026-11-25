@@ -1,4 +1,5 @@
 //! Real local remote-CLI and native adapter fixtures; never paid runtimes.
+use std::os::unix::fs::PermissionsExt;
 struct CapacityTransport {
     store: Arc<Journal>,
     entered: std::sync::atomic::AtomicUsize,
@@ -1754,6 +1755,7 @@ async fn l3_cli_receipt_reconciles_lost_reply_without_reclaiming_callback() {
     for folder in ["home", "bin", "remote-state", "local-journal"] {
         std::fs::create_dir_all(root.join(folder)).unwrap();
     }
+    std::fs::set_permissions(root.join("remote-state"), std::fs::Permissions::from_mode(0o700)).unwrap();
     let journal = Journal::open(&root.join("local-journal")).unwrap();
     let (parent, grant, input) = super::tests::fixture();
     journal.put_grant(&parent.workspace_id, &grant).unwrap();
@@ -1875,6 +1877,7 @@ async fn l2_attempted_never_admitted_cancel_settles_and_fences_delayed_launch() 
     for folder in ["home", "bin", "remote-state", "local-journal"] {
         std::fs::create_dir_all(root.join(folder)).unwrap();
     }
+    std::fs::set_permissions(root.join("remote-state"), std::fs::Permissions::from_mode(0o700)).unwrap();
     let app = tauri::test::mock_app();
     let store = Arc::new(Journal::open(&root.join("local-journal")).unwrap());
     let parent = Parent {
@@ -1942,6 +1945,7 @@ async fn cancel_of_terminal_receiver_drains_saved_cursor_after_restart() {
     for folder in ["home", "bin", "remote-state", "local-journal"] {
         std::fs::create_dir_all(root.join(folder)).unwrap();
     }
+    std::fs::set_permissions(root.join("remote-state"), std::fs::Permissions::from_mode(0o700)).unwrap();
     let app = tauri::test::mock_app();
     let store = Arc::new(Journal::open(&root.join("local-journal")).unwrap());
     let parent = Parent {
