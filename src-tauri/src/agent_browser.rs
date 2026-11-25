@@ -1811,7 +1811,8 @@ fn run_agent_browser_native_raw(
     cmd.env("AGENT_BROWSER_STREAM_PORT", stream_port.to_string())
         .env("AGENT_BROWSER_ARGS", STEALTH_CHROMIUM_ARGS)
         .env("AGENT_BROWSER_USER_AGENT", stealth_user_agent())
-        .env_remove("AGENT_BROWSER_DAEMON");
+        .env_remove("AGENT_BROWSER_DAEMON")
+        .env_remove("AGENT_BROWSER_DEBUG");
     cmd.stdout(std::process::Stdio::piped());
     if discard_stderr {
         cmd.stderr(std::process::Stdio::null());
