@@ -7341,7 +7341,7 @@ const handlers: Record<string, Handler> = {
       message:
         `codemux-remote v${MOCK_REMOTE_VERSION} reinstalled on ${host.name}. ` +
         "Active terminal daemons keep running and use the new binary when they restart. " +
-        "The headless service will use the new binary when it restarts.",
+        "Stopped headless services are started; running ones use the new binary after restart.",
     };
   },
 

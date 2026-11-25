@@ -455,14 +455,15 @@ pub async fn hosts_bootstrap_install<R: tauri::Runtime>(
                     _ => String::new(),
                 };
 
-                // Always provision the headless `serve` daemon. Unlike
-                // the scheduler this needs no auth token or server id —
-                // it's a per-host local control plane. After this
+                // Enable and start the headless `serve` daemon without
+                // restarting an already-running service or its terminals.
+                // Unlike the scheduler this needs no auth token or server
+                // id — it's a per-host local control plane. After this
                 // returns successfully, an MCP-capable agent on the host
                 // that the user points at `codemux-remote mcp` can use it.
                 // Same best-effort contract: a failure logs and is
                 // surfaced in the result message, doesn't fail bootstrap.
-                let serve_note = match crate::ssh::bootstrap::provision_serve(
+                let serve_note = match crate::ssh::bootstrap::ensure_serve_running(
                     &host.ssh_target,
                     "~/.local/bin/codemux-remote",
                     std::time::Duration::from_secs(30),
@@ -530,7 +531,7 @@ pub struct HostBootstrapResult {
 #[cfg(unix)]
 pub(crate) struct RemoteReinstallOutcome {
     version: String,
-    serve_restarted: bool,
+    serve_enabled: bool,
 }
 
 /// After a successful install the device is ready: show it online now,
@@ -575,10 +576,10 @@ pub async fn hosts_reinstall_remote<R: tauri::Runtime>(
         Ok(match force_reinstall_remote_binary(&app, &host).await {
             Ok(outcome) => {
                 mark_host_ready(&app, host.id);
-                let serve_note = if outcome.serve_restarted {
-                    "The headless service restarted."
+                let serve_note = if outcome.serve_enabled {
+                    "Stopped headless services are started; running ones use the new binary after restart."
                 } else {
-                    "The headless service will use the new binary when it restarts."
+                    "The headless service could not be enabled; see logs."
                 };
                 HostBootstrapResult {
                     ok: true,
@@ -1687,9 +1688,8 @@ pub(crate) async fn ensure_remote_binary_current<R: tauri::Runtime>(
 /// built bits onto the host during development.
 ///
 /// Steps: probe uname → atomically upload and verify the bundled binary →
-/// restart the headless `serve` daemon only when it has confirmed zero live
-/// terminals. Existing PTY daemons keep their running sessions and use the
-/// new binary after they exit and restart.
+/// enable and start the headless `serve` daemon if stopped. Running services
+/// and PTY daemons keep their sessions and use the new binary when restarted.
 #[cfg(unix)]
 pub(crate) async fn force_reinstall_remote_binary<R: tauri::Runtime>(
     app: &tauri::AppHandle<R>,
@@ -1746,52 +1746,27 @@ pub(crate) async fn force_reinstall_remote_binary<R: tauri::Runtime>(
         }
     };
 
-    // Step 3: a service restart can end host-side terminals. Reuse the
-    // upgrade path's session probe so an explicit reinstall also preserves
-    // live sessions. An unknown count defers the restart as well. A failed
-    // restart remains best-effort: the binary on disk is current and takes
-    // effect on the next restart.
-    let live_sessions = crate::hosts_upgrade::probe_live_host_sessions(&host.ssh_target).await;
-    let serve_restarted = if should_restart_serve(live_sessions) {
-        match crate::ssh::bootstrap::provision_serve(
-            &host.ssh_target,
-            "~/.local/bin/codemux-remote",
-            std::time::Duration::from_secs(30),
-        )
-        .await
-        {
-            Ok(()) => {
-                eprintln!("[hosts] re-provisioned codemux-remote.service on {}", host.name);
-                true
-            }
-            Err(error) => {
-                eprintln!(
-                    "[hosts] re-provisioning serve on {} after reinstall failed (continuing): {error}",
-                    host.name
-                );
-                false
-            }
-        }
-    } else {
-        match live_sessions {
-            Some(n) => eprintln!(
-                "[hosts] deferred serve restart on {} to preserve {n} live terminal(s)",
+    // Step 3: `enable --now` starts a stopped service, including a missing
+    // unit repaired by this install, but never restarts an active one. A
+    // failure is best-effort because the binary on disk is already current.
+    let serve_enabled = match crate::ssh::bootstrap::ensure_serve_running(
+        &host.ssh_target,
+        "~/.local/bin/codemux-remote",
+        std::time::Duration::from_secs(30),
+    )
+    .await
+    {
+        Ok(()) => true,
+        Err(error) => {
+            eprintln!(
+                "[hosts] enabling serve on {} after reinstall failed (continuing): {error}",
                 host.name
-            ),
-            None => eprintln!(
-                "[hosts] deferred serve restart on {} because live terminal count is unknown",
-                host.name
-            ),
+            );
+            false
         }
-        false
     };
 
-    Ok(RemoteReinstallOutcome { version: reported_version, serve_restarted })
-}
-
-#[cfg(unix)]
-fn should_restart_serve(live_sessions: Option<u64>) -> bool {
-    matches!(live_sessions, Some(0))
+    Ok(RemoteReinstallOutcome { version: reported_version, serve_enabled })
 }
 
 /// Stash the synced OpenCode session id into the adapter captures of the
@@ -1885,14 +1860,6 @@ fn terminate_workspace_sessions<R: tauri::Runtime>(
 #[cfg(test)]
 mod tests {
     use super::{interpret_github_probe, validate_host_fields};
-
-    #[cfg(unix)]
-    #[test]
-    fn reinstall_restarts_serve_only_when_no_sessions_are_confirmed() {
-        assert!(super::should_restart_serve(Some(0)));
-        assert!(!super::should_restart_serve(Some(1)));
-        assert!(!super::should_restart_serve(None));
-    }
 
     #[test]
     fn host_fields_are_trimmed_and_checked() {

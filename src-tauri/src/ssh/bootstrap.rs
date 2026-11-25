@@ -427,7 +427,9 @@ pub async fn provision_scheduler(
     .map_err(|e| format!("enabling the scheduler service: {e}"))
 }
 
-/// Provision the headless `codemux-remote serve` daemon on a host.
+/// Provision the headless `codemux-remote serve` daemon on a host and restart
+/// it onto the newly installed binary. Call only when the caller can safely
+/// restart an existing service.
 ///
 /// Installs a systemd **user** unit that runs `codemux-remote serve`,
 /// enables lingering so it survives logout and reboot, and starts it.
@@ -444,6 +446,57 @@ pub async fn provision_serve(
     ssh_target: &str,
     remote_install_path: &str,
     deadline: Duration,
+) -> Result<(), String> {
+    provision_serve_with_activation(
+        ssh_target,
+        remote_install_path,
+        deadline,
+        ServeActivation::Restart,
+    )
+    .await
+}
+
+/// Install the unit and start it if stopped, without interrupting a running
+/// service or its terminals. Used by repair and manual reinstall paths where
+/// a status probe cannot safely authorize a later restart.
+pub async fn ensure_serve_running(
+    ssh_target: &str,
+    remote_install_path: &str,
+    deadline: Duration,
+) -> Result<(), String> {
+    provision_serve_with_activation(
+        ssh_target,
+        remote_install_path,
+        deadline,
+        ServeActivation::StartIfStopped,
+    )
+    .await
+}
+
+#[derive(Clone, Copy)]
+enum ServeActivation {
+    StartIfStopped,
+    Restart,
+}
+
+fn serve_activation_script(unit: &str, activation: ServeActivation) -> String {
+    let start = match activation {
+        ServeActivation::StartIfStopped => format!("systemctl --user enable --now {unit}"),
+        ServeActivation::Restart => format!(
+            "systemctl --user enable {unit} && systemctl --user restart {unit}"
+        ),
+    };
+    format!(
+        "loginctl enable-linger \"$USER\" >/dev/null 2>&1; \
+         systemctl --user daemon-reload && {start}"
+    )
+}
+
+async fn provision_serve_with_activation(
+    ssh_target: &str,
+    remote_install_path: &str,
+    deadline: Duration,
+    activation: ServeActivation,
 ) -> Result<(), String> {
     use crate::automations::service;
 
@@ -463,13 +516,6 @@ pub async fn provision_serve(
     .await
     .map_err(|e| format!("writing serve systemd unit: {e}"))?;
 
-    // `enable + restart` (not `enable --now`) is intentional: it makes
-    // this function correct for both first install AND upgrade. On
-    // first install, restart of an inactive unit is identical to
-    // start. On upgrade, the running daemon is killed and respawned
-    // from the new binary on disk — without this, an upgraded binary
-    // wouldn't take effect until the next host reboot or manual
-    // `systemctl --user restart`.
     run_with_timeout(
         Command::new("ssh")
             .arg("-o")
@@ -477,13 +523,7 @@ pub async fn provision_serve(
             .arg("-o")
             .arg("ConnectTimeout=10")
             .arg(ssh_target)
-            .arg(format!(
-                "loginctl enable-linger \"$USER\" >/dev/null 2>&1; \
-                 systemctl --user daemon-reload && \
-                 systemctl --user enable {unit} && \
-                 systemctl --user restart {unit}",
-                unit = service::SERVE_SYSTEMD_UNIT_NAME
-            )),
+            .arg(serve_activation_script(service::SERVE_SYSTEMD_UNIT_NAME, activation)),
         deadline,
     )
     .await
@@ -762,6 +802,17 @@ async fn ssh_write_file(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn repair_activation_starts_stopped_service_without_restarting_running_service() {
+        let script = serve_activation_script(
+            "codemux-remote.service",
+            ServeActivation::StartIfStopped,
+        );
+        assert!(script.contains("systemctl --user daemon-reload"));
+        assert!(script.contains("systemctl --user enable --now codemux-remote.service"));
+        assert!(!script.contains("systemctl --user restart"));
+    }
 
     #[test]
     fn target_for_uname_covers_all_four_release_targets() {
