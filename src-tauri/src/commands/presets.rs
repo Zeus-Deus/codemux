@@ -424,22 +424,20 @@ pub fn apply_preset<R: tauri::Runtime>(
                     if command.is_empty() {
                         continue;
                     }
-                    let (cmd, needs_pty_injection) = crate::branch_name::prepare_agent_command(
-                        &preset_id,
-                        command,
-                        initial_prompt.as_deref(),
+                    let shell = receiving_shell_for_agent_prompt(
+                        &state, &workspace_id, &session_id, false,
                     );
+                    let (cmd, prompt_requires_manual_entry) =
+                        crate::branch_name::prepare_agent_command(
+                            &preset_id,
+                            command,
+                            initial_prompt.as_deref(),
+                            shell.as_deref(),
+                        );
                     state.update_terminal_session_command(&session_id, command.clone());
                     write_command_when_ready(sessions_arc.clone(), session_id.clone(), cmd, 120);
-                    if needs_pty_injection {
-                        if let Some(ref prompt) = initial_prompt {
-                            write_command_when_ready(
-                                sessions_arc.clone(),
-                                session_id.clone(),
-                                prompt.clone(),
-                                1500,
-                            );
-                        }
+                    if prompt_requires_manual_entry {
+                        report_prompt_requires_manual_entry(&app, &session_id, &preset.name);
                     }
                 }
             } else {
@@ -730,6 +728,77 @@ fn wait_and_write_command(
     wait_and_write(sessions, session_id, command, settle_ms, PTY_COMMAND_TERMINATOR);
 }
 
+/// Pick the shell that receives a preset command. Device sessions run Bash
+/// regardless of the desktop's SHELL. A newly created local session uses the
+/// same default-shell selection as PTY spawn. An existing session with no
+/// recorded shell remains unknown, so its prompt cannot be embedded.
+pub(crate) fn receiving_shell_for_agent_prompt(
+    state: &AppStateStore,
+    workspace_id: &str,
+    session_id: &str,
+    newly_spawned: bool,
+) -> Option<String> {
+    let snapshot = state.snapshot();
+    let remote = snapshot
+        .workspaces
+        .iter()
+        .find(|workspace| workspace.workspace_id.0 == workspace_id)?
+        .host_id.is_some();
+    let shell = snapshot
+        .terminal_sessions
+        .iter()
+        .find(|session| session.session_id.0 == session_id)?
+        .shell.as_deref();
+    let local_default = (!remote && newly_spawned).then(terminal::default_shell);
+    choose_agent_launch_shell(remote, shell, local_default.as_deref())
+}
+
+fn choose_agent_launch_shell(
+    remote: bool,
+    recorded_shell: Option<&str>,
+    newly_spawned_local_shell: Option<&str>,
+) -> Option<String> {
+    if remote {
+        Some("bash".to_string())
+    } else {
+        recorded_shell
+            .or(newly_spawned_local_shell)
+            .map(str::to_string)
+    }
+}
+
+/// Tell the user a prompt cannot be delivered safely through this terminal.
+pub(crate) fn report_prompt_requires_manual_entry<R: tauri::Runtime>(
+    app: &tauri::AppHandle<R>,
+    session_id: &str,
+    agent: &str,
+) {
+    use tauri::Manager as _;
+    let message = format!(
+        "Codemux cannot include the starting prompt when launching {agent}. \
+         Enter it directly in the agent once it opens."
+    );
+    let state = app.state::<AppStateStore>();
+    if state
+        .add_notification(
+            Some(session_id.to_string()),
+            None,
+            message.clone(),
+            crate::state::NotificationLevel::Attention,
+        )
+        .is_err()
+    {
+        // The session may have closed while the agent started.
+        let _ = state.add_notification(
+            None,
+            None,
+            message,
+            crate::state::NotificationLevel::Attention,
+        );
+    }
+    crate::state::emit_app_state(app);
+}
+
 /// `wait_and_write_command` with the byte(s) written after the command as a
 /// parameter: an empty `terminator` leaves the command typed but not run.
 fn wait_and_write(
@@ -739,6 +808,8 @@ fn wait_and_write(
     settle_ms: u64,
     terminator: &[u8],
 ) {
+    // Only commands reach the PTY through this helper. Untrusted
+    // starting prompts never enter a PTY input queue.
     // Phase 1: poll until the PTY writer is available (shell process spawned).
     //
     // This used to share a single 5-second budget with Phase 2's quiet-
@@ -893,7 +964,7 @@ fn wait_and_write(
     match terminal::write_pty_input_sync(sessions, session_id, &payload) {
         Ok(()) => eprintln!(
             "[codemux::presets] wrote preset/resume command to {session_id} \
-             (payload_len={}, cmd={command_to_write:?})",
+             (payload_len={})",
             payload.len(),
         ),
         Err(error) => {
@@ -997,6 +1068,25 @@ mod tests {
     use crate::terminal::SessionRuntime;
     use std::collections::HashMap;
     use std::io::Write;
+
+    #[test]
+    fn agent_prompt_uses_the_receiving_shell() {
+        // Device PTYs launch Bash even when the desktop launches Fish.
+        let remote_shell = choose_agent_launch_shell(true, None, Some("/usr/bin/fish"));
+        assert_eq!(remote_shell.as_deref(), Some("bash"));
+        assert_eq!(
+            crate::branch_name::prepare_agent_command(
+                "builtin-claude", "claude", Some("fix it"), remote_shell.as_deref(),
+            ),
+            ("claude $'fix it'".to_string(), false)
+        );
+        assert_eq!(
+            choose_agent_launch_shell(false, Some("/bin/zsh"), Some("/usr/bin/fish")),
+            Some("/bin/zsh".to_string())
+        );
+        // Existing local sessions without a recorded shell are unknown.
+        assert_eq!(choose_agent_launch_shell(false, None, None), None);
+    }
 
     fn make_sessions() -> Arc<std::sync::Mutex<HashMap<String, SessionRuntime>>> {
         Arc::new(std::sync::Mutex::new(HashMap::new()))

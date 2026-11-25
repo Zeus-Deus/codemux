@@ -1512,7 +1512,7 @@ fn windows_user_local_bin() -> Option<String> {
 }
 
 #[cfg(unix)]
-fn default_shell() -> String {
+pub(crate) fn default_shell() -> String {
     env::var("SHELL")
         .ok()
         .filter(|shell| !shell.trim().is_empty())
@@ -1520,7 +1520,7 @@ fn default_shell() -> String {
 }
 
 #[cfg(windows)]
-fn default_shell() -> String {
+pub(crate) fn default_shell() -> String {
     resolve_windows_shell(
         |cmd| which::which(cmd).ok().map(|p| p.display().to_string()),
         env::var("COMSPEC").ok(),
@@ -4048,22 +4048,29 @@ pub(crate) fn parse_stat_pgrp_tpgid(stat: &str) -> Option<(i32, i32)> {
 /// or None when the shell itself owns the terminal (idle at a prompt) or the
 /// process can't be read.
 fn read_foreground_job(shell_pid: u32) -> Option<String> {
+    let (pgrp, tpgid) = read_pgrp_tpgid(shell_pid)?;
+    if tpgid <= 0 || tpgid == pgrp {
+        return None;
+    }
+    // The foreground group's id is its leader's pid.
+    let name = std::fs::read_to_string(format!("/proc/{tpgid}/comm"))
+        .map(|comm| comm.trim().to_string())
+        .unwrap_or_default();
+    Some(if name.is_empty() { "process".to_string() } else { name })
+}
+
+/// `(pgrp, tpgid)` of a local process, or None when it can't be read
+/// (process gone, or no `/proc` on this host). Callers pick their own
+/// default for None.
+pub(crate) fn read_pgrp_tpgid(pid: u32) -> Option<(i32, i32)> {
     #[cfg(target_os = "linux")]
     {
-        let stat = std::fs::read_to_string(format!("/proc/{shell_pid}/stat")).ok()?;
-        let (pgrp, tpgid) = parse_stat_pgrp_tpgid(&stat)?;
-        if tpgid <= 0 || tpgid == pgrp {
-            return None;
-        }
-        // The foreground group's id is its leader's pid.
-        let name = std::fs::read_to_string(format!("/proc/{tpgid}/comm"))
-            .map(|comm| comm.trim().to_string())
-            .unwrap_or_default();
-        Some(if name.is_empty() { "process".to_string() } else { name })
+        let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+        parse_stat_pgrp_tpgid(&stat)
     }
     #[cfg(not(target_os = "linux"))]
     {
-        let _ = shell_pid;
+        let _ = pid;
         None
     }
 }

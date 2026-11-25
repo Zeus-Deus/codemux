@@ -702,7 +702,7 @@ fn legacy_tools() -> Vec<McpTool> {
         // -- Delegation primitives (Phase 1.5 vexis-agent integration) --
         McpTool {
             name: "worktree_create",
-            description: "Create a git worktree + Codemux workspace in one atomic call, optionally launching an agent inside with a starting prompt. Mirrors the in-app branch-picker \"Fork → \" flow. Does ALL of: `git worktree add` under ~/.codemux/worktrees/<repo>/<branch>, workspace state hydration with the requested layout, PTY spawn, setup-script run, and (if `agent_preset_id` is set) launching the preset's CLI with `initial_prompt` injected. Returns the new `workspace_id`. Pair with `preset_list` first if you need to know which agent presets are installed.",
+            description: "Create a git worktree + Codemux workspace in one atomic call, optionally launching an agent inside with a starting prompt. Mirrors the in-app branch-picker \"Fork → \" flow. Does ALL of: `git worktree add` under ~/.codemux/worktrees/<repo>/<branch>, workspace state hydration with the requested layout, PTY spawn, setup-script run, and (if `agent_preset_id` is set) launching the preset's CLI. A starting prompt is passed only when the CLI and receiving shell support a safe argument; otherwise Codemux notifies the user to enter it in the agent. Returns the new `workspace_id`. Pair with `preset_list` first if you need to know which agent presets are installed.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -731,7 +731,7 @@ fn legacy_tools() -> Vec<McpTool> {
                     },
                     "initial_prompt": {
                         "type": "string",
-                        "description": "Optional starting prompt to feed the agent. For Claude/Codex presets it's appended as a positional ANSI-C-quoted argument; for other CLIs (Gemini, OpenCode, custom) it's typed into the terminal after a ~1500ms TUI settle. Ignored unless `agent_preset_id` is set."
+                        "description": "Optional starting prompt for the agent. Passed as a quoted CLI argument when the preset and receiving shell support it; otherwise the agent starts without it and Codemux notifies the user to enter it manually. Ignored unless `agent_preset_id` is set."
                     },
                     "agent_preset_id": {
                         "type": "string",
@@ -767,7 +767,7 @@ fn legacy_tools() -> Vec<McpTool> {
                     },
                     "initial_prompt": {
                         "type": "string",
-                        "description": "Optional prompt to feed the agent after launch. Same injection rules as `worktree_create`: positional arg for Claude/Codex, PTY-typed for others."
+                        "description": "Optional starting prompt for the agent. Passed as a quoted CLI argument when the preset and receiving shell support it; otherwise the agent starts without it and Codemux notifies the user to enter it manually."
                     }
                 },
                 "required": ["workspace_id", "preset_id"]

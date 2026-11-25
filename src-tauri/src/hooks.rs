@@ -239,15 +239,10 @@ fn monitor_sessions() -> &'static Mutex<HashMap<String, Arc<AtomicBool>>> {
 /// foreground pgrp, or when the process no longer exists.
 #[cfg(target_os = "linux")]
 fn shell_is_foreground(shell_pid: u32) -> bool {
-    let stat_path = format!("/proc/{shell_pid}/stat");
-    let stat = match std::fs::read_to_string(&stat_path) {
-        Ok(s) => s,
-        Err(_) => return true, // Process gone — treat as exited
-    };
-    matches!(
-        crate::terminal::parse_stat_pgrp_tpgid(&stat),
-        Some((pgrp, tpgid)) if tpgid == pgrp
-    )
+    match crate::terminal::read_pgrp_tpgid(shell_pid) {
+        Some((pgrp, tpgid)) => tpgid == pgrp,
+        None => true, // Process gone — treat as exited
+    }
 }
 
 #[cfg(not(target_os = "linux"))]
