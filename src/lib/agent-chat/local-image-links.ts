@@ -62,6 +62,9 @@ export function localImagePath(destination: unknown): string | null {
 
 function textContent(node: HastNode): string {
   if (node.type === "text") return node.value ?? "";
+  if (node.tagName === "img" && typeof node.properties?.alt === "string") {
+    return node.properties.alt;
+  }
   return (node.children ?? []).map(textContent).join("");
 }
 
@@ -69,12 +72,16 @@ function upgradeNode(node: HastNode) {
   if (node.type === "element" && node.tagName === "a") {
     const path = localImagePath(node.properties?.href);
     if (path) {
+      const caption = textContent(node).trim();
       node.tagName = CHAT_LOCAL_IMAGE_TAG;
       node.properties = {
         path,
-        caption: textContent(node).trim(),
+        caption,
         sourceSyntax: "link",
       };
+      // The preview is itself a button. Its former link label must be text,
+      // not a nested image reference that creates a second action.
+      node.children = [];
     }
   } else if (node.type === "element" && node.tagName === "img") {
     const path = localImagePath(node.properties?.src);

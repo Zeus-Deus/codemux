@@ -145,6 +145,19 @@ describe("ChatMarkdown rich external links", () => {
     expect(screen.queryByText("https://images.example/badge.png")).toBeNull();
   });
 
+  it.each([
+    "[![Badge](https://images.example/badge.png)](/tmp/outer.png)",
+    "[![Screenshot](/tmp/inner.png)](/tmp/outer.png)",
+  ])("keeps a local-image link as one preview action (%s)", (markdown) => {
+    const { container } = render(<ChatMarkdown>{markdown}</ChatMarkdown>);
+    const previews = container.querySelectorAll("[data-chat-local-image]");
+    expect(previews).toHaveLength(1);
+    expect(previews[0]).toHaveTextContent(/Badge|Screenshot/);
+    expect(previews[0]?.querySelectorAll("button")).toHaveLength(1);
+    expect(previews[0]?.querySelector("button a, button button")).toBeNull();
+    expect(container.querySelector('img[src*="images.example"]')).toBeNull();
+  });
+
   it("leaves a network-share image inert without starting a local preview", () => {
     const { container } = render(
       <ChatMarkdown>{"![Share](//server/share/proof.png)"}</ChatMarkdown>,
