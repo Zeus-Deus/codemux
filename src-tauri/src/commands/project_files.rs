@@ -469,14 +469,14 @@ enum FolderRuleSource {
 
 enum RuleReadError {
     Io(String),
-    Directory(String),
+    NonRegular(String),
     Rejected(String),
 }
 
 impl RuleReadError {
     fn into_message(self) -> String {
         match self {
-            Self::Io(message) | Self::Directory(message) | Self::Rejected(message) => message,
+            Self::Io(message) | Self::NonRegular(message) | Self::Rejected(message) => message,
         }
     }
 }
@@ -531,11 +531,11 @@ impl FolderWalkFilter {
         .into_iter()
         .flatten()
         {
-            // Git treats unreadable optional config sources and directories as
-            // unavailable. Budgets and other file-shape violations stay fatal.
+            // Git treats unreadable and nonregular optional config sources as
+            // unavailable. Byte budgets still reject the preview.
             let bytes = match Self::read_bounded_file(&file, rule_bytes, true) {
                 Ok(Some(bytes)) => bytes,
-                Ok(None) | Err(RuleReadError::Io(_) | RuleReadError::Directory(_)) => continue,
+                Ok(None) | Err(RuleReadError::Io(_) | RuleReadError::NonRegular(_)) => continue,
                 Err(RuleReadError::Rejected(message)) => return Err(message),
             };
             if let Some(path) = Self::config_exclude_path(&bytes, home.as_deref()) {
@@ -550,7 +550,7 @@ impl FolderWalkFilter {
         };
         let bytes = match Self::read_bounded_file(&file, rule_bytes, true) {
             Ok(Some(bytes)) => bytes,
-            Ok(None) | Err(RuleReadError::Io(_) | RuleReadError::Directory(_)) => return Ok(None),
+            Ok(None) | Err(RuleReadError::Io(_) | RuleReadError::NonRegular(_)) => return Ok(None),
             Err(RuleReadError::Rejected(message)) => return Err(message),
         };
         Self::compile_rule_bytes(&cwd, &file, &bytes, rule_lines).map(Some)
@@ -836,15 +836,10 @@ impl FolderWalkFilter {
             }
         };
         if !metadata.is_file() {
-            let message = format!(
+            return Err(RuleReadError::NonRegular(format!(
                 "attachment ignore rules are not a regular file: {}",
                 file.display()
-            );
-            return Err(if metadata.is_dir() {
-                RuleReadError::Directory(message)
-            } else {
-                RuleReadError::Rejected(message)
-            });
+            )));
         }
         if metadata.len() > MAX_ATTACHMENT_IGNORE_FILE_BYTES {
             return Err(RuleReadError::Rejected(format!(
@@ -867,15 +862,10 @@ impl FolderWalkFilter {
         if !opened_metadata.is_file()
             || (!allow_symlinks && opened_metadata.file_type().is_symlink())
         {
-            let message = format!(
+            return Err(RuleReadError::NonRegular(format!(
                 "attachment ignore rules are not a regular file: {}",
                 file.display()
-            );
-            return Err(if opened_metadata.is_dir() {
-                RuleReadError::Directory(message)
-            } else {
-                RuleReadError::Rejected(message)
-            });
+            )));
         }
         if opened_metadata.len() > MAX_ATTACHMENT_IGNORE_FILE_BYTES {
             return Err(RuleReadError::Rejected(format!(
@@ -3269,6 +3259,54 @@ mod tests {
         .unwrap();
         assert!(info.tree.contains("visible.txt"));
         assert!(!info.tree.contains("hidden.secret"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn nonregular_global_ignore_matches_picker() {
+        let dir = tempdir().unwrap();
+        let xdg = dir.path().join("xdg");
+        fs::create_dir_all(xdg.join("git")).unwrap();
+        std::os::unix::fs::symlink("/dev/null", xdg.join("git/ignore")).unwrap();
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "commands::project_files::tests::nonregular_global_ignore_child",
+                "--nocapture",
+            ])
+            .env("CODEMUX_ATTACHMENT_NONREGULAR_IGNORE_CHILD", "1")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_SYSTEM", "/dev/null")
+            .env("XDG_CONFIG_HOME", xdg)
+            .env("HOME", dir.path())
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "stdout: {}\nstderr: {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn nonregular_global_ignore_child() {
+        if std::env::var_os("CODEMUX_ATTACHMENT_NONREGULAR_IGNORE_CHILD").is_none() {
+            return;
+        }
+        let dir = tempdir().unwrap();
+        fs::create_dir(dir.path().join(".git")).unwrap();
+        fs::write(dir.path().join("visible.secret"), "x").unwrap();
+        let picked = walk_project(dir.path());
+        assert!(picked.paths.iter().any(|path| path == "visible.secret"));
+        let info = read_folder_for_attachment_blocking(
+            dir.path().to_string_lossy().into_owned(),
+            None,
+            1,
+        )
+        .unwrap();
+        assert!(info.tree.contains("visible.secret"));
     }
 
     #[test]
