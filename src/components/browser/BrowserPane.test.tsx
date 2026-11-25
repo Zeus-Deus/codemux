@@ -8,6 +8,7 @@ import type { AppStateSnapshot } from "@/tauri/types";
 
 const mocks = vi.hoisted(() => ({
   startBrowserStream: vi.fn(),
+  browserStreamBridgeEndpoints: vi.fn(),
   agentBrowserRun: vi.fn(),
   copyToClipboard: vi.fn(),
   toastSuccess: vi.fn(),
@@ -16,6 +17,7 @@ const mocks = vi.hoisted(() => ({
 
 vi.mock("@/tauri/commands", () => ({
   startBrowserStream: (...a: unknown[]) => mocks.startBrowserStream(...a),
+  browserStreamBridgeEndpoints: (...a: unknown[]) => mocks.browserStreamBridgeEndpoints(...a),
   agentBrowserRun: (...a: unknown[]) => mocks.agentBrowserRun(...a),
   activatePane: vi.fn(),
   writeToPty: vi.fn(),
@@ -40,6 +42,7 @@ class FakeWebSocket {
   static sent: Array<Record<string, unknown>> = [];
   static urls: string[] = [];
   static opened = 0;
+  static lastUrl: string | null = null;
   readyState = 0;
   onopen: (() => void) | null = null;
   onmessage: ((ev: { data: string }) => void) | null = null;
@@ -47,6 +50,7 @@ class FakeWebSocket {
   onclose: (() => void) | null = null;
   constructor(public url: string) {
     FakeWebSocket.urls.push(url);
+    FakeWebSocket.lastUrl = url;
     setTimeout(() => {
       this.readyState = FakeWebSocket.OPEN;
       FakeWebSocket.opened++;
@@ -67,6 +71,10 @@ function renderPane() {
 
 beforeEach(() => {
   mocks.startBrowserStream.mockReset();
+  mocks.browserStreamBridgeEndpoints.mockReset().mockResolvedValue({
+    ws_url: "ws://127.0.0.1:9777/private/browser/9999/ws",
+    http_base: "http://127.0.0.1:9777/private/browser/9999",
+  });
   mocks.agentBrowserRun.mockReset().mockResolvedValue(null);
   mocks.copyToClipboard.mockReset();
   mocks.toastSuccess.mockReset();
@@ -74,6 +82,7 @@ beforeEach(() => {
   FakeWebSocket.sent = [];
   FakeWebSocket.urls = [];
   FakeWebSocket.opened = 0;
+  FakeWebSocket.lastUrl = null;
   vi.stubGlobal("WebSocket", FakeWebSocket);
   useAppStore.setState({ appState: null });
 });
@@ -86,7 +95,7 @@ afterEach(() => {
 });
 
 describe("BrowserPane start failures", () => {
-  it("connects to the newly started port when the session snapshot has an old URL", async () => {
+  it("connects through the fresh bridge when the session snapshot has an old URL", async () => {
     useAppStore.setState({
       appState: {
         schema_version: 1,
@@ -118,12 +127,26 @@ describe("BrowserPane start failures", () => {
       },
     });
     mocks.startBrowserStream.mockResolvedValue("ws://127.0.0.1:9224");
+    mocks.browserStreamBridgeEndpoints.mockResolvedValue({
+      ws_url: "ws://127.0.0.1:9777/private/browser/9224/ws",
+      http_base: "http://127.0.0.1:9777/private/browser/9224",
+    });
 
     renderPane();
     await act(async () => {
       await vi.waitFor(() => expect(FakeWebSocket.urls).toHaveLength(1));
     });
-    expect(FakeWebSocket.urls).toEqual(["ws://127.0.0.1:9224"]);
+    expect(FakeWebSocket.urls).toEqual(["ws://127.0.0.1:9777/private/browser/9224/ws"]);
+  });
+
+  it("does not connect directly when the desktop bridge is unavailable", async () => {
+    mocks.startBrowserStream.mockResolvedValue("ws://127.0.0.1:9999");
+    mocks.browserStreamBridgeEndpoints.mockRejectedValue("bridge unavailable");
+    renderPane();
+    await act(async () => {});
+
+    expect(screen.getByText("Failed to start browser: bridge unavailable")).toBeInTheDocument();
+    expect(FakeWebSocket.opened).toBe(0);
   });
 
   it("retries a failed start a few times, then waits for Retry now", async () => {
@@ -186,6 +209,12 @@ describe("BrowserPane keyboard", () => {
   }
 
   const keyUps = () => FakeWebSocket.sent.filter((m) => m.eventType === "keyUp");
+
+  it("connects through the authenticated desktop bridge", async () => {
+    await renderLive();
+    expect(mocks.browserStreamBridgeEndpoints).toHaveBeenCalledWith("browser-1");
+    expect(FakeWebSocket.lastUrl).toBe("ws://127.0.0.1:9777/private/browser/9999/ws");
+  });
 
   it("keeps browser shortcuts, press and release, away from the page", async () => {
     const canvas = await renderLive();

@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState, useCallback, memo } from "react";
-import { startBrowserStream, agentBrowserRun, activatePane, writeToPty } from "@/tauri/commands";
+import { startBrowserStream, browserStreamBridgeEndpoints, agentBrowserRun, activatePane, writeToPty } from "@/tauri/commands";
 import { selectActiveWorkspaceId, useAppStore } from "@/stores/app-store";
 import { useAgentChatStore } from "@/stores/agent-chat-store";
 import { toast } from "@/lib/toast";
@@ -33,7 +33,6 @@ import {
   nextClickState,
   mapToViewport,
   sanitizeCursor,
-  httpBaseFromStreamUrl,
   remoteBrowserEndpoints,
   buildCursorProbeScript,
   SELECTION_SCRIPT,
@@ -327,10 +326,15 @@ export const BrowserPane = memo(function BrowserPane({ browserId, focused, visib
       frameCountRef.current = 0;
 
       const streamSessionId = browserSession?.agent_session_name ?? browserId;
+      const remoteClient = isRemoteClient();
 
       let streamUrl: string;
+      let desktopEndpoints: Awaited<ReturnType<typeof browserStreamBridgeEndpoints>> | null = null;
       try {
         streamUrl = await startBrowserStream(streamSessionId);
+        if (!remoteClient) {
+          desktopEndpoints = await browserStreamBridgeEndpoints(streamSessionId);
+        }
       } catch (err) {
         if (!active) return;
         console.error("[browser] startBrowserStream FAILED", err);
@@ -352,21 +356,25 @@ export const BrowserPane = memo(function BrowserPane({ browserId, focused, visib
       // The daemon serves HTTP on the same port as the stream WS —
       // used for the liveness probe, cursor probe, and clipboard bridge.
       //
-      // Desktop connects to the daemon's loopback socket directly. A remote
-      // (browser) client can't reach loopback, so it derives its WS + HTTP
-      // endpoints from the served origin's authenticated `/proxy/browser/<port>`
-      // routes instead (cookie rides along same-origin). Desktop path unchanged.
+      // Desktop uses an authenticated local bridge. Remote viewers use the
+      // paired web-remote origin's authenticated `/proxy/browser/<port>` routes.
       let connectUrl = streamUrl;
-      if (isRemoteClient()) {
+      if (remoteClient) {
         const endpoints = remoteBrowserEndpoints(streamUrl, window.location.origin);
-        if (endpoints) {
-          connectUrl = endpoints.wsUrl;
-          httpBaseRef.current = endpoints.httpBase;
-        } else {
-          httpBaseRef.current = httpBaseFromStreamUrl(streamUrl);
+        if (!endpoints) {
+          setStatus("error");
+          setErrorMsg("Invalid browser stream endpoint");
+          return;
         }
+        connectUrl = endpoints.wsUrl;
+        httpBaseRef.current = endpoints.httpBase;
+      } else if (desktopEndpoints) {
+        connectUrl = desktopEndpoints.ws_url;
+        httpBaseRef.current = desktopEndpoints.http_base;
       } else {
-        httpBaseRef.current = httpBaseFromStreamUrl(streamUrl);
+        setStatus("error");
+        setErrorMsg("Browser bridge unavailable");
+        return;
       }
 
       // Auto-reconnecting WebSocket — retries until screencast is live.

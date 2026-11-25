@@ -19,8 +19,9 @@
 //! The daemon reads each HTTP request with ONE peek and only sees the first
 //! TCP segment (~1.4 KB); a request that spans segments looks like it has an
 //! empty body. The HTTP forwarder therefore
-//! rebuilds a MINIMAL request — request line, `Host`, and (only with a body)
-//! `Content-Type` / `Content-Length`, plus `Connection: close` — and writes it
+//! rebuilds a MINIMAL request — request line, loopback `Host` and matching
+//! `Origin`, and (only with a body) `Content-Type` / `Content-Length`, plus
+//! `Connection: close` — and writes it
 //! in a single `write_all`. Every inbound header (cookies, the session bearer,
 //! `User-Agent`, `Accept*`, and all hop-by-hop headers) is dropped, both to
 //! respect the size budget and to never leak the paired session's credentials
@@ -118,7 +119,7 @@ pub(super) async fn ws_proxy<R: Runtime>(
 /// Bidirectionally pipe an upgraded client socket to the loopback daemon at
 /// `port`. Both directions await each send, so a slow peer stalls the reader
 /// on the other side (TCP backpressure) instead of buffering unboundedly.
-async fn bridge_ws(client: WebSocket, port: u16) {
+pub(crate) async fn bridge_ws(client: WebSocket, port: u16) {
     let url = format!("ws://127.0.0.1:{port}");
     let daemon = match tokio_tungstenite::connect_async(&url).await {
         Ok((ws, _)) => ws,
@@ -231,7 +232,7 @@ pub async fn http_forward<R: Runtime>(
 
 /// Open a raw TCP connection to the daemon, write a minimal single-segment
 /// request, and translate the response back into an axum `Response`.
-async fn forward(
+pub(crate) async fn forward(
     port: u16,
     method: &Method,
     rest: &str,
@@ -244,13 +245,14 @@ async fn forward(
         _ => format!("/api/{rest}"),
     };
 
-    // Minimal request head. Deliberately NO cookies/authorization/user-agent/
-    // accept — see the module note on the single-segment constraint and on
-    // never leaking the paired session's credentials to the daemon.
+    // The daemon requires a same-origin Origin for command POSTs. This
+    // trusted, authenticated proxy supplies its own loopback origin instead
+    // of forwarding the remote client's origin or credentials.
     let mut head = format!(
-        "{} {} HTTP/1.1\r\nHost: 127.0.0.1:{}\r\n",
+        "{} {} HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nOrigin: http://127.0.0.1:{}\r\n",
         method.as_str(),
         target,
+        port,
         port
     );
     if !body.is_empty() {
@@ -488,6 +490,44 @@ mod tests {
             }
         }
         panic!("no free loopback port in the browser daemon range");
+    }
+
+    #[tokio::test]
+    async fn authenticated_http_proxy_supplies_daemon_origin_without_client_credentials() {
+        let daemon = bind_test_daemon().await;
+        let port = daemon.local_addr().unwrap().port();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = daemon.accept().await.unwrap();
+            let mut buf = [0; 4096];
+            let len = stream.read(&mut buf).await.unwrap();
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 2\r\n\r\n{}")
+                .await
+                .unwrap();
+            String::from_utf8_lossy(&buf[..len]).into_owned()
+        });
+
+        let mut headers = HeaderMap::new();
+        headers.insert(header::CONTENT_TYPE, "application/json".parse().unwrap());
+        headers.insert(header::COOKIE, "session=private".parse().unwrap());
+        headers.insert(header::AUTHORIZATION, "Bearer private".parse().unwrap());
+        let response = forward(
+            port,
+            &Method::POST,
+            "command",
+            None,
+            &headers,
+            br#"{"action":"stream_status"}"#,
+        )
+        .await
+        .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let request = server.await.unwrap();
+        assert!(request.contains(&format!("Host: 127.0.0.1:{port}\r\n")));
+        assert!(request.contains(&format!("Origin: http://127.0.0.1:{port}\r\n")));
+        assert!(!request.contains("session=private"));
+        assert!(!request.contains("Bearer private"));
     }
 
     type TestSocket = WebSocketStream<TcpStream>;

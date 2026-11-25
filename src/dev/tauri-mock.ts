@@ -5044,15 +5044,13 @@ const handlers: Record<string, Handler> = {
 
   // ── Browser pane ──
   //
-  // The pane connects its stream WebSocket to whatever URL this
-  // returns. To exercise the browser pane end-to-end in plain-browser
-  // dev, run a real daemon on the dev stream port first:
-  //
-  //   AGENT_BROWSER_STREAM_PORT=9777 agent-browser open https://example.com --headless --session devmock
-  //
-  // Without a daemon the pane sits in its connecting/retry state —
-  // the same UI as a dead daemon in the real app.
+  // The mock has no Rust browser bridge, so the pane stays in its
+  // connecting/retry state. Use tauri:dev to exercise a live browser stream.
   start_browser_stream: () => "ws://127.0.0.1:9777",
+  browser_stream_bridge_endpoints: () => ({
+    ws_url: "ws://127.0.0.1:9777",
+    http_base: "http://127.0.0.1:9777",
+  }),
   create_browser_pane: (a) => {
     const loc = findSurfaceForPane(a.paneId);
     if (!loc) throw new Error("Pane is not open");

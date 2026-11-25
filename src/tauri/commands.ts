@@ -1333,6 +1333,14 @@ export const agentBrowserScreenshot = (browserId: string) =>
 export const startBrowserStream = (browserId: string) =>
   invoke<string>("start_browser_stream", { browserId });
 
+export interface BrowserStreamBridgeEndpoints {
+  ws_url: string;
+  http_base: string;
+}
+
+export const browserStreamBridgeEndpoints = (browserId: string) =>
+  invoke<BrowserStreamBridgeEndpoints>("browser_stream_bridge_endpoints", { browserId });
+
 // ── Browser Data ──
 
 export const getBrowserDataSize = () =>
