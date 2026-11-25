@@ -1126,6 +1126,7 @@ fn close_verified_unix_browser_peer(
     expected_pid: u32,
     deadline: Instant,
     still_owned: impl FnOnce() -> bool,
+    on_verified_peer: impl FnOnce(),
 ) -> Result<(), String> {
     use std::io::{Read, Write};
 
@@ -1134,6 +1135,7 @@ fn close_verified_unix_browser_peer(
     if unix_browser_control_peer_pid(&stream).ok() != Some(expected_pid) || !still_owned() {
         return Err("Browser control peer changed during shutdown".into());
     }
+    on_verified_peer();
     let remaining = deadline.saturating_duration_since(Instant::now());
     if remaining.is_zero() {
         return Err("Browser close deadline elapsed".into());
@@ -1336,11 +1338,12 @@ fn kill_verified_browser_pid(record: &BrowserPidRecord, session: &str) {
 #[cfg(target_os = "macos")]
 fn close_verified_browser_pid_until(record: &BrowserPidRecord, session: &str, deadline: Instant) {
     let dir = run_dir_for_session(session);
-    let files = dir.as_ref().and_then(|dir| capture_closed_browser_files(dir, session, record));
+    let mut files = None;
     let socket = dir.as_ref().map(|dir| dir.join(format!("{session}.sock")));
     let result = socket.ok_or_else(|| "Browser control path is unavailable".to_string())
         .and_then(|path| close_verified_unix_browser_peer(
             &path, record.pid, deadline, || browser_process_matches(record, session),
+            || files = dir.as_ref().and_then(|dir| capture_closed_browser_files(dir, session, record)),
         ));
     if let Err(error) = result {
         eprintln!("[codemux::browser] Could not gracefully close browser session {session}: {error}");
@@ -1411,7 +1414,7 @@ fn browser_file_identity(path: &std::path::Path) -> Option<BrowserFileIdentity> 
 #[cfg(all(unix, any(test, target_os = "macos")))]
 struct ClosedBrowserFiles {
     pid: BrowserFileIdentity,
-    record: BrowserFileIdentity,
+    record: Option<BrowserFileIdentity>,
     stream: Option<BrowserFileIdentity>,
     socket: Option<BrowserFileIdentity>,
 }
@@ -1431,16 +1434,25 @@ fn capture_closed_browser_files(
     }
     let pid_path = dir.join(format!("{session}.pid"));
     let record_path = dir.join(format!("agent-browser-{session}.pid"));
-    if read_daemon_pid_file(&pid_path) != Some(record.pid)
-        || read_browser_pid_record(&record_path).as_ref() != Some(record)
-    {
+    if read_daemon_pid_file(&pid_path) != Some(record.pid) {
         return None;
     }
     let pid = std::fs::symlink_metadata(&pid_path).ok()?;
-    let owned = std::fs::symlink_metadata(&record_path).ok()?;
-    if !pid.file_type().is_file() || !owned.file_type().is_file() {
+    if !pid.file_type().is_file() {
         return None;
     }
+    // Failed-open rollback can identify a late daemon from its process
+    // marker before Codemux has written its own PID record. An existing
+    // record must still match this exact daemon; a newly published record
+    // must not be mistaken for the one observed before close.
+    let owned = match std::fs::symlink_metadata(&record_path) {
+        Ok(meta) if meta.file_type().is_file()
+            && read_browser_pid_record(&record_path).as_ref() == Some(record) => {
+                Some(browser_file_identity(&record_path)?)
+            }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        _ => return None,
+    };
     let stream_path = dir.join(format!("{session}.stream"));
     let socket_path = dir.join(format!("{session}.sock"));
     let stream = std::fs::symlink_metadata(&stream_path).ok()
@@ -1451,7 +1463,7 @@ fn capture_closed_browser_files(
         .and_then(|_| browser_file_identity(&socket_path));
     Some(ClosedBrowserFiles {
         pid: browser_file_identity(&pid_path)?,
-        record: browser_file_identity(&record_path)?,
+        record: owned,
         stream,
         socket,
     })
@@ -1463,6 +1475,22 @@ fn optional_browser_file_matches(path: &std::path::Path, expected: Option<Browse
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => true,
         Ok(_) => browser_file_identity(path) == expected,
         Err(_) => false,
+    }
+}
+
+#[cfg(all(unix, any(test, target_os = "macos")))]
+fn captured_browser_record_matches(
+    path: &std::path::Path,
+    record: &BrowserPidRecord,
+    expected: Option<BrowserFileIdentity>,
+) -> bool {
+    match expected {
+        Some(identity) => {
+            read_browser_pid_record(path).as_ref() == Some(record)
+                && browser_file_identity(path) == Some(identity)
+        }
+        None => matches!(std::fs::symlink_metadata(path),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound),
     }
 }
 
@@ -1488,9 +1516,8 @@ fn cleanup_closed_browser_files(
         old_exited()
             && !browser_control_endpoint_ready(session, dir)
             && read_daemon_pid_file(&pid_path) == Some(record.pid)
-            && read_browser_pid_record(&record_path).as_ref() == Some(record)
             && browser_file_identity(&pid_path) == Some(files.pid)
-            && browser_file_identity(&record_path) == Some(files.record)
+            && captured_browser_record_matches(&record_path, record, files.record)
             && optional_browser_file_matches(&stream_path, files.stream)
             && optional_browser_file_matches(&socket_path, files.socket)
     };
@@ -1514,12 +1541,11 @@ fn cleanup_closed_browser_files(
         || [pid_path.as_path(), stream_path.as_path(), socket_path.as_path()]
             .iter().any(|path| !matches!(std::fs::symlink_metadata(path),
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound))
-        || read_browser_pid_record(&record_path).as_ref() != Some(record)
-        || browser_file_identity(&record_path) != Some(files.record)
+        || !captured_browser_record_matches(&record_path, record, files.record)
     {
         return false;
     }
-    std::fs::remove_file(record_path).is_ok()
+    files.record.is_none() || std::fs::remove_file(record_path).is_ok()
 }
 
 #[cfg(windows)]
@@ -1817,13 +1843,41 @@ fn output_capture_and_track_browser_daemon(
     timeout: Duration,
     session: &str,
 ) -> std::io::Result<std::process::Output> {
-    let outcome = output_capture_with_timeout(command, timeout);
+    output_capture_and_track_browser_daemon_with_status(command, timeout, session)
+        .map_err(|failure| failure.error)
+}
+
+#[cfg(not(windows))]
+#[derive(Debug)]
+struct UnixBrowserLaunchFailure {
+    error: std::io::Error,
+    may_have_launched: bool,
+}
+
+#[cfg(not(windows))]
+fn output_capture_and_track_browser_daemon_with_status(
+    mut command: std::process::Command,
+    timeout: Duration,
+    session: &str,
+) -> Result<std::process::Output, UnixBrowserLaunchFailure> {
+    command
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    let mut spawned = false;
+    let outcome = spawn_wait_collect_with_child(command, timeout, |_| {
+        spawned = true;
+        Ok(())
+    });
     // A first command may start the daemon before failing or timing out.
     // Persist its verified identity before the caller handles either result.
-    if track_current_browser_daemon(session).is_none() {
+    // A failed Command::spawn could not have started the launcher.
+    if spawned && track_current_browser_daemon(session).is_none() {
         track_late_browser_daemon(session);
     }
-    outcome
+    outcome.map_err(|error| UnixBrowserLaunchFailure {
+        error,
+        may_have_launched: spawned,
+    })
 }
 
 #[cfg(not(windows))]
@@ -2461,6 +2515,28 @@ fn require_unix_browser_launcher(binary: &str) -> Result<(), String> {
         .map_err(|_| "Browser launcher is unavailable".to_string())
 }
 
+#[cfg(not(windows))]
+fn browser_action_command(
+    binary: &str,
+    argv: &[String],
+    session: &str,
+    stream_port: u16,
+) -> Result<std::process::Command, String> {
+    let mut command = if binary == "npx agent-browser" {
+        let mut command = std::process::Command::new("npx");
+        command.arg("agent-browser");
+        command
+    } else {
+        std::process::Command::new(binary)
+    };
+    set_browser_owner_env(&mut command, session)?;
+    command.args(argv)
+        .env("AGENT_BROWSER_STREAM_PORT", stream_port.to_string())
+        .env("AGENT_BROWSER_ARGS", STEALTH_CHROMIUM_ARGS)
+        .env("AGENT_BROWSER_USER_AGENT", stealth_user_agent());
+    Ok(command)
+}
+
 #[cfg(not(target_os = "windows"))]
 fn browser_open_command(bin: &str, session: &str, port: u16) -> Result<std::process::Command, String> {
     let mut cmd = if bin == "npx agent-browser" {
@@ -2797,9 +2873,8 @@ fn format_dpr(dpr: f64) -> String {
     }
 }
 
-/// Argv-form sibling of `build_agent_browser_command`. Used only on Windows
-/// to spawn agent-browser.exe without depending on Git Bash being installed.
-#[cfg(target_os = "windows")]
+/// Argv-form sibling of `build_agent_browser_command`. Direct execution lets
+/// Unix distinguish an exec failure from a launcher that actually ran.
 fn build_agent_browser_argv_groups(
     session: &str,
     action: &str,
@@ -2819,7 +2894,10 @@ fn build_agent_browser_argv_groups(
             // the `open` subcommand and the binary exits silently —
             // exactly the "no log activity, browser never loads" mode
             // the user hit.
+            #[cfg(windows)]
             let mut open_argv: Vec<String> = windows_executable_path_args();
+            #[cfg(not(windows))]
+            let mut open_argv: Vec<String> = Vec::new();
             open_argv.extend(["open".into(), url, "--session".into(), s.clone()]);
             // agent-browser open already waits for load. A second wait
             // subscribes after that event and can stall until its timeout.
@@ -4095,22 +4173,30 @@ fn execute_agent_browser_action_with_status(
 
     #[cfg(not(target_os = "windows"))]
     let (stdout, stderr, status_success, may_have_launched) = {
-        let shell_cmd = build_agent_browser_command(&bin, session, action, &params)
+        let groups = build_agent_browser_argv_groups(session, action, &params)
             .map_err(BrowserActionFailure::before_launch)?;
-        let mut cmd = std::process::Command::new("sh");
-        set_browser_owner_env(&mut cmd, session).map_err(BrowserActionFailure::before_launch)?;
-        cmd.args(["-c", &shell_cmd])
-            .env("AGENT_BROWSER_STREAM_PORT", stream_port.to_string())
-            .env("AGENT_BROWSER_ARGS", STEALTH_CHROMIUM_ARGS)
-            .env("AGENT_BROWSER_USER_AGENT", stealth_user_agent());
-        let output = output_capture_and_track_browser_daemon(cmd, action_timeout(action), session)
-            .map_err(|error| BrowserActionFailure::after_launch(format!("Failed to run agent-browser: {}", error)))?;
-        (
-            String::from_utf8_lossy(&output.stdout).to_string(),
-            String::from_utf8_lossy(&output.stderr).to_string(),
-            output.status.success(),
-            true,
-        )
+        let mut combined_stdout = String::new();
+        let mut combined_stderr = String::new();
+        let mut all_ok = true;
+        let mut launched = false;
+        for argv in &groups {
+            let command = browser_action_command(&bin, argv, session, stream_port)
+                .map_err(|message| BrowserActionFailure { message, may_have_launched: launched })?;
+            let output = output_capture_and_track_browser_daemon_with_status(
+                command, action_timeout(action), session,
+            ).map_err(|failure| BrowserActionFailure {
+                message: format!("Failed to run agent-browser: {}", failure.error),
+                may_have_launched: launched || failure.may_have_launched,
+            })?;
+            launched = true;
+            combined_stdout.push_str(&String::from_utf8_lossy(&output.stdout));
+            combined_stderr.push_str(&String::from_utf8_lossy(&output.stderr));
+            if !output.status.success() {
+                all_ok = false;
+                break;
+            }
+        }
+        (combined_stdout, combined_stderr, all_ok, launched)
     };
 
     if (!may_have_launched && action != "close")
@@ -4761,7 +4847,8 @@ impl AgentBrowserManager {
         params: &serde_json::Value,
         binary: &str,
     ) -> Result<bool, String> {
-        build_agent_browser_command_for_binary(binary, session, action, params)?;
+        require_unix_browser_launcher(binary)?;
+        build_agent_browser_argv_groups(session, action, params)?;
         Ok(self.note_action_start(browser_id, action).await)
     }
 
@@ -6616,6 +6703,44 @@ mod tests {
             "the same session must accept a fresh first action");
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn unix_launcher_with_missing_interpreter_releases_first_action_for_retry() {
+        use std::os::unix::fs::{symlink, PermissionsExt};
+
+        let temp = tempfile::tempdir().unwrap();
+        let interpreter = temp.path().join("interpreter");
+        let launcher = temp.path().join("agent-browser");
+        std::fs::write(&launcher, format!("#!{}\nexit 0\n", interpreter.display())).unwrap();
+        std::fs::set_permissions(&launcher, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let binary = launcher.to_str().unwrap();
+        let session = format!("browser-exec-retry-{}", uuid::Uuid::new_v4().simple());
+        let params = serde_json::json!({"url": "about:blank"});
+        let manager = AgentBrowserManager::new();
+        let port = manager.allocate_port(&session).await.unwrap();
+        let was_running = manager.prepare_unix_action(&session, &session, "open", &params, binary).await.unwrap();
+        assert!(!was_running);
+
+        let argv = build_agent_browser_argv_groups(&session, "open", &params).unwrap().remove(0);
+        let command = browser_action_command(binary, &argv, &session, port).unwrap();
+        let failure = output_capture_and_track_browser_daemon_with_status(
+            command, Duration::from_secs(2), &session,
+        ).err().expect("a missing shebang interpreter must prevent exec");
+        assert_eq!(failure.error.kind(), std::io::ErrorKind::NotFound);
+        assert!(!failure.may_have_launched);
+        let result = Err(BrowserActionFailure::before_launch(failure.error.to_string()));
+        manager.reconcile_action_attempt(&session, &session, "open", was_running, false, &result).await;
+        assert!(!manager.sessions.lock().await.get(&session).unwrap().running);
+
+        symlink("/bin/sh", &interpreter).unwrap();
+        assert!(!manager.prepare_unix_action(&session, &session, "open", &params, binary).await.unwrap());
+        let command = browser_action_command(binary, &argv, &session, port).unwrap();
+        let output = output_capture_and_track_browser_daemon_with_status(
+            command, Duration::from_secs(2), &session,
+        ).unwrap();
+        assert!(output.status.success());
+    }
+
     #[cfg(not(target_os = "windows"))]
     #[test]
     fn build_command_open_uses_navigation_load_wait_only() {
@@ -7508,9 +7633,9 @@ mod tests {
         });
 
         let deadline = || Instant::now() + Duration::from_secs(2);
-        assert!(close_verified_unix_browser_peer(&socket, std::process::id() + 1, deadline(), || true).is_err());
-        assert!(close_verified_unix_browser_peer(&socket, std::process::id(), deadline(), || false).is_err());
-        close_verified_unix_browser_peer(&socket, std::process::id(), deadline(), || true).unwrap();
+        assert!(close_verified_unix_browser_peer(&socket, std::process::id() + 1, deadline(), || true, || {}).is_err());
+        assert!(close_verified_unix_browser_peer(&socket, std::process::id(), deadline(), || false, || {}).is_err());
+        close_verified_unix_browser_peer(&socket, std::process::id(), deadline(), || true, || {}).unwrap();
         let requests = server.join().unwrap();
         assert_eq!(requests.len(), 1);
         assert_eq!(requests[0]["action"], "close");
@@ -7537,7 +7662,7 @@ mod tests {
 
         let started = Instant::now();
         let result = close_verified_unix_browser_peer(
-            &socket, std::process::id(), started + Duration::from_millis(250), || true,
+            &socket, std::process::id(), started + Duration::from_millis(250), || true, || {},
         );
         assert!(result.is_err());
         assert!(started.elapsed() < Duration::from_secs(1));
@@ -7545,22 +7670,68 @@ mod tests {
     }
 
     #[cfg(unix)]
+    #[test]
+    fn browser_close_captures_pid_published_after_peer_connection() {
+        use std::io::{BufRead, Write};
+        use std::os::unix::net::UnixListener;
+
+        let dir = tempfile::tempdir().unwrap();
+        let session = "browser-close-late-pid";
+        let record = test_browser_record(std::process::id(), 1, browser_owner_token().to_owned());
+        let socket_path = dir.path().join(format!("{session}.sock"));
+        assert!(capture_closed_browser_files(dir.path(), session, &record).is_none());
+        let listener = UnixListener::bind(&socket_path).unwrap();
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let server_dir = dir.path().to_path_buf();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            std::fs::write(server_dir.join(format!("{session}.pid")), std::process::id().to_string()).unwrap();
+            std::fs::write(server_dir.join(format!("{session}.stream")), "43210").unwrap();
+            ready_tx.send(()).unwrap();
+            let mut line = String::new();
+            std::io::BufReader::new(&stream).read_line(&mut line).unwrap();
+            assert_eq!(serde_json::from_str::<serde_json::Value>(&line).unwrap()["action"], "close");
+            stream.write_all(b"{\"success\":true}\n").unwrap();
+        });
+
+        let mut files = None;
+        close_verified_unix_browser_peer(
+            &socket_path, std::process::id(), Instant::now() + Duration::from_secs(10),
+            || true,
+            || {
+                ready_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+                files = capture_closed_browser_files(dir.path(), session, &record);
+            },
+        ).unwrap();
+        server.join().unwrap();
+        let files = files.expect("late PID and socket were captured after peer verification");
+        assert!(files.record.is_none());
+        assert!(cleanup_closed_browser_files(dir.path(), session, &record, &files, || true));
+        assert!(!socket_path.exists());
+    }
+
+    #[cfg(unix)]
     fn closed_browser_file_fixture(
         dir: &std::path::Path,
         session: &str,
         record: &BrowserPidRecord,
+        with_record: bool,
     ) -> ClosedBrowserFiles {
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
         use std::os::unix::net::UnixListener;
 
         std::fs::write(dir.join(format!("{session}.pid")), record.pid.to_string()).unwrap();
         std::fs::write(dir.join(format!("{session}.stream")), "43210").unwrap();
         let socket = UnixListener::bind(dir.join(format!("{session}.sock"))).unwrap();
         drop(socket);
-        std::fs::write(
-            dir.join(format!("agent-browser-{session}.pid")),
-            format!("{} {} {} {} {} v2\n", record.pid, record.start_time,
-                record.token, record.owner_pid, record.owner_start_time),
-        ).unwrap();
+        if with_record {
+            let mut owned = std::fs::OpenOptions::new().write(true).create_new(true)
+                .mode(0o600)
+                .open(dir.join(format!("agent-browser-{session}.pid"))).unwrap();
+            writeln!(owned, "{} {} {} {} {} v2", record.pid, record.start_time,
+                record.token, record.owner_pid, record.owner_start_time).unwrap();
+        }
         capture_closed_browser_files(dir, session, record).unwrap()
     }
 
@@ -7570,7 +7741,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let session = "browser-close-metadata";
         let record = test_browser_record(12345, 1, browser_owner_token().to_owned());
-        let files = closed_browser_file_fixture(dir.path(), session, &record);
+        let files = closed_browser_file_fixture(dir.path(), session, &record, true);
         assert!(!cleanup_closed_browser_files(dir.path(), session, &record, &files, || false));
         assert!(dir.path().join(format!("{session}.pid")).exists());
         assert!(cleanup_closed_browser_files(dir.path(), session, &record, &files, || true));
@@ -7588,7 +7759,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let session = "browser-close-replaced";
         let record = test_browser_record(12345, 1, browser_owner_token().to_owned());
-        let files = closed_browser_file_fixture(dir.path(), session, &record);
+        let files = closed_browser_file_fixture(dir.path(), session, &record, true);
         let socket_path = dir.path().join(format!("{session}.sock"));
         std::fs::remove_file(&socket_path).unwrap();
         let replacement = UnixListener::bind(&socket_path).unwrap();
@@ -7607,6 +7778,42 @@ mod tests {
         ).unwrap();
         assert!(!cleanup_closed_browser_files(dir.path(), session, &record, &files, || true));
         assert!(read_browser_pid_record(&dir.path().join(format!("agent-browser-{session}.pid"))).as_ref() == Some(&changed));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn browser_close_without_record_retires_only_the_untracked_daemon_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let session = "browser-close-untracked";
+        let record = test_browser_record(12345, 1, browser_owner_token().to_owned());
+        let files = closed_browser_file_fixture(dir.path(), session, &record, false);
+        assert!(files.record.is_none());
+        assert!(!cleanup_closed_browser_files(dir.path(), session, &record, &files, || false));
+        assert!(cleanup_closed_browser_files(dir.path(), session, &record, &files, || true));
+        for suffix in ["pid", "stream", "sock"] {
+            assert!(!dir.path().join(format!("{session}.{suffix}")).exists());
+        }
+        assert!(!dir.path().join(format!("agent-browser-{session}.pid")).exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn browser_close_without_record_preserves_a_new_ownership_record() {
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let session = "browser-close-record-race";
+        let record = test_browser_record(12345, 1, browser_owner_token().to_owned());
+        let files = closed_browser_file_fixture(dir.path(), session, &record, false);
+        let path = dir.path().join(format!("agent-browser-{session}.pid"));
+        let mut replacement = std::fs::OpenOptions::new().write(true).create_new(true)
+            .mode(0o600).open(&path).unwrap();
+        writeln!(replacement, "{} {} {} {} {} v2", record.pid, record.start_time,
+            uuid::Uuid::new_v4().simple(), record.owner_pid, record.owner_start_time).unwrap();
+        assert!(!cleanup_closed_browser_files(dir.path(), session, &record, &files, || true));
+        assert!(dir.path().join(format!("{session}.pid")).exists());
+        assert!(path.exists());
     }
 
     #[cfg(target_os = "macos")]
