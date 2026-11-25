@@ -483,6 +483,15 @@ fn prepare_agent_command_for_shell(
         Some(p) if !p.trim().is_empty() => p,
         _ => return (base_command.to_string(), false),
     };
+    // A prompt that starts with `-` would be read as an option by the agent
+    // CLI (`--mcp-config ...`); a leading space keeps it a plain argument.
+    let spaced;
+    let prompt = if prompt.starts_with('-') {
+        spaced = format!(" {prompt}");
+        spaced.as_str()
+    } else {
+        prompt
+    };
 
     match interactive_prompt_flag(preset_id).zip(quote_prompt_argument(prompt, shell)) {
         Some((flag, quoted)) => (format!("{base_command} {flag}{quoted}"), false),
@@ -510,6 +519,25 @@ pub fn agent_binary_name(command: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_prompt_starting_with_a_dash_never_becomes_an_option() {
+        let (cmd, typed) = prepare_agent_command_for_shell(
+            "builtin-claude",
+            "claude",
+            Some("--mcp-config x"),
+            "/bin/bash",
+        );
+        assert!(!typed);
+        assert_eq!(cmd, "claude $' --mcp-config x'");
+        let (cmd, _) = prepare_agent_command_for_shell(
+            "builtin-claude",
+            "claude",
+            Some("-p"),
+            "pwsh",
+        );
+        assert_eq!(cmd, "claude ' -p'");
+    }
 
     #[test]
     fn sanitize_basic() {
