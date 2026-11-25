@@ -392,7 +392,7 @@ impl McpRegistry {
         let app = app.cloned();
         tokio::spawn(async move {
             registry
-                .ensure_started_owned(app.as_ref(), config, Some(&token))
+                .ensure_started_owned(app.as_ref(), config, Some(&token), None)
                 .await;
         });
         Ok(())

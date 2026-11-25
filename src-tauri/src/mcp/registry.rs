@@ -15,8 +15,9 @@ use serde_json::Value;
 // * **App-shutdown kill.** `shutdown_all` is called from the Tauri
 //   `RunEvent::Exit` handler in `lib.rs`. Each child gets a graceful
 //   2-second budget via `JsonRpcChild::shutdown` before SIGKILL.
-// * **No auto-restart.** A crashed server stays in `Errored`; the user
-//   restarts manually via `restart_mcp_server`.
+// * **Bounded startup recovery.** A failed initial spawn or handshake may
+//   retry in the background with backoff. A server that failed after it was
+//   running still needs a manual restart.
 // * **Codemux exception.** The hardcoded `Codemux` source row is
 //   always-on; toggling it is suppressed at the command layer.
 
@@ -29,6 +30,7 @@ pub use plugin::{
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter, Runtime};
@@ -109,6 +111,28 @@ fn same_prime_definition(existing: &McpServerConfig, discovered: &McpServerConfi
         && existing.project_root == discovered.project_root
         && existing.checkout_root == discovered.checkout_root
         && effective_raw(&existing.raw) == effective_raw(&discovered.raw)
+}
+
+const STARTUP_RETRY_DELAYS: [Duration; 3] = [
+    Duration::from_secs(2),
+    Duration::from_secs(5),
+    Duration::from_secs(15),
+];
+const STARTUP_RETRY_CYCLE_COOLDOWN: Duration = Duration::from_secs(60);
+
+fn retryable_startup_failure(handle: &McpServerHandle) -> bool {
+    matches!(handle.status, McpServerStatus::Errored { .. })
+        && handle.started_at_ms.is_none()
+        && handle.child.is_none()
+        && handle.remote.is_none()
+}
+
+struct StartupRetryState {
+    definition: McpServerConfig,
+    task_id: String,
+    generation: String,
+    active: bool,
+    next_cycle: Instant,
 }
 
 /// Process-wide registry of MCP children. Stored as Tauri managed state
@@ -243,6 +267,7 @@ struct RegistryInner {
     /// Keyed by `McpServerConfig.id`. Codemux's hardcoded row is also
     /// in here under `"codemux-self"` once spawned.
     handles: HashMap<String, McpServerHandle>,
+    startup_retries: HashMap<String, StartupRetryState>,
     /// Mirror of the frontend zustand `disabledIds` — written by
     /// `set_disabled_ids` whenever the store changes. Disabled servers
     /// are skipped during `prime_for_chat` and stopped if currently
@@ -266,6 +291,7 @@ impl Default for McpRegistry {
         Self {
             inner: Arc::new(Mutex::new(RegistryInner {
                 handles: HashMap::new(),
+                startup_retries: HashMap::new(),
                 plugins: HashMap::new(),
                 watchers: HashMap::new(),
                 cancel_calls: HashMap::new(),
@@ -562,6 +588,7 @@ impl McpRegistry {
                 .filter(|id| inner.disabled_ids.contains(*id) && !next.contains(*id))
                 .filter_map(|id| inner.handles.get(id).map(|handle| handle.config.clone()))
                 .collect::<Vec<_>>();
+            inner.startup_retries.retain(|id, _| !next.contains(id));
             inner.disabled_ids = next;
             // Codemux self can't be disabled.
             inner.disabled_ids.remove("codemux-self");
@@ -622,6 +649,15 @@ impl McpRegistry {
         app: Option<&AppHandle<R>>,
         config: McpServerConfig,
     ) -> McpServerRuntime {
+        self.ensure_started_with_retry_guard(app, config, None).await
+    }
+
+    async fn ensure_started_with_retry_guard<R: Runtime>(
+        &self,
+        app: Option<&AppHandle<R>>,
+        config: McpServerConfig,
+        retry_guard: Option<(&str, &str)>,
+    ) -> McpServerRuntime {
         let (config, token) = if config.sources.contains(&McpConfigSource::Plugin) {
             let inner = self.inner.lock().await;
             match (inner.plugins.get(&config.id), inner.handles.get(&config.id)) {
@@ -631,7 +667,7 @@ impl McpRegistry {
         } else {
             (config, None)
         };
-        self.ensure_started_owned(app, config, token.as_deref())
+        self.ensure_started_owned(app, config, token.as_deref(), retry_guard)
             .await
     }
 
@@ -640,10 +676,31 @@ impl McpRegistry {
         app: Option<&AppHandle<R>>,
         mut config: McpServerConfig,
         token: Option<&str>,
+        retry_guard: Option<(&str, &str)>,
     ) -> McpServerRuntime {
         let id = config.id.clone();
         let server_lock = self.server_lock(&id);
         let lifecycle = server_lock.lock().await;
+
+        if let Some((task_id, generation)) = retry_guard {
+            let inner = self.inner.lock().await;
+            let Some(handle) = inner.handles.get(&id) else {
+                return McpServerRuntime::from_handle(&McpServerHandle::discovered(config));
+            };
+            let current = inner.startup_retries.get(&id).is_some_and(|retry| {
+                retry.active
+                    && retry.task_id == task_id
+                    && retry.generation == generation
+                    && same_prime_definition(&retry.definition, &config)
+            });
+            if !current
+                || !retryable_startup_failure(handle)
+                || !same_prime_definition(&handle.config, &config)
+                || handle.config.raw.get("runtimeGeneration").and_then(Value::as_str) != Some(generation)
+            {
+                return McpServerRuntime::from_handle(handle);
+            }
+        }
 
         // Codemux self is always-on regardless of disabled set; everyone
         // else respects the user's toggle.
@@ -713,6 +770,24 @@ impl McpRegistry {
         let _start_guard;
         {
             let mut inner = self.inner.lock().await;
+            if let Some((task_id, expected_generation)) = retry_guard {
+                let current = inner.startup_retries.get(&id).is_some_and(|retry| {
+                    retry.active
+                        && retry.task_id == task_id
+                        && retry.generation == expected_generation
+                        && same_prime_definition(&retry.definition, &config)
+                }) && inner.handles.get(&id).is_some_and(|handle| {
+                    retryable_startup_failure(handle)
+                        && same_prime_definition(&handle.config, &config)
+                        && handle.config.raw.get("runtimeGeneration").and_then(Value::as_str)
+                            == Some(expected_generation)
+                });
+                if !current || inner.disabled_ids.contains(&id) {
+                    return inner.handles.get(&id)
+                        .map(McpServerRuntime::from_handle)
+                        .unwrap_or_else(|| McpServerRuntime::from_handle(&McpServerHandle::discovered(config)));
+                }
+            }
             if let Some(existing) = inner.handles.get(&id) {
                 if matches!(
                     existing.status,
@@ -740,6 +815,11 @@ impl McpRegistry {
             _start_guard = plugin::CallGuard::new(tracker.clone(), None);
             inner.calls_in_flight.insert(id.clone(), tracker);
             inner.handles.insert(id.clone(), placeholder);
+            if retry_guard.is_some() {
+                inner.startup_retries.get_mut(&id)
+                    .expect("retry task exists")
+                    .generation = generation.clone();
+            }
         }
         drop(approval_guard);
         emit_status_with_bus(
@@ -1021,6 +1101,7 @@ impl McpRegistry {
             if let Some(task) = inner.watchers.remove(id) {
                 task.abort();
             }
+            inner.startup_retries.remove(id);
             inner.cancel_calls.remove(id);
             let tracker = inner.calls_in_flight.remove(id);
             let handle = inner
@@ -1171,6 +1252,97 @@ impl McpRegistry {
         Ok(revoked)
     }
 
+    /// Retry only failures from initial startup, after the current chat has
+    /// made its catalog decision. One worker owns each definition; repeated
+    /// resume attempts cannot start another handshake or reset its backoff.
+    async fn schedule_startup_retry<R: Runtime>(
+        &self,
+        app: Option<&AppHandle<R>>,
+        config: &McpServerConfig,
+    ) {
+        let id = config.id.clone();
+        let task_id = uuid::Uuid::new_v4().to_string();
+        let generation = {
+            let mut inner = self.inner.lock().await;
+            if inner.disabled_ids.contains(&id) {
+                return;
+            }
+            let Some(handle) = inner.handles.get(&id) else { return };
+            if !retryable_startup_failure(handle)
+                || !same_prime_definition(&handle.config, config)
+            {
+                return;
+            }
+            let Some(generation) = handle.config.raw.get("runtimeGeneration")
+                .and_then(Value::as_str).map(str::to_owned) else { return };
+            let now = Instant::now();
+            if inner.startup_retries.get(&id).is_some_and(|retry| {
+                same_prime_definition(&retry.definition, config)
+                    && (retry.active || now < retry.next_cycle)
+            }) {
+                return;
+            }
+            inner.startup_retries.insert(id.clone(), StartupRetryState {
+                definition: config.clone(),
+                task_id: task_id.clone(),
+                generation: generation.clone(),
+                active: true,
+                next_cycle: now,
+            });
+            generation
+        };
+
+        let registry = self.clone();
+        let app = app.cloned();
+        let config = config.clone();
+        tokio::spawn(async move {
+            let mut expected_generation = generation;
+            for delay in STARTUP_RETRY_DELAYS {
+                tokio::time::sleep(delay).await;
+                let row = registry.ensure_started_with_retry_guard(
+                    app.as_ref(), config.clone(), Some((&task_id, &expected_generation)),
+                ).await;
+                if !matches!(row.status, McpServerStatus::Errored { .. }) {
+                    break;
+                }
+                let next_generation = {
+                    let inner = registry.inner.lock().await;
+                    inner.startup_retries.get(&id)
+                        .filter(|retry| retry.active && retry.task_id == task_id)
+                        .and_then(|retry| inner.handles.get(&id).filter(|handle| {
+                            retryable_startup_failure(handle)
+                                && same_prime_definition(&handle.config, &config)
+                                && handle.config.raw.get("runtimeGeneration").and_then(Value::as_str)
+                                    == Some(retry.generation.as_str())
+                        }).map(|_| retry.generation.clone()))
+                };
+                match next_generation {
+                    Some(next) if next != expected_generation => expected_generation = next,
+                    _ => break,
+                }
+            }
+
+            let mut inner = registry.inner.lock().await;
+            if inner.startup_retries.get(&id).is_some_and(|retry| retry.task_id == task_id) {
+                let still_failed = inner.handles.get(&id).is_some_and(|handle| {
+                    retryable_startup_failure(handle)
+                        && same_prime_definition(&handle.config, &config)
+                        && inner.startup_retries.get(&id).is_some_and(|retry| {
+                            handle.config.raw.get("runtimeGeneration").and_then(Value::as_str)
+                                == Some(retry.generation.as_str())
+                        })
+                });
+                if still_failed {
+                    let retry = inner.startup_retries.get_mut(&id).expect("retry task exists");
+                    retry.active = false;
+                    retry.next_cycle = Instant::now() + STARTUP_RETRY_CYCLE_COOLDOWN;
+                } else {
+                    inner.startup_retries.remove(&id);
+                }
+            }
+        });
+    }
+
     /// Spawn every enabled (non-disabled) MCP server discovered for the
     /// given project root, plus Codemux's own hardcoded entry. Errors
     /// per server are surfaced as `Errored` rows rather than failing
@@ -1220,8 +1392,11 @@ impl McpRegistry {
             // changed definition still take the normal start path.
             let row = match settled_failure {
                 Some(row) => row,
-                None => self.ensure_started(app, cfg).await,
+                None => self.ensure_started(app, cfg.clone()).await,
             };
+            if !disabled && approved && matches!(row.status, McpServerStatus::Errored { .. }) {
+                self.schedule_startup_retry(app, &cfg).await;
+            }
             // A previous prime may still be discovering this server. Terminal
             // failures are settled: the adapter's catalog hash decides
             // whether their absent tools change a saved Codex thread.
@@ -1650,6 +1825,7 @@ impl McpRegistry {
             let mut inner = self.inner.lock().await;
             let mut out = Vec::new();
             inner.cancel_calls.clear();
+            inner.startup_retries.clear();
             for (_, task) in inner.watchers.drain() {
                 task.abort();
             }
@@ -2330,6 +2506,117 @@ mod tests {
         assert!(matches!(handle.status, McpServerStatus::Errored { .. }));
         assert_ne!(handle.config.raw["runtimeGeneration"], generation);
         assert_eq!(handle.config.command, changed.command);
+    }
+
+    #[tokio::test]
+    async fn chat_prime_recovers_an_unchanged_http_server_after_startup_failure() {
+        use mockito::Matcher;
+
+        let mut server = mockito::Server::new_async().await;
+        let mut cfg = make_config("recovering", "recovering", &format!("{}/mcp", server.url()));
+        cfg.transport = McpTransport::Http;
+        let reg = McpRegistry::new();
+        reg.set_prime_configs_for_test(vec![cfg]).await;
+
+        // The first initialize has no matching endpoint. The same config
+        // becomes available before the delayed retry, without a manual
+        // restart or a definition change.
+        assert!(reg.prime_for_chat(None::<&tauri::AppHandle<tauri::Wry>>, None).await);
+        assert!(matches!(reg.list_runtime().await[0].status, McpServerStatus::Errored { .. }));
+        let initialize = server.mock("POST", "/mcp")
+            .match_body(Matcher::PartialJson(serde_json::json!({"method": "initialize"})))
+            .with_header("content-type", "application/json")
+            .with_body(serde_json::json!({
+                "jsonrpc": "2.0", "id": 1,
+                "result": {
+                    "protocolVersion": "2025-06-18", "capabilities": {},
+                    "serverInfo": {"name": "recovering", "version": "1"}
+                }
+            }).to_string())
+            .expect(1)
+            .create_async().await;
+        let initialized = server.mock("POST", "/mcp")
+            .match_body(Matcher::PartialJson(serde_json::json!({"method": "notifications/initialized"})))
+            .with_status(202)
+            .expect(1)
+            .create_async().await;
+        let list = server.mock("POST", "/mcp")
+            .match_body(Matcher::PartialJson(serde_json::json!({"method": "tools/list"})))
+            .with_header("content-type", "application/json")
+            .with_body(serde_json::json!({
+                "jsonrpc": "2.0", "id": 2,
+                "result": {"tools": [{"name": "echo", "inputSchema": {"type": "object"}}]}
+            }).to_string())
+            .expect(1)
+            .create_async().await;
+        let _no_events = server.mock("GET", "/mcp").with_status(405).create_async().await;
+
+        tokio::time::timeout(Duration::from_secs(6), async {
+            loop {
+                if reg.list_runtime().await.iter().any(|row| {
+                    matches!(row.status, McpServerStatus::Running { tool_count: 1 })
+                }) {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        }).await.expect("unchanged server did not recover in the background");
+        assert_eq!(reg.list_all_tools().await[0].name, "echo");
+        initialize.assert_async().await;
+        initialized.assert_async().await;
+        list.assert_async().await;
+        reg.shutdown_all().await;
+    }
+
+    #[tokio::test]
+    async fn repeated_chat_primes_do_not_restart_a_persistently_failed_server() {
+        let reg = McpRegistry::new();
+        let cfg = make_config("offline", "offline", "/no/such/binary/at/all");
+        reg.set_prime_configs_for_test(vec![cfg.clone()]).await;
+        assert!(reg.prime_for_chat(None::<&tauri::AppHandle<tauri::Wry>>, None).await);
+        let initial = reg.inner.lock().await.handles[&cfg.id].config.raw["runtimeGeneration"].clone();
+        for _ in 0..6 {
+            assert!(reg.prime_for_chat(None::<&tauri::AppHandle<tauri::Wry>>, None).await);
+            assert_eq!(reg.inner.lock().await.handles[&cfg.id].config.raw["runtimeGeneration"], initial);
+        }
+
+        let retried = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let generation = reg.inner.lock().await.handles[&cfg.id].config.raw["runtimeGeneration"].clone();
+                if generation != initial {
+                    break generation;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        }).await.expect("the bounded background retry never ran");
+        for _ in 0..6 {
+            assert!(reg.prime_for_chat(None::<&tauri::AppHandle<tauri::Wry>>, None).await);
+            assert_eq!(reg.inner.lock().await.handles[&cfg.id].config.raw["runtimeGeneration"], retried);
+        }
+
+        // A user stop revokes the sleeping worker before its next attempt.
+        reg.stop_server(None::<&tauri::AppHandle<tauri::Wry>>, &cfg.id).await.unwrap();
+        tokio::time::sleep(Duration::from_secs(6)).await;
+        assert!(matches!(reg.list_runtime().await[0].status, McpServerStatus::Stopped));
+    }
+
+    #[tokio::test]
+    async fn manual_start_supersedes_a_sleeping_startup_retry() {
+        let reg = McpRegistry::new();
+        let cfg = make_config("offline", "offline", "/no/such/binary/at/all");
+        reg.set_prime_configs_for_test(vec![cfg.clone()]).await;
+        assert!(reg.prime_for_chat(None::<&tauri::AppHandle<tauri::Wry>>, None).await);
+        let initial = reg.inner.lock().await.handles[&cfg.id].config.raw["runtimeGeneration"].clone();
+
+        let manual = reg.ensure_started(None::<&tauri::AppHandle<tauri::Wry>>, cfg.clone()).await;
+        assert!(matches!(manual.status, McpServerStatus::Errored { .. }));
+        let manual_generation = reg.inner.lock().await.handles[&cfg.id].config.raw["runtimeGeneration"].clone();
+        assert_ne!(manual_generation, initial);
+
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        let inner = reg.inner.lock().await;
+        assert_eq!(inner.handles[&cfg.id].config.raw["runtimeGeneration"], manual_generation);
+        assert!(!inner.startup_retries.contains_key(&cfg.id));
     }
 
     #[tokio::test]
