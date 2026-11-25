@@ -35,6 +35,7 @@ use tauri::{AppHandle, Emitter, Runtime};
 use tokio::sync::{broadcast, Mutex, OnceCell};
 
 use super::codemux_self::codemux_self_config;
+use super::http_client::HttpRequestAdmission;
 use super::parser::{
     parse_claude_wrapped_config, parse_codex_config_file, parse_mcp_config_file,
     parse_opencode_config_file,
@@ -775,10 +776,14 @@ impl McpRegistry {
                 McpServerRuntime::from_handle(&McpServerHandle::discovered(config))
             });
         }
+        let http_admission = fingerprint.as_ref().map(|_| {
+            HttpRequestAdmission::new(self.project_approval_lock.clone(), start_cancelled.clone())
+        });
         let mut handle = super::runtime::start_mcp_server_cancellable(
             config.clone(),
             Some(start_cancelled),
             (spawn_inner_guard, spawn_approval_guard),
+            http_admission,
         ).await;
         let row;
         let host_tools = self.collision_host_tools();
@@ -1107,6 +1112,9 @@ impl McpRegistry {
         fingerprint: &str,
     ) -> Result<bool, String> {
         let approval_guard = self.project_approval_lock.lock().await;
+        // The transport takes this same lock before admitting each HTTP
+        // request. A failed delete leaves both approval and starts intact.
+        let revoked = super::project_trust::revoke_approval(app, fingerprint)?;
         let configs: Vec<McpServerConfig> = {
             let inner = self.inner.lock().await;
             let configs: Vec<_> = inner
@@ -1117,9 +1125,8 @@ impl McpRegistry {
                 })
                 .map(|handle| handle.config.clone())
                 .collect();
-            // Close every in-flight reservation before deleting the approval.
-            // A pending HTTP first poll must see cancellation before it can
-            // send headers from a definition that is no longer approved.
+            // Close every in-flight reservation before releasing approval
+            // admission, including startup retries and notification requests.
             for config in &configs {
                 if let Some(cancel) = inner.cancel_calls.get(&config.id) {
                     cancel.send_replace(true);
@@ -1127,7 +1134,6 @@ impl McpRegistry {
             }
             configs
         };
-        let revoked = super::project_trust::revoke_approval(app, fingerprint)?;
         drop(approval_guard);
         for config in configs {
             let _ = self.stop_server(Some(app), &config.id).await;
@@ -1437,6 +1443,13 @@ impl McpRegistry {
                 }
                 for tool in &handle.tools {
                     if tool.prefixed_name == prefixed_name {
+                        if inner
+                            .cancel_calls
+                            .get(&handle.config.id)
+                            .is_some_and(|cancel| *cancel.borrow())
+                        {
+                            return Err("MCP server stopped during tools/call".into());
+                        }
                         if !handle.status.is_running() {
                             return Err(format!(
                                 "MCP server '{}' is not running",
@@ -1515,6 +1528,9 @@ impl McpRegistry {
         let cancellation = async {
             match cancelled.as_mut() {
                 Some(rx) => {
+                    if *rx.borrow() {
+                        return;
+                    }
                     let _ = rx.changed().await;
                 }
                 None => std::future::pending::<()>().await,
@@ -2946,6 +2962,35 @@ mod project_trust_tests {
 
     #[cfg(unix)]
     #[tokio::test]
+    async fn cancelled_project_stdio_generation_rejects_calls_before_shutdown() {
+        let project = tempfile::tempdir().unwrap();
+        let fixture = format!("{}/tests/fixtures/plugin_mcp.py", env!("CARGO_MANIFEST_DIR"));
+        write_project(project.path(), serde_json::json!({"lint": {
+            "command": "python3", "args": [fixture]
+        }}));
+        let app = app();
+        let reg = McpRegistry::new();
+        let config = discovered(project.path(), "lint");
+        let row = reg.ensure_started(Some(app.handle()), config.clone()).await;
+        let row = reg.approve_project_server(app.handle(), &config.id, &shown_fingerprint(&row))
+            .await.unwrap();
+        assert!(row.status.is_running());
+        let tool = reg.list_tools_for_server(&config.id).await.into_iter()
+            .find(|tool| tool.name == "echo").unwrap();
+
+        // Revocation marks every matching generation before it stops them
+        // one by one. This server is still running but must admit no call.
+        {
+            let inner = reg.inner.lock().await;
+            inner.cancel_calls.get(&config.id).unwrap().send_replace(true);
+        }
+        let result = reg.dispatch_tool_call(&tool.prefixed_name, serde_json::json!({}), None).await;
+        assert!(result.unwrap_err().contains("stopped during tools/call"));
+        reg.shutdown_all().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
     async fn revocation_waits_for_a_first_start_reservation() {
         let project = tempfile::tempdir().unwrap();
         let fixture = format!("{}/tests/fixtures/plugin_mcp.py", env!("CARGO_MANIFEST_DIR"));
@@ -3107,6 +3152,43 @@ mod project_trust_tests {
             other => panic!("expected needsApproval, got {other:?}"),
         }
         untouched.assert_async().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn failed_approval_delete_keeps_reserved_start_retryable() {
+        let (project, scratch) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let marker = scratch.path().join("started");
+        write_project(project.path(), serde_json::json!({"lint": touch_server(&marker)}));
+        let app = app();
+        let reg = McpRegistry::new();
+        let config = discovered(project.path(), "lint");
+        let fingerprint = super::super::project_trust::fingerprint(&config).unwrap();
+        super::super::project_trust::record_approval(app.handle(), &fingerprint, &config).unwrap();
+
+        let (entered, release) = (Arc::new(tokio::sync::Notify::new()), Arc::new(tokio::sync::Notify::new()));
+        let start_reg = reg.clone();
+        let start_app = app.handle().clone();
+        let start_config = config.clone();
+        let start_entered = entered.clone();
+        let start_release = release.clone();
+        let start = tokio::spawn(async move {
+            BEFORE_PROJECT_ADMISSION_GATE.scope((start_entered, start_release), async move {
+                start_reg.ensure_started(Some(&start_app), start_config).await
+            }).await
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(5), entered.notified())
+            .await.unwrap();
+        app.state::<crate::database::DatabaseStore>().test_query_only(true);
+        assert!(reg.revoke_project_approval(app.handle(), &fingerprint).await.is_err());
+        assert!(super::super::project_trust::is_approved(Some(app.handle()), &fingerprint));
+        release.notify_one();
+        let row = tokio::time::timeout(std::time::Duration::from_secs(10), start)
+            .await.unwrap().unwrap();
+        assert!(appears(&marker).await, "failed revocation cancelled approved startup");
+        assert!(!matches!(row.status, McpServerStatus::Starting));
+        app.state::<crate::database::DatabaseStore>().test_query_only(false);
+        reg.shutdown_all().await;
     }
 
     #[tokio::test]

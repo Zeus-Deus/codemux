@@ -1,6 +1,7 @@
 //! Minimal MCP Streamable HTTP client owned by the cross-provider registry.
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::Arc;
 
 use crate::json_rpc_child::Notification;
 use futures_util::StreamExt;
@@ -15,6 +16,11 @@ const MCP_PROTOCOL_VERSION: &str = "2025-06-18";
 pub(super) const NOTIFICATION_STREAM_ERROR: &str = "codemux/notification_stream_error";
 pub(super) const NOTIFICATION_STREAM_OPENED: &str = "codemux/notification_stream_opened";
 const INITIAL_GET_ATTEMPTS: usize = 6;
+
+#[cfg(test)]
+tokio::task_local! {
+    static BEFORE_INITIALIZED_SEND_GATE: (Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>);
+}
 
 pub(super) struct CatalogRefresh<'a> {
     client: &'a HttpMcpClient,
@@ -45,9 +51,24 @@ struct HttpSession {
     needs_initialization: bool,
 }
 
+/// Serializes admission of each project HTTP request with approval revocation.
+/// Responses and retries never hold the approval lock.
+#[derive(Debug)]
+pub(crate) struct HttpRequestAdmission {
+    approval_lock: Arc<Mutex<()>>,
+    cancelled: watch::Receiver<bool>,
+}
+
+impl HttpRequestAdmission {
+    pub(crate) fn new(approval_lock: Arc<Mutex<()>>, cancelled: watch::Receiver<bool>) -> Self {
+        Self { approval_lock, cancelled }
+    }
+}
+
 #[derive(Debug)]
 pub struct HttpMcpClient {
     http: reqwest::Client,
+    admission: Option<HttpRequestAdmission>,
     url: String,
     headers: HeaderMap,
     session: Mutex<HttpSession>,
@@ -61,6 +82,13 @@ pub struct HttpMcpClient {
 
 impl HttpMcpClient {
     pub async fn connect(config: &McpServerConfig) -> Result<Self, String> {
+        Self::connect_with_admission(config, None).await
+    }
+
+    pub(crate) async fn connect_with_admission(
+        config: &McpServerConfig,
+        admission: Option<HttpRequestAdmission>,
+    ) -> Result<Self, String> {
         let headers = headers_from_config(config)?;
         let mut http = reqwest::Client::builder().redirect(reqwest::redirect::Policy::none());
         // Local MCP credentials must never travel through an environment
@@ -72,6 +100,7 @@ impl HttpMcpClient {
             http: http
                 .build()
                 .map_err(|error| format!("build HTTP client: {error}"))?,
+            admission,
             url: config.command.clone(),
             headers,
             session: Mutex::new(HttpSession {
@@ -169,7 +198,7 @@ impl HttpMcpClient {
                 request = request.header("mcp-session-id", id);
             }
             let response = tokio::select! {
-                response = tokio::time::timeout(Duration::from_secs(5), request.send()) => response.ok().and_then(Result::ok),
+                response = tokio::time::timeout(Duration::from_secs(5), self.send_with_admission(request)) => response.ok().and_then(Result::ok),
                 _ = changes.changed() => continue,
             };
             if let Some(response) = response {
@@ -416,10 +445,45 @@ impl HttpMcpClient {
         if let Some(id) = session_id {
             request = request.header("mcp-session-id", id);
         }
-        request
-            .send()
-            .await
-            .map_err(|error| format!("HTTP request failed: {error}"))
+        #[cfg(test)]
+        if message.get("method").and_then(Value::as_str) == Some("notifications/initialized") {
+            if let Ok((entered, release)) = BEFORE_INITIALIZED_SEND_GATE.try_with(Clone::clone) {
+                entered.notify_one();
+                release.notified().await;
+            }
+        }
+        self.send_with_admission(request).await
+    }
+
+    async fn send_with_admission(
+        &self,
+        request: reqwest::RequestBuilder,
+    ) -> Result<reqwest::Response, String> {
+        let Some(admission) = &self.admission else {
+            return request.send().await.map_err(|error| format!("HTTP request failed: {error}"));
+        };
+        let guard = admission.approval_lock.lock().await;
+        let mut cancelled = admission.cancelled.clone();
+        if *cancelled.borrow() || cancelled.has_changed().is_err() {
+            return Err("MCP server stopped before HTTP request admission".into());
+        }
+        let send = request.send();
+        tokio::pin!(send);
+        // Poll the request once while revocation is excluded. Later network
+        // progress may await a response, so release the lock immediately.
+        let first = std::future::poll_fn(|cx| {
+            std::task::Poll::Ready(std::future::Future::poll(send.as_mut(), cx))
+        }).await;
+        drop(guard);
+        let result = match first {
+            std::task::Poll::Ready(result) => result,
+            std::task::Poll::Pending => tokio::select! {
+                biased;
+                _ = cancelled.changed() => return Err("MCP server stopped during HTTP request".into()),
+                result = send => result,
+            },
+        };
+        result.map_err(|error| format!("HTTP request failed: {error}"))
     }
 
     async fn read_response(
@@ -745,6 +809,51 @@ mod live_tests {
     };
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
+
+    #[tokio::test]
+    async fn revocation_before_initialized_request_sends_no_second_header() {
+        use mockito::Matcher;
+        let mut server = mockito::Server::new_async().await;
+        let initialize = server.mock("POST", "/mcp")
+            .match_body(Matcher::PartialJson(json!({"method": "initialize"})))
+            .with_header("content-type", "application/json")
+            .with_body(json!({"jsonrpc":"2.0","id":1,"result":{
+                "protocolVersion":"2025-06-18","capabilities":{},
+                "serverInfo":{"name":"fixture","version":"1"}
+            }}).to_string())
+            .expect(1).create_async().await;
+        let initialized = server.mock("POST", "/mcp")
+            .match_body(Matcher::PartialJson(json!({"method": "notifications/initialized"})))
+            .expect(0).create_async().await;
+        let config = McpServerConfig {
+            id: "project-http".into(), name: "project-http".into(), sources: vec![],
+            command: format!("{}/mcp", server.url()), args: vec![], env: Default::default(),
+            disabled: false, transport: super::super::McpTransport::Http,
+            raw: json!({"headers":{"x-secret":"fixture-secret"}}), project_root: None,
+        };
+        let approval_lock = Arc::new(Mutex::new(()));
+        let (cancel, cancelled) = watch::channel(false);
+        let admission = HttpRequestAdmission::new(approval_lock.clone(), cancelled);
+        let (entered, release) = (Arc::new(tokio::sync::Notify::new()), Arc::new(tokio::sync::Notify::new()));
+        let connect = BEFORE_INITIALIZED_SEND_GATE.scope(
+            (entered.clone(), release.clone()),
+            HttpMcpClient::connect_with_admission(&config, Some(admission)),
+        );
+        tokio::pin!(connect);
+        tokio::select! {
+            result = &mut connect => panic!("connect completed before initialized gate: {result:?}"),
+            _ = entered.notified() => {},
+        }
+        let guard = approval_lock.lock().await;
+        cancel.send_replace(true);
+        drop(guard);
+        release.notify_one();
+        let error = tokio::time::timeout(Duration::from_secs(5), connect)
+            .await.unwrap().unwrap_err();
+        assert!(error.contains("MCP server stopped"), "{error}");
+        initialize.assert_async().await;
+        initialized.assert_async().await;
+    }
 
     #[derive(Clone)]
     struct Fixture {

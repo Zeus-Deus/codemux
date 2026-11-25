@@ -26,7 +26,7 @@ use serde_json::{json, Value};
 
 use crate::json_rpc_child::{JsonRpcChild, RpcChildError, SpawnConfig};
 
-use super::http_client::HttpMcpClient;
+use super::http_client::{HttpMcpClient, HttpRequestAdmission};
 use super::{McpConfigSource, McpServerConfig, McpTransport};
 
 /// The revision this client offers in `initialize`. A server answers with it
@@ -178,29 +178,23 @@ impl McpServerHandle {
 /// `None` (we drop the child handle so the watchdog reaps it).
 ///
 pub async fn start_mcp_server(config: McpServerConfig) -> McpServerHandle {
-    start_mcp_server_cancellable(config, None, ()).await
+    start_mcp_server_cancellable(config, None, (), None).await
 }
 
-pub async fn start_mcp_server_cancellable<G: Send>(
+pub(crate) async fn start_mcp_server_cancellable<G: Send>(
     config: McpServerConfig,
     mut cancelled: Option<tokio::sync::watch::Receiver<bool>>,
     spawn_guards: G,
+    http_admission: Option<HttpRequestAdmission>,
 ) -> McpServerHandle {
     if matches!(config.transport, McpTransport::Http) {
-        // The first poll admits the outbound request while revocation is
-        // excluded by the approval guard. Release the guards immediately
-        // afterward so the network response cannot hold up revocation.
-        let http_start = start_http_mcp_server(config.clone());
-        tokio::pin!(http_start);
-        let mut admission_guards = Some(spawn_guards);
+        // Each outbound request acquires its own approval gate in the HTTP
+        // transport. The connection and response must not hold registry locks.
+        drop(spawn_guards);
         return tokio::select! {
             biased;
             _ = cancellation(&mut cancelled) => stopped_handle(config.clone()),
-            handle = std::future::poll_fn(|cx| {
-                let result = std::future::Future::poll(http_start.as_mut(), cx);
-                drop(admission_guards.take());
-                result
-            }) => handle,
+            handle = start_http_mcp_server(config.clone(), http_admission) => handle,
         };
     }
 
@@ -320,7 +314,10 @@ fn stopped_handle(config: McpServerConfig) -> McpServerHandle {
     handle
 }
 
-async fn start_http_mcp_server(config: McpServerConfig) -> McpServerHandle {
+async fn start_http_mcp_server(
+    config: McpServerConfig,
+    admission: Option<HttpRequestAdmission>,
+) -> McpServerHandle {
     if config.command.is_empty() {
         return McpServerHandle {
             stderr_tail: None,
@@ -335,7 +332,7 @@ async fn start_http_mcp_server(config: McpServerConfig) -> McpServerHandle {
             config,
         };
     }
-    let connected = tokio::time::timeout(HANDSHAKE_TIMEOUT, HttpMcpClient::connect(&config)).await;
+    let connected = tokio::time::timeout(HANDSHAKE_TIMEOUT, HttpMcpClient::connect_with_admission(&config, admission)).await;
     match connected {
         Err(_) => McpServerHandle {
             stderr_tail: None,
