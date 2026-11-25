@@ -1968,6 +1968,12 @@ impl AppStateStore {
         Some(build_pty_hydration_plan(&snapshot, workspace))
     }
 
+    #[cfg(unix)]
+    pub(crate) fn workspace_id_for_terminal_session(&self, session_id: &str) -> Option<String> {
+        let snapshot = self.inner.lock().unwrap();
+        find_workspace_id_for_session(&snapshot.workspaces, session_id).map(|id| id.0)
+    }
+
     /// Narrow one-session form used by normal pane creation. Restored
     /// workspace hydration uses [`Self::pty_hydration_plan_for_workspace`] so
     /// eight panes still cost one state read.

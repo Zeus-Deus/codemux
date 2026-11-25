@@ -21,6 +21,8 @@ use std::time::Duration;
 use tokio::process::Command;
 use tokio::time::timeout;
 
+use super::exec::verified_ssh_command;
+
 /// Minimum size (in bytes) a candidate `codemux-remote` binary must be
 /// before we'll treat it as a real, uploadable binary. The production
 /// binary is ~16 MB; the dev-build placeholder sidecars checked into
@@ -284,10 +286,7 @@ pub async fn bootstrap_remote<R: tauri::Runtime>(opts: BootstrapOptions<'_, R>) 
 
     // Step 4: verify by re-probing the version subcommand.
     let verify = run_capture_with_timeout(
-        Command::new("ssh")
-            .arg("-o")
-            .arg("BatchMode=yes")
-            .arg(opts.ssh_target)
+        verified_ssh_command(opts.ssh_target, 10)
             .arg(format!("{} version", opts.remote_install_path)),
         opts.timeout,
     )
@@ -409,12 +408,7 @@ pub async fn provision_scheduler(
     // Enable lingering (so the service runs without an active login)
     // and start the unit.
     run_with_timeout(
-        Command::new("ssh")
-            .arg("-o")
-            .arg("BatchMode=yes")
-            .arg("-o")
-            .arg("ConnectTimeout=10")
-            .arg(ssh_target)
+        verified_ssh_command(ssh_target, 10)
             .arg(format!(
                 "loginctl enable-linger \"$USER\" >/dev/null 2>&1; \
                  systemctl --user daemon-reload && \
@@ -471,12 +465,7 @@ pub async fn provision_serve(
     // wouldn't take effect until the next host reboot or manual
     // `systemctl --user restart`.
     run_with_timeout(
-        Command::new("ssh")
-            .arg("-o")
-            .arg("BatchMode=yes")
-            .arg("-o")
-            .arg("ConnectTimeout=10")
-            .arg(ssh_target)
+        verified_ssh_command(ssh_target, 10)
             .arg(format!(
                 "loginctl enable-linger \"$USER\" >/dev/null 2>&1; \
                  systemctl --user daemon-reload && \
@@ -528,12 +517,7 @@ pub async fn register_workspace_on_remote(
     }
 
     let out = run_capture_with_timeout(
-        Command::new("ssh")
-            .arg("-o")
-            .arg("BatchMode=yes")
-            .arg("-o")
-            .arg("ConnectTimeout=10")
-            .arg(ssh_target)
+        verified_ssh_command(ssh_target, 10)
             .arg(&script),
         deadline,
     )
@@ -657,13 +641,7 @@ pub(crate) async fn ssh_upload_executable(
 
     let script = upload_script(remote_path, len);
 
-    let mut child = Command::new("ssh")
-        .arg("-o")
-        .arg("BatchMode=yes")
-        .arg("-o")
-        .arg("ConnectTimeout=10")
-        .arg("--")
-        .arg(ssh_target)
+    let mut child = verified_ssh_command(ssh_target, 10)
         .arg(&script)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -717,12 +695,7 @@ async fn ssh_write_file(
 ) -> Result<(), String> {
     use tokio::io::AsyncWriteExt;
 
-    let mut child = Command::new("ssh")
-        .arg("-o")
-        .arg("BatchMode=yes")
-        .arg("-o")
-        .arg("ConnectTimeout=10")
-        .arg(ssh_target)
+    let mut child = verified_ssh_command(ssh_target, 10)
         .arg({
             // Tilde-aware shell quoting (see ssh_upload_executable):
             // keeps `~/` expandable, quotes the body, neutralizes any
@@ -834,15 +807,7 @@ mod tests {
     /// The new code path goes through the remote shell and works.
     #[tokio::test]
     async fn ssh_upload_executable_works_against_localhost() {
-        // BatchMode test: are we allowed to ssh to ourselves without
-        // a password prompt? If not, skip.
-        let probe = std::process::Command::new("ssh")
-            .arg("-o").arg("BatchMode=yes")
-            .arg("-o").arg("ConnectTimeout=3")
-            .arg("-o").arg("StrictHostKeyChecking=accept-new")
-            .arg("localhost")
-            .arg("true")
-            .output();
+        let probe = verified_ssh_command("localhost", 3).arg("true").output().await;
         let probe_ok = matches!(probe, Ok(out) if out.status.success());
         if !probe_ok {
             eprintln!("[test] skipping: ssh BatchMode=yes localhost not reachable");

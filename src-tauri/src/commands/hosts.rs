@@ -353,7 +353,7 @@ pub async fn hosts_test_connection<R: tauri::Runtime>(
             }
             ProbeOutcome::Unreachable { reason } => HostTestResult {
                 ok: false,
-                message: reason,
+                message: device_connection_error(reason),
                 needs_install: false,
                 uname: None,
             },
@@ -370,6 +370,24 @@ pub async fn hosts_test_connection<R: tauri::Runtime>(
             needs_install: false,
             uname: None,
         })
+    }
+}
+
+#[cfg(unix)]
+fn is_host_key_error(reason: &str) -> bool {
+    reason.contains("Host key verification failed")
+        || reason.contains("REMOTE HOST IDENTIFICATION HAS CHANGED")
+}
+
+#[cfg(unix)]
+fn device_connection_error(reason: String) -> String {
+    if is_host_key_error(&reason) {
+        format!(
+            "SSH could not verify this device's host key. Confirm its fingerprint with the \
+             device administrator, then add the matching key to your SSH known_hosts and retry.\n{reason}"
+        )
+    } else {
+        reason
     }
 }
 
@@ -545,9 +563,8 @@ fn mark_host_ready<R: tauri::Runtime>(app: &tauri::AppHandle<R>, host_id: i64) {
 ///
 /// This is the dev-workflow escape hatch behind the "Reinstall agent on
 /// host" button in Settings → Hosts. Rebuilding `codemux-remote` from a
-/// branch keeps the version string the same, so the push-time version
-/// check (`ensure_remote_binary_current`) sees a match and skips the
-/// upgrade — leaving the host running a stale binary. This command always
+/// branch keeps the version string the same, so checking the installed
+/// version cannot tell it apart from the previous build. This command always
 /// re-uploads the freshly built bits (and kills the running pty-daemon),
 /// so the next push uses them. No manual `scp` + `pkill` needed.
 ///
@@ -625,6 +642,9 @@ pub async fn workspace_push_to_host<R: tauri::Runtime>(
     // doesn't leave the workspace in a half-remote state.
     host_id: i64,
 ) -> Result<crate::commands::hosts::WorkspacePushOutcome, String> {
+    #[cfg(unix)]
+    let migration = crate::commands::agent_chat::begin_workspace_migration(&workspace_id).await;
+
     let app_state: tauri::State<'_, crate::state::AppStateStore> = app.state();
     let snapshot = app_state.snapshot();
     let ws = snapshot
@@ -665,34 +685,6 @@ pub async fn workspace_push_to_host<R: tauri::Runtime>(
 
     #[cfg(unix)]
     {
-        // Auto-update the remote codemux-remote binary if our version
-        // doesn't match what's installed on the host. Skipping this is
-        // what made the cwd bug so painful: my fix lived in the local
-        // binary but pandora was still running the May-16 build, and
-        // every "the bug isn't fixed" loop was actually "the binary
-        // we sent commands to didn't have the fix yet."
-        //
-        // Cheap when versions match (one SSH probe, ~1s). When they
-        // differ we re-bootstrap (~10s) — but that only happens once
-        // per Codemux version bump, and the next call is back to fast.
-        //
-        // For dev users editing daemon code without bumping the version
-        // string, the version check passes and the stale-binary problem
-        // returns. Workaround: manually re-scp, or rebuild + clear
-        // ~/.local/bin/codemux-remote on the remote so the version
-        // probe sees MISSING and triggers a bootstrap.
-        if let Err(error) = ensure_remote_binary_current(&app, &host).await {
-            // Don't block the push on this — if the auto-update fails,
-            // the push may still work with the older binary. Log loudly
-            // so we know to look here next time something cwd-shaped
-            // misbehaves.
-            eprintln!(
-                "[hosts] auto-update of codemux-remote on {} failed (continuing \
-                 with existing binary): {error}",
-                host.name
-            );
-        }
-
         // Key the host landing path on project_uid so two different repos
         // sharing a basename don't clobber each other on the host. The exact
         // landing path is recorded (origin_path), so pull-back resolves it
@@ -715,159 +707,75 @@ pub async fn workspace_push_to_host<R: tauri::Runtime>(
         // conversations there. The next send then starts each one where the
         // workspace runs (the host once this succeeds), resuming its
         // conversation. Every outcome releases the gate.
-        let migration =
-            crate::commands::agent_chat::begin_workspace_migration(&app, &workspace_id).await;
+        let target_matches = || {
+            db.list_hosts().into_iter().any(|current| {
+                current.id == host_id && current.ssh_target == host.ssh_target
+            })
+        };
+        let prepare_error = |error| {
+            device_connection_error(format!("Could not prepare {}: {error}", host.name))
+        };
+        let helper = verify_workspace_push_helper(&host.ssh_target)
+            .await
+            .map_err(prepare_error)?;
+        let daemon_running =
+            crate::ssh::tunnel::verify_workspace_daemon(&host.ssh_target, &workspace_id)
+                .await
+                .map_err(prepare_error)?;
+        if !daemon_running {
+            helper.check_prepared_spawn().map_err(prepare_error)?;
+            // Version metadata cannot tell whether sshd allows forwarding.
+            crate::ssh::tunnel::verify_installed_workspace_daemon(&host.ssh_target)
+                .await
+                .map_err(prepare_error)?;
+        }
+        if !target_matches() {
+            return Err("The saved SSH target changed before the copy.".into());
+        }
+        crate::commands::agent_chat::stop_workspace_chat_sessions(&app, &workspace_id).await;
+        if !target_matches() {
+            return Err("The saved SSH target changed before the copy.".into());
+        }
         let result = crate::ssh::push_workspace(opts).await;
         let outcome = match result {
             crate::ssh::PushResult::Pushed { rsync_summary, .. } => {
                 // Atomicity guarantee — see fn doc. Stamp host_id
                 // ONLY after rsync confirms success.
-                if let Err(error) =
+                let assignment = if target_matches() {
                     app_state.set_workspace_host_id(&workspace_id, Some(host_id))
-                {
-                    eprintln!(
-                        "[hosts] push succeeded but host_id assignment failed: {error}"
-                    );
-                }
-                // Spawn (or replace) the TunnelSupervisor that keeps
-                // the remote daemon reachable. The supervisor handles
-                // SSH flaps with its built-in exponential backoff +
-                // circuit breaker. Registered by workspace id so
-                // subsequent push/pull/close can find and shut it
-                // down.
-                let local_socket =
-                    crate::ssh::local_socket_for_workspace(&workspace_id);
-                let remote_socket =
-                    crate::ssh::remote_socket_for_workspace(&workspace_id);
-                // Forget the cached PtyDaemonClient BEFORE
-                // installing the new supervisor. A re-push with a
-                // stale client in cache would have the next spawn
-                // attempt connect to the OLD tunnel's socket
-                // (which is about to be torn down), causing the
-                // shell to hang at "Starting…" forever.
-                crate::ssh::forget_workspace_client(&workspace_id).await;
-                let supervisor = crate::ssh::TunnelSupervisor::spawn(
-                    host.ssh_target.clone(),
-                    remote_socket,
-                    local_socket,
-                    // Absolute path via $HOME, not bare
-                    // `codemux-remote`. Non-interactive SSH
-                    // shells often don't have ~/.local/bin on
-                    // PATH (only interactive shells do, via
-                    // ~/.profile / ~/.bashrc). Bootstrap installs
-                    // here, tunnel must reach here.
-                    "$HOME/.local/bin/codemux-remote".to_string(),
-                );
-                crate::ssh::install_supervisor(&workspace_id, supervisor.clone())
-                    .await;
-                // Surface reconnect / circuit-open state to the UI for this
-                // freshly-pushed workspace.
-                crate::ssh::spawn_tunnel_status_forwarder(
-                    app.clone(),
-                    workspace_id.clone(),
-                    &supervisor,
-                );
-
-                // Sync Claude session JSONLs from
-                // ~/.claude/projects/<local-encoded>/ to the
-                // remote's matching encoded path, so a fresh
-                // `claude --resume <uuid>` on the remote finds the
-                // conversation history. Best-effort: failure here
-                // only loses continuity, never blocks the push.
-                //
-                // We need the REMOTE's absolute cwd (with remote
-                // $HOME) for the encoded dir name. Query $HOME via
-                // ssh — ~1s round trip, only when there's actually
-                // local history to sync.
-                let local_workspace_cwd =
-                    std::path::PathBuf::from(&ws.cwd);
-                if !local_workspace_cwd.as_os_str().is_empty() {
-                    match tokio::process::Command::new("ssh")
-                        .arg("-o")
-                        .arg("BatchMode=yes")
-                        .arg(&host.ssh_target)
-                        .arg("echo $HOME")
-                        .output()
-                        .await
-                    {
-                        Ok(out) if out.status.success() => {
-                            let remote_home =
-                                String::from_utf8_lossy(&out.stdout)
-                                    .trim()
-                                    .to_string();
-                            if !remote_home.is_empty() {
-                                // Build the remote absolute cwd from the path we
-                                // ACTUALLY pushed to (`remote_path_str`, already
-                                // uid-keyed and root-aware), not a recomputed
-                                // basename — otherwise a uid-keyed pushed
-                                // workspace's history syncs to the wrong encoded
-                                // dir and `claude --resume` finds nothing.
-                                let remote_absolute_cwd =
-                                    resolve_remote_cwd(&remote_home, &remote_path_str);
-                                if let Err(error) = sync_claude_projects(
-                                    &host.ssh_target,
-                                    &local_workspace_cwd,
-                                    &remote_absolute_cwd,
-                                )
-                                .await
-                                {
-                                    eprintln!(
-                                        "[hosts] Claude JSONL sync failed (continuing — \
-                                         agent will launch but conversation will be \
-                                         fresh): {error}"
-                                    );
-                                }
-
-                                // OpenCode conversation sync (issue #16):
-                                // export this workspace's active OpenCode
-                                // session from the laptop's opencode.db and
-                                // import it into the host's DB associated
-                                // with the remote cwd, so the remote
-                                // relaunch (`opencode --session <id>`)
-                                // continues the laptop's conversation. Only
-                                // this one session id is touched — the
-                                // host's other OpenCode sessions are never
-                                // clobbered. Best-effort, same as Claude.
-                                match crate::ssh::sync_opencode_session(
-                                    &host.ssh_target,
-                                    &local_workspace_cwd,
-                                    &remote_absolute_cwd,
-                                )
-                                .await
-                                {
-                                    Ok(Some(oc_session_id)) => {
-                                        // Stash the id so the daemon-backed
-                                        // remote relaunch can target the
-                                        // exact synced session.
-                                        record_opencode_session_capture(
-                                            &app,
-                                            &workspace_id,
-                                            &oc_session_id,
-                                        );
-                                    }
-                                    Ok(None) => {}
-                                    Err(error) => eprintln!(
-                                        "[hosts] OpenCode session sync failed (continuing \
-                                         — agent will launch with a fresh conversation): \
-                                         {error}"
-                                    ),
-                                }
-                            }
-                        }
-                        Ok(out) => eprintln!(
-                            "[hosts] ssh 'echo $HOME' failed (status {}); \
-                             skipping Claude JSONL sync",
-                            out.status
+                } else {
+                    Err("the saved SSH target changed during the copy".into())
+                };
+                if let Err(error) = assignment {
+                    return Ok(WorkspacePushOutcome {
+                        ok: false,
+                        message: format!(
+                            "Workspace copied to {}. Host assignment failed with {error}.",
+                            host.name
                         ),
-                        Err(e) => eprintln!(
-                            "[hosts] ssh 'echo $HOME' spawn failed: {e}; \
-                             skipping Claude JSONL sync"
-                        ),
-                    }
+                        remote_path: Some(remote_path_str),
+                        rsync_summary: Some(rsync_summary),
+                    });
                 }
-                // host_id names the host and the conversations are there:
-                // chats may start again, on the host.
-                drop(migration);
+                // Seal the prior terminal handles at the placement commit.
+                // Guarded cleanup retains the route that owns each old shell.
+                let closing = terminate_workspace_sessions(&app, &workspace_id);
+                crate::terminal::emit_migrating_for_workspace(
+                    &app, &workspace_id, &format!("Switching to {}…", host.name),
+                );
+                let mut tunnel_error = crate::ssh::registry::replace_workspace_tunnel(
+                    &app, &workspace_id, host_id, &host.ssh_target,
+                    drain_terminal_closes(closing),
+                ).await.err();
+
+                sync_workspace_history(
+                    &app,
+                    &workspace_id,
+                    &host.ssh_target,
+                    std::path::Path::new(&ws.cwd),
+                    &remote_path_str,
+                    HistoryDirection::Push,
+                ).await;
 
                 // Close any pre-existing sessions on this workspace's
                 // remote daemon BEFORE respawning. The daemon process
@@ -887,98 +795,79 @@ pub async fn workspace_push_to_host<R: tauri::Runtime>(
                 //
                 // Filter defensively by workspace_id anyway in case
                 // that invariant ever changes.
-                match crate::ssh::client_for_workspace(
-                    &app,
-                    &workspace_id,
-                    Some(host_id),
-                )
-                .await
-                {
-                    Ok(remote_client) => match remote_client.list().await {
-                        Ok(remote_sessions) => {
-                            let mut closed = 0usize;
-                            for s in remote_sessions {
-                                if !s.workspace_id.is_empty()
-                                    && s.workspace_id != workspace_id
-                                {
-                                    continue;
+                if tunnel_error.is_none() {
+                    match crate::ssh::client_for_workspace(
+                        &app,
+                        &workspace_id,
+                        Some(host_id),
+                    )
+                    .await
+                    {
+                        Ok(remote_client) => match remote_client.list().await {
+                            Ok(remote_sessions) => {
+                                let mut closed = 0usize;
+                                for s in remote_sessions {
+                                    if !s.workspace_id.is_empty()
+                                        && s.workspace_id != workspace_id
+                                    {
+                                        continue;
+                                    }
+                                    if let Err(e) =
+                                        remote_client.close(s.session_id.clone()).await
+                                    {
+                                        eprintln!(
+                                            "[hosts] failed to close stale remote session \
+                                             {} on push: {e}",
+                                            s.session_id
+                                        );
+                                    } else {
+                                        closed += 1;
+                                    }
                                 }
-                                if let Err(e) =
-                                    remote_client.close(s.session_id.clone()).await
-                                {
-                                    eprintln!(
-                                        "[hosts] failed to close stale remote session \
-                                         {} on push: {e}",
-                                        s.session_id
-                                    );
-                                } else {
-                                    closed += 1;
-                                }
+                                eprintln!(
+                                    "[hosts] closed {closed} stale remote session(s) for \
+                                     workspace {workspace_id} before respawn"
+                                );
                             }
-                            eprintln!(
-                                "[hosts] closed {closed} stale remote session(s) for \
-                                 workspace {workspace_id} before respawn"
-                            );
+                            Err(e) => eprintln!(
+                                "[hosts] failed to list remote sessions before respawn: {e}"
+                            ),
+                        },
+                        Err(error) => {
+                            tunnel_error = Some(error.to_string());
                         }
-                        Err(e) => eprintln!(
-                            "[hosts] failed to list remote sessions before respawn: {e}"
-                        ),
-                    },
-                    Err(e) => eprintln!(
-                        "[hosts] failed to reach remote daemon for pre-respawn \
-                         cleanup: {e} (continuing — fresh sessions will be created \
-                         but stale ones may persist on the daemon)"
-                    ),
+                    }
                 }
 
-                // Stop-sync-restart for live PTYs: terminate the
-                // workspace's existing local sessions, then
-                // explicitly re-spawn each pane's session so the
-                // user's terminals come back online on the remote
-                // daemon. We tried "let the frontend respawn from
-                // GC" originally but the frontend has no auto-
-                // respawn path (the cache GC only DISPOSES dead
-                // entries); without an explicit backend respawn
-                // the user just sees "shell ended" overlays and
-                // has to manually close + reopen every pane.
-                //
-                // `spawn_pty_for_session` is idempotent per
-                // session id (gated by `try_reserve_session_spawn`),
-                // and now routes through `client_for_workspace`
-                // which sees host_id is set → remote daemon →
-                // fresh shells appear on the host machine.
-                terminate_workspace_sessions(&app, &workspace_id);
-                // Show a "Switching to <host>…" overlay on every pane for the
-                // window between the old PTYs dying and the remote replacements
-                // producing output. Without it the user stares at frozen local
-                // scrollback with no signal anything is happening. Auto-dismissed
-                // when the respawned session goes Ready / emits its first output.
-                crate::terminal::emit_migrating_for_workspace(
-                    &app,
-                    &workspace_id,
-                    &format!("Switching to {}…", host.name),
-                );
+                // Restart panes after the remote history and daemon are ready.
+                drop(migration);
                 crate::terminal::spawn_missing_ptys_for_workspace(
                     app.clone(),
                     &workspace_id,
                 );
                 WorkspacePushOutcome {
                     ok: true,
-                    message: format!("Workspace pushed to {}", host.name),
+                    message: match tunnel_error {
+                        Some(error) => format!(
+                            "Workspace copied to {}. Terminal connection failed with {error}.",
+                            host.name
+                        ),
+                        None => format!("Pushed to {}", host.name),
+                    },
                     remote_path: Some(remote_path_str.clone()),
                     rsync_summary: Some(rsync_summary),
                 }
             }
             crate::ssh::PushResult::RsyncFailed { reason } => WorkspacePushOutcome {
                 ok: false,
-                message: format!("rsync failed: {reason}"),
+                message: device_connection_error(format!("rsync failed: {reason}")),
                 remote_path: None,
                 rsync_summary: None,
             },
             crate::ssh::PushResult::HostUnreachable { reason } => {
                 WorkspacePushOutcome {
                     ok: false,
-                    message: format!("Host unreachable: {reason}"),
+                    message: device_connection_error(format!("Host unreachable: {reason}")),
                     remote_path: None,
                     rsync_summary: None,
                 }
@@ -1036,6 +925,12 @@ pub async fn workspace_pull_back_impl<R: tauri::Runtime>(
     app: tauri::AppHandle<R>,
     workspace_id: String,
 ) -> Result<WorkspacePullOutcome, String> {
+    // Acquire the migration gate before capturing the host and source path.
+    // A transfer queued behind another move must use the committed placement.
+    #[cfg(unix)]
+    let migration =
+        crate::commands::agent_chat::begin_workspace_migration(&workspace_id).await;
+
     // Resolve State guards in a tight pre-await scope and capture
     // owned values so the State guards drop before any `.await`
     // (they are not Send).
@@ -1145,169 +1040,57 @@ pub async fn workspace_pull_back_impl<R: tauri::Runtime>(
         // De-dup while preserving order (uid-keyed == basename when no uid).
         candidate_sources.dedup();
 
-        // Same as push: stop the workspace's chat sessions before copying
-        // it back, so none keeps editing the host copy, and hold new ones
-        // off until host_id is cleared, so the next send starts each one on
-        // this computer once this succeeds. Every outcome releases the gate.
-        let migration =
-            crate::commands::agent_chat::begin_workspace_migration(&app, &workspace_id).await;
-
-        // Try each candidate; only a "remote path missing" outcome is
-        // worth retrying the next one — success / rsync error / host
-        // unreachable are all authoritative. Remember which source we
-        // settled on so the Claude JSONL sync below encodes the dir from
-        // the path we ACTUALLY pulled from (uid-keyed or origin_path),
-        // not a recomputed basename.
-        let mut result_opt = None;
-        let mut pulled_src: Option<String> = None;
+        // Resolve the source under the migration gate before interrupting
+        // active chats. Only a missing directory allows trying a fallback.
+        let mut preparation = None;
         for src in &candidate_sources {
-            let opts =
-                crate::ssh::PullOptions::new(&host.ssh_target, src, &local_worktree);
-            let r = crate::ssh::pull_workspace_back(opts).await;
-            let keep_trying = matches!(r, crate::ssh::PullResult::RemoteNotFound { .. });
-            pulled_src = Some(src.clone());
-            result_opt = Some(r);
+            let opts = crate::ssh::PullOptions::new(&host.ssh_target, src, &local_worktree);
+            let verified = opts.verify_source().await;
+            let keep_trying = matches!(&verified, Err(crate::ssh::PullResult::RemoteNotFound { .. }));
+            preparation = Some((verified, src));
             if !keep_trying {
                 break;
             }
         }
-        // candidate_sources is never empty, so this always resolves.
-        let result = result_opt.expect("at least one pull source candidate");
+        let (verified, pulled_src) = preparation.expect("at least one pull source candidate");
+        let result = match verified {
+            Ok(verified) => {
+                // A device can be edited while SSH runs or its chats shut down.
+                let target_matches = || {
+                    app.state::<DatabaseStore>().list_hosts().iter().any(|current| {
+                        current.id == host.id && current.ssh_target == host.ssh_target
+                    })
+                };
+                if !target_matches() {
+                    return Err("The saved SSH source changed before the copy.".into());
+                }
+                crate::commands::agent_chat::stop_workspace_chat_sessions(&app, &workspace_id).await;
+                if !target_matches() {
+                    return Err("The saved SSH source changed before the copy.".into());
+                }
+                verified.transfer().await
+            }
+            Err(result) => result,
+        };
         let outcome = match result {
             crate::ssh::PullResult::Pulled { rsync_summary, .. } => {
-                // Symmetric Claude JSONL sync (remote → local) BEFORE
-                // we kill the remote and respawn locally. Without this,
-                // any conversation continuation that happened on the
-                // remote would be lost on pull-back.
-                //
-                // SAFETY: we only sync the workspace's specific
-                // encoded directory (not the whole projects/ tree),
-                // and we use rsync's default per-file mtime/size
-                // comparison so newer files (the remote's continued
-                // session) overwrite older ones (laptop's pre-push
-                // version). We do NOT pass --delete, so any local-
-                // only session files (e.g. older runs that never
-                // went to the remote) survive untouched.
-                let local_workspace_cwd =
-                    std::path::PathBuf::from(&ws.cwd);
-                if !local_workspace_cwd.as_os_str().is_empty() {
-                    match tokio::process::Command::new("ssh")
-                        .arg("-o")
-                        .arg("BatchMode=yes")
-                        .arg(&host.ssh_target)
-                        .arg("echo $HOME")
-                        .output()
-                        .await
-                    {
-                        Ok(out) if out.status.success() => {
-                            let remote_home =
-                                String::from_utf8_lossy(&out.stdout)
-                                    .trim()
-                                    .to_string();
-                            if !remote_home.is_empty() {
-                                // Derive the remote cwd from the path we ACTUALLY
-                                // pulled from (`origin_path` or the uid-keyed
-                                // candidate that resolved), not a recomputed
-                                // basename — so a uid-keyed workspace's history
-                                // pulls back from the right encoded dir. The
-                                // fallback is unreachable in practice (a `Pulled`
-                                // result implies a source succeeded) but stays
-                                // safe by reconstructing the uid-keyed path.
-                                let remote_source = match pulled_src.as_deref() {
-                                    Some(src) => src.to_string(),
-                                    None => {
-                                        let p = if is_root {
-                                            crate::workspace_paths::conventional_remote_root_path_keyed(
-                                                puid,
-                                                &project_name,
-                                            )
-                                        } else {
-                                            crate::ssh::conventional_remote_path_keyed(
-                                                puid,
-                                                &project_name,
-                                                &branch,
-                                            )
-                                        };
-                                        p.to_string_lossy().to_string()
-                                    }
-                                };
-                                let remote_absolute_cwd =
-                                    resolve_remote_cwd(&remote_home, &remote_source);
-                                if let Err(error) = pull_claude_projects(
-                                    &host.ssh_target,
-                                    &remote_absolute_cwd,
-                                    &local_workspace_cwd,
-                                )
-                                .await
-                                {
-                                    eprintln!(
-                                        "[hosts] Claude JSONL pull-back failed \
-                                         (continuing — agent will launch with whatever \
-                                         conversation history was already local): {error}"
-                                    );
-                                }
-
-                                // OpenCode pull-back (issue #16): symmetric
-                                // to the push sync — export the host's
-                                // (possibly-extended) OpenCode session and
-                                // import it back into the laptop's DB so the
-                                // local relaunch continues the conversation
-                                // that happened on the host.
-                                match crate::ssh::pull_opencode_session(
-                                    &host.ssh_target,
-                                    &remote_absolute_cwd,
-                                    &local_workspace_cwd,
-                                )
-                                .await
-                                {
-                                    Ok(Some(oc_session_id)) => {
-                                        record_opencode_session_capture(
-                                            &app,
-                                            &workspace_id,
-                                            &oc_session_id,
-                                        );
-                                    }
-                                    Ok(None) => {}
-                                    Err(error) => eprintln!(
-                                        "[hosts] OpenCode pull-back failed (continuing — \
-                                         agent will launch with whatever conversation \
-                                         history was already local): {error}"
-                                    ),
-                                }
-                            }
-                        }
-                        Ok(out) => eprintln!(
-                            "[hosts] ssh 'echo $HOME' failed on pull-back (status {}); \
-                             skipping Claude JSONL sync",
-                            out.status
-                        ),
-                        Err(e) => eprintln!(
-                            "[hosts] ssh 'echo $HOME' spawn failed on pull-back: {e}; \
-                             skipping Claude JSONL sync"
-                        ),
-                    }
-                }
+                sync_workspace_history(
+                    &app,
+                    &workspace_id,
+                    &host.ssh_target,
+                    std::path::Path::new(&ws.cwd),
+                    pulled_src,
+                    HistoryDirection::Pull,
+                ).await;
 
                 // On success: clear host_id so the workspace is local
                 // again and the next pane spawn uses the local
                 // pty-daemon.
                 app_state.set_workspace_host_id(&workspace_id, None)?;
-                // The conversations came back above: chats may start again,
-                // here.
-                drop(migration);
-                // Forget the cached tunneled client BEFORE shutting
-                // down the supervisor — order matters because the
-                // cached client holds a socket that the supervisor
-                // is about to unbind.
-                crate::ssh::forget_workspace_client(&workspace_id).await;
-                crate::ssh::shutdown_supervisor(&workspace_id).await;
-                // Symmetric to push: terminate remote-routed PTY
-                // sessions and immediately respawn each pane's
-                // session on the local daemon (host_id is now
-                // None, so `client_for_workspace` returns the
-                // local singleton). Same agent-caveat as push —
-                // see the long comment in `workspace_push_to_host`.
-                terminate_workspace_sessions(&app, &workspace_id);
+                let closing = terminate_workspace_sessions(&app, &workspace_id);
+                crate::ssh::registry::shutdown_supervisor_after(
+                    &workspace_id, drain_terminal_closes(closing),
+                ).await;
                 // Mirror of the push overlay: "Returning to this device…" while
                 // the remote PTYs are torn down and the local replacements come
                 // up. Same auto-dismiss on Ready / first output.
@@ -1316,6 +1099,7 @@ pub async fn workspace_pull_back_impl<R: tauri::Runtime>(
                     &workspace_id,
                     "Returning to this device…",
                 );
+                drop(migration);
                 crate::terminal::spawn_missing_ptys_for_workspace(
                     app.clone(),
                     &workspace_id,
@@ -1329,14 +1113,14 @@ pub async fn workspace_pull_back_impl<R: tauri::Runtime>(
             crate::ssh::PullResult::RsyncFailed { reason } => {
                 WorkspacePullOutcome {
                     ok: false,
-                    message: format!("rsync failed: {reason}"),
+                    message: device_connection_error(format!("rsync failed: {reason}")),
                     rsync_summary: None,
                 }
             }
             crate::ssh::PullResult::HostUnreachable { reason } => {
                 WorkspacePullOutcome {
                     ok: false,
-                    message: format!("Host unreachable: {reason}"),
+                    message: device_connection_error(format!("Host unreachable: {reason}")),
                     rsync_summary: None,
                 }
             }
@@ -1395,6 +1179,67 @@ fn schedule_background_sync<R: tauri::Runtime>(app: tauri::AppHandle<R>) {
     });
 }
 
+#[cfg(unix)]
+#[derive(Clone, Copy)]
+enum HistoryDirection {
+    Push,
+    Pull,
+}
+
+// The deadline covers both providers and the home-directory probe. A large
+// history transfer may time out, but should never keep terminal hydration
+// behind the workspace migration gate indefinitely.
+#[cfg(unix)]
+const WORKSPACE_HISTORY_BUDGET: std::time::Duration = std::time::Duration::from_secs(60);
+
+#[cfg(unix)]
+async fn sync_workspace_history<R: tauri::Runtime>(
+    app: &tauri::AppHandle<R>,
+    workspace_id: &str,
+    ssh_target: &str,
+    local_cwd: &std::path::Path,
+    remote_path: &str,
+    direction: HistoryDirection,
+) {
+    if local_cwd.as_os_str().is_empty() {
+        return;
+    }
+    use crate::ssh::history_process::{output, ssh_command, within_deadline};
+    let result = within_deadline(WORKSPACE_HISTORY_BUDGET, async {
+        let mut command = ssh_command(ssh_target);
+        command.arg("echo $HOME");
+        let probe = output(&mut command, None)
+            .await
+            .map_err(|error| format!("SSH home probe failed: {error}"))?;
+        if !probe.status.success() {
+            return Err(format!("SSH home probe exited with {}", probe.status));
+        }
+        let home = String::from_utf8_lossy(&probe.stdout);
+        let home = home.trim();
+        if home.is_empty() {
+            return Err("SSH home probe returned an empty path".into());
+        }
+        // Use the actual path selected by the workspace transfer.
+        let remote_cwd = resolve_remote_cwd(home, remote_path);
+        let claude = match direction {
+            HistoryDirection::Push => sync_claude_projects(ssh_target, local_cwd, &remote_cwd).await,
+            HistoryDirection::Pull => pull_claude_projects(ssh_target, &remote_cwd, local_cwd).await,
+        };
+        if let Err(error) = claude {
+            eprintln!("[hosts] Claude history sync failed: {error}");
+        }
+        match direction {
+            HistoryDirection::Push => crate::ssh::sync_opencode_session(ssh_target, local_cwd, &remote_cwd).await,
+            HistoryDirection::Pull => crate::ssh::pull_opencode_session(ssh_target, &remote_cwd, local_cwd).await,
+        }
+    }).await;
+    match result {
+        Ok(Some(session_id)) => record_opencode_session_capture(app, workspace_id, &session_id),
+        Ok(None) => {}
+        Err(error) => eprintln!("[hosts] Continuing workspace move after history sync: {error}"),
+    }
+}
+
 /// Resolve a remote workspace path — which may be `~/`-relative (the
 /// conventional / uid-keyed landing) or already absolute (a daemon-recorded
 /// `origin_path`) — into an absolute path under the remote `$HOME`.
@@ -1431,7 +1276,8 @@ async fn sync_claude_projects(
     local_cwd: &std::path::Path,
     remote_cwd: &std::path::Path,
 ) -> Result<(), String> {
-    use tokio::process::Command;
+    use crate::ssh::exec::rsync_transport;
+    use crate::ssh::history_process::{output, ssh_command};
 
     // Step 1: figure out the laptop-side source dir. If no Claude
     // session has ever been started in this workspace, the dir
@@ -1443,7 +1289,9 @@ async fn sync_claude_projects(
         .join(".claude")
         .join("projects")
         .join(&local_dir_name);
-    if !local_source.exists() {
+    if !tokio::fs::try_exists(&local_source).await.map_err(|error| {
+        format!("inspect local Claude history: {error}")
+    })? {
         eprintln!(
             "[hosts] no local Claude session history for this workspace \
              ({}); skipping JSONL sync",
@@ -1463,17 +1311,15 @@ async fn sync_claude_projects(
     // Step 3: ensure the remote dest dir exists. rsync creates the
     // LAST path component but not parents; mkdir -p covers the
     // ~/.claude/projects/<encoded>/ chain in one shot.
-    let mkdir = Command::new("ssh")
-        .arg("-o")
-        .arg("BatchMode=yes")
-        .arg(ssh_target)
-        .arg(format!(
-            "mkdir -p ~/.claude/projects/{}",
-            shell_word_quote(&remote_dir_name)
-        ))
-        .status()
+    let mut command = ssh_command(ssh_target);
+    command.arg(format!(
+        "mkdir -p ~/.claude/projects/{}",
+        shell_word_quote(&remote_dir_name)
+    ));
+    let mkdir = output(&mut command, None)
         .await
-        .map_err(|e| format!("ssh mkdir spawn: {e}"))?;
+        .map_err(|error| format!("ssh mkdir: {error}"))?
+        .status;
     if !mkdir.success() {
         return Err(format!("mkdir on remote failed (status: {mkdir})"));
     }
@@ -1483,17 +1329,16 @@ async fn sync_claude_projects(
     // --delete because the remote may have OTHER sessions started
     // there that we don't want to wipe.
     let source_with_slash = format!("{}/", local_source.display());
-    let rsync = Command::new("rsync")
-        .arg("-a")
-        .arg("--no-owner")
-        .arg("--no-group")
-        .arg("-e")
-        .arg("ssh -o BatchMode=yes")
+    let mut command = crate::execution::host_command_tokio("rsync");
+    command.args(["-a", "--no-owner", "--no-group", "-e"])
+        .arg(rsync_transport())
+        .arg("--")
         .arg(&source_with_slash)
-        .arg(&remote_dest)
-        .status()
+        .arg(&remote_dest);
+    let rsync = output(&mut command, None)
         .await
-        .map_err(|e| format!("rsync spawn: {e}"))?;
+        .map_err(|error| format!("rsync: {error}"))?
+        .status;
     if !rsync.success() {
         return Err(format!("rsync failed (status: {rsync})"));
     }
@@ -1536,7 +1381,8 @@ async fn pull_claude_projects(
     remote_cwd: &std::path::Path,
     local_cwd: &std::path::Path,
 ) -> Result<(), String> {
-    use tokio::process::Command;
+    use crate::ssh::exec::rsync_transport;
+    use crate::ssh::history_process::{output, ssh_command};
 
     let local_home = std::env::var("HOME")
         .map_err(|_| "HOME env var not set on laptop".to_string())?;
@@ -1547,25 +1393,23 @@ async fn pull_claude_projects(
         .join(&local_dir_name);
     // mkdir the local destination if it doesn't exist (first time
     // pulling a workspace whose Claude sessions never ran locally).
-    if !local_dest.exists() {
-        if let Err(e) = std::fs::create_dir_all(&local_dest) {
-            return Err(format!("create local dest: {e}"));
-        }
-    }
+    tokio::fs::create_dir_all(&local_dest)
+        .await
+        .map_err(|error| format!("create local dest: {error}"))?;
 
     let remote_dir_name = crate::ssh::claude_project_dir_name(remote_cwd);
     // Check the remote dir exists first — if not, nothing to pull.
-    let probe = Command::new("ssh")
-        .arg("-o")
-        .arg("BatchMode=yes")
-        .arg(ssh_target)
-        .arg(format!(
-            "test -d ~/.claude/projects/{} && echo EXISTS || echo MISSING",
-            shell_word_quote(&remote_dir_name)
-        ))
-        .output()
+    let mut command = ssh_command(ssh_target);
+    command.arg(format!(
+        "test -d ~/.claude/projects/{} && echo EXISTS || echo MISSING",
+        shell_word_quote(&remote_dir_name)
+    ));
+    let probe = output(&mut command, None)
         .await
-        .map_err(|e| format!("ssh probe spawn: {e}"))?;
+        .map_err(|error| format!("ssh history probe: {error}"))?;
+    if !probe.status.success() {
+        return Err(format!("ssh history probe exited with {}", probe.status));
+    }
     let probe_out = String::from_utf8_lossy(&probe.stdout).trim().to_string();
     if probe_out != "EXISTS" {
         eprintln!(
@@ -1580,17 +1424,16 @@ async fn pull_claude_projects(
         "{ssh_target}:~/.claude/projects/{remote_dir_name}/"
     );
     let local_dest_with_slash = format!("{}/", local_dest.display());
-    let rsync = Command::new("rsync")
-        .arg("-a")
-        .arg("--no-owner")
-        .arg("--no-group")
-        .arg("-e")
-        .arg("ssh -o BatchMode=yes")
+    let mut command = crate::execution::host_command_tokio("rsync");
+    command.args(["-a", "--no-owner", "--no-group", "-e"])
+        .arg(rsync_transport())
+        .arg("--")
         .arg(&remote_source)
-        .arg(&local_dest_with_slash)
-        .status()
+        .arg(&local_dest_with_slash);
+    let rsync = output(&mut command, None)
         .await
-        .map_err(|e| format!("rsync spawn: {e}"))?;
+        .map_err(|error| format!("rsync: {error}"))?
+        .status;
     if !rsync.success() {
         return Err(format!("rsync failed (status: {rsync})"));
     }
@@ -1602,19 +1445,77 @@ async fn pull_claude_projects(
     Ok(())
 }
 
-/// Probe the remote `codemux-remote` binary's version. If it
-/// doesn't match what we'd ship from this Codemux build, re-bootstrap
-/// (scp the current binary + chmod + verify) so the daemon spawn the
-/// supervisor's about to make uses the up-to-date binary. Also kills
-/// any running daemon on the remote so the next SSH `exec` can bind
-/// the same socket without an "address in use" conflict.
-///
-/// Returns Ok on either "already current, nothing to do" or "updated
-/// successfully." Returns Err when the host can't be reached or the
-/// bootstrap attempt itself failed (no bundled binary for the target
-/// uname, upload failed, etc.). Caller decides whether to propagate or
-/// warn-and-continue. Installs the binary on a host that lacks it, so
-/// call it only from flows the user started on that device.
+#[cfg(unix)]
+#[derive(Debug, serde::Deserialize)]
+struct PushHelperVersion {
+    version: String,
+    protocol_version: u32,
+    guarded_shells: Option<bool>,
+    prepared_spawn: Option<bool>,
+}
+
+#[cfg(unix)]
+impl PushHelperVersion {
+    fn verify_protocol(&self) -> Result<(), String> {
+        let expected = crate::pty_daemon::PROTOCOL_VERSION;
+        if self.protocol_version == expected {
+            Ok(())
+        } else {
+            Err(format!(
+                "codemux-remote {} uses PTY protocol {}, but this desktop requires {}. Set up the device again before moving the workspace.",
+                self.version, self.protocol_version, expected
+            ))
+        }
+    }
+
+    /// An explicit false rejects the helper before starting a cold probe.
+    fn check_prepared_spawn(&self) -> Result<(), String> {
+        match (self.guarded_shells, self.prepared_spawn) {
+            (Some(false), _) | (_, Some(false)) => Err(format!(
+                "codemux-remote {} does not support prepared terminal spawns. Set up the device again before moving the workspace.",
+                self.version
+            )),
+            _ => Ok(()),
+        }
+    }
+}
+
+#[cfg(unix)]
+async fn verify_workspace_push_helper(ssh_target: &str) -> Result<PushHelperVersion, String> {
+    // Device setup installs or repairs the helper. Workspace moves inspect
+    // it without replacing the executable or restarting live daemons.
+    let output = crate::ssh::exec::run_remote(
+        ssh_target,
+        r#"helper="$HOME/.local/bin/codemux-remote"
+if [ ! -e "$helper" ] && [ ! -L "$helper" ]; then
+    printf 'CMX_PUSH_HELPER: missing\n'
+elif version=$("$helper" version 2>/dev/null); then
+    printf 'CMX_PUSH_HELPER: %s\n' "$version"
+else
+    printf 'CMX_PUSH_HELPER: failed\n'
+fi"#,
+        std::time::Duration::from_secs(20),
+    )
+    .await
+    .map_err(|error| format!("version probe: {error}"))?;
+    let payload = output
+        .lines()
+        .rev()
+        .find_map(|line| line.strip_prefix("CMX_PUSH_HELPER: "))
+        .ok_or("The SSH version probe did not report the device helper's status")?;
+    let helper: PushHelperVersion = match payload {
+        "missing" => Err("codemux-remote is missing. Set up the device before moving the workspace."),
+        "failed" => Err("codemux-remote failed to report its version. Check the device setup before moving the workspace."),
+        _ => serde_json::from_str(payload).map_err(|_| {
+            "codemux-remote returned an unreadable version. Check the device setup before moving the workspace."
+        }),
+    }?;
+    helper.verify_protocol()?;
+    Ok(helper)
+}
+
+/// Prepare the helper CLI for creating a workspace directly on a device.
+/// Installing a replacement leaves the device's workspace PTY daemons running.
 #[cfg(unix)]
 pub(crate) async fn ensure_remote_binary_current<R: tauri::Runtime>(
     app: &tauri::AppHandle<R>,
@@ -1649,9 +1550,10 @@ pub(crate) async fn ensure_remote_binary_current<R: tauri::Runtime>(
                 "[hosts] {} has codemux-remote {version}, upgrading to {our_version}",
                 host.name
             );
-            return crate::hosts_upgrade::upgrade_host(app, host)
-                .await
-                .map(|_| ());
+            return match crate::hosts_upgrade::upgrade_host(app, host).await? {
+                crate::hosts_upgrade::UpgradeOutcome::NotAttempted { reason } => Err(reason),
+                _ => Ok(()),
+            };
         }
         None => {}
     }
@@ -1660,95 +1562,67 @@ pub(crate) async fn ensure_remote_binary_current<R: tauri::Runtime>(
         host.name
     );
 
-    // Missing or broken: nothing is running from it, so a full reinstall is
-    // safe. Shared with the manual "Set up again" (`hosts_reinstall_remote`),
-    // which runs the same steps without the version check above.
-    force_reinstall_remote_binary(app, host).await.map(|_| ())
+    let _device = crate::hosts_upgrade::claim_device(&host.ssh_target).await;
+    install_remote_helper(app, host).await.map(|_| ())
 }
 
-/// Force a freshly built `codemux-remote` onto a host and restart it,
-/// *without* the version-skip check in `ensure_remote_binary_current`.
-///
-/// This is the dev-workflow primitive behind the "Reinstall agent on
-/// host" button. Rebuilding `codemux-remote` from a branch keeps the
-/// version string the same (e.g. `0.9.5`), so the push-time version
-/// check sees a match and never re-uploads — leaving the host running a
-/// stale binary. Forcing the reinstall is the only way to get freshly
-/// built bits onto the host during development.
-///
-/// Steps: probe uname → kill the SSH-spawned pty-daemon → scp + chmod +
-/// verify the bundled binary → restart the headless `serve` daemon.
-/// Returns the reported version on success.
+/// Install the matching bundled helper while the caller holds the device claim.
 #[cfg(unix)]
-pub(crate) async fn force_reinstall_remote_binary<R: tauri::Runtime>(
+async fn install_remote_helper<R: tauri::Runtime>(
     app: &tauri::AppHandle<R>,
     host: &crate::database::HostRecord,
 ) -> Result<String, String> {
-    use crate::ssh::exec::run_remote;
+    use crate::ssh::bootstrap::{bootstrap_remote, BootstrapOptions, BootstrapResult};
     use std::time::Duration;
 
-    // Waits out a background upgrade of this device: two uploads at once
-    // would share its temp file.
-    let _device = crate::hosts_upgrade::claim_device(&host.ssh_target).await;
-
-    // Step 1: figure out the remote uname so we can pick the right
-    // bundled binary. The last line wins over any login banner.
-    let uname_output = run_remote(&host.ssh_target, "uname -s -m", Duration::from_secs(20))
-        .await
-        .map_err(|e| format!("uname probe: {e}"))?;
+    let uname_output =
+        crate::ssh::exec::run_remote(&host.ssh_target, "uname -s -m", Duration::from_secs(20))
+            .await
+            .map_err(|e| format!("uname probe: {e}"))?;
     let uname = uname_output
         .lines()
         .map(str::trim)
         .filter(|line| !line.is_empty())
         .last()
-        .unwrap_or_default()
-        .to_string();
-    if uname.is_empty() {
-        return Err("uname probe returned empty string".into());
-    }
+        .ok_or("uname probe returned empty string")?;
 
-    // Step 2: kill any running pty-daemon. Otherwise the freshly-bootstrapped
-    // binary won't actually be used until the next SSH-spawn cycle, and
-    // a stale daemon still bound to the workspace's Unix socket would
-    // make that next spawn fail with "address in use." The narrow `-f`
-    // pattern only matches the SSH-spawned pty-daemon — user-launched
-    // `codemux-remote mcp` or `serve` invocations are spared. `serve`
-    // is restarted via systemctl in step 4 instead.
-    let _ = run_remote(
+    match bootstrap_remote(BootstrapOptions::new(&host.ssh_target, uname).with_app(app)).await {
+        BootstrapResult::Installed { reported_version } => {
+            eprintln!(
+                "[hosts] bootstrapped {} → codemux-remote {reported_version}",
+                host.name
+            );
+            Ok(reported_version)
+        }
+        BootstrapResult::BinaryNotBundled { wanted_target } => Err(format!(
+            "this Codemux build doesn't include a codemux-remote for {wanted_target}"
+        )),
+        BootstrapResult::UploadFailed { reason } => Err(format!("upload: {reason}")),
+        BootstrapResult::PostInstallProbeFailed { reason } => Err(format!("verify: {reason}")),
+    }
+}
+
+/// Restart the device's daemons after a user-requested reinstall succeeds.
+#[cfg(unix)]
+async fn force_reinstall_remote_binary<R: tauri::Runtime>(
+    app: &tauri::AppHandle<R>,
+    host: &crate::database::HostRecord,
+) -> Result<String, String> {
+    use std::time::Duration;
+
+    let _device = crate::hosts_upgrade::claim_device(&host.ssh_target).await;
+    let reported_version = install_remote_helper(app, host).await?;
+
+    // Existing workspace daemons still run from the old executable. Only
+    // explicit device setup asks them to exit so the new binary takes over.
+    let _ = crate::ssh::exec::run_remote(
         &host.ssh_target,
         "pkill -f 'codemux-remote pty-daemon' 2>/dev/null || true",
         Duration::from_secs(20),
     )
     .await;
 
-    // Step 3: bootstrap (upload binary + verify version).
-    use crate::ssh::bootstrap::{bootstrap_remote, BootstrapOptions, BootstrapResult};
-    let outcome = bootstrap_remote(
-        BootstrapOptions::new(&host.ssh_target, &uname).with_app(app),
-    )
-    .await;
-    let reported_version = match outcome {
-        BootstrapResult::Installed { reported_version } => {
-            eprintln!(
-                "[hosts] bootstrapped {} → codemux-remote {reported_version}",
-                host.name
-            );
-            reported_version
-        }
-        BootstrapResult::BinaryNotBundled { wanted_target } => {
-            return Err(format!(
-                "this Codemux build doesn't include a codemux-remote for {wanted_target}"
-            ));
-        }
-        BootstrapResult::UploadFailed { reason } => {
-            return Err(format!("upload: {reason}"));
-        }
-        BootstrapResult::PostInstallProbeFailed { reason } => {
-            return Err(format!("verify: {reason}"));
-        }
-    };
-
-    // Step 4: re-provision the headless `serve` daemon. This is
+    // Re-provision the headless `serve` daemon. This is
     // idempotent — it rewrites the systemd unit (so a unit-content
     // change in this Codemux version takes effect immediately), runs
     // daemon-reload, and **restarts** the unit (not just `enable
@@ -1765,7 +1639,7 @@ pub(crate) async fn force_reinstall_remote_binary<R: tauri::Runtime>(
     if let Err(error) = crate::ssh::bootstrap::provision_serve(
         &host.ssh_target,
         "~/.local/bin/codemux-remote",
-        std::time::Duration::from_secs(30),
+        Duration::from_secs(30),
     )
     .await
     {
@@ -1842,7 +1716,7 @@ fn record_opencode_session_capture<R: tauri::Runtime>(
 fn terminate_workspace_sessions<R: tauri::Runtime>(
     app: &tauri::AppHandle<R>,
     workspace_id: &str,
-) {
+) -> Vec<tauri::async_runtime::JoinHandle<()>> {
     let app_state: tauri::State<'_, crate::state::AppStateStore> = app.state();
     let pty_state: tauri::State<'_, crate::terminal::PtyState> = app.state();
     let snapshot = app_state.snapshot();
@@ -1852,7 +1726,7 @@ fn terminate_workspace_sessions<R: tauri::Runtime>(
         .find(|w| w.workspace_id.0 == workspace_id)
         .map(|w| crate::state::collect_terminal_sessions(&w.surfaces))
         .unwrap_or_default();
-    for sid in session_ids {
+    session_ids.into_iter().filter_map(|sid| {
         // Use the keep-channel variant so the frontend's xterm output
         // channel survives the kill-and-respawn. Otherwise the user
         // has to tab-switch away and back to see the respawned PTY's
@@ -1864,13 +1738,114 @@ fn terminate_workspace_sessions<R: tauri::Runtime>(
             app,
             &pty_state.sessions,
             &sid,
-        );
-    }
+        )
+    }).collect()
 }
+
+#[cfg(unix)]
+async fn drain_terminal_closes(tasks: Vec<tauri::async_runtime::JoinHandle<()>>) {
+    let _ = tokio::time::timeout(
+        std::time::Duration::from_secs(3),
+        futures_util::future::join_all(tasks),
+    ).await;
+}
+
+#[cfg(all(test, unix))]
+#[path = "hosts_push_tests.rs"]
+mod hosts_push_tests;
 
 #[cfg(test)]
 mod tests {
     use super::{interpret_github_probe, validate_host_fields};
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn push_checks_the_installed_helper_without_reinstalling_it() {
+        if crate::test_isolation::isolated(
+            "commands::hosts::tests::push_checks_the_installed_helper_without_reinstalling_it",
+        ) {
+            return;
+        }
+        use std::os::unix::fs::PermissionsExt;
+
+        let fixture = tempfile::tempdir().unwrap();
+        let ssh = fixture.path().join("ssh");
+        let log = fixture.path().join("ssh-log");
+        let protocol = crate::pty_daemon::PROTOCOL_VERSION;
+        std::fs::write(
+            &ssh,
+            r#"#!/bin/sh
+case " $* " in
+    *" StrictHostKeyChecking=yes "*" ControlPath=none "*) ;;
+    *) exit 255 ;;
+esac
+while [ "$1" != -- ]; do shift; done
+shift
+target=$1
+shift
+case "$1" in
+    *CMX_PUSH_HELPER*) printf '%s\n' "$target" >> "$CODEMUX_PUSH_TEST_LOG" ;;
+    *) printf 'unexpected command\n' >> "$CODEMUX_PUSH_TEST_LOG"; exit 1 ;;
+esac
+HOME="$CODEMUX_PUSH_TEST_HOME/$target" exec sh -c "$1"
+"#,
+        )
+        .unwrap();
+        std::fs::set_permissions(&ssh, std::fs::Permissions::from_mode(0o700)).unwrap();
+        for (target, command) in [
+            ("older", format!("printf '%s\\n' '{{\"version\":\"0.26.0\",\"protocol_version\":{protocol},\"guarded_shells\":true,\"prepared_spawn\":true}}'")),
+            ("unadvertised", format!("printf '%s\\n' '{{\"version\":\"0.26.0\",\"protocol_version\":{protocol}}}'")),
+            ("unsupported", format!("printf '%s\\n' '{{\"version\":\"0.26.0\",\"protocol_version\":{protocol},\"prepared_spawn\":false}}'")),
+            ("incompatible", "printf '%s\\n' '{\"version\":\"0.26.0\",\"protocol_version\":0}'".into()),
+            ("malformed", "printf '%s\\n' 'not a version'".into()),
+            ("failed", "exit 3".into()),
+        ] {
+            let bin = fixture.path().join(target).join(".local/bin");
+            std::fs::create_dir_all(&bin).unwrap();
+            let helper = bin.join("codemux-remote");
+            std::fs::write(&helper, format!("#!/bin/sh\n{command}\n")).unwrap();
+            std::fs::set_permissions(&helper, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        let path = std::env::join_paths(
+            std::iter::once(fixture.path().to_owned())
+                .chain(std::env::split_paths(&std::env::var_os("PATH").unwrap())),
+        )
+        .unwrap();
+        // This test runs alone in the isolated child.
+        std::env::set_var("PATH", path);
+        std::env::set_var("CODEMUX_PUSH_TEST_LOG", &log);
+        std::env::set_var("CODEMUX_PUSH_TEST_HOME", fixture.path());
+
+        super::verify_workspace_push_helper("older")
+            .await
+            .unwrap()
+            .check_prepared_spawn()
+            .unwrap();
+        super::verify_workspace_push_helper("unadvertised")
+            .await
+            .unwrap()
+            .check_prepared_spawn()
+            .unwrap();
+        let error = super::verify_workspace_push_helper("unsupported")
+            .await
+            .unwrap()
+            .check_prepared_spawn()
+            .unwrap_err();
+        assert!(error.contains("does not support prepared terminal spawns"), "{error}");
+        for (target, expected) in [
+            ("incompatible", "uses PTY protocol 0"),
+            ("malformed", "returned an unreadable version"),
+            ("failed", "failed to report its version"),
+            ("missing", "is missing"),
+        ] {
+            let error = super::verify_workspace_push_helper(target).await.unwrap_err();
+            assert!(error.contains(expected), "{error}");
+        }
+        assert_eq!(
+            std::fs::read_to_string(log).unwrap(),
+            "older\nunadvertised\nunsupported\nincompatible\nmalformed\nfailed\nmissing\n"
+        );
+    }
 
     #[test]
     fn host_fields_are_trimmed_and_checked() {

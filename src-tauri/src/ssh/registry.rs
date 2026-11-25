@@ -23,12 +23,13 @@
 #![cfg(unix)]
 
 use crate::pty_daemon::{PtyDaemonClient, PtyDaemonError};
-use crate::ssh::tunnel_supervisor::{TunnelStatus, TunnelSupervisor};
+use crate::ssh::tunnel::verify_daemon_protocol;
+use crate::ssh::tunnel_supervisor::{TunnelStatus, TunnelSupervisor, FIRST_CONNECT_WAIT};
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::future::Future;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tauri::Emitter;
+use tauri::{Emitter, Manager};
 use tokio::sync::{Mutex, OnceCell};
 
 // Non-interactive SSH shells may omit ~/.local/bin from PATH.
@@ -77,126 +78,145 @@ pub fn spawn_tunnel_status_forwarder<R: tauri::Runtime>(
     });
 }
 
-static REGISTRY: OnceCell<Mutex<HashMap<String, Arc<TunnelSupervisor>>>> = OnceCell::const_new();
-
-async fn registry() -> &'static Mutex<HashMap<String, Arc<TunnelSupervisor>>> {
-    REGISTRY
-        .get_or_init(|| async { Mutex::new(HashMap::new()) })
-        .await
+struct RegisteredTunnel {
+    host_id: Option<i64>,
+    supervisor: Arc<TunnelSupervisor>,
+    client: Option<Arc<PtyDaemonClient>>,
 }
 
-/// Register a freshly-spawned supervisor under the given workspace
-/// id. If an existing supervisor is registered, it's gracefully
-/// shut down before the new one takes its place — protects against
-/// double-pushes leaking a tunnel.
-pub async fn install_supervisor(workspace_id: &str, supervisor: Arc<TunnelSupervisor>) {
-    let map = registry().await;
-    let mut guard = map.lock().await;
-    let prev = guard.insert(workspace_id.to_string(), supervisor);
-    crate::trace_cloud_push!(
-        "[registry] install_supervisor({workspace_id}, replaced_existing={})",
-        prev.is_some()
-    );
-    drop(guard);
-    if let Some(prev) = prev {
-        // Run shutdown in the background so install_supervisor stays
-        // snappy — the new supervisor is already in the map and live.
-        tokio::spawn(async move { prev.shutdown().await });
+impl RegisteredTunnel {
+    fn matches_host(&self, host_id: i64, ssh_target: &str) -> bool {
+        self.host_id == Some(host_id) && self.supervisor.ssh_target() == ssh_target
     }
 }
 
-/// Look up a supervisor by workspace id. Returns `None` when the
-/// workspace is local or was never pushed.
-pub async fn get_supervisor(workspace_id: &str) -> Option<Arc<TunnelSupervisor>> {
-    let map = registry().await;
-    let guard = map.lock().await;
-    let result = guard.get(workspace_id).cloned();
-    crate::trace_cloud_push!(
-        "[registry] get_supervisor({workspace_id}) -> {} (registry has {} entries: {:?})",
-        if result.is_some() { "FOUND" } else { "MISS" },
-        guard.len(),
-        guard.keys().collect::<Vec<_>>(),
-    );
-    result
+type TunnelRoutes = HashMap<String, RegisteredTunnel>;
+static REGISTRY: OnceCell<Mutex<TunnelRoutes>> = OnceCell::const_new();
+
+async fn registry() -> &'static Mutex<TunnelRoutes> {
+    REGISTRY.get_or_init(|| async { Mutex::new(HashMap::new()) }).await
 }
 
-/// Stop and remove the supervisor for a workspace. Called on
-/// pull-back and on workspace close. Idempotent — calling on a
-/// workspace that never had a supervisor is a no-op.
-pub async fn shutdown_supervisor(workspace_id: &str) {
-    let map = registry().await;
-    let supervisor = {
-        let mut guard = map.lock().await;
-        guard.remove(workspace_id)
+fn workspace_host<R: tauri::Runtime>(app: &tauri::AppHandle<R>, workspace_id: &str) -> Option<Option<i64>> {
+    app.state::<crate::state::AppStateStore>().with_canonical_snapshot(|snapshot| {
+        snapshot.workspaces.iter()
+            .find(|workspace| workspace.workspace_id.0 == workspace_id)
+            .map(|workspace| workspace.host_id)
+    })
+}
+
+fn ssh_target_for_host<R: tauri::Runtime>(app: &tauri::AppHandle<R>, host_id: i64) -> Option<String> {
+    app.state::<crate::database::DatabaseStore>().list_hosts().into_iter()
+        .find(|host| host.id == host_id)
+        .map(|host| host.ssh_target)
+}
+
+fn host_changed() -> PtyDaemonError {
+    PtyDaemonError::Daemon("Workspace host changed while opening the terminal tunnel".into())
+}
+
+/// Replace both supervisor and client as a single route, including when the
+/// new private local socket cannot be allocated.
+fn replace_route(
+    routes: &mut TunnelRoutes,
+    workspace_id: &str,
+    host_id: i64,
+    spawn: impl FnOnce() -> Result<Arc<TunnelSupervisor>, String>,
+) -> (Option<RegisteredTunnel>, Result<Arc<TunnelSupervisor>, String>) {
+    let previous = routes.remove(workspace_id);
+    let next = spawn().map(|supervisor| {
+        routes.insert(workspace_id.to_owned(), RegisteredTunnel {
+            host_id: Some(host_id),
+            supervisor: supervisor.clone(),
+            client: None,
+        });
+        supervisor
+    });
+    (previous, next)
+}
+
+pub(crate) async fn replace_workspace_tunnel<R: tauri::Runtime>(
+    app: &tauri::AppHandle<R>,
+    workspace_id: &str,
+    host_id: i64,
+    ssh_target: &str,
+    cleanup: impl Future<Output = ()> + Send + 'static,
+) -> Result<(), String> {
+    let (previous, next) = {
+        let mut routes = registry().await.lock().await;
+        if workspace_host(app, workspace_id) != Some(Some(host_id)) {
+            return Err(host_changed().to_string());
+        }
+        replace_route(&mut routes, workspace_id, host_id, || {
+            if ssh_target_for_host(app, host_id).as_deref() != Some(ssh_target) {
+                return Err(host_changed().to_string());
+            }
+            TunnelSupervisor::spawn(
+                ssh_target.to_owned(), workspace_id, REMOTE_DAEMON_BINARY.to_owned(),
+            )
+        })
     };
-    if let Some(s) = supervisor {
-        s.shutdown().await;
+    if let Ok(supervisor) = &next {
+        spawn_tunnel_status_forwarder(app.clone(), workspace_id.to_owned(), supervisor);
+    }
+    retire_route_after(previous, cleanup).await;
+    next.map(|_| ())
+}
+
+/// Retire a registered route after an explicit host assignment change.
+pub(crate) async fn discard_stale_workspace_tunnel<R: tauri::Runtime>(
+    app: &tauri::AppHandle<R>,
+    workspace_id: &str,
+) {
+    let stale = {
+        let mut routes = registry().await.lock().await;
+        let selected = workspace_host(app, workspace_id).flatten();
+        let current = routes.get(workspace_id).is_some_and(|route| {
+            selected.is_some_and(|id| {
+                ssh_target_for_host(app, id).is_some_and(|target| route.matches_host(id, &target))
+            })
+        });
+        if current { None } else { routes.remove(workspace_id) }
+    };
+    if let Some(stale) = stale {
+        stale.supervisor.shutdown().await;
     }
 }
 
-/// Stop every supervisor and its ssh process. Called on app exit, where
-/// nothing else would end the tunnels: without it each remote workspace
-/// leaves an ssh (and a remote sshd session) running after quit.
+/// Stop and remove the tunnel and cached client for a workspace.
+pub async fn shutdown_supervisor(workspace_id: &str) {
+    shutdown_supervisor_after(workspace_id, std::future::ready(())).await;
+}
+
+pub(crate) async fn shutdown_supervisor_after(
+    workspace_id: &str,
+    cleanup: impl Future<Output = ()> + Send + 'static,
+) {
+    let route = registry().await.lock().await.remove(workspace_id);
+    retire_route_after(route, cleanup).await;
+}
+
+async fn retire_route_after(
+    route: Option<RegisteredTunnel>,
+    cleanup: impl Future<Output = ()> + Send + 'static,
+) {
+    // Removing the entry seals it for new admissions. Finish captured close
+    // requests on its still-live socket. A canceled transfer cannot strand SSH.
+    let _ = tokio::spawn(async move {
+        cleanup.await;
+        if let Some(route) = route {
+            route.supervisor.shutdown().await;
+        }
+    }).await;
+}
+
+/// Stop every supervisor and its ssh process on application exit.
 pub async fn shutdown_all() {
     let supervisors: Vec<_> = match REGISTRY.get() {
-        Some(map) => map.lock().await.drain().map(|(_, s)| s).collect(),
+        Some(routes) => routes.lock().await.drain().map(|(_, route)| route.supervisor).collect(),
         None => return,
     };
-    if let Some(clients) = WORKSPACE_CLIENTS.get() {
-        clients.lock().await.clear();
-    }
     futures_util::future::join_all(supervisors.iter().map(|s| s.shutdown())).await;
-}
-
-/// Helper for the push flow: compose a stable local socket path
-/// from the workspace id. Putting all tunnels under a single dir
-/// keeps cleanup easy + avoids per-call temp-file allocation. The
-/// hash-truncated workspace id stays well under Darwin's 104-byte
-/// sun_path limit.
-pub fn local_socket_for_workspace(workspace_id: &str) -> PathBuf {
-    use std::collections::hash_map::DefaultHasher;
-    use std::hash::{Hash, Hasher};
-    let mut hasher = DefaultHasher::new();
-    workspace_id.hash(&mut hasher);
-    let short = format!("{:x}", hasher.finish());
-    // Full 16 hex chars (the whole u64) — truncating to 12 left only a
-    // 48-bit space (birthday collisions ~2^24 workspaces). 16 stays well
-    // under the 104-byte macOS sun_path limit (see the test below).
-    let truncated = &short[..short.len().min(16)];
-    std::env::temp_dir().join(format!("codemux-tunnel-{truncated}.sock"))
-}
-
-/// Compute the conventional remote socket path for a workspace's
-/// tunnel. Same id-hash truncation as the local side so the two
-/// match up visually in process listings, and short enough to fit
-/// macOS-server sun_path limits if anyone ever runs codemux-remote
-/// on a Mac.
-pub fn remote_socket_for_workspace(workspace_id: &str) -> String {
-    use std::collections::hash_map::DefaultHasher;
-    use std::hash::{Hash, Hasher};
-    let mut hasher = DefaultHasher::new();
-    workspace_id.hash(&mut hasher);
-    let short = format!("{:x}", hasher.finish());
-    // Full 16 hex chars (the whole u64) — truncating to 12 left only a
-    // 48-bit space (birthday collisions ~2^24 workspaces). 16 stays well
-    // under the 104-byte macOS sun_path limit (see the test below).
-    let truncated = &short[..short.len().min(16)];
-    format!("/tmp/codemux-ptyd-{truncated}.sock")
-}
-
-/// Per-workspace `PtyDaemonClient` cache. Local workspaces share the
-/// singleton local daemon client; remote workspaces each get their
-/// own client connected through their per-workspace SSH tunnel.
-///
-/// Keyed by workspace_id. Entries are removed when the workspace's
-/// supervisor is shut down (on pull-back or close).
-static WORKSPACE_CLIENTS: OnceCell<Mutex<HashMap<String, Arc<PtyDaemonClient>>>> =
-    OnceCell::const_new();
-
-async fn workspace_clients() -> &'static Mutex<HashMap<String, Arc<PtyDaemonClient>>> {
-    WORKSPACE_CLIENTS
-        .get_or_init(|| async { Mutex::new(HashMap::new()) })
-        .await
 }
 
 /// A tunnel to the original owner of a shell after its workspace has moved.
@@ -207,19 +227,18 @@ pub(crate) struct CleanupDaemonTunnel {
 }
 
 impl CleanupDaemonTunnel {
-    pub(crate) async fn start(workspace_id: &str, ssh_target: &str) -> Self {
+    pub(crate) async fn start(workspace_id: &str, ssh_target: &str) -> Result<Self, PtyDaemonError> {
         let key = format!("terminal-cleanup:{}", uuid::Uuid::new_v4());
         let mut supervisors = registry().await.lock().await;
         // Register without an await after spawning so cancellation cannot
         // leave a live tunnel outside the app's shutdown registry.
         let supervisor = TunnelSupervisor::spawn(
             ssh_target.to_string(),
-            remote_socket_for_workspace(workspace_id),
-            local_socket_for_workspace(&key),
+            workspace_id,
             REMOTE_DAEMON_BINARY.to_string(),
-        );
-        supervisors.insert(key.clone(), supervisor);
-        Self { key, client: None }
+        ).map_err(PtyDaemonError::Daemon)?;
+        supervisors.insert(key.clone(), RegisteredTunnel { host_id: None, supervisor, client: None });
+        Ok(Self { key, client: None })
     }
 
     pub(crate) async fn client(
@@ -231,8 +250,8 @@ impl CleanupDaemonTunnel {
                 return Ok(client.clone());
             }
         }
-        let supervisor = get_supervisor(&self.key)
-            .await
+        let supervisor = registry().await.lock().await.get(&self.key)
+            .map(|route| route.supervisor.clone())
             .ok_or_else(|| PtyDaemonError::Daemon("terminal cleanup tunnel shut down".into()))?;
         let client = connect_tunnel_daemon(workspace_id, &supervisor).await?;
         self.client = Some(client.clone());
@@ -267,69 +286,64 @@ pub async fn client_for_workspace<R: tauri::Runtime>(
     workspace_id: &str,
     host_id: Option<i64>,
 ) -> Result<Arc<PtyDaemonClient>, PtyDaemonError> {
-    use crate::pty_daemon::ensure_daemon;
-    use tauri::Manager;
-
-    // Local fast path.
-    let Some(host_id) = host_id else {
-        return ensure_daemon().await;
-    };
-
-    // Per-workspace cache.
-    {
-        let map = workspace_clients().await;
-        let mut guard = map.lock().await;
-        if let Some(client) = guard.get(workspace_id).cloned() {
-            if !client.is_closed() {
-                return Ok(client);
-            }
-            // A tunnel or remote-daemon restart permanently closes this
-            // socket. Evict it so the existing supervisor can establish a new
-            // connection below; returning the same dead Arc would make every
-            // subsequent retry fail immediately forever.
-            crate::trace_cloud_push!(
-                "[client_for_workspace:{workspace_id}] cached daemon client closed; reconnecting"
-            );
-            guard.remove(workspace_id);
-        }
+    if workspace_host(app, workspace_id) != Some(host_id) {
+        return Err(host_changed());
     }
-
-    // Ensure a supervisor exists for this workspace. Lazy-create
-    // for restored workspaces that had host_id persisted but no
-    // active tunnel.
-    let supervisor = match get_supervisor(workspace_id).await {
-        Some(s) => s,
-        None => {
-            let db = app.state::<crate::database::DatabaseStore>();
-            let host = db
-                .list_hosts()
-                .into_iter()
-                .find(|h| h.id == host_id)
-                .ok_or_else(|| {
-                    PtyDaemonError::Daemon(format!(
-                        "Workspace's host {host_id} is no longer in the local hosts list"
-                    ))
-                })?;
-            let local_socket = local_socket_for_workspace(workspace_id);
-            let remote_socket = remote_socket_for_workspace(workspace_id);
-            let s = TunnelSupervisor::spawn(
-                host.ssh_target.clone(),
-                remote_socket,
-                local_socket,
-                REMOTE_DAEMON_BINARY.to_string(),
-            );
-            install_supervisor(workspace_id, s.clone()).await;
-            spawn_tunnel_status_forwarder(app.clone(), workspace_id.to_string(), &s);
-            s
-        }
+    let Some(host_id) = host_id else {
+        let client = crate::pty_daemon::ensure_daemon().await?;
+        return if workspace_host(app, workspace_id) == Some(None) {
+            Ok(client)
+        } else {
+            Err(host_changed())
+        };
     };
 
+    let (previous, supervisor, created, ssh_target) = {
+        let mut routes = registry().await.lock().await;
+        if workspace_host(app, workspace_id) != Some(Some(host_id)) {
+            return Err(host_changed());
+        }
+        let Some(ssh_target) = ssh_target_for_host(app, host_id) else {
+            drop(routes);
+            discard_stale_workspace_tunnel(app, workspace_id).await;
+            return Err(PtyDaemonError::Daemon(format!(
+                "Workspace's host {host_id} is no longer in the local hosts list"
+            )));
+        };
+        if let Some(route) = routes.get(workspace_id).filter(|route| route.matches_host(host_id, &ssh_target)) {
+            if let Some(client) = route.client.as_ref().filter(|client| !client.is_closed()) {
+                return Ok(client.clone());
+            }
+            (None, Ok(route.supervisor.clone()), false, ssh_target)
+        } else {
+            let (previous, next) = replace_route(&mut routes, workspace_id, host_id, || {
+                TunnelSupervisor::spawn(
+                    ssh_target.clone(), workspace_id, REMOTE_DAEMON_BINARY.to_owned(),
+                )
+            });
+            (previous, next, true, ssh_target)
+        }
+    };
+    if let Some(previous) = previous {
+        previous.supervisor.shutdown().await;
+    }
+    let supervisor = supervisor.map_err(PtyDaemonError::Daemon)?;
+    if created {
+        spawn_tunnel_status_forwarder(app.clone(), workspace_id.to_owned(), &supervisor);
+    }
     let client = connect_tunnel_daemon(workspace_id, &supervisor).await?;
-    workspace_clients()
-        .await
-        .lock()
-        .await
-        .insert(workspace_id.to_string(), client.clone());
+
+    // A transfer can complete while the SSH connection is in flight. Only
+    // the still-current route can publish a client back into the registry.
+    let mut routes = registry().await.lock().await;
+    if workspace_host(app, workspace_id) != Some(Some(host_id))
+        || ssh_target_for_host(app, host_id).as_deref() != Some(ssh_target.as_str())
+    {
+        return Err(host_changed());
+    }
+    let current = routes.get_mut(workspace_id).filter(|route| Arc::ptr_eq(&route.supervisor, &supervisor))
+        .ok_or_else(host_changed)?;
+    current.client = Some(client.clone());
     Ok(client)
 }
 
@@ -338,11 +352,9 @@ async fn connect_tunnel_daemon(
     supervisor: &TunnelSupervisor,
 ) -> Result<Arc<PtyDaemonClient>, PtyDaemonError> {
     // Wait for the tunnel to become Connected (or fail loudly).
-    // Connected fires when the LOCAL socket file appears, i.e.
-    // when SSH -L successfully bound the local side. It does NOT
-    // mean the remote daemon is up and listening yet — see the
-    // connect+hello retry loop below.
-    let tunnel_wait = Duration::from_secs(20);
+    // Connected fires after SSH binds the local forward and its authenticated
+    // remote command confirms that the daemon socket is ready.
+    let tunnel_wait = FIRST_CONNECT_WAIT;
     let mut rx = supervisor.subscribe();
     // Mark the initial subscribed value as seen so `rx.changed()`
     // wakes ONLY on subsequent updates. Without this, on a freshly
@@ -436,7 +448,9 @@ async fn connect_tunnel_daemon(
                 // prove the remote side is healthy.
                 let remaining = connect_deadline.saturating_duration_since(Instant::now());
                 match tokio::time::timeout(remaining, c.hello_with_host_plugin()).await {
-                    Ok(Ok(((pid, version, _), host_claude_plugin))) => {
+                    Ok(Ok(((pid, version, protocol), host_claude_plugin))) => {
+                        verify_daemon_protocol(&version, protocol)
+                            .map_err(PtyDaemonError::Daemon)?;
                         c.set_ssh_target(supervisor.ssh_target());
                         eprintln!(
                             "[client_for_workspace:{workspace_id}] daemon reached: \
@@ -483,40 +497,39 @@ async fn connect_tunnel_daemon(
 /// (workspace goes back to local) and on close, before the
 /// supervisor itself shuts down.
 pub async fn forget_workspace_client(workspace_id: &str) {
-    let map = workspace_clients().await;
-    let mut guard = map.lock().await;
-    guard.remove(workspace_id);
+    if let Some(route) = registry().await.lock().await.get_mut(workspace_id) {
+        route.client = None;
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    #[test]
-    fn local_socket_for_workspace_is_deterministic() {
-        let a = local_socket_for_workspace("workspace-42");
-        let b = local_socket_for_workspace("workspace-42");
-        assert_eq!(a, b, "same workspace id must yield same socket path");
-    }
+    #[tokio::test]
+    async fn host_change_discards_previous_route_even_when_socket_allocation_fails() {
+        // An option-like target is rejected before the supervisor invokes
+        // discovery; the test never connects to an SSH host.
+        let old = TunnelSupervisor::spawn(
+            "-old-fixture".into(),
+            "workspace",
+            REMOTE_DAEMON_BINARY.into(),
+        )
+        .unwrap();
+        let mut routes = TunnelRoutes::new();
+        let (_, installed) = replace_route(&mut routes, "workspace", 1, || Ok(old.clone()));
+        assert!(installed.is_ok());
+        assert!(routes["workspace"].matches_host(1, "-old-fixture"));
+        assert!(!routes["workspace"].matches_host(2, "-old-fixture"));
+        assert!(!routes["workspace"].matches_host(1, "-other-fixture"));
 
-    #[test]
-    fn local_socket_for_workspace_distinguishes_workspaces() {
-        let a = local_socket_for_workspace("workspace-42");
-        let b = local_socket_for_workspace("workspace-43");
-        assert_ne!(a, b, "different workspace ids must yield different paths");
-    }
-
-    #[test]
-    fn local_socket_path_fits_sun_path_limit() {
-        // Darwin's sun_path is 104 bytes; we should stay well under
-        // that even when the system tempdir is longish (e.g.
-        // /var/folders/... on macOS).
-        let path = local_socket_for_workspace("workspace-with-long-name");
-        let len = path.to_string_lossy().len();
-        assert!(
-            len < 100,
-            "socket path is {len} bytes, must stay under 104 for Darwin: {}",
-            path.display()
-        );
+        let (retired, replacement) = replace_route(&mut routes, "workspace", 2, || {
+            Err("fixture socket allocation failed".into())
+        });
+        assert!(replacement.is_err());
+        assert!(!routes.contains_key("workspace"));
+        let retired = retired.unwrap();
+        assert!(Arc::ptr_eq(&retired.supervisor, &old));
+        retired.supervisor.shutdown().await;
     }
 }

@@ -19,13 +19,17 @@
 
 #![cfg(unix)]
 
-use crate::ssh::tunnel::{build_tunnel_argv, TunnelOptions};
+use crate::ssh::exec::validate_ssh_target;
+use crate::ssh::tunnel::{
+    build_tunnel_argv, has_private_socket_parent, prepare_local_socket, supervised_ssh_command,
+    wait_for_socket, TunnelOptions,
+};
+use crate::ssh::tunnel_paths::{discover_remote_socket, LocalSocket, DISCOVERY_TIMEOUT};
 use serde::Serialize;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncRead, AsyncReadExt};
-use tokio::process::Command;
 use tokio::sync::{watch, Mutex};
 
 /// Observable status of a supervised tunnel. Pushed via a `watch`
@@ -59,6 +63,8 @@ const CIRCUIT_RETRY_INTERVAL: Duration = Duration::from_secs(60);
 /// SSH. The first connect can be slow (DNS, key handshake); later
 /// reconnects are usually instant.
 const SPAWN_TIMEOUT: Duration = Duration::from_secs(15);
+pub(super) const FIRST_CONNECT_WAIT: Duration =
+    DISCOVERY_TIMEOUT.saturating_add(SPAWN_TIMEOUT).saturating_add(Duration::from_secs(4));
 const STDERR_DRAIN_TIMEOUT: Duration = Duration::from_millis(250);
 const STDERR_BYTE_LIMIT: u64 = 16 * 1024;
 
@@ -75,6 +81,7 @@ pub struct TunnelSupervisor {
 struct SupervisorInner {
     ssh_target: String,
     local_socket: PathBuf,
+    _socket_directory: Option<LocalSocket>,
     status_tx: watch::Sender<TunnelStatus>,
     shutdown_tx: watch::Sender<bool>,
     /// Latest SSH process. Wrapped so `shutdown` can kill it under
@@ -87,37 +94,34 @@ impl TunnelSupervisor {
     /// attempt is asynchronous. Watch the status channel for state.
     pub fn spawn(
         ssh_target: String,
-        remote_socket: String,
-        local_socket: PathBuf,
+        workspace_id: &str,
         remote_binary: String,
-    ) -> Arc<Self> {
+    ) -> Result<Arc<Self>, String> {
+        let socket = LocalSocket::allocate()?;
+        let local_socket = socket.path.clone();
         let (status_tx, _status_rx) = watch::channel(TunnelStatus::Pending);
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         let inner = Arc::new(SupervisorInner {
             ssh_target,
             local_socket: local_socket.clone(),
+            _socket_directory: Some(socket),
             status_tx,
             shutdown_tx,
             current_child: Mutex::new(None),
         });
         let task_inner = inner.clone();
-        let mut cmd = Command::new("ssh");
-        // The remote side ends in a long `exec sleep`, so an ssh that
-        // outlives its owner would hold the tunnel and an sshd session
-        // open indefinitely.
-        cmd.kill_on_drop(true);
         let task = tokio::spawn(run_supervisor(
             task_inner,
-            remote_socket,
+            RemoteSocket::Workspace(workspace_id.to_owned()),
             local_socket,
             remote_binary,
             shutdown_rx,
-            cmd,
+            PathBuf::from("ssh"),
         ));
-        Arc::new(Self {
+        Ok(Arc::new(Self {
             inner,
             task: std::sync::Mutex::new(Some(task)),
-        })
+        }))
     }
 
     pub(crate) fn ssh_target(&self) -> &str {
@@ -148,37 +152,43 @@ impl TunnelSupervisor {
         if let Some(task) = task {
             let _ = task.await;
         }
-        let _ = std::fs::remove_file(&self.inner.local_socket);
+        if has_private_socket_parent(&self.inner.local_socket) {
+            let _ = std::fs::remove_file(&self.inner.local_socket);
+        }
+    }
+}
+
+enum RemoteSocket {
+    Workspace(String),
+    #[cfg(test)]
+    Fixture(String),
+}
+
+impl RemoteSocket {
+    async fn discover(&self, ssh_target: &str) -> Result<String, String> {
+        match self {
+            Self::Workspace(workspace_id) => discover_remote_socket(ssh_target, workspace_id).await,
+            #[cfg(test)]
+            Self::Fixture(path) => Ok(path.clone()),
+        }
     }
 }
 
 async fn run_supervisor(
     inner: Arc<SupervisorInner>,
-    remote_socket: String,
+    remote: RemoteSocket,
     local_socket: PathBuf,
     remote_binary: String,
     mut shutdown_rx: watch::Receiver<bool>,
-    mut cmd: Command,
+    ssh_program: PathBuf,
 ) {
     let ssh_target = &inner.ssh_target;
     eprintln!(
         "[tunnel-supervisor] start: ssh_target={ssh_target} \
-         local_socket={local_socket:?} remote_socket={remote_socket} \
+         local_socket={local_socket:?} \
          remote_binary={remote_binary}"
     );
     let mut retry = RetryState::default();
-    let opts = TunnelOptions {
-        ssh_target,
-        remote_socket: &remote_socket,
-        local_socket: &local_socket,
-        remote_binary: &remote_binary,
-    };
-    let argv = build_tunnel_argv(&opts);
-    cmd.args(&argv)
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped());
-
     loop {
         if *shutdown_rx.borrow() {
             return;
@@ -196,18 +206,28 @@ async fn run_supervisor(
             let _ = inner.status_tx.send_replace(TunnelStatus::Pending);
         }
 
-        crate::trace_cloud_push!(
-            "[tunnel-supervisor] attempt {} argv: ssh {}",
-            retry.attempt + 1,
-            argv.join(" ")
-        );
-
-        // A dead ssh can leave its -L socket file behind. Readiness is
-        // "the socket exists", so clear it first or the next attempt
-        // reports Connected before ssh has even authenticated.
-        // (StreamLocalBindUnlink lets ssh rebind the path either way.)
-        remove_stale_socket(&local_socket);
-        let spawn_res = cmd.spawn();
+        let spawn_res = tokio::select! {
+            result = async {
+                validate_ssh_target(ssh_target)?;
+                prepare_local_socket(&local_socket)?;
+                let remote_socket = remote.discover(ssh_target).await?;
+                let argv = build_tunnel_argv(&TunnelOptions {
+                    ssh_target,
+                    remote_socket: &remote_socket,
+                    local_socket: &local_socket,
+                    remote_binary: &remote_binary,
+                });
+                remove_stale_socket(&local_socket);
+                let mut cmd = supervised_ssh_command(&ssh_program).await;
+                cmd.args(argv)
+                    .stdin(std::process::Stdio::null())
+                    .stdout(std::process::Stdio::piped())
+                    .stderr(std::process::Stdio::piped())
+                    .kill_on_drop(true);
+                cmd.spawn().map_err(|error| error.to_string())
+            } => result,
+            _ = shutdown_rx.wait_for(|stop| *stop) => return,
+        };
         let mut child = match spawn_res {
             Ok(c) => {
                 crate::trace_cloud_push!(
@@ -228,7 +248,7 @@ async fn run_supervisor(
             }
         };
 
-        // Wait for the socket to appear (or SSH to die before it does).
+        // Wait for the local socket and authenticated remote readiness.
         let socket_ready = tokio::select! {
             ready = wait_for_socket(&local_socket, &mut child, SPAWN_TIMEOUT) => Some(ready),
             _ = shutdown_rx.wait_for(|stop| *stop) => None,
@@ -330,51 +350,6 @@ async fn sleep_or_shutdown(
 
 /// Poll for the local socket to appear OR for SSH to exit. Returns
 /// `Ok(())` if the socket appears in time, `Err(reason)` otherwise.
-async fn wait_for_socket(
-    local_socket: &Path,
-    child: &mut tokio::process::Child,
-    deadline: Duration,
-) -> Result<(), String> {
-    let start = Instant::now();
-    let mut last_log_at_secs: u64 = 0;
-    crate::trace_cloud_push!(
-        "[tunnel-supervisor] waiting for local socket {:?} (deadline {:?})",
-        local_socket, deadline
-    );
-    loop {
-        if let Ok(Some(status)) = child.try_wait() {
-            return Err(format!(
-                "ssh exited before tunnel came up (status={status})"
-            ));
-        }
-        if local_socket.exists() {
-            // Tiny grace beat so the daemon's listener is fully up.
-            tokio::time::sleep(Duration::from_millis(50)).await;
-            crate::trace_cloud_push!(
-                "[tunnel-supervisor] local socket appeared after {:?}",
-                start.elapsed()
-            );
-            return Ok(());
-        }
-        let elapsed_secs = start.elapsed().as_secs();
-        if elapsed_secs > last_log_at_secs {
-            // Per-second progress so we know the loop is alive.
-            crate::trace_cloud_push!(
-                "[tunnel-supervisor] still waiting for socket (elapsed {}s, ssh alive)",
-                elapsed_secs
-            );
-            last_log_at_secs = elapsed_secs;
-        }
-        if start.elapsed() >= deadline {
-            return Err(format!(
-                "socket {:?} did not appear within {:?}",
-                local_socket, deadline
-            ));
-        }
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    }
-}
-
 /// Block until the supervised SSH child exits or shutdown signals.
 /// Returns `true` if child exited (need to reconnect), `false` if
 /// shutdown.
@@ -478,16 +453,25 @@ fn circuit_open(failures: &[Instant]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::process::Command;
+
+    fn private_test_dir() -> tempfile::TempDir {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        dir
+    }
 
     #[tokio::test]
     async fn startup_timeout_reconnects_and_reaps_ssh() {
         use std::os::unix::fs::PermissionsExt;
 
-        let dir = tempfile::tempdir().unwrap();
+        let dir = private_test_dir();
         let fake_ssh = dir.path().join("ssh");
         std::fs::write(
             &fake_ssh,
-            "#!/bin/sh\necho $$ > \"$0.pid\"\nprintf 'connection stalled\\n' >&2\nexec /bin/sleep 300\n",
+            "#!/bin/sh\n[ \"$1\" != -G ] || exit 1\necho $$ > \"$0.pid\"\nprintf 'connection stalled\\n' >&2\nexec /bin/sleep 300\n",
         )
         .unwrap();
         std::fs::set_permissions(&fake_ssh, std::fs::Permissions::from_mode(0o755)).unwrap();
@@ -496,6 +480,7 @@ mod tests {
         let local_socket = dir.path().join("tunnel.sock");
         let inner = Arc::new(SupervisorInner {
             ssh_target: "unused-host".into(),
+            _socket_directory: None,
             local_socket: local_socket.clone(),
             status_tx,
             shutdown_tx,
@@ -505,17 +490,13 @@ mod tests {
             inner: inner.clone(),
             task: std::sync::Mutex::new(None),
         };
-        let mut cmd = Command::new(&fake_ssh);
-        // Keep a failing regression test from leaving its fake SSH alive
-        // when the supervisor task is aborted during cleanup.
-        cmd.kill_on_drop(true);
         let mut task = tokio::spawn(run_supervisor(
             inner,
-            "/unused/remote.sock".into(),
+            RemoteSocket::Fixture("/unused/remote.sock".into()),
             local_socket,
             "/unused/codemux-remote".into(),
             shutdown_rx,
-            cmd,
+            fake_ssh,
         ));
         let result = tokio::time::timeout(SPAWN_TIMEOUT + Duration::from_secs(2), async {
             loop {
@@ -558,11 +539,11 @@ mod tests {
     async fn shutdown_kills_ssh_that_is_still_connecting() {
         use std::os::unix::fs::PermissionsExt;
 
-        let dir = tempfile::tempdir().unwrap();
+        let dir = private_test_dir();
         let fake_ssh = dir.path().join("ssh");
         std::fs::write(
             &fake_ssh,
-            "#!/bin/sh\necho $$ > \"$0.pid\"\nexec /bin/sleep 300\n",
+            "#!/bin/sh\n[ \"$1\" != -G ] || exit 1\necho $$ > \"$0.pid\"\nexec /bin/sleep 300\n",
         )
         .unwrap();
         std::fs::set_permissions(&fake_ssh, std::fs::Permissions::from_mode(0o755)).unwrap();
@@ -571,20 +552,19 @@ mod tests {
         let local_socket = dir.path().join("tunnel.sock");
         let inner = Arc::new(SupervisorInner {
             ssh_target: "unused-host".into(),
+            _socket_directory: None,
             local_socket: local_socket.clone(),
             status_tx,
             shutdown_tx,
             current_child: Mutex::new(None),
         });
-        let mut cmd = Command::new(&fake_ssh);
-        cmd.kill_on_drop(true);
         let task = tokio::spawn(run_supervisor(
             inner.clone(),
-            "/unused/remote.sock".into(),
+            RemoteSocket::Fixture("/unused/remote.sock".into()),
             local_socket,
             "/unused/codemux-remote".into(),
             shutdown_rx,
-            cmd,
+            fake_ssh,
         ));
         let supervisor = TunnelSupervisor {
             inner,
@@ -617,10 +597,10 @@ mod tests {
     async fn stale_local_socket_is_not_reported_as_connected() {
         use std::os::unix::fs::PermissionsExt;
 
-        let dir = tempfile::tempdir().unwrap();
+        let dir = private_test_dir();
         // An ssh that never binds the forward (e.g. stuck authenticating).
         let fake_ssh = dir.path().join("ssh");
-        std::fs::write(&fake_ssh, "#!/bin/sh\nexec /bin/sleep 300\n").unwrap();
+        std::fs::write(&fake_ssh, "#!/bin/sh\n[ \"$1\" != -G ] || exit 1\nexec /bin/sleep 300\n").unwrap();
         std::fs::set_permissions(&fake_ssh, std::fs::Permissions::from_mode(0o755)).unwrap();
         let local_socket = dir.path().join("tunnel.sock");
         // Left behind by a previous ssh that died.
@@ -630,20 +610,19 @@ mod tests {
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         let inner = Arc::new(SupervisorInner {
             ssh_target: "unused-host".into(),
+            _socket_directory: None,
             local_socket: local_socket.clone(),
             status_tx,
             shutdown_tx,
             current_child: Mutex::new(None),
         });
-        let mut cmd = Command::new(&fake_ssh);
-        cmd.kill_on_drop(true);
         let task = tokio::spawn(run_supervisor(
             inner,
-            "/unused/remote.sock".into(),
+            RemoteSocket::Fixture("/unused/remote.sock".into()),
             local_socket.clone(),
             "/unused/codemux-remote".into(),
             shutdown_rx,
-            cmd,
+            fake_ssh,
         ));
         let connected = tokio::time::timeout(Duration::from_secs(1), async {
             loop {

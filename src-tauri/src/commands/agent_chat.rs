@@ -2781,17 +2781,16 @@ fn record_native_worker_mode<R: Runtime>(
     }
 }
 
-/// Per-workspace gate between push / pull and chat session starts.
+/// Per-workspace gate between push / pull and session starts.
 ///
 /// A move stops the workspace's chats before copying it, but a send or a new
 /// pane during the copy would otherwise place its session from the
 /// still-current `host_id`, start it on the machine being left, and keep
 /// editing there after the move succeeds. Push / pull hold the gate for
-/// writing from before they stop the chats until the destination is
-/// committed ([`begin_workspace_migration`]); every session start holds it
-/// for reading from resolving its placement until the provider has started
-/// ([`wait_for_workspace_placement`]), so it waits out a move and then starts
-/// where the workspace runs.
+/// writing from before they stop the chats until the destination has been
+/// committed and its terminals cleaned up ([`begin_workspace_migration`]).
+/// Chat startup and daemon PTY hydration hold it for reading while resolving
+/// placement and starting or attaching to their session.
 ///
 /// Lock order: this gate, then a thread's [`resume_lock_for`] lock. A move
 /// takes resume locks while it holds the gate, so waiting for the gate with
@@ -2812,7 +2811,7 @@ fn migration_gate_for(workspace_id: &str) -> Arc<tokio::sync::RwLock<()>> {
 /// Wait out any push / pull of `workspace_id`, then keep the next one from
 /// starting until the guard drops. `None` (a thread with no workspace) has
 /// nothing to wait for.
-async fn wait_for_workspace_placement(
+pub(crate) async fn wait_for_workspace_placement(
     workspace_id: Option<&str>,
 ) -> Option<tokio::sync::OwnedRwLockReadGuard<()>> {
     Some(migration_gate_for(workspace_id?).read_owned().await)
@@ -2910,21 +2909,12 @@ async fn stop_moved_session<R: Runtime>(
     Ok(())
 }
 
-/// Start moving a workspace to another machine (push / pull): close its
-/// migration gate ([`migration_gate_for`]), then stop its live chats.
-///
-/// Until the returned guard drops no chat session in the workspace starts,
-/// so none can begin on the machine being left. Hold it until the new
-/// `host_id` is committed and the conversations have travelled with the
-/// files; dropping it on failure lets chats start where the workspace still
-/// runs.
-pub async fn begin_workspace_migration<R: Runtime>(
-    app: &AppHandle<R>,
+/// Reserve a workspace move before reading its current placement.
+#[cfg(any(unix, test))]
+pub(crate) async fn begin_workspace_migration(
     workspace_id: &str,
 ) -> tokio::sync::OwnedRwLockWriteGuard<()> {
-    let gate = migration_gate_for(workspace_id).write_owned().await;
-    stop_workspace_chat_sessions(app, workspace_id).await;
-    gate
+    migration_gate_for(workspace_id).write_owned().await
 }
 
 /// Stop every live chat session in a workspace that push / pull is about to
@@ -2935,7 +2925,11 @@ pub async fn begin_workspace_migration<R: Runtime>(
 /// the provider can. Runs under the migration gate, so no thread starts
 /// meanwhile; the moved check in [`ensure_live_session`] still catches a
 /// session that outlives a move.
-async fn stop_workspace_chat_sessions<R: Runtime>(app: &AppHandle<R>, workspace_id: &str) {
+#[cfg(any(unix, test))]
+pub(crate) async fn stop_workspace_chat_sessions<R: Runtime>(
+    app: &AppHandle<R>,
+    workspace_id: &str,
+) {
     let threads = app
         .try_state::<AppStateStore>()
         .and_then(|state| state.find_workspace(workspace_id))
@@ -14179,7 +14173,8 @@ mod tests {
         provider.live.lock().unwrap().insert(thread.to_string());
         record_session_host(thread, None);
 
-        let migration = begin_workspace_migration(&handle, &workspace).await;
+        let migration = begin_workspace_migration(&workspace).await;
+        stop_workspace_chat_sessions(&handle, &workspace).await;
         assert_eq!(*provider.stopped.lock().unwrap(), vec![thread.to_string()]);
         let send = tokio::spawn({
             let handle = handle.clone();
@@ -14213,7 +14208,8 @@ mod tests {
         provider.live.lock().unwrap().insert(thread.to_string());
         record_session_host(thread, Some(host_id));
 
-        let migration = begin_workspace_migration(&handle, &workspace).await;
+        let migration = begin_workspace_migration(&workspace).await;
+        stop_workspace_chat_sessions(&handle, &workspace).await;
         assert_eq!(*provider.stopped.lock().unwrap(), vec![thread.to_string()]);
         let send = tokio::spawn({
             let handle = handle.clone();
@@ -14234,6 +14230,227 @@ mod tests {
         assert_eq!(*provider.started_on.lock().unwrap(), vec![None]);
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn stale_pull_leaves_the_local_chat_running() {
+        let thread = "stale-pull-local-chat";
+        let provider = Arc::new(PlacementProvider::default());
+        let (app, workspace) = placement_app(thread, None, provider.clone()).await;
+        provider.live.lock().unwrap().insert(thread.to_string());
+
+        let error = super::super::hosts::workspace_pull_back_impl(
+            app.handle().clone(),
+            workspace,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error, "Workspace is already local.");
+        assert!(provider.stopped.lock().unwrap().is_empty());
+        assert!(provider.has_session(&ThreadId(thread.to_string())).await);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn pull_with_unverified_host_key_leaves_the_device_chat_running() {
+        use std::os::unix::fs::PermissionsExt;
+
+        const TEST: &str =
+            "commands::agent_chat::tests::pull_with_unverified_host_key_leaves_the_device_chat_running";
+        if crate::test_isolation::isolated(TEST) {
+            return;
+        }
+        let root = crate::test_isolation::isolated_root().unwrap();
+        let fixture = root.join("ssh");
+        std::fs::write(
+            &fixture,
+            r#"#!/bin/sh
+strict=no
+for arg do
+    if [ "$arg" = StrictHostKeyChecking=yes ]; then strict=yes; fi
+done
+[ "$strict" = yes ] || exit 2
+printf '%s\n' 'Host key verification failed.' >&2
+exit 255
+"#,
+        )
+        .unwrap();
+        std::fs::set_permissions(&fixture, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let path = std::env::var_os("PATH").unwrap_or_default();
+        let path = std::env::join_paths(
+            std::iter::once(root.clone()).chain(std::env::split_paths(&path)),
+        )
+        .unwrap();
+        std::env::set_var("PATH", path);
+
+        let thread = "unverified-pull-device-chat";
+        let provider = Arc::new(PlacementProvider::default());
+        let (app, workspace) = placement_app(thread, Some(1), provider.clone()).await;
+        let state = app.state::<AppStateStore>();
+        let host = state.find_workspace(&workspace).unwrap().host_id;
+        let local_target = root.join("pull-destination");
+        state.set_workspace_worktree(
+            &workspace,
+            local_target.display().to_string(),
+            "main".into(),
+        );
+        provider.live.lock().unwrap().insert(thread.to_string());
+        record_session_host(thread, host);
+
+        let outcome = super::super::hosts::workspace_pull_back_impl(
+            app.handle().clone(),
+            workspace.clone(),
+        )
+        .await
+        .unwrap();
+        assert!(!outcome.ok);
+        assert!(outcome.message.contains("Host key verification failed."), "{}", outcome.message);
+        assert_eq!(state.find_workspace(&workspace).unwrap().host_id, host);
+        assert!(provider.stopped.lock().unwrap().is_empty());
+        assert!(provider.has_session(&ThreadId(thread.to_string())).await);
+        assert!(!local_target.exists());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn push_leaves_the_local_chat_running_when_tunnel_preflight_fails() {
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
+        use std::os::unix::fs::PermissionsExt;
+
+        const TEST: &str =
+            "commands::agent_chat::tests::push_leaves_the_local_chat_running_when_tunnel_preflight_fails";
+        if crate::test_isolation::isolated(TEST) {
+            return;
+        }
+        let root = crate::test_isolation::isolated_root().unwrap();
+        // Keep the remote socket on the home route even when the test's
+        // TMPDIR is too long to hold a Unix socket path.
+        let remote = tempfile::Builder::new()
+            .prefix("cmux-device.")
+            .permissions(std::fs::Permissions::from_mode(0o700))
+            .tempdir_in("/tmp")
+            .unwrap();
+        let remote_home = remote.path();
+        let state_dir = remote_home.join(".cmux-tunnels");
+        std::fs::create_dir_all(&state_dir).unwrap();
+        std::fs::set_permissions(&state_dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let remote_bin = remote_home.join(".local/bin");
+        std::fs::create_dir_all(&remote_bin).unwrap();
+        let helper = remote_bin.join("codemux-remote");
+        let version = json!({
+            "version": env!("CARGO_PKG_VERSION"),
+            "protocol_version": crate::pty_daemon::PROTOCOL_VERSION,
+            "guarded_shells": true,
+            "prepared_spawn": true,
+        });
+        std::fs::write(&helper, format!("#!/bin/sh\nprintf '%s\\n' '{version}'\n")).unwrap();
+        std::fs::set_permissions(&helper, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+        let ssh = root.join("ssh");
+        std::fs::write(
+            &ssh,
+            r#"#!/bin/sh
+strict=no
+forward=no
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+        StrictHostKeyChecking=yes) strict=yes;;
+        -L) forward=yes; shift;;
+        --) shift; break;;
+    esac
+    shift
+done
+[ "$strict" = yes ] && [ "$#" -eq 2 ] && [ "$1" = deus@ai-node ] || exit 255
+case "$2" in
+    *CMX_PUSH_HELPER*) step=helper;;
+    *PROBE_ONLY=1*) step=discovery;;
+    *CODEMUX_PTY_DAEMON_DIR=*)
+        [ "$forward" = yes ] || exit 1
+        printf 'forward\n' >> "$CODEMUX_TEST_PUSH_LOG"
+        exit 255;;
+    mkdir\ -p\ *) printf 'mkdir\n' >> "$CODEMUX_TEST_PUSH_LOG"; exit 0;;
+    *) printf 'unexpected\n' >> "$CODEMUX_TEST_PUSH_LOG"; exit 1;;
+esac
+printf '%s\n' "$step" >> "$CODEMUX_TEST_PUSH_LOG"
+HOME="$CODEMUX_TEST_PUSH_REMOTE_HOME" XDG_RUNTIME_DIR= exec /bin/sh -c "$2"
+"#,
+        )
+        .unwrap();
+        std::fs::set_permissions(ssh, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let rsync = root.join("rsync");
+        std::fs::write(
+            &rsync,
+            "#!/bin/sh\nprintf 'rsync\\n' >> \"$CODEMUX_TEST_PUSH_LOG\"\nexit 1\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(rsync, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let path = std::env::var_os("PATH").unwrap_or_default();
+        let path = std::env::join_paths(
+            std::iter::once(root.clone()).chain(std::env::split_paths(&path)),
+        )
+        .unwrap();
+        let log = root.join("push-log");
+        std::env::set_var("PATH", path);
+        std::env::set_var("CODEMUX_TEST_PUSH_LOG", &log);
+        std::env::set_var("CODEMUX_TEST_PUSH_REMOTE_HOME", remote_home);
+
+        let thread = ThreadId("unusable-device-socket-root".into());
+        let provider = Arc::new(PlacementProvider::default());
+        let (app, workspace_id) = placement_app(&thread.0, None, provider.clone()).await;
+        let db = app.state::<DatabaseStore>();
+        let host_id = db.list_hosts()[0].id;
+        let state = app.state::<AppStateStore>();
+        let checkout = root.join("checkout");
+        std::fs::create_dir(&checkout).unwrap();
+        state.set_workspace_worktree(&workspace_id, checkout.display().to_string(), "Test".into());
+        provider.live.lock().unwrap().insert(thread.0.clone());
+        record_session_host(&thread.0, None);
+
+        let mut hasher = DefaultHasher::new();
+        workspace_id.hash(&mut hasher);
+        let socket_name = format!("{:x}.sock", hasher.finish());
+        for blocked_suffix in [None, Some(""), Some(".pid"), Some(".log")] {
+            let blocker =
+                blocked_suffix.map(|suffix| state_dir.join(format!("{socket_name}{suffix}")));
+            if let Some(entry) = &blocker {
+                std::fs::create_dir(entry).unwrap();
+            }
+            std::fs::write(&log, "").unwrap();
+            let error = super::super::hosts::workspace_push_to_host(
+                app.handle().clone(), app.state(), workspace_id.clone(), host_id,
+            )
+            .await
+            .unwrap_err();
+            assert!(error.contains("no usable private workspace socket directory"), "{error}");
+            assert_eq!(std::fs::read_to_string(&log).unwrap(), "helper\ndiscovery\n");
+            assert_eq!(
+                std::fs::read_dir(&state_dir).unwrap().count(),
+                usize::from(blocker.is_some()),
+            );
+            if let Some(entry) = blocker {
+                assert!(entry.is_dir());
+                std::fs::remove_dir(entry).unwrap();
+            } else {
+                std::fs::set_permissions(&state_dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+            }
+        }
+
+        // The socket directory is usable and version metadata advertises
+        // both capabilities. The SSH server can still refuse forwarding.
+        std::fs::write(&log, "").unwrap();
+        let error = super::super::hosts::workspace_push_to_host(
+            app.handle().clone(), app.state(), workspace_id.clone(), host_id,
+        )
+        .await
+        .unwrap_err();
+        assert!(error.contains("ssh exited before tunnel came up"), "{error}");
+        assert_eq!(state.find_workspace(&workspace_id).unwrap().host_id, None);
+        assert!(provider.stopped.lock().unwrap().is_empty());
+        assert!(provider.has_session(&thread).await);
+        assert_eq!(std::fs::read_to_string(&log).unwrap(), "helper\ndiscovery\nforward\n");
+        assert_eq!(std::fs::read_dir(state_dir).unwrap().count(), 0);
+    }
+
     /// A failed move leaves the workspace where it was, and a send waiting
     /// on it starts the chat there.
     #[tokio::test]
@@ -14243,7 +14460,8 @@ mod tests {
         let (app, workspace) = placement_app(thread, None, provider.clone()).await;
         let handle = app.handle().clone();
 
-        let migration = begin_workspace_migration(&handle, &workspace).await;
+        let migration = begin_workspace_migration(&workspace).await;
+        stop_workspace_chat_sessions(&handle, &workspace).await;
         let send = tokio::spawn({
             let handle = handle.clone();
             async move {
@@ -14280,7 +14498,8 @@ mod tests {
         }))
         .unwrap();
 
-        let migration = begin_workspace_migration(&handle, &workspace).await;
+        let migration = begin_workspace_migration(&workspace).await;
+        stop_workspace_chat_sessions(&handle, &workspace).await;
         let start = tokio::spawn({
             let handle = handle.clone();
             async move { agent_chat_start_session(handle, pane, ProviderKind::Codex, input, None).await }

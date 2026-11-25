@@ -19,7 +19,8 @@
 
 use crate::pty_daemon::manifest::{remove_manifest, write_manifest, DaemonManifest};
 use crate::pty_daemon::protocol::{
-    ClientRequest, DaemonSessionInfo, Frame, ServerEvent, ServerResponse, PROTOCOL_VERSION,
+    ClientRequest, DaemonSessionInfo, Frame, ServerEvent, ServerResponse, GUARDED_SHELLS_SUPPORTED,
+    PREPARED_SPAWN_SUPPORTED, PROTOCOL_VERSION,
 };
 use base64::Engine;
 use portable_pty::{native_pty_system, CommandBuilder, MasterPty, PtySize};
@@ -568,8 +569,8 @@ async fn handle_request(
             daemon_pid: std::process::id(),
             daemon_version: env!("CARGO_PKG_VERSION").to_string(),
             host_claude_plugin: HOST_CLAUDE_PLUGIN.get().is_some(),
-            guarded_shells: true,
-            prepared_spawn: true,
+            guarded_shells: GUARDED_SHELLS_SUPPORTED,
+            prepared_spawn: PREPARED_SPAWN_SUPPORTED,
         },
         ClientRequest::PrepareOwnedSpawn { request_id, session_id, shell_id } => {
             let mut guard = state.lock().await;

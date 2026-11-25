@@ -30,6 +30,10 @@ use uuid::Uuid;
 /// the supervisor must respawn it rather than silently no-op backpressure.
 pub const PROTOCOL_VERSION: u32 = 2;
 
+/// Terminal capabilities advertised by both a running daemon and its helper.
+pub const GUARDED_SHELLS_SUPPORTED: bool = cfg!(unix);
+pub const PREPARED_SPAWN_SUPPORTED: bool = cfg!(unix);
+
 /// Request from the Tauri app to the daemon. Every request carries a
 /// `request_id` so the client can correlate responses without ordering
 /// guarantees.

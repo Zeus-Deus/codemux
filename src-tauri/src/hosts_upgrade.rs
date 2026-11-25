@@ -444,18 +444,8 @@ async fn probe_live_host_sessions(ssh_target: &str) -> Option<u64> {
     use std::process::Stdio;
     let cmd_str = live_sessions_script();
     let output = tokio::time::timeout(Duration::from_secs(12), async {
-        tokio::process::Command::new("ssh")
-            .args([
-                "-o",
-                "BatchMode=yes",
-                "-o",
-                "ConnectTimeout=10",
-                "-o",
-                "StrictHostKeyChecking=accept-new",
-                "--",
-                ssh_target,
-                &cmd_str,
-            ])
+        crate::ssh::exec::verified_ssh_command(ssh_target, 10)
+            .arg(&cmd_str)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())

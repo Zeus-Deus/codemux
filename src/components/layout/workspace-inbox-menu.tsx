@@ -126,7 +126,7 @@ export function WorkspaceInboxMenu({
       const result = await workspacePushToHost(workspace.workspace_id, host.id);
       if (result.ok) {
         toast.undoable({
-          message: `Pushed to ${host.name}`,
+          message: result.message,
           description: "Tap Undo within 10s to pull it back.",
           onUndo: async () => {
             const undoResult = await workspacePullBack(workspace.workspace_id);

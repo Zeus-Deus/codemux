@@ -64,6 +64,8 @@ fn version_subcommand_prints_json() {
     assert_eq!(parsed["name"], "codemux-remote");
     assert!(parsed["version"].is_string());
     assert!(parsed["protocol_version"].is_number());
+    assert_eq!(parsed["guarded_shells"].as_bool(), Some(true));
+    assert_eq!(parsed["prepared_spawn"].as_bool(), Some(true));
 }
 
 #[test]

@@ -649,16 +649,8 @@ async fn forget_fallback_for_listed_shell<R: Runtime>(
 /// once, which is what enables the one-List invariant.
 pub(crate) async fn spawn_pty_for_session_via_daemon<R: Runtime>(
     app: AppHandle<R>,
-    session_id: String,
+    plan: PtyHydrationPlan,
 ) -> Result<(), DaemonHydrationFailure> {
-    let state: State<'_, AppStateStore> = app.state();
-    let plan = state
-        .pty_hydration_plan_for_session(&session_id)
-        .ok_or_else(|| {
-            DaemonHydrationFailure::SafeToFallback(
-                "terminal session has no owning workspace".to_string(),
-            )
-        })?;
     let failures = hydrate_workspace_via_daemon(app, plan, None).await?;
     failures.failures
         .into_iter()
@@ -1953,9 +1945,11 @@ async fn drain_pending_daemon_closes<R: Runtime>(
                             if let Some(ssh_target) = &route.ssh_target {
                                 let mut tunnel = cleanup_tunnel.lock().await;
                                 if tunnel.is_none() {
-                                    *tunnel = Some(crate::ssh::registry::CleanupDaemonTunnel::start(
+                                    let started = crate::ssh::registry::CleanupDaemonTunnel::start(
                                         &route.workspace_id, ssh_target,
-                                    ).await);
+                                    ).await;
+                                    let Ok(started) = started else { return false };
+                                    *tunnel = Some(started);
                                 }
                                 tunnel.as_mut().expect("cleanup tunnel initialized")
                                     .client(&route.workspace_id).await

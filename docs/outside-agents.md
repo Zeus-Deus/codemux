@@ -566,6 +566,8 @@ Exit codes: `0` done, `1` failed or error, `2` needs input, `3` timed out, `64` 
 
 When you add a server under **Settings → Connections → Devices**, Codemux installs `codemux-remote` there. An agent on that server can use `codemux-remote mcp` to register folders and git worktrees on the server, run shells there and check the helper. Workspaces it registers show up under Devices in the Codemux app. It can't start or message Codemux chats.
 
+Before testing a new device or moving a workspace, confirm the server's SSH host-key fingerprint with its administrator and add the matching key to your SSH `known_hosts`. Codemux checks that key before connecting, updating the device helper, or copying workspace files.
+
 `codemux-remote` writes no agent config on the server. Codemux chats and remote tasks that run Claude Code on the server, and Claude Code typed in a Codemux terminal on it, get that server's `codemux-remote mcp` per session. To use it from another agent there, add it yourself, for example `claude mcp add --scope user codemux -- ~/.local/bin/codemux-remote mcp`. A Vexis entry for it in `~/.vexis/mcp-servers.yaml` keeps working.
 
 Older versions of `codemux-remote serve` added `codemux-remote mcp` to `~/.claude.json` as `codemux`, and keep doing so until the service is updated. On a machine where the Codemux app also runs, Codemux and `codemux-remote serve` remove that entry when they start, but only if it is exactly what was written: `codemux-remote` with the single argument `mcp` and no other settings. On a server that runs only `codemux-remote`, the entry stays. An entry you add with `claude mcp add` is never removed.

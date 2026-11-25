@@ -31,12 +31,14 @@
 
 pub mod bootstrap;
 pub mod exec;
+pub(crate) mod history_process;
 pub mod opencode_db_sync;
 pub mod probe;
 pub mod push;
 pub mod registry;
 pub mod sidecar;
 pub mod tunnel;
+mod tunnel_paths;
 pub mod tunnel_supervisor;
 
 pub use bootstrap::{bootstrap_remote, BootstrapResult};
@@ -48,10 +50,7 @@ pub use push::{
     PullOptions, PullResult, PushOptions, PushResult,
 };
 pub use registry::{
-    client_for_workspace, forget_workspace_client, get_supervisor,
-    install_supervisor, local_socket_for_workspace,
-    remote_socket_for_workspace, shutdown_all, shutdown_supervisor,
-    spawn_tunnel_status_forwarder,
+    client_for_workspace, forget_workspace_client, shutdown_all, shutdown_supervisor,
 };
 pub use tunnel::{spawn_ssh_tunnel, TunnelHandle};
 pub use tunnel_supervisor::{TunnelStatus, TunnelSupervisor};
