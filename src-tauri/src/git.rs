@@ -1961,7 +1961,7 @@ fn registered_checkout(listing: &[u8], separator: u8, target_ref: &str) -> Regis
 }
 
 /// A path git printed, kept byte for byte where the platform allows it.
-fn path_from_git_bytes(bytes: Vec<u8>) -> Option<PathBuf> {
+pub(crate) fn path_from_git_bytes(bytes: Vec<u8>) -> Option<PathBuf> {
     #[cfg(unix)]
     {
         use std::os::unix::ffi::OsStringExt;
@@ -2019,7 +2019,7 @@ fn git_line(dir: &Path, args: &[&str]) -> Option<Vec<u8>> {
     Some(strip_git_line_ending(output.stdout))
 }
 
-fn strip_git_line_ending(mut bytes: Vec<u8>) -> Vec<u8> {
+pub(crate) fn strip_git_line_ending(mut bytes: Vec<u8>) -> Vec<u8> {
     if bytes.last() == Some(&b'\n') {
         bytes.pop();
         #[cfg(not(unix))]
