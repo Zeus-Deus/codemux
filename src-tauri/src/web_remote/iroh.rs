@@ -610,16 +610,24 @@ enum KeyAclScope {
     KeyFile,
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", all(unix, test)))]
 const ACL_FIRST_ENTRY: libc::c_int = 0;
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", all(unix, test)))]
 const ACL_NEXT_ENTRY: libc::c_int = -1;
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", all(unix, test)))]
 const ACL_EXTENDED_ALLOW: libc::c_int = 1;
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", all(unix, test)))]
 const ACL_EXTENDED_DENY: libc::c_int = 2;
+#[cfg(any(target_os = "macos", all(unix, test)))]
+const ACL_GENERIC_ALL: u64 = 1 << 21;
+#[cfg(any(target_os = "macos", all(unix, test)))]
+const ACL_GENERIC_EXECUTE: u64 = 1 << 22;
+#[cfg(any(target_os = "macos", all(unix, test)))]
+const ACL_GENERIC_WRITE: u64 = 1 << 23;
+#[cfg(any(target_os = "macos", all(unix, test)))]
+const ACL_GENERIC_READ: u64 = 1 << 24;
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", all(unix, test)))]
 fn acl_lookup_has_entry(
     found: libc::c_int,
     entry_id: libc::c_int,
@@ -641,7 +649,7 @@ fn acl_lookup_has_entry(
     ))
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", all(unix, test)))]
 fn check_key_acl_entries(
     context: &str,
     scope: KeyAclScope,
@@ -653,6 +661,9 @@ fn check_key_acl_entries(
         (1 << 2) | (1 << 4) | (1 << 5) | (1 << 6) | (1 << 8) | (1 << 10) | (1 << 12) | (1 << 13);
     const READ_DATA: u64 = 1 << 1;
     const SEARCH: u64 = 1 << 3;
+    const GENERIC_RIGHTS: u64 =
+        ACL_GENERIC_ALL | ACL_GENERIC_EXECUTE | ACL_GENERIC_WRITE | ACL_GENERIC_READ;
+    const SPECIFIC_RIGHTS: u64 = ((1 << 14) - (1 << 1)) | (1 << 20);
     let forbidden = match scope {
         KeyAclScope::Ancestor => MUTATE,
         KeyAclScope::PrivateDirectory => MUTATE | READ_DATA | SEARCH,
@@ -666,7 +677,23 @@ fn check_key_acl_entries(
         if tag != ACL_EXTENDED_ALLOW {
             return Err(format!("{context} has an unsupported ACL entry"));
         }
-        if mask & forbidden != 0 {
+        if mask & !(SPECIFIC_RIGHTS | GENERIC_RIGHTS) != 0 {
+            return Err(format!("{context} ACL has unsupported rights"));
+        }
+        // Darwin expands these generic rights when evaluating an ACL entry.
+        // Use the same specific rights before deciding whether a grant is safe.
+        let mut rights = mask;
+        if mask & (ACL_GENERIC_ALL | ACL_GENERIC_READ) != 0 {
+            rights |= READ_DATA | (1 << 7) | (1 << 9) | (1 << 11);
+        }
+        if mask & (ACL_GENERIC_ALL | ACL_GENERIC_WRITE) != 0 {
+            rights |= (1 << 2) | (1 << 4) | (1 << 5) | (1 << 6)
+                | (1 << 8) | (1 << 10) | (1 << 12);
+        }
+        if mask & (ACL_GENERIC_ALL | ACL_GENERIC_EXECUTE) != 0 {
+            rights |= SEARCH;
+        }
+        if rights & forbidden != 0 {
             return Err(format!("{context} ACL grants unsafe access"));
         }
     }
@@ -1714,7 +1741,7 @@ mod tests {
         assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
     }
 
-    #[cfg(target_os = "macos")]
+    #[cfg(unix)]
     #[test]
     fn iroh_identity_key_acl_scans_past_deny_entries() {
         let mut entries = [(ACL_EXTENDED_DENY, 1 << 1), (ACL_EXTENDED_ALLOW, 1 << 1)].into_iter();
@@ -1727,7 +1754,7 @@ mod tests {
         assert!(entries.next().is_none());
     }
 
-    #[cfg(target_os = "macos")]
+    #[cfg(unix)]
     #[test]
     fn iroh_identity_key_acl_lookup_only_accepts_next_entry_end() {
         assert!(acl_lookup_has_entry(0, ACL_FIRST_ENTRY, None, "iroh key").unwrap());
@@ -1735,6 +1762,32 @@ mod tests {
         assert!(!acl_lookup_has_entry(-1, ACL_NEXT_ENTRY, Some(libc::EINVAL), "iroh key").unwrap());
         assert!(acl_lookup_has_entry(-1, ACL_FIRST_ENTRY, Some(libc::EINVAL), "iroh key").is_err());
         assert!(acl_lookup_has_entry(-1, ACL_NEXT_ENTRY, Some(libc::EIO), "iroh key").is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn iroh_identity_key_acl_expands_generic_grants() {
+        fn check(scope: KeyAclScope, rights: u64) -> Result<(), String> {
+            let mut entries = [(ACL_EXTENDED_ALLOW, rights)].into_iter();
+            check_key_acl_entries("iroh key", scope, || Ok(entries.next()))
+        }
+
+        for (scope, generic, specific) in [
+            (KeyAclScope::KeyFile, ACL_GENERIC_READ, 1 << 1),
+            (KeyAclScope::Ancestor, ACL_GENERIC_WRITE, 1 << 2),
+            (KeyAclScope::PrivateDirectory, ACL_GENERIC_EXECUTE, 1 << 3),
+        ] {
+            assert!(check(scope, specific).unwrap_err().contains("unsafe access"));
+            assert!(check(scope, generic).unwrap_err().contains("unsafe access"));
+        }
+        assert!(check(KeyAclScope::KeyFile, ACL_GENERIC_ALL)
+            .unwrap_err()
+            .contains("unsafe access"));
+        check(KeyAclScope::Ancestor, 1 << 1).unwrap();
+        check(KeyAclScope::Ancestor, ACL_GENERIC_READ).unwrap();
+        assert!(check(KeyAclScope::KeyFile, 1 << 31)
+            .unwrap_err()
+            .contains("unsupported rights"));
     }
 
     #[cfg(unix)]
