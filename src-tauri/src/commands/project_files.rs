@@ -535,16 +535,18 @@ impl FolderWalkFilter {
     }
 
     fn config_exclude_path(bytes: &[u8], home: Option<&Path>) -> Result<Option<PathBuf>, String> {
-        let text = std::str::from_utf8(bytes)
-            .map_err(|_| "cannot parse global Git config for folder preview".to_string())?;
-        for line in text.lines() {
-            let Some((key, value)) = line.split_once('=') else {
+        // Unrelated comments and settings may contain non-UTF-8 bytes; only
+        // the selected ignore path needs to be decoded.
+        for line in bytes.split(|byte| *byte == b'\n') {
+            let Some(separator) = line.iter().position(|byte| *byte == b'=') else {
                 continue;
             };
-            if !key.trim().eq_ignore_ascii_case("excludesfile") {
+            if !line[..separator].trim_ascii().eq_ignore_ascii_case(b"excludesfile") {
                 continue;
             }
-            let value = value.trim().trim_matches('"');
+            let value = std::str::from_utf8(line[separator + 1..].trim_ascii())
+                .map_err(|_| "cannot parse global Git ignore path for folder preview".to_string())?
+                .trim_matches('"');
             if value.is_empty() {
                 return Err("cannot parse global Git ignore path for folder preview".to_string());
             }
@@ -2914,16 +2916,15 @@ mod tests {
     }
 
     #[test]
-    fn configured_global_ignore_is_applied_from_bounded_bytes() {
+    fn non_utf8_global_config_comment_keeps_valid_ignore_rules() {
         let dir = tempdir().unwrap();
         let config = dir.path().join("global-git-config");
         let global_ignore = dir.path().join("global-ignore");
         fs::write(&global_ignore, "*.secret\n").unwrap();
-        fs::write(
-            &config,
-            format!("[core]\nexcludesFile = {}\n", global_ignore.display()),
-        )
-        .unwrap();
+        let mut config_bytes = b"[core]\n# unrelated ".to_vec();
+        config_bytes.extend_from_slice(&[0xff, b'\n']);
+        config_bytes.extend_from_slice(format!("excludesFile = {}\n", global_ignore.display()).as_bytes());
+        fs::write(&config, config_bytes).unwrap();
         let output = std::process::Command::new(std::env::current_exe().unwrap())
             .args([
                 "--exact",
