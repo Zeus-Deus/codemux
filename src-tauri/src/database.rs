@@ -18,9 +18,12 @@ pub mod turn_diffs;
 pub mod mobile_push;
 pub mod queued_turns;
 pub mod restart_resumes;
+#[cfg(windows)]
+mod project_script_paths;
 #[cfg(unix)]
 pub(crate) mod daemon_closes;
 mod layout_closes;
+mod lifecycle_worktrees;
 
 /// Merge every session row matching `group` (an `agent_chat_sessions`
 /// predicate over `?1 = key`) into `survivor` (`?2`), which must match it
@@ -264,13 +267,121 @@ fn agent_chat_session(conn: &Connection, thread_id: &str) -> Option<AgentChatSes
 use rusqlite::{params, params_from_iter, types::Value, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 const SCHEMA_VERSION: u32 = 24;
 
 pub struct DatabaseStore {
     conn: Mutex<Connection>,
+}
+
+pub(crate) const REVIEWED_PROJECT_CHANGED: &str =
+    "The reviewed project changed. Reopen Settings and review the scripts again.";
+
+pub(crate) struct ReviewedProjectRoot {
+    path: PathBuf,
+    directory: std::fs::File,
+}
+
+impl ReviewedProjectRoot {
+    #[cfg(unix)]
+    fn open(path: PathBuf) -> std::io::Result<Self> {
+        let directory = cap_std::fs::Dir::open_ambient_dir(&path, cap_std::ambient_authority())?;
+        Ok(Self { path, directory: directory.into_std_file() })
+    }
+
+    #[cfg(windows)]
+    fn open(path: PathBuf) -> std::io::Result<Self> {
+        use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
+        use windows_sys::Win32::Storage::FileSystem::{
+            FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
+            FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
+        };
+
+        // Settings keeps this identity available while open. A replaceable
+        // handle lets the user move the directory without inheriting consent.
+        let directory = std::fs::OpenOptions::new()
+            .access_mode(FILE_READ_ATTRIBUTES)
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
+            .open(&path)?;
+        let metadata = directory.metadata()?;
+        if !metadata.is_dir() || metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+            return Err(std::io::Error::other(REVIEWED_PROJECT_CHANGED));
+        }
+        Ok(Self { path, directory })
+    }
+
+    pub(crate) fn path(&self) -> &Path {
+        &self.path
+    }
+
+    fn identity(&self) -> Option<ProjectDirectoryId> {
+        ProjectDirectoryId::from_file(&self.directory)
+    }
+
+    pub(crate) fn matches_path(&self, path: &Path) -> bool {
+        let Some(expected) = self.identity() else {
+            return false;
+        };
+        dunce::canonicalize(path).is_ok_and(|current| {
+            current == self.path
+                && Self::open(current).ok().and_then(|root| root.identity()) == Some(expected)
+        })
+    }
+}
+
+#[cfg(unix)]
+#[derive(Serialize, Deserialize, PartialEq, Eq, Clone, Copy)]
+pub(crate) struct ProjectDirectoryId {
+    device: u64,
+    inode: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    created: Option<std::time::Duration>,
+}
+
+#[cfg(unix)]
+impl ProjectDirectoryId {
+    pub(crate) fn from_file(directory: &std::fs::File) -> Option<Self> {
+        use std::os::unix::fs::MetadataExt;
+        let metadata = directory.metadata().ok()?;
+        metadata.is_dir().then(|| Self {
+            device: metadata.dev(),
+            inode: metadata.ino(),
+            created: metadata.created().ok()
+                .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok()),
+        })
+    }
+}
+
+#[cfg(windows)]
+#[derive(Serialize, Deserialize, PartialEq, Eq, Clone, Copy)]
+pub(crate) struct ProjectDirectoryId {
+    volume: u64,
+    file_id: [u8; 16],
+    created: u64,
+}
+
+#[cfg(windows)]
+impl ProjectDirectoryId {
+    pub(crate) fn from_file(directory: &std::fs::File) -> Option<Self> {
+        use std::os::windows::fs::MetadataExt;
+        let metadata = directory.metadata().ok()?;
+        if !metadata.is_dir() {
+            return None;
+        }
+        let (volume, file_id) = crate::windows_file_id::file_id(directory).ok()?;
+        Some(Self { volume, file_id: file_id.to_le_bytes(), created: metadata.creation_time() })
+    }
+}
+
+#[derive(Serialize, Deserialize)]
+struct ReviewedProjectScripts {
+    #[serde(flatten)]
+    scripts: ProjectScripts,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    reviewed_directory: Option<ProjectDirectoryId>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -590,7 +701,7 @@ pub struct AgentChatSessionCleanup {
     pub checkpoint_refs: Vec<(String, String)>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
 pub struct ProjectScripts {
     #[serde(default)]
     pub setup: Vec<String>,
@@ -633,6 +744,7 @@ fn database_path() -> Option<PathBuf> {
 }
 
 fn create_schema(conn: &Connection) -> Result<(), String> {
+    conn.execute_batch(lifecycle_worktrees::SCHEMA).map_err(|error| error.to_string())?;
     conn.execute_batch(agent_control::SCHEMA).map_err(|e| e.to_string())?;
     mcp_connector::migrate(conn)?;
     conn.execute_batch(local_sessions::SCHEMA).map_err(|e|e.to_string())?;
@@ -1568,7 +1680,10 @@ impl DatabaseStore {
     }
 
     pub fn set_setting(&self, key: &str, value: &str) -> Result<(), String> {
-        let conn = self.conn.lock().unwrap();
+        Self::write_setting(&self.conn.lock().unwrap(), key, value)
+    }
+
+    fn write_setting(conn: &Connection, key: &str, value: &str) -> Result<(), String> {
         conn.execute(
             "INSERT INTO settings (user_id, key, value, updated_at) VALUES ('local', ?1, ?2, datetime('now'))
              ON CONFLICT(user_id, key) DO UPDATE SET value = ?2, updated_at = datetime('now')",
@@ -1666,9 +1781,91 @@ impl DatabaseStore {
     // ── Project Scripts ──
 
     pub fn get_project_scripts(&self, project_root: &str) -> Option<ProjectScripts> {
-        let key = format!("project.scripts:{project_root}");
-        self.get_setting(&key)
-            .and_then(|v| serde_json::from_str(&v).ok())
+        self.get_project_scripts_at(&dunce::canonicalize(project_root).ok()?, None)
+    }
+
+    /// Load consent only for the directory to which Settings bound it.
+    pub(crate) fn get_project_scripts_at(
+        &self,
+        project_root: &Path,
+        held_directory: Option<&std::fs::File>,
+    ) -> Option<ProjectScripts> {
+        let key = format!("project.scripts:{}", project_root.to_str()?);
+        let saved: ReviewedProjectScripts = serde_json::from_str(&self.get_setting(&key)?).ok()?;
+        let expected = saved.reviewed_directory?;
+        let actual = match held_directory {
+            Some(directory) => ProjectDirectoryId::from_file(directory),
+            None => ReviewedProjectRoot::open(project_root.to_path_buf()).ok()?.identity(),
+        }?;
+        (expected == actual).then_some(saved.scripts)
+    }
+
+    /// Settings holds the selected directory even when this is the first
+    /// save. Unbound or replaced entries can be displayed for local review.
+    pub(crate) fn project_scripts_for_settings(
+        &self,
+        project_root: &str,
+    ) -> Result<(ProjectScripts, ReviewedProjectRoot, bool), String> {
+        let canonical = dunce::canonicalize(project_root)
+            .map_err(|error| format!("Could not resolve the selected project: {error}"))?;
+        let root = ReviewedProjectRoot::open(canonical)
+            .map_err(|error| format!("Could not open the selected project: {error}"))?;
+        let identity = root.identity().ok_or(REVIEWED_PROJECT_CHANGED)?;
+        let path = root.path.to_str().ok_or("Project root is not valid Unicode")?;
+        if let Some(value) = self.get_setting(&format!("project.scripts:{path}")) {
+            let saved: ReviewedProjectScripts =
+                serde_json::from_str(&value).map_err(|error| error.to_string())?;
+            let needs_review = saved.reviewed_directory != Some(identity);
+            return Ok((saved.scripts, root, needs_review));
+        }
+        #[cfg(unix)]
+        let draft = self.legacy_project_scripts_for_review(project_root, &root.path);
+        #[cfg(windows)]
+        let draft = project_script_paths::read_legacy(&self.conn.lock().unwrap(), &root.path);
+        let needs_review = draft.is_some();
+        Ok((draft.unwrap_or_default(), root, needs_review))
+    }
+
+    /// Find older Unix settings for review. Resolving a former alias can
+    /// surface its contents, but it cannot grant automatic execution.
+    #[cfg(unix)]
+    fn legacy_project_scripts_for_review(
+        &self,
+        project_root: &str,
+        canonical: &Path,
+    ) -> Option<ProjectScripts> {
+        let legacy_rows = {
+            let conn = self.conn.lock().unwrap();
+            let mut statement = conn
+                .prepare(
+                    "SELECT key, value FROM settings
+                     WHERE user_id = 'local' AND key GLOB 'project.scripts:*'",
+                )
+                .ok()?;
+            let rows = statement
+                .query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))
+                .ok()?;
+            rows.collect::<Result<Vec<_>, _>>().ok()?
+        };
+        let mut selected_draft = None;
+        let mut candidate: Option<ProjectScripts> = None;
+        let mut ambiguous = false;
+        for (key, value) in legacy_rows {
+            let old_path = key.strip_prefix("project.scripts:")?;
+            if !dunce::canonicalize(old_path).is_ok_and(|path| path == canonical) {
+                continue;
+            }
+            let Ok(scripts) = serde_json::from_str::<ProjectScripts>(&value) else {
+                continue;
+            };
+            if old_path == project_root {
+                selected_draft = Some(scripts);
+                continue;
+            }
+            ambiguous |= candidate.as_ref().is_some_and(|previous| previous != &scripts);
+            candidate = Some(scripts);
+        }
+        selected_draft.or_else(|| if ambiguous { None } else { candidate })
     }
 
     pub fn set_project_scripts(
@@ -1676,9 +1873,107 @@ impl DatabaseStore {
         project_root: &str,
         scripts: &ProjectScripts,
     ) -> Result<(), String> {
-        let key = format!("project.scripts:{project_root}");
-        let value = serde_json::to_string(scripts).map_err(|e| e.to_string())?;
-        self.set_setting(&key, &value)
+        let (_, root, needs_review) = self.project_scripts_for_settings(project_root)?;
+        if needs_review || !root.matches_path(Path::new(project_root)) {
+            return Err(REVIEWED_PROJECT_CHANGED.into());
+        }
+        self.update_bound_project_scripts(&root, false, |_| scripts.clone())
+    }
+
+    pub(crate) fn set_project_run_script(
+        &self,
+        project_root: &str,
+        run: String,
+    ) -> Result<(), String> {
+        let (_, root, needs_review) = self.project_scripts_for_settings(project_root)?;
+        if needs_review {
+            return Err(
+                "Review saved project scripts in Settings before changing the Run command.".into(),
+            );
+        }
+        if !root.matches_path(Path::new(project_root)) {
+            return Err(REVIEWED_PROJECT_CHANGED.into());
+        }
+        self.update_bound_project_scripts(&root, false, |mut current| {
+            current.run = Some(run);
+            current
+        })
+    }
+
+    /// Merge edits from one Settings editor into the current commands. An
+    /// explicit approval writes the reviewed configuration as a whole.
+    pub(crate) fn save_reviewed_project_scripts(
+        &self,
+        root: &ReviewedProjectRoot,
+        scripts: &ProjectScripts,
+        baseline: &ProjectScripts,
+        reviewed: bool,
+    ) -> Result<(), String> {
+        self.update_bound_project_scripts(root, reviewed, |mut current| {
+            if reviewed {
+                return scripts.clone();
+            }
+            if scripts.setup != baseline.setup {
+                current.setup.clone_from(&scripts.setup);
+            }
+            if scripts.teardown != baseline.teardown {
+                current.teardown.clone_from(&scripts.teardown);
+            }
+            if scripts.run != baseline.run {
+                current.run.clone_from(&scripts.run);
+            }
+            if scripts.worktree_includes != baseline.worktree_includes {
+                current.worktree_includes.clone_from(&scripts.worktree_includes);
+            }
+            current
+        })
+    }
+
+    /// Read and update the project's commands in one transaction, using the
+    /// held directory to enforce the same local consent checks for each writer.
+    fn update_bound_project_scripts(
+        &self,
+        root: &ReviewedProjectRoot,
+        reviewed: bool,
+        update: impl FnOnce(ProjectScripts) -> ProjectScripts,
+    ) -> Result<(), String> {
+        let identity = root.identity().ok_or(REVIEWED_PROJECT_CHANGED)?;
+        if !root.matches_path(&root.path) {
+            return Err(REVIEWED_PROJECT_CHANGED.into());
+        }
+        let path = root.path.to_str().ok_or("Project root is not valid Unicode")?;
+        let key = format!("project.scripts:{path}");
+        let mut conn = self.conn.lock().unwrap();
+        let transaction = conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .map_err(|error| error.to_string())?;
+        let previous = transaction
+            .query_row(
+                "SELECT value FROM settings WHERE user_id = 'local' AND key = ?1",
+                params![key],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(|error| error.to_string())?
+            .map(|value| serde_json::from_str::<ReviewedProjectScripts>(&value))
+            .transpose()
+            .map_err(|error| error.to_string())?;
+        let already_bound = previous
+            .as_ref()
+            .is_some_and(|saved| saved.reviewed_directory == Some(identity));
+        // A review that was needed at load time becomes stale when another
+        // editor approves the same directory. Ordinary edits require consent.
+        if (reviewed && already_bound) || (!reviewed && previous.is_some() && !already_bound) {
+            return Err(REVIEWED_PROJECT_CHANGED.into());
+        }
+
+        let value = serde_json::to_string(&ReviewedProjectScripts {
+            scripts: update(previous.map(|saved| saved.scripts).unwrap_or_default()),
+            reviewed_directory: Some(identity),
+        })
+        .map_err(|error| error.to_string())?;
+        Self::write_setting(&transaction, &key, &value)?;
+        transaction.commit().map_err(|error| error.to_string())
     }
 
     // ── Recent Projects ──
@@ -7924,10 +8219,11 @@ mod tests {
             run: Some("npm run dev".into()),
             ..Default::default()
         };
-        db.set_project_scripts("/home/user/my-project", &scripts)
-            .unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().to_str().unwrap();
+        db.set_project_scripts(path, &scripts).unwrap();
         let loaded = db
-            .get_project_scripts("/home/user/my-project")
+            .get_project_scripts(path)
             .expect("scripts should exist");
         assert_eq!(loaded.setup, vec!["npm install", "cp .env.example .env"]);
         assert_eq!(loaded.teardown, vec!["docker compose down"]);
@@ -7949,7 +8245,9 @@ mod tests {
             run: None,
             ..Default::default()
         };
-        db.set_project_scripts("/project", &scripts).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().to_str().unwrap();
+        db.set_project_scripts(path, &scripts).unwrap();
 
         let updated = ProjectScripts {
             setup: vec!["yarn install".into()],
@@ -7957,9 +8255,9 @@ mod tests {
             run: Some("yarn dev".into()),
             ..Default::default()
         };
-        db.set_project_scripts("/project", &updated).unwrap();
+        db.set_project_scripts(path, &updated).unwrap();
 
-        let loaded = db.get_project_scripts("/project").unwrap();
+        let loaded = db.get_project_scripts(path).unwrap();
         assert_eq!(loaded.setup, vec!["yarn install"]);
         assert_eq!(loaded.teardown, vec!["echo bye"]);
         assert_eq!(loaded.run, Some("yarn dev".into()));

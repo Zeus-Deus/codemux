@@ -1861,10 +1861,17 @@ fn branch_worktree(repo_path: &Path, branch: &str) -> Result<Option<PathBuf>, St
 /// newline cannot be read back; such a checkout then fails
 /// [`is_checkout_of`] and the merge is refused rather than misdirected.
 fn worktree_listing(repo_path: &Path) -> Result<(Vec<u8>, u8), String> {
+    read_worktree_listing(|| {
+        let mut command = git_command();
+        command.current_dir(repo_path);
+        command
+    })
+}
+
+fn read_worktree_listing(command: impl Fn() -> Command) -> Result<(Vec<u8>, u8), String> {
     let run = |args: &[&str]| {
-        git_command()
+        command()
             .args(args)
-            .current_dir(repo_path)
             .output()
             .map_err(|e| format!("Failed to run git: {e}"))
     };
@@ -1880,6 +1887,31 @@ fn worktree_listing(repo_path: &Path) -> Result<(Vec<u8>, u8), String> {
         "git worktree failed: {}",
         String::from_utf8_lossy(&output.stderr).trim()
     ))
+}
+
+pub(crate) fn lists_active_worktree(git_dir: &Path, checkout: &Path) -> bool {
+    let Ok((listing, separator)) = read_worktree_listing(|| {
+        let mut command = git_command();
+        command
+            .arg("--git-dir")
+            .arg(git_dir)
+            .env_remove("GIT_COMMON_DIR")
+            .env_remove("GIT_WORK_TREE");
+        command
+    }) else {
+        return false;
+    };
+    let fields: Vec<_> = listing.split(|&byte| byte == separator).collect();
+    fields.split(|field| field.is_empty()).any(|record| {
+        let path = record
+            .first()
+            .and_then(|field| field.strip_prefix(b"worktree "))
+            .and_then(|path| path_from_git_bytes(path.to_vec()));
+        path.is_some_and(|path| dunce::canonicalize(path).is_ok_and(|path| path == checkout))
+            && !record.iter().any(|field| {
+                *field == b"bare" || *field == b"prunable" || field.starts_with(b"prunable ")
+            })
+    })
 }
 
 /// Where a porcelain worktree listing has a branch checked out.

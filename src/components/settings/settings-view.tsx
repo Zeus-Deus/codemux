@@ -100,6 +100,8 @@ import {
   setAiResolverModel,
   setAiResolverStrategy,
   getProjectScripts,
+  getProjectScriptsForReview,
+  discardProjectScriptsReview,
   setProjectScripts,
   getWorkspaceConfig,
   hasCodemuxinclude,
@@ -1786,15 +1788,23 @@ export function SettingsView() {
 
   // What the backend last confirmed for `scriptsRoot`, so a blur with no
   // edits does not write, and a failed save stays dirty for the next blur.
-  const savedScripts = useRef<{ root: string; generation: number; snapshot: string } | null>(null);
+  const savedScripts = useRef<{
+    root: string;
+    generation: number;
+    snapshot: string;
+    reviewId?: string;
+    pendingSaves: Set<Promise<void>>;
+  } | null>(null);
   const scriptsGeneration = useRef(0);
   const scriptSaveGeneration = useRef(0);
   const currentScriptsRoot = useRef(scriptsRoot);
   currentScriptsRoot.current = scriptsRoot;
   const [loadedScriptsRoot, setLoadedScriptsRoot] = useState<string | null>(null);
   const [scriptsLoadError, setScriptsLoadError] = useState<string | null>(null);
+  const [scriptReview, setScriptReview] = useState<{ root: string; id: string } | null>(null);
+  const [reviewSaving, setReviewSaving] = useState(false);
   const scriptsReady = loadedScriptsRoot === scriptsRoot && savedScripts.current?.root === scriptsRoot;
-  const [savedField, setSavedField] = useState<ProjectField | null>(null);
+  const [savedField, setSavedField] = useState<ProjectField | "review" | null>(null);
   const [savedVisible, setSavedVisible] = useState(false);
   const savedTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   useEffect(() => () => {
@@ -1808,6 +1818,8 @@ export function SettingsView() {
     savedScripts.current = null;
     setLoadedScriptsRoot(null);
     setScriptsLoadError(null);
+    setScriptReview(null);
+    setReviewSaving(false);
     setSetupScripts("");
     setTeardownScripts("");
     setRunCommand("");
@@ -1820,8 +1832,30 @@ export function SettingsView() {
     // A slow answer for the previously chosen project must not land in
     // the form after the user picked another one.
     let stale = false;
-    getProjectScripts(scriptsRoot).then((scripts) => {
-      if (stale) return;
+    let selectionReviewId: string | undefined;
+    const discardReview = (reviewId: string) => {
+      void discardProjectScriptsReview(reviewId).catch(console.error);
+    };
+    const readScripts = isRemoteClient() ? getProjectScripts : getProjectScriptsForReview;
+    readScripts(scriptsRoot).then((scripts) => {
+      const reviewId = scripts && "review_id" in scripts && typeof scripts.review_id === "string"
+        ? scripts.review_id
+        : undefined;
+      if (stale) {
+        if (reviewId) discardReview(reviewId);
+        return;
+      }
+      selectionReviewId = reviewId;
+      if (scripts && "review_root" in scripts && scripts.review_root !== undefined) {
+        if (
+          typeof scripts.review_root !== "string" ||
+          typeof reviewId !== "string"
+        ) {
+          setScriptsLoadError("Could not verify the project for script review.");
+          return;
+        }
+        setScriptReview({ root: scripts.review_root, id: reviewId });
+      }
       const setup = scripts?.setup.join("\n") ?? "";
       const teardown = scripts?.teardown.join("\n") ?? "";
       const run = scripts?.run ?? "";
@@ -1834,6 +1868,8 @@ export function SettingsView() {
         root: scriptsRoot,
         generation,
         snapshot: JSON.stringify(projectScriptsFrom(setup, teardown, run, includes)),
+        reviewId,
+        pendingSaves: new Set(),
       };
       setLoadedScriptsRoot(scriptsRoot);
     }).catch((error) => {
@@ -1849,12 +1885,20 @@ export function SettingsView() {
       stale = true;
       ++scriptsGeneration.current;
       ++scriptSaveGeneration.current;
+      const reviewId = selectionReviewId;
+      if (reviewId) {
+        const owner = savedScripts.current;
+        const pendingSaves = owner?.generation === generation ? owner.pendingSaves : [];
+        void Promise.allSettled(pendingSaves).then(() => discardReview(reviewId));
+      }
     };
   }, [pageSections, scriptsRoot]);
 
-  const saveProjectSettings = (field: ProjectField) => {
+  const saveProjectSettings = (field: ProjectField | "review") => {
     const owner = savedScripts.current;
     if (!scriptsRoot || !scriptsReady || owner?.root !== scriptsRoot) return;
+    const reviewing = field === "review";
+    if (reviewing !== Boolean(scriptReview) || reviewSaving) return;
     const root = scriptsRoot;
     const generation = owner.generation;
     const scripts = projectScriptsFrom(
@@ -1864,21 +1908,39 @@ export function SettingsView() {
       worktreeIncludes,
     );
     const snapshot = JSON.stringify(scripts);
-    if (snapshot === owner.snapshot) return;
+    if (!reviewing && snapshot === owner.snapshot) return;
+    if (reviewing) setReviewSaving(true);
     const saveGeneration = ++scriptSaveGeneration.current;
     const stillCurrent = () => currentScriptsRoot.current === root &&
       scriptsGeneration.current === generation && scriptSaveGeneration.current === saveGeneration;
-    setProjectScripts(root, scripts)
+    const saved = scriptReview
+      ? setProjectScripts(scriptReview.root, scripts, scriptReview.id, true)
+      : owner.reviewId
+        ? setProjectScripts(root, scripts, owner.reviewId)
+        : setProjectScripts(root, scripts);
+    owner.pendingSaves.add(saved);
+    saved
       .then(() => {
         if (!stillCurrent()) return;
-        savedScripts.current = { root, generation, snapshot };
+        savedScripts.current = { ...owner, snapshot };
+        setScriptReview(null);
         setSavedField(field);
         setSavedVisible(true);
         if (savedTimer.current) clearTimeout(savedTimer.current);
         savedTimer.current = setTimeout(() => setSavedVisible(false), 1500);
       })
       .catch((error) => {
-        if (stillCurrent()) reportFailure(`Couldn't save ${basename(root)}'s scripts`)(error);
+        if (!stillCurrent()) return;
+        if (reviewing) {
+          setScriptReview(null);
+          setLoadedScriptsRoot(null);
+          setScriptsLoadError(String(error));
+        }
+        reportFailure(`Couldn't save ${basename(root)}'s scripts`)(error);
+      })
+      .finally(() => {
+        owner.pendingSaves.delete(saved);
+        if (reviewing && stillCurrent()) setReviewSaving(false);
       });
   };
 
@@ -2796,7 +2858,9 @@ export function SettingsView() {
           <div>
             <SectionHeader
               title="Projects"
-              description="Lifecycle scripts and worktree files for each project. Changes save when you leave a field."
+              description={scriptReview
+                ? "Lifecycle scripts and worktree files for each project."
+                : "Lifecycle scripts and worktree files for each project. Changes save when you leave a field."}
               action={
                 <Select value={scriptsRoot} onValueChange={setChosenProject}>
                   <SelectTrigger aria-label="Project" className="w-48">
@@ -2824,12 +2888,33 @@ export function SettingsView() {
                 </p>
               </SettingsCard>
             )}
+            {scriptsReady && scriptReview && (
+              <SettingsCard className="mb-6 space-y-3">
+                <p className="text-body-sm text-muted-foreground">
+                  Review these saved scripts for this directory before enabling automatic setup
+                  and teardown.
+                  <code className="mt-1 block break-all font-mono">{scriptReview.root}</code>
+                </p>
+                <Button
+                  variant="outline"
+                  size="sm"
+                  disabled={reviewSaving}
+                  onClick={() => saveProjectSettings("review")}
+                >
+                  Save reviewed scripts
+                </Button>
+              </SettingsCard>
+            )}
+            {scriptsReady && savedVisible && savedField === "review" && (
+              <p className="mb-6 text-body-sm text-muted-foreground" role="status">Reviewed scripts saved.</p>
+            )}
             {hasConfigFile && (
               <SettingsCard className="mb-6 flex items-start gap-3">
                 <div className="size-1.5 rounded-full bg-warning shrink-0 mt-1.5" />
                 <p className="text-body-sm text-muted-foreground leading-relaxed">
                   A <code className="font-mono text-label bg-background/60 border border-border/40 px-1.5 py-0.5 rounded-sm">.codemux/config.json</code> file was found.
-                  File-based configuration takes precedence over these settings.
+                  Automatic setup and teardown use the commands saved below. The file supplies
+                  worktree include patterns and commands for Re-run setup and Run.
                 </p>
               </SettingsCard>
             )}
@@ -2838,7 +2923,7 @@ export function SettingsView() {
               <FormField
                 label="Worktree includes"
                 status={savedNote("includes")}
-                helper="Files matching these patterns are copied from the main project into new worktrees. One pattern per line."
+                helper="New worktrees copy matching top-level files. Use Re-run setup to include nested files. One pattern per line."
                 caption={
                   <>
                     Create a <code className="font-mono text-label bg-muted/60 border border-border/40 px-1.5 py-0.5 rounded-sm">.codemuxinclude</code> file
@@ -2860,7 +2945,7 @@ export function SettingsView() {
                   className="font-mono text-body min-h-[90px] leading-relaxed"
                   placeholder={".env\n.env.*\n.env.local"}
                   value={worktreeIncludes}
-                  disabled={!scriptsReady}
+                  disabled={!scriptsReady || reviewSaving}
                   onChange={(e) => setWorktreeIncludes(e.target.value)}
                   onBlur={() => saveProjectSettings("includes")}
                 />
@@ -2875,7 +2960,7 @@ export function SettingsView() {
                   className="font-mono text-body min-h-[90px] leading-relaxed"
                   placeholder="e.g. npm install"
                   value={setupScripts}
-                  disabled={!scriptsReady}
+                  disabled={!scriptsReady || reviewSaving}
                   onChange={(e) => setSetupScripts(e.target.value)}
                   onBlur={() => saveProjectSettings("setup")}
                 />
@@ -2890,7 +2975,7 @@ export function SettingsView() {
                   className="font-mono text-body min-h-[90px] leading-relaxed"
                   placeholder="e.g. docker compose down"
                   value={teardownScripts}
-                  disabled={!scriptsReady}
+                  disabled={!scriptsReady || reviewSaving}
                   onChange={(e) => setTeardownScripts(e.target.value)}
                   onBlur={() => saveProjectSettings("teardown")}
                 />
@@ -2909,7 +2994,7 @@ export function SettingsView() {
                   className="font-mono text-body"
                   placeholder="e.g. npm run dev"
                   value={runCommand}
-                  disabled={!scriptsReady}
+                  disabled={!scriptsReady || reviewSaving}
                   onChange={(e) => setRunCommand(e.target.value)}
                   onBlur={() => saveProjectSettings("run")}
                 />

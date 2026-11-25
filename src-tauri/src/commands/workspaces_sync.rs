@@ -1796,12 +1796,8 @@ mod tests {
 
         let root = crate::test_isolation::isolated_root().unwrap();
         let copy = dirs::home_dir().unwrap().join(".codemux/worktrees/copy/main");
-        std::fs::create_dir_all(copy.join(".codemux")).unwrap();
+        std::fs::create_dir_all(&copy).unwrap();
         std::fs::write(copy.join("README.md"), "keep this file\n").unwrap();
-        std::fs::write(
-            copy.join(".codemux/config.json"),
-            r#"{"teardown":["touch teardown-ran"]}"#,
-        ).unwrap();
         let commands: &[&[&str]] = &[
             &["init", "--quiet"],
             &["add", "."],
@@ -1815,7 +1811,6 @@ mod tests {
                 .unwrap();
             assert!(output.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&output.stderr));
         }
-        assert_eq!(crate::scripts::teardown_commands(&copy, None), ["touch teardown-ran"]);
 
         let layout = AppStateStore::default();
         let workspace_id = layout
@@ -1837,6 +1832,10 @@ mod tests {
             shell_id,
         };
         let db = DatabaseStore::test_file(&root.join("reconcile-copy.sqlite"));
+        db.set_project_scripts(&copy.to_string_lossy(), &crate::database::ProjectScripts {
+            teardown: vec!["touch teardown-ran".into()],
+            ..Default::default()
+        }).unwrap();
         std::fs::write(root.join("layout.json"), b"invalid layout").unwrap();
         assert!(crate::state::load_persisted_state_checked().unwrap().is_none());
         assert!(crate::state::layout_recovery_pending());

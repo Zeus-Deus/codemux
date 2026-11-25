@@ -737,6 +737,7 @@ fn build_core_app<R: tauri::Runtime>(
         .manage(resource_metrics::ResourceMonitorState::default())
         .manage(scrollback::ScrollbackCache::default())
         .manage(auth::AuthState::default())
+        .manage(commands::database::ProjectScriptsReviews::default())
         .manage(skills_sync::SyncEngine::new())
         .manage(commands::agent_chat::ProviderRegistry::new())
         .manage(agent_control::NativeControlState::default())
@@ -2947,6 +2948,7 @@ fn build_core_app<R: tauri::Runtime>(
             commands::close_workspace_with_worktree,
             commands::workspaces_worktree_sizes,
             commands::archive_workspace,
+            commands::archive_workspace_without_teardown,
             commands::unarchive_workspace,
             commands::delete_archived_workspace,
             commands::generate_branch_name,
@@ -3160,7 +3162,10 @@ fn build_core_app<R: tauri::Runtime>(
             commands::db_add_recent_project,
             commands::db_get_recent_projects,
             commands::get_project_scripts,
+            commands::get_project_scripts_for_review,
+            commands::discard_project_scripts_review,
             commands::set_project_scripts,
+            commands::set_project_run_script,
             commands::check_is_git_repo,
             commands::init_git_repo,
             commands::init_git_repo_no_commit,

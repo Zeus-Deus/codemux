@@ -763,6 +763,16 @@ body.pane-resizing iframe {
   border-color: var(--border);
   color: var(--popover-foreground);
 }
+[data-sonner-toaster] .cn-toast-archive-recovery[data-sonner-toast][data-styled="true"] {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  align-items: start;
+}
+[data-sonner-toaster] .cn-toast-archive-recovery[data-sonner-toast][data-styled="true"] [data-action] {
+  grid-column: 2;
+  justify-self: start;
+  margin-inline: 0;
+}
 /* Undo window: an ember bar along the bottom edge drains over the toast's
  * lifetime and pauses while the stack is hovered or the window is hidden, as
  * Sonner's timer does.

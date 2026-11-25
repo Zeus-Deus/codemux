@@ -12,6 +12,7 @@ import {
   activateWorkspace,
   agentChatOpenSearchResult,
   archiveWorkspace,
+  archiveWorkspaceWithoutTeardown,
   closeWorkspace,
   closeWorkspaceWithWorktree,
 } from "./commands";
@@ -61,6 +62,7 @@ describe("workspace removal commands", () => {
       () => closeWorkspaceWithWorktree("ws-1", true, false, false),
     ],
     ["archiveWorkspace", () => archiveWorkspace("ws-1")],
+    ["archiveWorkspaceWithoutTeardown", () => archiveWorkspaceWithoutTeardown("ws-1")],
   ])("%s marks the backend's fallback activation as local", async (_, run) => {
     await run();
 
@@ -71,6 +73,14 @@ describe("workspace removal commands", () => {
   it("does not adopt an activation when nothing was closed", () => {
     expect(adoptLocalFallbackActivation("ws-theirs")).toBe(false);
     expect(wasActivatedLocally("ws-theirs")).toBe(false);
+  });
+
+  it("invokes the dedicated command to archive without teardown", async () => {
+    await archiveWorkspaceWithoutTeardown("ws-1");
+
+    expect(mockInvoke).toHaveBeenCalledWith("archive_workspace_without_teardown", {
+      workspaceId: "ws-1",
+    });
   });
 });
 

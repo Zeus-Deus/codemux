@@ -706,9 +706,7 @@ async fn workspace_close_keeps_commits_its_teardown_made() {
     }
     let (app, _provider, _root, _workspace, repo) = git_fixture().await;
     // Every checkout of the repository commits on teardown.
-    write_scripts(&repo, json!({"teardown": ["git -c commit.gpgsign=false commit --allow-empty -m checkpoint"]}));
-    git(&repo, &["add", ".codemux"]);
-    git(&repo, &["commit", "-m", "teardown checkpoint"]);
+    save_scripts(&app, &repo, json!({"teardown": ["git -c commit.gpgsign=false commit --allow-empty -m checkpoint"]}));
     let owner = named(ControlAccess::FullAccess);
     let full = connector(ControlAccess::FullAccess);
 
@@ -1258,9 +1256,9 @@ fn held_command(started: &str) -> String {
     format!("touch {started}; i=0; while [ ! -e release ] && [ $i -lt 200 ]; do sleep 0.05; i=$((i+1)); done")
 }
 
-fn write_scripts(folder: &Path, scripts: Value) {
-    std::fs::create_dir_all(folder.join(".codemux")).unwrap();
-    std::fs::write(folder.join(".codemux/config.json"), scripts.to_string()).unwrap();
+fn save_scripts(app: &App, folder: &Path, scripts: Value) {
+    let scripts = serde_json::from_value::<crate::database::ProjectScripts>(scripts).unwrap();
+    app.state::<DatabaseStore>().set_project_scripts(&folder.to_string_lossy(), &scripts).unwrap();
 }
 
 async fn appears(path: &Path) {
@@ -1292,8 +1290,8 @@ async fn worktree_setup_revoked_during_a_command_starts_no_further_command() {
         return;
     }
     let (app, _provider, _root, _workspace, repo) = git_fixture().await;
-    // The new checkout falls back to the repository's own scripts.
-    write_scripts(&repo, json!({"setup": [held_command("setup-started"), "touch setup-second"]}));
+    // The new checkout uses the scripts saved in local Settings.
+    save_scripts(&app, &repo, json!({"setup": [held_command("setup-started"), "touch setup-second"]}));
     let mut outcomes = setup_outcomes(&app);
     let caller = connector_caller(&app, "setup-client", "setup-grant", ControlAccess::FullAccess).await;
     let args = json!({"repo_path": repo, "branch": "setup-revoked", "layout": "empty", "client_request_id": "setup-revoked"});
@@ -1325,10 +1323,14 @@ async fn workspace_close_revoked_during_teardown_leaves_the_workspace_open() {
     let parent = tempfile::tempdir().unwrap();
     let checkout = parent.path().join("teardown-close");
     git(&repo, &["worktree", "add", "-b", "teardown-close", checkout.to_str().unwrap()]);
-    write_scripts(&checkout, json!({"teardown": [held_command("teardown-started"), "touch teardown-second"]}));
+    save_scripts(&app, &repo, json!({"teardown": [held_command("teardown-started"), "touch teardown-second"]}));
     let state = app.state::<AppStateStore>();
     let closing = state.create_empty_workspace_at_path(checkout.clone()).0;
     state.set_workspace_worktree(&closing, checkout.display().to_string(), "teardown-close".into());
+    crate::config::workspace_config::LifecyclePaths::resolve_fresh_worktree(&checkout, &repo)
+        .unwrap()
+        .bind_to_workspace(&app.state::<DatabaseStore>(), &closing)
+        .unwrap();
     // A chat in the workspace, which closing it would stop.
     let chat = call(&app, &ControlCaller::trusted(), "thread_launch", json!({
         "workspace_id": closing, "client_request_id": "teardown-chat", "provider": "claude", "permission_mode": "default",
@@ -1424,8 +1426,8 @@ async fn workspace_launch_setup_outlives_the_turn_but_not_a_stop() {
         let repo = root.path().to_path_buf();
         git(&repo, &["init", "-b", "main"]);
         git(&repo, &["commit", "--allow-empty", "-m", "first"]);
-        // The new checkout falls back to the repository's own scripts.
-        write_scripts(&repo, json!({"setup": ["touch setup-first"]}));
+        // The new checkout uses the scripts saved in local Settings.
+        save_scripts(&app, &repo, json!({"setup": ["touch setup-first"]}));
         let mut outcomes = setup_outcomes(&app);
         let branch = if stopped { "launch-stopped" } else { "launch-turn-ended" };
         let path = crate::git::conventional_worktree_path(&repo, branch).unwrap();

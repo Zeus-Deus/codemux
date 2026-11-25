@@ -126,6 +126,27 @@ impl Serve {
         serde_json::from_str(&reply).unwrap_or_else(|_| panic!("`codemux json {command}` printed {reply:?}:\n{}", self.log()))
     }
 
+    fn save_project_scripts(&self, project: &Path, mut scripts: Value) {
+        use std::os::unix::fs::MetadataExt;
+
+        let project = dunce::canonicalize(project).unwrap();
+        let directory = std::fs::metadata(&project).unwrap();
+        scripts["reviewed_directory"] = json!({
+            "device": directory.dev(),
+            "inode": directory.ino(),
+            "created": directory.created().ok()
+                .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok()),
+        });
+        let db_path = self.root.path().join("config").join(codemux_lib::APP_DIR_NAME).join("codemux.db");
+        let db = rusqlite::Connection::open(db_path).unwrap();
+        db.busy_timeout(Duration::from_secs(5)).unwrap();
+        db.execute(
+            "INSERT INTO settings (user_id, key, value) VALUES ('local', ?1, ?2)
+             ON CONFLICT(user_id, key) DO UPDATE SET value = excluded.value",
+            rusqlite::params![format!("project.scripts:{}", project.display()), scripts.to_string()],
+        ).unwrap();
+    }
+
     /// Stops the serve and keeps its home. This test started it; stop it by
     /// its pid, and never signal a pid already reaped, which may be reused.
     fn stop(&mut self) {
@@ -310,9 +331,9 @@ fn pty_shell_is_the_owner() {
     assert!(env.contains("CODEMUX_SESSION_ID="), "the dump is the terminal's env");
 }
 
-/// Setup scripts come from the folder's `.codemux/config.json`, which an
-/// agent can write, and an agent may run them (`create_workspace` and
-/// `rerun_setup` are Machine class). A `codemux` they start is an agent
+/// Automatic setup scripts come from saved local project settings.
+/// Agents with Machine access may trigger them via `create_workspace`
+/// or `rerun_setup`. A `codemux` they start is an agent
 /// process whoever triggered the setup, so it cannot answer for the person
 /// or mint a connector token.
 #[test]
@@ -335,7 +356,10 @@ fn setup_scripts_are_agent_processes() {
             unmarked = unmarked.display(),
             done = done.display(),
         );
-        std::fs::write(project.join(".codemux/config.json"), json!({ "setup": [script] }).to_string()).unwrap();
+        serve.save_project_scripts(&project, json!({ "setup": [script] }));
+        let rejected = file("repository-setup");
+        let repository = json!({ "setup": [format!("touch '{}'", rejected.display())] });
+        std::fs::write(project.join(".codemux/config.json"), repository.to_string()).unwrap();
 
         // The setup runs in the background once the folder is open.
         let created = serve.json("create_workspace", &json!({ "path": project }).to_string(), env);
@@ -354,6 +378,7 @@ fn setup_scripts_are_agent_processes() {
         }
         let env = std::fs::read_to_string(&env_dump).unwrap();
         assert!(env.lines().any(|line| line == format!("{AGENT_PROCESS}=setup-script")), "{name}: {env}");
+        assert!(!rejected.exists(), "repository commands must wait for explicit setup");
     }
     let owner = serve.json("agent_connector_status", "{}", &[]);
     assert_eq!(owner["ok"], true, "the owner keeps admin commands: {owner}");
@@ -375,7 +400,6 @@ fn socket_setup_and_teardown_scripts_can_call_codemux_back() {
     let created = serve.json("create_worktree_workspace", &params.to_string(), &[]);
     assert_eq!(created["ok"], true, "{created}");
     let id = created["data"]["workspace_id"].as_str().unwrap().to_owned();
-    let checkout = Path::new(created["data"]["cwd"].as_str().unwrap()).to_path_buf();
 
     // Written after creation, so only the commands below run these scripts.
     // The refusal exits non-zero; the script still succeeds, so the command
@@ -384,9 +408,10 @@ fn socket_setup_and_teardown_scripts_can_call_codemux_back() {
     let script = |phase: &str| {
         format!("'{CODEMUX}' json agent_connector_status '{{}}' > '{}' || true", reply_file(phase).display())
     };
-    std::fs::create_dir_all(checkout.join(".codemux")).unwrap();
-    let config = json!({ "setup": [script("setup")], "teardown": [script("teardown")] });
-    std::fs::write(checkout.join(".codemux/config.json"), config.to_string()).unwrap();
+    serve.save_project_scripts(&repo, json!({
+        "setup": [script("setup")],
+        "teardown": [script("teardown")],
+    }));
     let reply = |phase: &str| -> Value {
         serde_json::from_str(&std::fs::read_to_string(reply_file(phase)).unwrap()).unwrap()
     };
@@ -544,11 +569,8 @@ fn supervised_clients_cannot_run_teardown_through_archive_or_close() {
     let created = serve.json("create_worktree_workspace", &params.to_string(), &[]);
     assert_eq!(created["ok"], true, "{created}");
     let id = created["data"]["workspace_id"].as_str().unwrap().to_owned();
-    let checkout = Path::new(created["data"]["cwd"].as_str().unwrap()).to_path_buf();
     let ran = root.join("teardown-ran");
-    std::fs::create_dir_all(checkout.join(".codemux")).unwrap();
-    let config = json!({ "teardown": [format!("touch '{}'", ran.display())] });
-    std::fs::write(checkout.join(".codemux/config.json"), config.to_string()).unwrap();
+    serve.save_project_scripts(&repo, json!({ "teardown": [format!("touch '{}'", ran.display())] }));
 
     let mut supervised = Mcp::start(&serve, &["--client", "integration-bot", "--access", "supervised"]);
     let archived = supervised.call("workspace_archive", json!({ "workspace_id": id }));

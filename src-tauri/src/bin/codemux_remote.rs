@@ -185,8 +185,12 @@ enum WorktreeSubcommand {
     /// Create (or reuse) a worktree for `--branch` under
     /// ~/.codemux/worktrees and register it. An existing branch (local or
     /// on origin) is checked out; otherwise a new one starts from
-    /// `--base`, default the repo's default branch. Runs through the
-    /// `serve` daemon when it is up, so it owns the setup commands.
+    /// `--base`, default the repo's default branch. Repository setup
+    /// commands run only when requested separately with `worktree setup`.
+    ///
+    /// To get the workspace ID and name for setup, match the returned path
+    /// to an entry in `codemux-remote workspace list`. Use the same
+    /// `--state-dir` for both commands when selecting a custom registry.
     ///
     /// Stable contract: the last stdout line is one JSON object
     /// `{"path","branch","repo_root","created"}`. On failure: non-zero
@@ -206,9 +210,9 @@ enum WorktreeSubcommand {
         #[arg(long)]
         state_dir: Option<PathBuf>,
     },
-    /// Run a new worktree's setup commands. `worktree create` starts this
-    /// detached when no daemon is up to own them.
-    #[command(hide = true)]
+    /// Run an existing worktree's repository setup commands after reviewing them.
+    ///
+    /// Use the ID and name from the matching `workspace list` entry.
     Setup {
         #[arg(long)]
         path: PathBuf,
@@ -1086,20 +1090,7 @@ fn run_project_ensure(
     }
 }
 
-/// How long `worktree create` waits on a daemon whose process is up but
-/// isn't answering yet. A daemon that isn't running at all gets no wait.
-#[cfg(unix)]
-const DAEMON_STARTUP_WAIT: std::time::Duration = std::time::Duration::from_secs(3);
-
-/// Cap on one `worktree_create` call through the daemon, the same cap
-/// `codemux-remote mcp` applies to every tool call.
-#[cfg(unix)]
-const DAEMON_TOOL_TIMEOUT: std::time::Duration = codemux_lib::remote::tools::CALL_TIMEOUT;
-
-/// Implementation for `codemux-remote worktree create`. Prefers the
-/// `serve` daemon, which outlives this call and so can own the setup
-/// commands; without one, creates the worktree in-process and starts the
-/// setup commands detached.
+/// Run checkout creation against this host's workspace registry.
 #[cfg(unix)]
 fn run_worktree_create(
     repo: PathBuf,
@@ -1114,12 +1105,10 @@ fn run_worktree_create(
         Err(e) => return fail_one_line(e),
     };
     let state_dir = resolve_state_dir(state_dir_arg);
-    let data = match call_daemon_tool(&state_dir, "worktree_create", &args) {
-        Ok(Some(data)) => Ok(data),
-        Ok(None) => create_worktree_in_process(&state_dir, &args),
-        Err(e) => Err(e),
-    };
-    match data.and_then(|data| checkout::worktree_create_output(&data)) {
+    // Use this binary's lifecycle policy even if an older daemon is running.
+    match create_worktree_in_process(&state_dir, &args)
+        .and_then(|data| checkout::worktree_create_output(&data))
+    {
         Ok(output) => {
             println!("{output}");
             ExitCode::SUCCESS
@@ -1128,61 +1117,7 @@ fn run_worktree_create(
     }
 }
 
-/// Call one tool on the local `serve` daemon. `Ok(None)` means nothing
-/// was done — no daemon is running, it went away before the call, or it
-/// predates the tool — so the caller can do the work itself.
-#[cfg(unix)]
-fn call_daemon_tool(
-    state_dir: &std::path::Path,
-    tool: &str,
-    arguments: &serde_json::Value,
-) -> Result<Option<serde_json::Value>, String> {
-    use codemux_lib::remote::{config, manifest};
-    use serde_json::Value;
-
-    let manifest_path = config::manifest_path(state_dir);
-    let running = matches!(manifest::read(&manifest_path), Ok(Some(m)) if manifest::pid_alive(m.pid));
-    if !running {
-        return Ok(None);
-    }
-    let client = reqwest::blocking::Client::builder()
-        .timeout(DAEMON_TOOL_TIMEOUT)
-        .build()
-        .map_err(|e| format!("couldn't reach the codemux-remote daemon: {e}"))?;
-    let Some(manifest) = wait_for_healthy_daemon(&manifest_path, &client, DAEMON_STARTUP_WAIT) else {
-        return Ok(None);
-    };
-
-    let response = match client
-        .post(format!("{}/tools/call", manifest.endpoint))
-        .bearer_auth(&manifest.secret)
-        .json(&serde_json::json!({ "name": tool, "arguments": arguments }))
-        .send()
-    {
-        Ok(response) => response,
-        Err(e) if e.is_connect() => return Ok(None),
-        Err(e) => return Err(format!("the codemux-remote daemon didn't finish {tool}: {e}")),
-    };
-    let payload: Value = response
-        .json()
-        .map_err(|e| format!("unexpected reply from the codemux-remote daemon: {e}"))?;
-    if payload.get("ok") == Some(&Value::Bool(true)) {
-        return Ok(Some(payload.get("data").cloned().unwrap_or(Value::Null)));
-    }
-    let error = payload.get("error");
-    let kind = error.and_then(|e| e.get("kind")).and_then(Value::as_str);
-    let message = error
-        .and_then(|e| e.get("message"))
-        .and_then(Value::as_str)
-        .unwrap_or("the codemux-remote daemon reported an error");
-    if kind == Some("not_found") && message.starts_with("unknown tool") {
-        return Ok(None);
-    }
-    Err(message.to_string())
-}
-
-/// The `worktree_create` tool run in this process, with setup commands
-/// handed to a detached `worktree setup` so they outlive this call.
+/// Use the same workspace registry and checkout implementation as the daemon.
 #[cfg(unix)]
 fn create_worktree_in_process(
     state_dir: &std::path::Path,
@@ -1196,16 +1131,10 @@ fn create_worktree_in_process(
         config::workspaces_root(state_dir),
     )
     .map_err(|e| format!("couldn't open the workspace registry: {e}"))?;
-    let exe = std::env::current_exe().map_err(|e| format!("couldn't locate codemux-remote: {e}"))?;
-    let runner = tools::SetupRunner::Detached {
-        exe,
-        log_dir: config::logs_dir(state_dir),
-    };
-    tools::worktree_create_with(args, &store, &runner).map_err(|e| e.message)
+    tools::worktree_create(args, &store).map_err(|e| e.message)
 }
 
-/// Implementation for the hidden `codemux-remote worktree setup`. Output
-/// goes to the log file `worktree create` opened for it.
+/// Run repository setup when requested explicitly from the host CLI.
 #[cfg(unix)]
 fn run_worktree_setup(
     path: PathBuf,

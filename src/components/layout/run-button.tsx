@@ -33,7 +33,7 @@ import {
   getProjectScripts,
   getWorkspaceConfig,
   runProjectDevCommand,
-  setProjectScripts,
+  setProjectRunScript,
 } from "@/tauri/commands";
 import type { RunCandidate } from "@/tauri/types";
 import { reportFailure } from "@/lib/toast";
@@ -336,15 +336,7 @@ function RunCommandForm({
     setSaving(true);
     setError(null);
     try {
-      // Keep the project's other scripts; only the run command changes. A
-      // failed read aborts the save rather than writing empty scripts.
-      const existing = await getProjectScripts(projectRoot);
-      await setProjectScripts(projectRoot, {
-        setup: existing?.setup ?? [],
-        teardown: existing?.teardown ?? [],
-        worktree_includes: existing?.worktree_includes ?? [],
-        run: trimmed,
-      });
+      await setProjectRunScript(projectRoot, trimmed);
     } catch (e) {
       setError(String(e));
       setSaving(false);

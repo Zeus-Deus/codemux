@@ -297,8 +297,8 @@ fn git(dir: &std::path::Path, args: &[&str]) -> String {
 ///    stale local ref.
 /// 3. The gitignored `.env` must be copied into the worktree before
 ///    the tool returns.
-/// 4. The project's `.codemux/config.json` setup script must run with
-///    the CODEMUX_* env + the deterministic port from the response.
+/// 4. The repository's setup script waits for an explicit command
+///    on the host, then runs with the advertised workspace environment.
 #[test]
 fn http_worktree_create_provisions_like_desktop() {
     let work = TempDir::new().expect("work tempdir");
@@ -390,19 +390,25 @@ fn http_worktree_create_provisions_like_desktop() {
         .iter()
         .any(|v| v == ".env"));
 
-    // (4) Setup script ran with CODEMUX_* env + the reported port.
+    // (4) The daemon reports setup without running it automatically.
     assert_eq!(setup["setup_commands"], json!(1));
+    assert_eq!(setup["setup_running"], json!(false));
+    assert_eq!(setup["setup_requires_explicit_run"], json!(true));
     let port = setup["port"].as_u64().expect("setup.port");
     let marker = wt.join("setup-ran.txt");
-    let deadline = Instant::now() + Duration::from_secs(15);
-    while !marker.exists() {
-        assert!(
-            Instant::now() < deadline,
-            "setup script never produced {}",
-            marker.display()
-        );
-        std::thread::sleep(Duration::from_millis(100));
-    }
+    assert!(!marker.exists());
+    let status = Command::new(binary_path())
+        .args(["worktree", "setup", "--path"])
+        .arg(&wt)
+        .args([
+            "--workspace-id", ws["id"].as_str().unwrap(),
+            "--name", ws["name"].as_str().unwrap(),
+            "--branch", "provisioned",
+        ])
+        .env("HOME", fx.home.path())
+        .status()
+        .unwrap();
+    assert!(status.success());
     let recorded = std::fs::read_to_string(&marker).unwrap();
     let parts: Vec<&str> = recorded.split('|').collect();
     assert_eq!(parts.len(), 4, "marker: {recorded}");

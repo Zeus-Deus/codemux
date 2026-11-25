@@ -2063,7 +2063,7 @@ pub(crate) async fn dispatch_request_as<R: Runtime>(
                 let ws = snapshot.workspaces.iter()
                     .find(|w| w.workspace_id.0 == ws_id)
                     .ok_or_else(|| format!("No workspace found for {ws_id}"))?;
-                Ok((ws.cwd.clone(), ws.title.clone(), ws.git_branch.clone(), ws_id))
+                Ok((ws.cwd.clone(), ws.title.clone(), ws.git_branch.clone(), ws_id, ws.worktree_path.is_some()))
             });
             match target {
                 Err(error) => Err(error),
@@ -2071,14 +2071,19 @@ pub(crate) async fn dispatch_request_as<R: Runtime>(
                 // `codemux` back. On an async worker that call could never be
                 // answered: the blocked worker can leave nobody polling the
                 // socket.
-                Ok((cwd, title, branch, ws_id)) => {
+                Ok((cwd, title, branch, ws_id, expects_worktree)) => {
                     let app = app.clone();
                     tokio::task::spawn_blocking(move || {
                         let db: State<'_, crate::database::DatabaseStore> = app.state();
                         let port = crate::scripts::allocate_workspace_port(&ws_id);
-                        crate::scripts::run_setup_scripts(
-                            std::path::Path::new(&cwd), &title, &ws_id, &app, Some(&db),
-                            branch.as_deref(), Some(port),
+                        let folder = std::path::Path::new(&cwd);
+                        let paths = crate::config::workspace_config::LifecyclePaths::resolve_for_workspace(
+                            folder, &db, &ws_id, expects_worktree,
+                        )?;
+                        let config = paths.automatic_config(&db);
+                        crate::scripts::run_setup_pipeline(
+                            crate::scripts::ScriptLocation::Checked(&paths), &title, &ws_id, &app, Some(&config),
+                            branch.as_deref(), Some(port), &crate::workspace_service::Checkpoint::default(),
                         )?;
                         Ok::<_, String>(serde_json::json!({ "workspace_id": ws_id, "status": "complete" }))
                     })

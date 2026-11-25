@@ -6,7 +6,7 @@ import userEvent from "@testing-library/user-event";
 const mockGetProjectScripts = vi.fn();
 const mockGetWorkspaceConfig = vi.fn();
 const mockRunProjectDevCommand = vi.fn().mockResolvedValue(undefined);
-const mockSetProjectScripts = vi.fn().mockResolvedValue(undefined);
+const mockSetProjectRunScript = vi.fn().mockResolvedValue(undefined);
 const mockDetectRunCandidates = vi.fn();
 
 afterEach(() => { delete (window as { __CODEMUX_REMOTE__?: boolean }).__CODEMUX_REMOTE__; });
@@ -15,7 +15,7 @@ vi.mock("@/tauri/commands", () => ({
   getProjectScripts: (...args: unknown[]) => mockGetProjectScripts(...args),
   getWorkspaceConfig: (...args: unknown[]) => mockGetWorkspaceConfig(...args),
   runProjectDevCommand: (...args: unknown[]) => mockRunProjectDevCommand(...args),
-  setProjectScripts: (...args: unknown[]) => mockSetProjectScripts(...args),
+  setProjectRunScript: (...args: unknown[]) => mockSetProjectRunScript(...args),
   detectRunCandidates: (...args: unknown[]) => mockDetectRunCandidates(...args),
 }));
 
@@ -81,7 +81,7 @@ beforeEach(() => {
   vi.clearAllMocks();
   mockGetProjectScripts.mockResolvedValue(null);
   mockGetWorkspaceConfig.mockResolvedValue(null);
-  mockSetProjectScripts.mockResolvedValue(undefined);
+  mockSetProjectRunScript.mockResolvedValue(undefined);
   mockDetectRunCandidates.mockResolvedValue([
     { command: "pnpm run dev", source: "package.json" },
     { command: "cargo run", source: "Cargo.toml" },
@@ -213,7 +213,7 @@ describe("RunButton — panel variant", () => {
     expect(await screen.findByText("Configure this project's run command in the desktop app.")).toBeInTheDocument();
     expect(screen.queryByLabelText("Run command")).toBeNull();
     expect(mockDetectRunCandidates).not.toHaveBeenCalled();
-    expect(mockSetProjectScripts).not.toHaveBeenCalled();
+    expect(mockSetProjectRunScript).not.toHaveBeenCalled();
     expect(mockRunProjectDevCommand).not.toHaveBeenCalled();
   });
 
@@ -224,7 +224,7 @@ describe("RunButton — panel variant", () => {
     await flushPromises();
     await userEvent.click(screen.getByText("Run"));
     expect(mockRunProjectDevCommand).toHaveBeenCalledWith("ws-1");
-    expect(mockSetProjectScripts).not.toHaveBeenCalled();
+    expect(mockSetProjectRunScript).not.toHaveBeenCalled();
   });
 
   it('main segment shows "Set run command" and opens the popover with detected commands', async () => {
@@ -269,7 +269,7 @@ describe("RunButton — panel variant", () => {
     expect(mockRunProjectDevCommand).not.toHaveBeenCalled();
   });
 
-  it("picking a detected command saves it, keeps other scripts and runs it", async () => {
+  it("picking a detected command saves only the Run field and runs it", async () => {
     mockGetProjectScripts.mockResolvedValue({
       setup: ["pnpm install"],
       teardown: [],
@@ -280,12 +280,7 @@ describe("RunButton — panel variant", () => {
     await flushPromises();
     await userEvent.click(screen.getByText("Set run command"));
     await userEvent.click(await screen.findByRole("button", { name: /pnpm run dev/ }));
-    expect(mockSetProjectScripts).toHaveBeenCalledWith("/home/user/myapp", {
-      setup: ["pnpm install"],
-      teardown: [],
-      worktree_includes: [".env"],
-      run: "pnpm run dev",
-    });
+    expect(mockSetProjectRunScript).toHaveBeenCalledWith("/home/user/myapp", "pnpm run dev");
     expect(mockRunProjectDevCommand).toHaveBeenCalledWith("ws-1");
     await waitFor(() => expect(screen.getByText("Run")).toBeInTheDocument());
     expect(screen.queryByLabelText("Run command")).toBeNull();
@@ -296,15 +291,12 @@ describe("RunButton — panel variant", () => {
     await flushPromises();
     await userEvent.click(screen.getByText("Set run command"));
     await userEvent.type(await screen.findByLabelText("Run command"), "just serve{Enter}");
-    expect(mockSetProjectScripts).toHaveBeenCalledWith(
-      "/home/user/myapp",
-      expect.objectContaining({ run: "just serve" }),
-    );
+    expect(mockSetProjectRunScript).toHaveBeenCalledWith("/home/user/myapp", "just serve");
     expect(mockRunProjectDevCommand).toHaveBeenCalledWith("ws-1");
   });
 
   it("keeps the popover open and shows the error when saving fails", async () => {
-    mockSetProjectScripts.mockRejectedValue("database is locked");
+    mockSetProjectRunScript.mockRejectedValue("database is locked");
     renderPanelRunButton();
     await flushPromises();
     await userEvent.click(screen.getByText("Set run command"));
@@ -313,15 +305,14 @@ describe("RunButton — panel variant", () => {
     expect(mockRunProjectDevCommand).not.toHaveBeenCalled();
   });
 
-  it("does not save when the existing scripts cannot be read", async () => {
+  it("does not run when the saved scripts need local review", async () => {
+    const message = "Review saved project scripts in Settings before changing the Run command.";
+    mockSetProjectRunScript.mockRejectedValue(message);
     renderPanelRunButton();
     await flushPromises();
     await userEvent.click(screen.getByText("Set run command"));
-    // Writing after a failed read would wipe setup, teardown and includes.
-    mockGetProjectScripts.mockRejectedValue("read failed");
     await userEvent.click(await screen.findByRole("button", { name: /cargo run/ }));
-    expect(await screen.findByText("read failed")).toBeInTheDocument();
-    expect(mockSetProjectScripts).not.toHaveBeenCalled();
+    expect(await screen.findByText(message)).toBeInTheDocument();
     expect(mockRunProjectDevCommand).not.toHaveBeenCalled();
   });
 
@@ -387,10 +378,7 @@ describe("RunButton — panel variant", () => {
     expect(screen.getByRole("button", { name: /cargo run/ })).toHaveFocus();
     await userEvent.keyboard("{Enter}");
     await waitFor(() => expect(screen.getByText("Run")).toBeInTheDocument());
-    expect(mockSetProjectScripts).toHaveBeenCalledWith(
-      "/home/user/myapp",
-      expect.objectContaining({ run: "cargo run" }),
-    );
+    expect(mockSetProjectRunScript).toHaveBeenCalledWith("/home/user/myapp", "cargo run");
     await waitFor(() => expect(caret).toHaveFocus());
   });
 

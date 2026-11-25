@@ -727,6 +727,15 @@ export const archiveWorkspace = (workspaceId: string) => {
   return invoke<string>("archive_workspace", { workspaceId });
 };
 
+/** Archive on the desktop after the user explicitly chooses to skip teardown. */
+export const archiveWorkspaceWithoutTeardown = (workspaceId: string) => {
+  if (isRemoteClient()) {
+    return Promise.reject(new Error("Archiving without teardown requires the desktop app."));
+  }
+  noteLocalActivationFallback();
+  return invoke<string>("archive_workspace_without_teardown", { workspaceId });
+};
+
 /** Restore an archived workspace. Resolves with the restored workspace id;
  *  the backend also activates it unless `select` is false (an Undo of an
  *  archive the user wasn't looking at). Rejects (entry kept) when nothing is
@@ -769,8 +778,24 @@ export const runWorkspaceSetup = (workspaceId: string) =>
 export const getProjectScripts = (path: string) =>
   invoke<ProjectScripts | null>("get_project_scripts", { path });
 
-export const setProjectScripts = (path: string, scripts: ProjectScripts) =>
-  invoke<void>("set_project_scripts", { path, scripts });
+export const getProjectScriptsForReview = (path: string) =>
+  invoke<(ProjectScripts & { review_root?: string; review_id?: string }) | null>(
+    "get_project_scripts_for_review",
+    { path },
+  );
+
+export const discardProjectScriptsReview = (reviewId: string) =>
+  invoke<void>("discard_project_scripts_review", { reviewId });
+
+export const setProjectScripts = (
+  path: string,
+  scripts: ProjectScripts,
+  reviewId?: string,
+  reviewed?: boolean,
+) => invoke<void>("set_project_scripts", { path, scripts, reviewId, reviewed });
+
+export const setProjectRunScript = (path: string, run: string) =>
+  invoke<void>("set_project_run_script", { path, run });
 
 export const runProjectDevCommand = (workspaceId: string, forceNew?: boolean) =>
   invoke<void>("run_project_dev_command", { workspaceId, forceNew: forceNew ?? false });

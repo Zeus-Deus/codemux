@@ -95,27 +95,25 @@ export function WorkspaceInboxMenu({
     !isPrimary && workspace.protected !== true && !isAttachOrRemote;
 
   const handleArchiveOrClose = async () => {
+    if (!isAttachOrRemote) return archiveWorkspaceWithUndo(workspace);
+
     try {
-      if (isAttachOrRemote) {
-        if (workspace.worktree_path) {
-          await closeWorkspaceWithWorktree(
-            workspace.workspace_id,
-            false,
-            false,
-            false,
-          );
-        } else {
-          await closeWorkspace(workspace.workspace_id, false);
-        }
-        toast.success(
-          `Closed "${workspace.title}" — it stays available on its host under Devices`,
+      if (workspace.worktree_path) {
+        await closeWorkspaceWithWorktree(
+          workspace.workspace_id,
+          false,
+          false,
+          false,
         );
       } else {
-        await archiveWorkspaceWithUndo(workspace);
+        await closeWorkspace(workspace.workspace_id, false);
       }
+      toast.success(
+        `Closed "${workspace.title}" — it stays available on its host under Devices`,
+      );
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
-      toast.error(isAttachOrRemote ? "Close failed" : "Archive failed", {
+      toast.error("Close failed", {
         description: message,
       });
     }

@@ -7746,17 +7746,28 @@ const handlers: Record<string, Handler> = {
   // No mock project has a `.codemux/config.json`; like the backend, that
   // reads as null, so the DB scripts below are the effective config.
   get_workspace_config: () => null,
-  get_project_scripts: (a) =>
-    mockProjectScripts.get(a.path as string) ?? {
-      setup: [],
-      teardown: [],
-      run: null,
-      worktree_includes: [],
-    },
+  get_project_scripts: (a) => mockProjectScripts.get(a.path as string) ?? {
+    setup: [],
+    teardown: [],
+    run: null,
+    worktree_includes: [],
+  },
+  get_project_scripts_for_review: (a) => ({
+    ...(handlers.get_project_scripts(a) as ProjectScripts),
+    review_id: `fixture-project:${a.path}`,
+  }),
+  discard_project_scripts_review: () => null,
   // Kept in memory so the titlebar Run button flips from "Set Run" to
   // "Run" after a command is picked in its popover.
   set_project_scripts: (a) => {
     mockProjectScripts.set(a.path as string, a.scripts as ProjectScripts);
+    return null;
+  },
+  set_project_run_script: (a) => {
+    mockProjectScripts.set(a.path as string, {
+      ...(handlers.get_project_scripts(a) as ProjectScripts),
+      run: a.run as string,
+    });
     return null;
   },
   detect_run_candidates: () => [
@@ -8662,6 +8673,7 @@ const handlers: Record<string, Handler> = {
     emitAppState();
     return archiveId;
   },
+  archive_workspace_without_teardown: (a) => handlers.archive_workspace(a),
   unarchive_workspace: (a) => {
     const entries = appState.archived_workspaces ?? [];
     const entry = entries.find((e) => e.archive_id === a.archiveId);

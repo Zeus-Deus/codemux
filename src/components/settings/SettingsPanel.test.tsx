@@ -172,6 +172,8 @@ vi.mock("@/tauri/commands", () => ({
   setAiResolverModel: vi.fn().mockResolvedValue(undefined),
   setAiResolverStrategy: vi.fn().mockResolvedValue(undefined),
   getProjectScripts: vi.fn().mockResolvedValue(null),
+  getProjectScriptsForReview: vi.fn().mockResolvedValue(null),
+  discardProjectScriptsReview: vi.fn().mockResolvedValue(undefined),
   setProjectScripts: vi.fn().mockResolvedValue(undefined),
   getWorkspaceConfig: vi.fn().mockResolvedValue(null),
   hasCodemuxinclude: vi.fn().mockResolvedValue(false),
@@ -1117,7 +1119,7 @@ describe("Settings → Projects", () => {
     render(<SettingsView />);
 
     // Defaults to the active workspace's project.
-    await waitFor(() => expect(commands.getProjectScripts).toHaveBeenCalledWith("/tmp/proj"));
+    await waitFor(() => expect(commands.getProjectScriptsForReview).toHaveBeenCalledWith("/tmp/proj"));
     const picker = screen.getByRole("combobox", { name: "Project" });
     expect(picker).toHaveTextContent("proj");
 
@@ -1126,13 +1128,20 @@ describe("Settings → Projects", () => {
     Element.prototype.scrollIntoView ??= () => {};
     fireEvent.keyDown(picker, { key: "Enter" });
     fireEvent.keyDown(await screen.findByRole("option", { name: "other" }), { key: "Enter" });
-    await waitFor(() => expect(commands.getProjectScripts).toHaveBeenCalledWith("/tmp/other"));
+    await waitFor(() => expect(commands.getProjectScriptsForReview).toHaveBeenCalledWith("/tmp/other"));
     expect(screen.getByRole("combobox", { name: "Project" })).toHaveTextContent("other");
   });
 
   it("saves on blur only when something changed, then says so", async () => {
+    vi.mocked(commands.getProjectScriptsForReview).mockResolvedValueOnce({
+      setup: [],
+      teardown: [],
+      run: null,
+      worktree_includes: [],
+      review_id: "fixture-selected-project",
+    });
     render(<SettingsView />);
-    await waitFor(() => expect(commands.getProjectScripts).toHaveBeenCalled());
+    await waitFor(() => expect(commands.getProjectScriptsForReview).toHaveBeenCalled());
     const setup = screen.getByPlaceholderText("e.g. npm install");
 
     fireEvent.blur(setup);
@@ -1145,7 +1154,7 @@ describe("Settings → Projects", () => {
       teardown: [],
       run: null,
       worktree_includes: [],
-    });
+    }, "fixture-selected-project");
     // Every field carries a hidden note; only the one just saved shows.
     const visibleNotes = () =>
       screen.getAllByText("Saved").filter((el) => !el.closest("[aria-hidden='true']"));
@@ -1153,13 +1162,63 @@ describe("Settings → Projects", () => {
     expect(visibleNotes()[0].closest(".space-y-2")).toContainElement(setup);
   });
 
+  it("requires explicit review before saving scripts from an earlier project path", async () => {
+    vi.mocked(commands.getProjectScriptsForReview).mockResolvedValueOnce({
+      setup: ["npm ci"],
+      teardown: ["npm run cleanup"],
+      run: "npm run dev",
+      worktree_includes: [],
+      review_root: "/private/tmp/proj",
+      review_id: "fixture-review",
+    });
+    render(<SettingsView />);
+
+    const save = await screen.findByRole("button", { name: "Save reviewed scripts" });
+    const setup = screen.getByPlaceholderText("e.g. npm install");
+    expect(setup).toHaveValue("npm ci");
+    expect(screen.getByText("/private/tmp/proj")).toBeInTheDocument();
+    fireEvent.change(setup, { target: { value: "npm install" } });
+    fireEvent.blur(setup);
+    expect(commands.setProjectScripts).not.toHaveBeenCalled();
+
+    fireEvent.click(save);
+    expect(commands.setProjectScripts).toHaveBeenCalledWith("/private/tmp/proj", {
+      setup: ["npm install"],
+      teardown: ["npm run cleanup"],
+      run: "npm run dev",
+      worktree_includes: [],
+    }, "fixture-review", true);
+    await waitFor(() => expect(save).not.toBeInTheDocument());
+  });
+
+  it("disables saving after the reviewed directory changes", async () => {
+    vi.mocked(commands.getProjectScriptsForReview).mockResolvedValueOnce({
+      setup: ["npm ci"],
+      teardown: [],
+      run: null,
+      worktree_includes: [],
+      review_root: "/private/tmp/proj",
+      review_id: "fixture-invalidated-review",
+    });
+    vi.mocked(commands.setProjectScripts)
+      .mockRejectedValueOnce("The reviewed project changed. Reopen Settings and review the scripts again.");
+    render(<SettingsView />);
+
+    fireEvent.click(await screen.findByRole("button", { name: "Save reviewed scripts" }));
+    expect(await screen.findByRole("alert")).toHaveTextContent("The reviewed project changed.");
+    const setup = screen.getByPlaceholderText("e.g. npm install");
+    expect(setup).toBeDisabled();
+    fireEvent.blur(setup);
+    expect(commands.setProjectScripts).toHaveBeenCalledTimes(1);
+  });
+
   it("cannot save the previous project's values while the new project is loading", async () => {
     mockWorkspaces = [
       { workspace_id: "ws-1", project_root: "/tmp/proj" },
       { workspace_id: "ws-2", project_root: "/tmp/other" },
     ];
-    let resolveOther!: (scripts: Awaited<ReturnType<typeof commands.getProjectScripts>>) => void;
-    vi.mocked(commands.getProjectScripts)
+    let resolveOther!: (scripts: Awaited<ReturnType<typeof commands.getProjectScriptsForReview>>) => void;
+    vi.mocked(commands.getProjectScriptsForReview)
       .mockResolvedValueOnce({ setup: ["setup-for-a"], teardown: [], run: null, worktree_includes: [] })
       .mockReturnValueOnce(new Promise((resolve) => { resolveOther = resolve; }));
     render(<SettingsView />);
@@ -1182,7 +1241,7 @@ describe("Settings → Projects", () => {
   });
 
   it("keeps fields disabled and shows a project load error", async () => {
-    vi.mocked(commands.getProjectScripts).mockRejectedValueOnce(new Error("permission denied"));
+    vi.mocked(commands.getProjectScriptsForReview).mockRejectedValueOnce(new Error("permission denied"));
     render(<SettingsView />);
     expect(await screen.findByRole("alert")).toHaveTextContent("Couldn't load proj's scripts: Error: permission denied");
     const setup = screen.getByPlaceholderText("e.g. npm install");
@@ -1196,6 +1255,9 @@ describe("Settings → Projects", () => {
       { workspace_id: "ws-1", project_root: "/tmp/proj" },
       { workspace_id: "ws-2", project_root: "/tmp/other" },
     ];
+    vi.mocked(commands.getProjectScriptsForReview).mockResolvedValueOnce({
+      setup: [], teardown: [], run: null, worktree_includes: [], review_id: "fixture-project-a",
+    });
     let resolveSave!: () => void;
     vi.mocked(commands.setProjectScripts).mockReturnValueOnce(new Promise((resolve) => { resolveSave = resolve; }));
     render(<SettingsView />);
@@ -1205,17 +1267,30 @@ describe("Settings → Projects", () => {
     fireEvent.blur(setup);
     await chooseOtherProject();
     await waitFor(() => expect(setup).toBeEnabled());
+    expect(commands.discardProjectScriptsReview).not.toHaveBeenCalledWith("fixture-project-a");
     resolveSave();
+    await waitFor(() => expect(commands.discardProjectScriptsReview).toHaveBeenCalledWith("fixture-project-a"));
     await waitFor(() => expect(screen.getAllByText("Saved").filter((el) => !el.closest("[aria-hidden='true']"))).toHaveLength(0));
 
     fireEvent.blur(setup);
     expect(commands.setProjectScripts).toHaveBeenCalledTimes(1);
   });
 
+  it("discards a review returned after the editor closes", async () => {
+    let resolveReview!: (scripts: Awaited<ReturnType<typeof commands.getProjectScriptsForReview>>) => void;
+    vi.mocked(commands.getProjectScriptsForReview)
+      .mockReturnValueOnce(new Promise((resolve) => { resolveReview = resolve; }));
+    const view = render(<SettingsView />);
+    await waitFor(() => expect(commands.getProjectScriptsForReview).toHaveBeenCalled());
+    view.unmount();
+    resolveReview({ setup: [], teardown: [], run: null, worktree_includes: [], review_id: "fixture-late" });
+    await waitFor(() => expect(commands.discardProjectScriptsReview).toHaveBeenCalledWith("fixture-late"));
+  });
+
   it("reports a failed save and keeps the edit dirty", async () => {
     vi.mocked(commands.setProjectScripts).mockRejectedValueOnce("read-only");
     render(<SettingsView />);
-    await waitFor(() => expect(commands.getProjectScripts).toHaveBeenCalled());
+    await waitFor(() => expect(commands.getProjectScriptsForReview).toHaveBeenCalled());
     const run = screen.getByPlaceholderText("e.g. npm run dev");
 
     fireEvent.change(run, { target: { value: "npm run dev" } });
