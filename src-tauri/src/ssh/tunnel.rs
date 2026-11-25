@@ -31,9 +31,14 @@ use tokio::process::{Child, Command};
 use tokio::time::{sleep, timeout};
 
 use super::exec::{sh_quote, validate_ssh_target};
-use super::tunnel_paths::{forward_socket_path, is_private_directory, verified_ssh_args, DIRECTORY_CHECKS};
+use super::tunnel_paths::{
+    forward_socket_path, is_private_directory, probe_remote_socket, verified_ssh_args, LocalSocket,
+    DIRECTORY_CHECKS,
+};
+use crate::pty_daemon::{PtyDaemonClient, PROTOCOL_VERSION};
 
 const TUNNEL_READY: &str = "codemux:pty-tunnel-ready:v1";
+const PROBE_TIMEOUT: Duration = Duration::from_secs(15);
 
 pub(super) fn has_private_socket_parent(path: &Path) -> bool {
     path.parent().is_some_and(is_private_directory)
@@ -164,6 +169,20 @@ exec sleep 2147483647"#,
 /// Build the ssh argv we use to spawn the tunneled daemon. Extracted
 /// so tests can assert the exact flags without forking ssh.
 pub fn build_tunnel_argv(opts: &TunnelOptions<'_>) -> Vec<String> {
+    build_forward_argv(
+        opts.ssh_target,
+        opts.remote_socket,
+        opts.local_socket,
+        build_remote_command(opts.remote_socket, opts.remote_binary),
+    )
+}
+
+fn build_forward_argv(
+    ssh_target: &str,
+    remote_socket: &str,
+    local_socket: &Path,
+    remote_command: String,
+) -> Vec<String> {
     let mut args: Vec<_> = verified_ssh_args().into_iter().map(String::from).collect();
     args.extend([
         "-o".into(),
@@ -180,14 +199,87 @@ pub fn build_tunnel_argv(opts: &TunnelOptions<'_>) -> Vec<String> {
         // -L local:remote — forward the local Unix socket to the
         // remote Unix socket the daemon binds.
         "-L".into(),
-        format!("{}:{}", opts.local_socket.display(), opts.remote_socket),
+        format!("{}:{remote_socket}", local_socket.display()),
         "--".into(),
-        opts.ssh_target.into(),
-        // Remote command: reuse a live detached daemon or spawn one
-        // detached, then hold the forward open. See `build_remote_command`.
-        build_remote_command(opts.remote_socket, opts.remote_binary),
+        ssh_target.into(),
+        remote_command,
     ]);
     args
+}
+
+fn build_existing_daemon_command(remote_socket: &str) -> String {
+    let script = format!(
+        "UID_NUMBER=$(id -u) || exit 1\nSOCK={}\n{}{}",
+        sh_quote(remote_socket),
+        DIRECTORY_CHECKS,
+        r#"
+DIR=$(dirname "$SOCK") || exit 1
+if ! private_directory "$DIR"; then
+    # The old flat socket can be probed in the trusted sticky temp root.
+    # Recheck its ownership and mode in daemon_alive before using it.
+    [ "$DIR" = "$(absolute_dir /tmp)" ] && trusted_directory "$DIR" || exit 1
+fi
+daemon_alive "$SOCK" || exit 1
+printf '%s\n' 'codemux:pty-tunnel-ready:v1'
+# This shell exits when the probe's SSH stdin closes.
+IFS= read -r ignored"#,
+    );
+    format!("exec sh -c {}", sh_quote(&script))
+}
+
+pub(super) fn verify_daemon_protocol(version: &str, protocol: u32) -> Result<(), String> {
+    if protocol == PROTOCOL_VERSION {
+        return Ok(());
+    }
+    Err(format!(
+        "The device's running terminal daemon ({version}) uses PTY protocol {protocol}, but this desktop requires {PROTOCOL_VERSION}. Close its terminals and set up the device again before retrying."
+    ))
+}
+
+/// Check the live daemon that normal discovery would reuse. This probe
+/// sends only Hello and neither starts daemons nor changes remote paths.
+pub(crate) async fn verify_workspace_daemon(
+    ssh_target: &str,
+    workspace_id: &str,
+) -> Result<(), String> {
+    let Some(remote_socket) = probe_remote_socket(ssh_target, workspace_id).await? else {
+        return Ok(());
+    };
+    let local_socket = LocalSocket::allocate()?;
+    let argv = build_forward_argv(
+        ssh_target,
+        &remote_socket,
+        &local_socket.path,
+        build_existing_daemon_command(&remote_socket),
+    );
+    let mut command = Command::new("ssh");
+    command
+        .args(argv)
+        .kill_on_drop(true)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    crate::execution::sanitize_appimage_env_tokio(&mut command);
+    let mut child = command
+        .spawn()
+        .map_err(|error| format!("Could not open the device daemon probe: {error}"))?;
+    let result = verify_daemon_forward(&local_socket.path, &mut child).await;
+    let _ = child.kill().await;
+    result
+}
+
+async fn verify_daemon_forward(path: &Path, child: &mut Child) -> Result<(), String> {
+    // Child::wait closes its stdin immediately. Keep the probe command's
+    // lifetime bound to this handle until we finish checking the listener.
+    let _stdin = child.stdin.take();
+    timeout(PROBE_TIMEOUT, async {
+        wait_for_socket(path, child, PROBE_TIMEOUT).await?;
+        let client = PtyDaemonClient::connect(path).await.map_err(|e| e.to_string())?;
+        let (_, version, protocol) = client.hello().await.map_err(|e| e.to_string())?;
+        verify_daemon_protocol(&version, protocol)
+    })
+    .await
+    .map_err(|_| "The device's running terminal daemon did not answer the probe in time")?
 }
 
 /// Wait for both the SSH forward and the remote daemon's authenticated
@@ -445,4 +537,64 @@ mod tests {
         assert!(prepare_local_socket(&socket).is_err());
     }
 
+    #[tokio::test]
+    async fn workspace_daemon_preflight_checks_running_protocol_and_leaves_listener_alive() {
+        use crate::pty_daemon::protocol::{ClientRequest, Frame, ServerResponse};
+        use tokio::io::AsyncWriteExt;
+        use tokio::net::UnixListener;
+
+        let socket = LocalSocket::allocate().unwrap();
+        let listener = UnixListener::bind(&socket.path).unwrap();
+        fs::set_permissions(&socket.path, fs::Permissions::from_mode(0o600)).unwrap();
+        let pid = socket.path.with_extension("sock.pid");
+        fs::write(&pid, std::process::id().to_string()).unwrap();
+        fs::set_permissions(&pid, fs::Permissions::from_mode(0o600)).unwrap();
+
+        for protocol in [PROTOCOL_VERSION + 1, PROTOCOL_VERSION] {
+            let command = build_existing_daemon_command(socket.path.to_str().unwrap());
+            let mut child = Command::new("sh")
+                .args(["-c", &command])
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .kill_on_drop(true)
+                .spawn()
+                .unwrap();
+            let serve = async {
+                let (stream, _) = listener.accept().await.unwrap();
+                let mut stream = BufReader::new(stream);
+                let mut request = String::new();
+                stream.read_line(&mut request).await.unwrap();
+                let ClientRequest::Hello { request_id } = serde_json::from_str(&request).unwrap() else {
+                    panic!("The preflight should only send Hello");
+                };
+                let reply = Frame::Response(ServerResponse::Hello {
+                    request_id,
+                    protocol_version: protocol,
+                    daemon_pid: std::process::id(),
+                    daemon_version: "0.0.1".into(),
+                    host_claude_plugin: false,
+                    guarded_shells: false,
+                    prepared_spawn: false,
+                });
+                let mut frame = serde_json::to_vec(&reply).unwrap();
+                frame.push(b'\n');
+                stream.write_all(&frame).await.unwrap();
+                request.clear();
+                assert_eq!(stream.read_line(&mut request).await.unwrap(), 0);
+            };
+            let result = timeout(PROBE_TIMEOUT, async {
+                tokio::join!(verify_daemon_forward(&socket.path, &mut child), serve)
+            })
+            .await
+            .expect("Probe must connect and close its client");
+            let _ = child.kill().await;
+            if protocol == PROTOCOL_VERSION {
+                result.0.unwrap();
+            } else {
+                let error = result.0.unwrap_err();
+                assert!(error.contains(&format!("uses PTY protocol {protocol}")), "{error}");
+            }
+            assert!(socket.path.exists(), "the live socket should remain intact");
+        }
+    }
 }

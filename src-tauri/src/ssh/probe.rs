@@ -255,18 +255,17 @@ mod tests {
         )
     }
 
-    /// Run `script` under `sh` the way a device would: `home` is `$HOME`
-    /// and `path_dir` is the only non-system directory on PATH.
+    /// Give the fixture its own helper lookup path and stable OS probe.
     fn run_on_device(
         script: &str,
         home: &std::path::Path,
         path_dir: &std::path::Path,
     ) -> std::process::Output {
-        std::process::Command::new("sh")
+        std::process::Command::new("/bin/sh")
             .arg("-c")
-            .arg(script)
+            .arg(format!("uname() {{ printf '%s\\n' 'Linux x86_64'; }}\n{script}"))
             .env("HOME", home)
-            .env("PATH", format!("{}:/usr/bin:/bin", path_dir.display()))
+            .env("PATH", path_dir)
             .output()
             .unwrap()
     }

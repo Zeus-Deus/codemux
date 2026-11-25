@@ -563,9 +563,8 @@ fn mark_host_ready<R: tauri::Runtime>(app: &tauri::AppHandle<R>, host_id: i64) {
 ///
 /// This is the dev-workflow escape hatch behind the "Reinstall agent on
 /// host" button in Settings → Hosts. Rebuilding `codemux-remote` from a
-/// branch keeps the version string the same, so the push-time version
-/// check (`ensure_remote_binary_current`) sees a match and skips the
-/// upgrade — leaving the host running a stale binary. This command always
+/// branch keeps the version string the same, so checking the installed
+/// version cannot tell it apart from the previous build. This command always
 /// re-uploads the freshly built bits (and kills the running pty-daemon),
 /// so the next push uses them. No manual `scp` + `pkill` needed.
 ///
@@ -643,6 +642,9 @@ pub async fn workspace_push_to_host<R: tauri::Runtime>(
     // doesn't leave the workspace in a half-remote state.
     host_id: i64,
 ) -> Result<crate::commands::hosts::WorkspacePushOutcome, String> {
+    #[cfg(unix)]
+    let migration = crate::commands::agent_chat::begin_workspace_migration(&workspace_id).await;
+
     let app_state: tauri::State<'_, crate::state::AppStateStore> = app.state();
     let snapshot = app_state.snapshot();
     let ws = snapshot
@@ -683,14 +685,6 @@ pub async fn workspace_push_to_host<R: tauri::Runtime>(
 
     #[cfg(unix)]
     {
-        // Verify the device and its PTY protocol before stopping chats or
-        // copying files. A compatible helper may stay on its older release.
-        prepare_workspace_push(&app, &host)
-            .await
-            .map_err(|error| {
-                device_connection_error(format!("Could not prepare {}: {error}", host.name))
-            })?;
-
         // Key the host landing path on project_uid so two different repos
         // sharing a basename don't clobber each other on the host. The exact
         // landing path is recorded (origin_path), so pull-back resolves it
@@ -713,14 +707,24 @@ pub async fn workspace_push_to_host<R: tauri::Runtime>(
         // conversations there. The next send then starts each one where the
         // workspace runs (the host once this succeeds), resuming its
         // conversation. Every outcome releases the gate.
-        let migration =
-            crate::commands::agent_chat::begin_workspace_migration(&workspace_id).await;
-        crate::commands::agent_chat::stop_workspace_chat_sessions(&app, &workspace_id).await;
         let target_matches = || {
             db.list_hosts().into_iter().any(|current| {
                 current.id == host_id && current.ssh_target == host.ssh_target
             })
         };
+        let prepare_error = |error| {
+            device_connection_error(format!("Could not prepare {}: {error}", host.name))
+        };
+        verify_workspace_push_helper(&host.ssh_target)
+            .await
+            .map_err(prepare_error)?;
+        crate::ssh::tunnel::verify_workspace_daemon(&host.ssh_target, &workspace_id)
+            .await
+            .map_err(prepare_error)?;
+        if !target_matches() {
+            return Err("The saved SSH target changed before the copy.".into());
+        }
+        crate::commands::agent_chat::stop_workspace_chat_sessions(&app, &workspace_id).await;
         if !target_matches() {
             return Err("The saved SSH target changed before the copy.".into());
         }
@@ -1456,13 +1460,19 @@ impl PushHelperVersion {
 }
 
 #[cfg(unix)]
-async fn probe_workspace_push_helper(ssh_target: &str) -> Result<Option<PushHelperVersion>, String> {
-    // Probe the executable the workspace tunnel actually starts. Print a
-    // marker even if it is missing or broken, so SSH failure stays distinct.
+async fn verify_workspace_push_helper(ssh_target: &str) -> Result<(), String> {
+    // Workspace moves only inspect the installed helper. Device setup can
+    // install or repair it, and ordinary upgrades can run independently.
     let output = crate::ssh::exec::run_remote(
         ssh_target,
-        r#"printf 'CMX_PUSH_HELPER: '
-"$HOME/.local/bin/codemux-remote" version 2>/dev/null || printf '\n'"#,
+        r#"helper="$HOME/.local/bin/codemux-remote"
+if [ ! -e "$helper" ] && [ ! -L "$helper" ]; then
+    printf 'CMX_PUSH_HELPER: missing\n'
+elif version=$("$helper" version 2>/dev/null); then
+    printf 'CMX_PUSH_HELPER: %s\n' "$version"
+else
+    printf 'CMX_PUSH_HELPER: failed\n'
+fi"#,
         std::time::Duration::from_secs(20),
     )
     .await
@@ -1472,63 +1482,18 @@ async fn probe_workspace_push_helper(ssh_target: &str) -> Result<Option<PushHelp
         .rev()
         .find_map(|line| line.strip_prefix("CMX_PUSH_HELPER: "))
         .ok_or("The SSH version probe did not report the device helper's status")?;
-    Ok(serde_json::from_str(payload).ok())
+    let helper: PushHelperVersion = match payload {
+        "missing" => Err("codemux-remote is missing. Set up the device before moving the workspace."),
+        "failed" => Err("codemux-remote failed to report its version. Check the device setup before moving the workspace."),
+        _ => serde_json::from_str(payload).map_err(|_| {
+            "codemux-remote returned an unreadable version. Check the device setup before moving the workspace."
+        }),
+    }?;
+    helper.verify_protocol()
 }
 
-#[cfg(unix)]
-async fn prepare_workspace_push<R: tauri::Runtime>(
-    app: &tauri::AppHandle<R>,
-    host: &crate::database::HostRecord,
-) -> Result<(), String> {
-    use crate::hosts_upgrade::UpgradeOutcome;
-
-    let setup = match probe_workspace_push_helper(&host.ssh_target).await? {
-        Some(helper) if !crate::hosts_upgrade::is_older(&helper.version, env!("CARGO_PKG_VERSION")) => {
-            return helper.verify_protocol();
-        }
-        Some(_) => match crate::hosts_upgrade::upgrade_host(app, host).await {
-            Ok(UpgradeOutcome::AlreadyCurrent | UpgradeOutcome::Upgraded { .. }) => Ok(()),
-            Ok(UpgradeOutcome::NotAttempted { reason }) | Err(reason) => Err(reason),
-        },
-        None => force_reinstall_remote_binary(app, host).await.map(|_| ()),
-    };
-    if let Err(error) = &setup {
-        if is_host_key_error(error) {
-            return Err(error.clone());
-        }
-    }
-
-    // An upgrade can fail before uploading anything, or it can leave a
-    // broken helper. Continue only after verifying the reachable helper.
-    let installed = probe_workspace_push_helper(&host.ssh_target)
-        .await?
-        .ok_or_else(|| {
-            setup.as_ref().err().cloned().unwrap_or_else(|| {
-                "The device helper did not report its PTY protocol after setup".into()
-            })
-        })?;
-    installed.verify_protocol()?;
-    if let Err(error) = setup {
-        eprintln!(
-            "[hosts] could not update {}: {error}. Continuing with the verified compatible helper.",
-            host.name,
-        );
-    }
-    Ok(())
-}
-
-/// Probe the remote `codemux-remote` binary's version. If it
-/// doesn't match what we'd ship from this Codemux build, re-bootstrap
-/// (scp the current binary + chmod + verify) so the daemon spawn the
-/// supervisor's about to make uses the up-to-date binary. Also kills
-/// any running daemon on the remote so the next SSH `exec` can bind
-/// the same socket without an "address in use" conflict.
-///
-/// Returns Ok on either "already current, nothing to do" or "updated
-/// successfully." Returns Err when the host can't be reached or the
-/// bootstrap attempt itself failed (no bundled binary for the target
-/// uname, upload failed, etc.). Installs the binary on a host that lacks it, so
-/// call it only from flows the user started on that device.
+/// Prepare the helper CLI for creating a workspace directly on a device.
+/// Installing a replacement leaves the device's workspace PTY daemons running.
 #[cfg(unix)]
 pub(crate) async fn ensure_remote_binary_current<R: tauri::Runtime>(
     app: &tauri::AppHandle<R>,
@@ -1575,95 +1540,67 @@ pub(crate) async fn ensure_remote_binary_current<R: tauri::Runtime>(
         host.name
     );
 
-    // Missing or broken: nothing is running from it, so a full reinstall is
-    // safe. Shared with the manual "Set up again" (`hosts_reinstall_remote`),
-    // which runs the same steps without the version check above.
-    force_reinstall_remote_binary(app, host).await.map(|_| ())
+    let _device = crate::hosts_upgrade::claim_device(&host.ssh_target).await;
+    install_remote_helper(app, host).await.map(|_| ())
 }
 
-/// Force a freshly built `codemux-remote` onto a host and restart it,
-/// *without* the version-skip check in `ensure_remote_binary_current`.
-///
-/// This is the dev-workflow primitive behind the "Reinstall agent on
-/// host" button. Rebuilding `codemux-remote` from a branch keeps the
-/// version string the same (e.g. `0.9.5`), so the push-time version
-/// check sees a match and never re-uploads — leaving the host running a
-/// stale binary. Forcing the reinstall is the only way to get freshly
-/// built bits onto the host during development.
-///
-/// Steps: probe uname → kill the SSH-spawned pty-daemon → scp + chmod +
-/// verify the bundled binary → restart the headless `serve` daemon.
-/// Returns the reported version on success.
+/// Install the matching bundled helper while the caller holds the device claim.
 #[cfg(unix)]
-pub(crate) async fn force_reinstall_remote_binary<R: tauri::Runtime>(
+async fn install_remote_helper<R: tauri::Runtime>(
     app: &tauri::AppHandle<R>,
     host: &crate::database::HostRecord,
 ) -> Result<String, String> {
-    use crate::ssh::exec::run_remote;
+    use crate::ssh::bootstrap::{bootstrap_remote, BootstrapOptions, BootstrapResult};
     use std::time::Duration;
 
-    // Waits out a background upgrade of this device: two uploads at once
-    // would share its temp file.
-    let _device = crate::hosts_upgrade::claim_device(&host.ssh_target).await;
-
-    // Step 1: figure out the remote uname so we can pick the right
-    // bundled binary. The last line wins over any login banner.
-    let uname_output = run_remote(&host.ssh_target, "uname -s -m", Duration::from_secs(20))
-        .await
-        .map_err(|e| format!("uname probe: {e}"))?;
+    let uname_output =
+        crate::ssh::exec::run_remote(&host.ssh_target, "uname -s -m", Duration::from_secs(20))
+            .await
+            .map_err(|e| format!("uname probe: {e}"))?;
     let uname = uname_output
         .lines()
         .map(str::trim)
         .filter(|line| !line.is_empty())
         .last()
-        .unwrap_or_default()
-        .to_string();
-    if uname.is_empty() {
-        return Err("uname probe returned empty string".into());
-    }
+        .ok_or("uname probe returned empty string")?;
 
-    // Step 2: kill any running pty-daemon. Otherwise the freshly-bootstrapped
-    // binary won't actually be used until the next SSH-spawn cycle, and
-    // a stale daemon still bound to the workspace's Unix socket would
-    // make that next spawn fail with "address in use." The narrow `-f`
-    // pattern only matches the SSH-spawned pty-daemon — user-launched
-    // `codemux-remote mcp` or `serve` invocations are spared. `serve`
-    // is restarted via systemctl in step 4 instead.
-    let _ = run_remote(
+    match bootstrap_remote(BootstrapOptions::new(&host.ssh_target, uname).with_app(app)).await {
+        BootstrapResult::Installed { reported_version } => {
+            eprintln!(
+                "[hosts] bootstrapped {} → codemux-remote {reported_version}",
+                host.name
+            );
+            Ok(reported_version)
+        }
+        BootstrapResult::BinaryNotBundled { wanted_target } => Err(format!(
+            "this Codemux build doesn't include a codemux-remote for {wanted_target}"
+        )),
+        BootstrapResult::UploadFailed { reason } => Err(format!("upload: {reason}")),
+        BootstrapResult::PostInstallProbeFailed { reason } => Err(format!("verify: {reason}")),
+    }
+}
+
+/// Restart the device's daemons after a user-requested reinstall succeeds.
+#[cfg(unix)]
+async fn force_reinstall_remote_binary<R: tauri::Runtime>(
+    app: &tauri::AppHandle<R>,
+    host: &crate::database::HostRecord,
+) -> Result<String, String> {
+    use std::time::Duration;
+
+    let _device = crate::hosts_upgrade::claim_device(&host.ssh_target).await;
+    let reported_version = install_remote_helper(app, host).await?;
+
+    // Existing workspace daemons still run from the old executable. Only
+    // explicit device setup asks them to exit so the new binary takes over.
+    let _ = crate::ssh::exec::run_remote(
         &host.ssh_target,
         "pkill -f 'codemux-remote pty-daemon' 2>/dev/null || true",
         Duration::from_secs(20),
     )
     .await;
 
-    // Step 3: bootstrap (upload binary + verify version).
-    use crate::ssh::bootstrap::{bootstrap_remote, BootstrapOptions, BootstrapResult};
-    let outcome = bootstrap_remote(
-        BootstrapOptions::new(&host.ssh_target, &uname).with_app(app),
-    )
-    .await;
-    let reported_version = match outcome {
-        BootstrapResult::Installed { reported_version } => {
-            eprintln!(
-                "[hosts] bootstrapped {} → codemux-remote {reported_version}",
-                host.name
-            );
-            reported_version
-        }
-        BootstrapResult::BinaryNotBundled { wanted_target } => {
-            return Err(format!(
-                "this Codemux build doesn't include a codemux-remote for {wanted_target}"
-            ));
-        }
-        BootstrapResult::UploadFailed { reason } => {
-            return Err(format!("upload: {reason}"));
-        }
-        BootstrapResult::PostInstallProbeFailed { reason } => {
-            return Err(format!("verify: {reason}"));
-        }
-    };
-
-    // Step 4: re-provision the headless `serve` daemon. This is
+    // Re-provision the headless `serve` daemon. This is
     // idempotent — it rewrites the systemd unit (so a unit-content
     // change in this Codemux version takes effect immediately), runs
     // daemon-reload, and **restarts** the unit (not just `enable
@@ -1680,7 +1617,7 @@ pub(crate) async fn force_reinstall_remote_binary<R: tauri::Runtime>(
     if let Err(error) = crate::ssh::bootstrap::provision_serve(
         &host.ssh_target,
         "~/.local/bin/codemux-remote",
-        std::time::Duration::from_secs(30),
+        Duration::from_secs(30),
     )
     .await
     {
@@ -1797,9 +1734,9 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn push_keeps_a_verified_compatible_helper_without_a_bundled_upgrade() {
+    async fn push_checks_the_installed_helper_without_reinstalling_it() {
         if crate::test_isolation::isolated(
-            "commands::hosts::tests::push_keeps_a_verified_compatible_helper_without_a_bundled_upgrade",
+            "commands::hosts::tests::push_checks_the_installed_helper_without_reinstalling_it",
         ) {
             return;
         }
@@ -1811,32 +1748,36 @@ mod tests {
         let protocol = crate::pty_daemon::PROTOCOL_VERSION;
         std::fs::write(
             &ssh,
-            format!(
-                r#"#!/bin/sh
+            r#"#!/bin/sh
 case " $* " in
     *" StrictHostKeyChecking=yes "*" ControlPath=none "*) ;;
     *) exit 255 ;;
 esac
-case "$*" in
-    *fixture-incompatible*CMX_PUSH_HELPER*)
-        printf 'CMX_PUSH_HELPER: {{"version":"{current}","protocol_version":0}}\n'
-        ;;
-    *CMX_PUSH_HELPER*)
-        printf 'verify\n' >> "$CODEMUX_PUSH_TEST_LOG"
-        printf 'CMX_PUSH_HELPER: {{"version":"0.26.0","protocol_version":{protocol}}}\n'
-        ;;
-    *CMR:*)
-        printf 'upgrade\n' >> "$CODEMUX_PUSH_TEST_LOG"
-        printf 'UNAME: Linux fixture-unsupported-cpu\nCMR: {{"version":"0.26.0","protocol_version":{protocol}}}\n'
-        ;;
-    *) exit 255 ;;
+while [ "$1" != -- ]; do shift; done
+shift
+target=$1
+shift
+case "$1" in
+    *CMX_PUSH_HELPER*) printf '%s\n' "$target" >> "$CODEMUX_PUSH_TEST_LOG" ;;
+    *) printf 'unexpected command\n' >> "$CODEMUX_PUSH_TEST_LOG"; exit 1 ;;
 esac
+HOME="$CODEMUX_PUSH_TEST_HOME/$target" exec sh -c "$1"
 "#,
-                current = env!("CARGO_PKG_VERSION"),
-            ),
         )
         .unwrap();
         std::fs::set_permissions(&ssh, std::fs::Permissions::from_mode(0o700)).unwrap();
+        for (target, command) in [
+            ("older", format!("printf '%s\\n' '{{\"version\":\"0.26.0\",\"protocol_version\":{protocol}}}'")),
+            ("incompatible", "printf '%s\\n' '{\"version\":\"0.26.0\",\"protocol_version\":0}'".into()),
+            ("malformed", "printf '%s\\n' 'not a version'".into()),
+            ("failed", "exit 3".into()),
+        ] {
+            let bin = fixture.path().join(target).join(".local/bin");
+            std::fs::create_dir_all(&bin).unwrap();
+            let helper = bin.join("codemux-remote");
+            std::fs::write(&helper, format!("#!/bin/sh\n{command}\n")).unwrap();
+            std::fs::set_permissions(&helper, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
         let path = std::env::join_paths(
             std::iter::once(fixture.path().to_owned())
                 .chain(std::env::split_paths(&std::env::var_os("PATH").unwrap())),
@@ -1845,32 +1786,22 @@ esac
         // This test runs alone in the isolated child.
         std::env::set_var("PATH", path);
         std::env::set_var("CODEMUX_PUSH_TEST_LOG", &log);
+        std::env::set_var("CODEMUX_PUSH_TEST_HOME", fixture.path());
 
-        let host = crate::database::HostRecord {
-            id: 1,
-            server_id: None,
-            name: "Fixture device".into(),
-            ssh_target: "fixture".into(),
-            created_at: String::new(),
-            updated_at: String::new(),
-            deleted_at: None,
-            dirty: false,
-            last_seen_at: None,
-            disk_bytes: None,
-            disk_measured_at: None,
-        };
-        let app = tauri::test::mock_app();
-        super::prepare_workspace_push(app.handle(), &host).await.unwrap();
-        assert_eq!(std::fs::read_to_string(log).unwrap(), "verify\nupgrade\nverify\n");
-
-        let incompatible = crate::database::HostRecord {
-            ssh_target: "fixture-incompatible".into(),
-            ..host
-        };
-        let error = super::prepare_workspace_push(app.handle(), &incompatible)
-            .await
-            .unwrap_err();
-        assert!(error.contains("uses PTY protocol 0"), "{error}");
+        super::verify_workspace_push_helper("older").await.unwrap();
+        for (target, expected) in [
+            ("incompatible", "uses PTY protocol 0"),
+            ("malformed", "returned an unreadable version"),
+            ("failed", "failed to report its version"),
+            ("missing", "is missing"),
+        ] {
+            let error = super::verify_workspace_push_helper(target).await.unwrap_err();
+            assert!(error.contains(expected), "{error}");
+        }
+        assert_eq!(
+            std::fs::read_to_string(log).unwrap(),
+            "older\nincompatible\nmalformed\nfailed\nmissing\n"
+        );
     }
 
     #[test]

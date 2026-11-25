@@ -20,6 +20,12 @@ const MAX_DISCOVERY_OUTPUT: u64 = 16 * 1024;
 const PATH_MARKER: &str = "codemux:pty-path:v1 ";
 const LOCAL_SOCKET_FILE: &str = "pty.sock";
 
+#[derive(Clone, Copy)]
+enum SocketDiscovery {
+    Prepare,
+    Probe,
+}
+
 /// OpenSSH splits forwarding arguments at ':' and expands '%' and
 /// environment tokens. Use a path that is passed through literally.
 pub(super) fn forward_socket_path(path: &Path) -> bool {
@@ -184,11 +190,12 @@ unlock_socket_path() {
 }
 "#;
 
-fn discovery_command(key: &str, system_tmp: &Path) -> String {
+fn discovery_command(key: &str, system_tmp: &Path, discovery: SocketDiscovery) -> String {
     let script = format!(
-        "umask 077\nexport LC_ALL=C\nUID_NUMBER=$(id -u) || exit 1\nKEY={}\nTMP_ROOT={}\n{}{}",
+        "umask 077\nexport LC_ALL=C\nUID_NUMBER=$(id -u) || exit 1\nKEY={}\nTMP_ROOT={}\nPROBE_ONLY={}\n{}{}",
         sh_quote(key),
         sh_quote(&system_tmp.to_string_lossy()),
+        u8::from(matches!(discovery, SocketDiscovery::Probe)),
         DIRECTORY_CHECKS,
         r#"
 HOME_ROOT=$(absolute_dir "$HOME" 2>/dev/null) || HOME_ROOT=
@@ -198,24 +205,39 @@ if ! trusted_directory "$TMP_ROOT"; then TMP_ROOT=; fi
 STATE=
 if [ -n "$HOME_ROOT" ] && [ -O "$HOME_ROOT" ] && trusted_directory "$HOME_ROOT"; then
     STATE="$HOME_ROOT/.cmux-tunnels"
-    mkdir -m 700 "$STATE" 2>/dev/null || :
-    private_directory "$STATE" || STATE=
+    if [ "$PROBE_ONLY" = 0 ]; then
+        mkdir -m 700 "$STATE" 2>/dev/null || :
+    fi
+    # A missing state directory in a writable home is the place normal
+    # discovery will initialize, rather than an old runtime fallback.
+    if ! private_directory "$STATE"; then
+        if [ "$PROBE_ONLY" = 0 ] || [ -e "$STATE" ] || [ -L "$STATE" ] || [ ! -w "$HOME_ROOT" ]; then
+            STATE=
+        fi
+    fi
 fi
 if [ -z "$STATE" ] && [ -n "$RUNTIME" ] && private_directory "$RUNTIME"; then
     STATE="$RUNTIME/.cmux-tunnels"
-    mkdir -m 700 "$STATE" 2>/dev/null || :
+    if [ "$PROBE_ONLY" = 0 ]; then
+        mkdir -m 700 "$STATE" 2>/dev/null || :
+    fi
 fi
-[ -n "$STATE" ] && private_directory "$STATE" || exit 1
 
 socket_fits() {
     case "$1/$KEY.sock" in /*[!A-Za-z0-9_./-]*) return 1;; /*) ;; *) return 1;; esac
     [ "${#1}" -le "$((103 - ${#KEY} - 6))" ]
 }
-MARKER="$STATE/$KEY.root"
-lock_socket_path "$STATE/$KEY.lock.fd" || exit 1
 ROOT=
-if [ -f "$MARKER" ] && [ ! -L "$MARKER" ]; then
-    ROOT=$(cat "$MARKER") || ROOT=
+if [ -n "$STATE" ] && private_directory "$STATE"; then
+    MARKER="$STATE/$KEY.root"
+    if [ "$PROBE_ONLY" = 0 ]; then
+        lock_socket_path "$STATE/$KEY.lock.fd" || exit 1
+    fi
+    if [ -f "$MARKER" ] && [ ! -L "$MARKER" ]; then
+        ROOT=$(cat "$MARKER") || ROOT=
+    fi
+elif [ "$PROBE_ONLY" = 0 ]; then
+    exit 1
 fi
 # An active legacy listener must be renamed on the same filesystem.
 OLD=
@@ -225,6 +247,22 @@ if [ -n "$TMP_ROOT" ]; then
         OLD="$TMP_ROOT/codemux-ptyd-$KEY.sock"
         if ! daemon_alive "$OLD"; then OLD=; fi
     fi
+fi
+# Match normal reuse and migration decisions, without moving a legacy
+# listener, allocating a path, or creating a lock during a rejected push.
+if [ "$PROBE_ONLY" = 1 ]; then
+    SOCKET=absent
+    if [ -n "$ROOT" ] && private_directory "$ROOT" && socket_fits "$ROOT"; then
+        if daemon_alive "$ROOT/$KEY.sock"; then
+            SOCKET="$ROOT/$KEY.sock"
+        else
+            case "$ROOT" in "$TMP_ROOT"/cmux.*) SOCKET=${OLD:-absent};; esac
+        fi
+    elif [ -n "$OLD" ]; then
+        SOCKET="$OLD"
+    fi
+    printf 'codemux:pty-path:v1 %s\n' "$SOCKET"
+    exit 0
 fi
 if [ -z "$ROOT" ] || ! private_directory "$ROOT" || ! socket_fits "$ROOT"; then
     if [ -n "$OLD" ] || ! socket_fits "$STATE"; then
@@ -258,7 +296,11 @@ printf 'codemux:pty-path:v1 %s\n' "$SOCKET"
     format!("exec sh -c {}", sh_quote(&script))
 }
 
-fn parse_discovered_socket(output: &[u8], key: &str) -> Result<String, String> {
+fn parse_discovered_socket(
+    output: &[u8],
+    key: &str,
+    discovery: SocketDiscovery,
+) -> Result<Option<String>, String> {
     let output = std::str::from_utf8(output).map_err(|_| "Invalid SSH discovery output")?;
     let mut paths = output
         .lines()
@@ -266,20 +308,46 @@ fn parse_discovered_socket(output: &[u8], key: &str) -> Result<String, String> {
     let path = paths
         .next()
         .ok_or("SSH did not report a private socket path")?;
+    if paths.next().is_some() {
+        return Err("SSH reported ambiguous socket paths".into());
+    }
+    let probing = matches!(discovery, SocketDiscovery::Probe);
+    if probing && path == "absent" {
+        return Ok(None);
+    }
     let socket = Path::new(path);
-    if paths.next().is_some()
-        || !forward_socket_path(socket)
-        || socket.file_name().and_then(|name| name.to_str()) != Some(format!("{key}.sock").as_str())
-    {
+    let current = socket.file_name().and_then(|name| name.to_str())
+        == Some(format!("{key}.sock").as_str());
+    let legacy = probing
+        && (socket.ends_with(format!("codemux-ptyd-{key}.sock"))
+            || socket.ends_with(format!("codemux-ptyd-{key}.d/pty.sock")));
+    if !forward_socket_path(socket) || !(current || legacy) {
         return Err("SSH reported an invalid private socket path".into());
     }
-    Ok(path.to_owned())
+    Ok(Some(path.to_owned()))
 }
 
 pub(super) async fn discover_remote_socket(
     ssh_target: &str,
     workspace_id: &str,
 ) -> Result<String, String> {
+    find_remote_socket(ssh_target, workspace_id, SocketDiscovery::Prepare)
+        .await?
+        .ok_or_else(|| "SSH did not prepare a private socket path".into())
+}
+
+pub(super) async fn probe_remote_socket(
+    ssh_target: &str,
+    workspace_id: &str,
+) -> Result<Option<String>, String> {
+    find_remote_socket(ssh_target, workspace_id, SocketDiscovery::Probe).await
+}
+
+async fn find_remote_socket(
+    ssh_target: &str,
+    workspace_id: &str,
+    discovery: SocketDiscovery,
+) -> Result<Option<String>, String> {
     validate_ssh_target(ssh_target)?;
     let key = workspace_socket_key(workspace_id);
     let mut cmd = Command::new("ssh");
@@ -292,7 +360,7 @@ pub(super) async fn discover_remote_socket(
             "--",
             ssh_target,
         ])
-        .arg(discovery_command(&key, Path::new("/tmp")))
+        .arg(discovery_command(&key, Path::new("/tmp"), discovery))
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
@@ -322,7 +390,7 @@ pub(super) async fn discover_remote_socket(
             "SSH could not discover a private remote socket ({status})"
         ));
     }
-    parse_discovered_socket(&output, &key)
+    parse_discovered_socket(&output, &key, discovery)
 }
 
 #[cfg(test)]
@@ -372,8 +440,18 @@ mod tests {
     }
 
     fn run_discovery(home: &Path, runtime: Option<&Path>, tmp: &Path) -> Result<PathBuf, String> {
+        run_socket_search(home, runtime, tmp, SocketDiscovery::Prepare)?
+            .ok_or_else(|| "Fixture reported no socket path".into())
+    }
+
+    fn run_socket_search(
+        home: &Path,
+        runtime: Option<&Path>,
+        tmp: &Path,
+        discovery: SocketDiscovery,
+    ) -> Result<Option<PathBuf>, String> {
         let output = std::process::Command::new("/bin/sh")
-            .args(["-c", &discovery_command(WORKSPACE, tmp)])
+            .args(["-c", &discovery_command(WORKSPACE, tmp, discovery)])
             .env("HOME", home)
             .env("XDG_RUNTIME_DIR", runtime.unwrap_or_else(|| Path::new("")))
             .output()
@@ -381,7 +459,8 @@ mod tests {
         if !output.status.success() {
             return Err(String::from_utf8_lossy(&output.stderr).into_owned());
         }
-        parse_discovered_socket(&output.stdout, WORKSPACE).map(PathBuf::from)
+        parse_discovered_socket(&output.stdout, WORKSPACE, discovery)
+            .map(|path| path.map(PathBuf::from))
     }
 
     #[test]
@@ -459,9 +538,14 @@ mod tests {
     #[test]
     fn discovery_rejects_ambiguous_or_nonliteral_forward_paths() {
         assert_eq!(
-            parse_discovered_socket(b"banner\ncodemux:pty-path:v1 /tmp/abc123.sock\n", WORKSPACE)
-                .unwrap(),
-            "/tmp/abc123.sock",
+            parse_discovered_socket(
+                b"banner\ncodemux:pty-path:v1 /tmp/abc123.sock\n",
+                WORKSPACE,
+                SocketDiscovery::Prepare,
+            )
+            .unwrap()
+            .as_deref(),
+            Some("/tmp/abc123.sock"),
         );
         for output in [
             "codemux:pty-path:v1 relative/abc123.sock\n",
@@ -471,8 +555,35 @@ mod tests {
             "codemux:pty-path:v1 /tmp/another.sock\n",
             "codemux:pty-path:v1 /tmp/abc123.sock\ncodemux:pty-path:v1 /other/abc123.sock\n",
         ] {
-            assert!(parse_discovered_socket(output.as_bytes(), WORKSPACE).is_err());
+            assert!(
+                parse_discovered_socket(output.as_bytes(), WORKSPACE, SocketDiscovery::Prepare)
+                    .is_err()
+            );
         }
+    }
+
+    #[test]
+    fn checking_for_an_existing_socket_does_not_allocate_or_relocate_it() {
+        let home = private_temp();
+        let tmp = private_temp();
+        let probe = || run_socket_search(home.path(), None, tmp.path(), SocketDiscovery::Probe).unwrap();
+        assert_eq!(probe(), None);
+        assert_eq!(fs::read_dir(home.path()).unwrap().count(), 0);
+
+        let tmp_path = tmp.path().canonicalize().unwrap();
+        let legacy = tmp_path.join(format!("codemux-ptyd-{WORKSPACE}.sock"));
+        let _listener = UnixListener::bind(&legacy).unwrap();
+        fs::set_permissions(&legacy, fs::Permissions::from_mode(0o600)).unwrap();
+        let pid = legacy.with_extension("sock.pid");
+        fs::write(&pid, std::process::id().to_string()).unwrap();
+        fs::set_permissions(&pid, fs::Permissions::from_mode(0o600)).unwrap();
+        assert_eq!(probe().as_deref(), Some(legacy.as_path()));
+        assert!(UnixStream::connect(&legacy).is_ok());
+        assert_eq!(fs::read_dir(home.path()).unwrap().count(), 0);
+
+        let current = run_discovery(home.path(), None, &tmp_path).unwrap();
+        assert_eq!(probe().as_deref(), Some(current.as_path()));
+        assert!(UnixStream::connect(current).is_ok());
     }
 
     #[test]

@@ -23,6 +23,7 @@
 #![cfg(unix)]
 
 use crate::pty_daemon::{PtyDaemonClient, PtyDaemonError};
+use crate::ssh::tunnel::verify_daemon_protocol;
 use crate::ssh::tunnel_supervisor::{TunnelStatus, TunnelSupervisor, FIRST_CONNECT_WAIT};
 use std::collections::HashMap;
 use std::future::Future;
@@ -447,7 +448,9 @@ async fn connect_tunnel_daemon(
                 // prove the remote side is healthy.
                 let remaining = connect_deadline.saturating_duration_since(Instant::now());
                 match tokio::time::timeout(remaining, c.hello_with_host_plugin()).await {
-                    Ok(Ok(((pid, version, _), host_claude_plugin))) => {
+                    Ok(Ok(((pid, version, protocol), host_claude_plugin))) => {
+                        verify_daemon_protocol(&version, protocol)
+                            .map_err(PtyDaemonError::Daemon)?;
                         c.set_ssh_target(supervisor.ssh_target());
                         eprintln!(
                             "[client_for_workspace:{workspace_id}] daemon reached: \
