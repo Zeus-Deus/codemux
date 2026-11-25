@@ -284,9 +284,9 @@ pub async fn bootstrap_remote<R: tauri::Runtime>(opts: BootstrapOptions<'_, R>) 
 
     // Step 4: verify by re-probing the version subcommand.
     let verify = run_capture_with_timeout(
-        Command::new("ssh")
-            .arg("-o")
-            .arg("BatchMode=yes")
+        crate::ssh_policy::checked_ssh_tokio()
+            .args(crate::ssh_policy::verified_command_args())
+            .arg("--")
             .arg(opts.ssh_target)
             .arg(format!("{} version", opts.remote_install_path)),
         opts.timeout,
@@ -409,11 +409,11 @@ pub async fn provision_scheduler(
     // Enable lingering (so the service runs without an active login)
     // and start the unit.
     run_with_timeout(
-        Command::new("ssh")
-            .arg("-o")
-            .arg("BatchMode=yes")
+        crate::ssh_policy::checked_ssh_tokio()
+            .args(crate::ssh_policy::verified_command_args())
             .arg("-o")
             .arg("ConnectTimeout=10")
+            .arg("--")
             .arg(ssh_target)
             .arg(format!(
                 "loginctl enable-linger \"$USER\" >/dev/null 2>&1; \
@@ -471,11 +471,11 @@ pub async fn provision_serve(
     // wouldn't take effect until the next host reboot or manual
     // `systemctl --user restart`.
     run_with_timeout(
-        Command::new("ssh")
-            .arg("-o")
-            .arg("BatchMode=yes")
+        crate::ssh_policy::checked_ssh_tokio()
+            .args(crate::ssh_policy::verified_command_args())
             .arg("-o")
             .arg("ConnectTimeout=10")
+            .arg("--")
             .arg(ssh_target)
             .arg(format!(
                 "loginctl enable-linger \"$USER\" >/dev/null 2>&1; \
@@ -528,11 +528,11 @@ pub async fn register_workspace_on_remote(
     }
 
     let out = run_capture_with_timeout(
-        Command::new("ssh")
-            .arg("-o")
-            .arg("BatchMode=yes")
+        crate::ssh_policy::checked_ssh_tokio()
+            .args(crate::ssh_policy::verified_command_args())
             .arg("-o")
             .arg("ConnectTimeout=10")
+            .arg("--")
             .arg(ssh_target)
             .arg(&script),
         deadline,
@@ -657,9 +657,8 @@ pub(crate) async fn ssh_upload_executable(
 
     let script = upload_script(remote_path, len);
 
-    let mut child = Command::new("ssh")
-        .arg("-o")
-        .arg("BatchMode=yes")
+    let mut child = crate::ssh_policy::checked_ssh_tokio()
+        .args(crate::ssh_policy::verified_command_args())
         .arg("-o")
         .arg("ConnectTimeout=10")
         .arg("--")
@@ -717,11 +716,11 @@ async fn ssh_write_file(
 ) -> Result<(), String> {
     use tokio::io::AsyncWriteExt;
 
-    let mut child = Command::new("ssh")
-        .arg("-o")
-        .arg("BatchMode=yes")
+    let mut child = crate::ssh_policy::checked_ssh_tokio()
+        .args(crate::ssh_policy::verified_command_args())
         .arg("-o")
         .arg("ConnectTimeout=10")
+        .arg("--")
         .arg(ssh_target)
         .arg({
             // Tilde-aware shell quoting (see ssh_upload_executable):
@@ -836,10 +835,9 @@ mod tests {
     async fn ssh_upload_executable_works_against_localhost() {
         // BatchMode test: are we allowed to ssh to ourselves without
         // a password prompt? If not, skip.
-        let probe = std::process::Command::new("ssh")
-            .arg("-o").arg("BatchMode=yes")
+        let probe = crate::ssh_policy::checked_ssh()
+            .args(crate::ssh_policy::verified_command_args())
             .arg("-o").arg("ConnectTimeout=3")
-            .arg("-o").arg("StrictHostKeyChecking=accept-new")
             .arg("localhost")
             .arg("true")
             .output();

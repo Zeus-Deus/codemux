@@ -724,7 +724,7 @@ mod tests {
             Duration::from_secs(20),
         )
         .unwrap();
-        assert_eq!(cfg.program, std::path::PathBuf::from("ssh"));
+        assert_eq!(cfg.program, std::path::PathBuf::from("sh"));
         let script = cfg.args.last().unwrap();
         assert!(script.contains("command -v"));
         assert!(script.contains("codemux-claude-sidecar"));
@@ -889,7 +889,7 @@ mod tests {
     /// The device-side command line, as the device's login shell gets it
     /// from ssh.
     fn device_script(cfg: &SpawnConfig) -> &str {
-        assert_eq!(cfg.program, std::path::PathBuf::from("ssh"));
+        assert_eq!(cfg.program, std::path::PathBuf::from("sh"));
         assert!(cfg.env.is_empty(), "nothing rides on the local ssh client");
         cfg.args.last().unwrap()
     }

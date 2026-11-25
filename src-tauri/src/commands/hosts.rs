@@ -353,7 +353,7 @@ pub async fn hosts_test_connection<R: tauri::Runtime>(
             }
             ProbeOutcome::Unreachable { reason } => HostTestResult {
                 ok: false,
-                message: reason,
+                message: host_connection_failure(reason),
                 needs_install: false,
                 uname: None,
             },
@@ -370,6 +370,21 @@ pub async fn hosts_test_connection<R: tauri::Runtime>(
             needs_install: false,
             uname: None,
         })
+    }
+}
+
+#[cfg(unix)]
+fn host_connection_failure(reason: String) -> String {
+    if reason.contains("Host key verification failed")
+        || reason.contains("REMOTE HOST IDENTIFICATION HAS CHANGED")
+    {
+        format!(
+            "SSH could not verify this device's host key. Confirm its fingerprint with the \
+             device administrator, then set up the matching key in your SSH known_hosts on \
+             this computer and retry.\n{reason}"
+        )
+    } else {
+        reason
     }
 }
 
@@ -782,9 +797,9 @@ pub async fn workspace_push_to_host<R: tauri::Runtime>(
                 let local_workspace_cwd =
                     std::path::PathBuf::from(&ws.cwd);
                 if !local_workspace_cwd.as_os_str().is_empty() {
-                    match tokio::process::Command::new("ssh")
-                        .arg("-o")
-                        .arg("BatchMode=yes")
+                    match crate::ssh_policy::checked_ssh_tokio()
+                        .args(crate::ssh_policy::verified_command_args())
+                        .arg("--")
                         .arg(&host.ssh_target)
                         .arg("echo $HOME")
                         .output()
@@ -1191,9 +1206,9 @@ pub async fn workspace_pull_back_impl<R: tauri::Runtime>(
                 let local_workspace_cwd =
                     std::path::PathBuf::from(&ws.cwd);
                 if !local_workspace_cwd.as_os_str().is_empty() {
-                    match tokio::process::Command::new("ssh")
-                        .arg("-o")
-                        .arg("BatchMode=yes")
+                    match crate::ssh_policy::checked_ssh_tokio()
+                        .args(crate::ssh_policy::verified_command_args())
+                        .arg("--")
                         .arg(&host.ssh_target)
                         .arg("echo $HOME")
                         .output()
@@ -1463,9 +1478,9 @@ async fn sync_claude_projects(
     // Step 3: ensure the remote dest dir exists. rsync creates the
     // LAST path component but not parents; mkdir -p covers the
     // ~/.claude/projects/<encoded>/ chain in one shot.
-    let mkdir = Command::new("ssh")
-        .arg("-o")
-        .arg("BatchMode=yes")
+    let mkdir = crate::ssh_policy::checked_ssh_tokio()
+        .args(crate::ssh_policy::verified_command_args())
+        .arg("--")
         .arg(ssh_target)
         .arg(format!(
             "mkdir -p ~/.claude/projects/{}",
@@ -1488,7 +1503,7 @@ async fn sync_claude_projects(
         .arg("--no-owner")
         .arg("--no-group")
         .arg("-e")
-        .arg("ssh -o BatchMode=yes")
+        .arg(crate::ssh_policy::verified_shell_command())
         .arg(&source_with_slash)
         .arg(&remote_dest)
         .status()
@@ -1555,9 +1570,9 @@ async fn pull_claude_projects(
 
     let remote_dir_name = crate::ssh::claude_project_dir_name(remote_cwd);
     // Check the remote dir exists first — if not, nothing to pull.
-    let probe = Command::new("ssh")
-        .arg("-o")
-        .arg("BatchMode=yes")
+    let probe = crate::ssh_policy::checked_ssh_tokio()
+        .args(crate::ssh_policy::verified_command_args())
+        .arg("--")
         .arg(ssh_target)
         .arg(format!(
             "test -d ~/.claude/projects/{} && echo EXISTS || echo MISSING",
@@ -1585,7 +1600,7 @@ async fn pull_claude_projects(
         .arg("--no-owner")
         .arg("--no-group")
         .arg("-e")
-        .arg("ssh -o BatchMode=yes")
+        .arg(crate::ssh_policy::verified_shell_command())
         .arg(&remote_source)
         .arg(&local_dest_with_slash)
         .status()
@@ -1871,6 +1886,21 @@ fn terminate_workspace_sessions<R: tauri::Runtime>(
 #[cfg(test)]
 mod tests {
     use super::{interpret_github_probe, validate_host_fields};
+
+    #[cfg(unix)]
+    #[test]
+    fn host_key_failure_preserves_ssh_error_and_explains_enrollment() {
+        for reason in [
+            "Host key verification failed.",
+            "WARNING: REMOTE HOST IDENTIFICATION HAS CHANGED!",
+        ] {
+            let message = super::host_connection_failure(reason.into());
+            assert!(message.contains("Confirm its fingerprint"));
+            assert!(message.ends_with(reason));
+        }
+        let network_error = "ssh: connect to host fixture port 22: Connection timed out";
+        assert_eq!(super::host_connection_failure(network_error.into()), network_error);
+    }
 
     #[test]
     fn host_fields_are_trimmed_and_checked() {

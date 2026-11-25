@@ -83,6 +83,7 @@ pub mod remote_task_protocol;
 // `~/.ssh/config`, agent, and known_hosts).
 #[cfg(unix)]
 pub mod ssh;
+mod ssh_policy;
 pub mod resource_metrics;
 pub mod scripts;
 pub mod scrollback;

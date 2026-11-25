@@ -566,6 +566,16 @@ Exit codes: `0` done, `1` failed or error, `2` needs input, `3` timed out, `64` 
 
 When you add a server under **Settings → Connections → Devices**, Codemux installs `codemux-remote` there. An agent on that server can use `codemux-remote mcp` to register folders and git worktrees on the server, run shells there and check the helper. Workspaces it registers show up under Devices in the Codemux app. It can't start or message Codemux chats.
 
+Before adding a device, get its SSH host-key fingerprint from the device console or its administrator. On the computer running Codemux, connect in a terminal using the same SSH target or alias. Compare the fingerprint before accepting the key. Codemux uses the SSH client's `known_hosts` and other configured trust sources and refuses unknown or changed device keys. If the fingerprint changes, confirm the replacement before updating your SSH trust settings.
+
+Codemux rejects OpenSSH `ProxyJump` on managed connections because OpenSSH starts those clients with their own settings. For a device that requires a relay, configure an explicit `ProxyCommand` and verify every relay's key in the initiating client's trust store. Codemux verifies the destination key and runs the configured `ProxyCommand` as supplied. The command's owner manages its relay connections and trust settings.
+
+When Codemux clones or fetches a repository on a device over SSH, its default SSH transport uses the same policy with that device account's configuration and `known_hosts`. Verify the Git forge's key on the device, or use an HTTPS repository URL. Explicit Git SSH overrides such as `core.sshCommand` retain Git's normal precedence and manage their own trust policy. Git versions without `GIT_CONFIG_SYSTEM` support use a shell-invoked fallback when Git selects SSH. The fallback requires Git 2.3 or later for the default SSH transport.
+
+Git 2.3 through 2.9 uses the verified default unless you set an explicit `GIT_SSH_COMMAND` or `GIT_SSH` environment override. Git started using `core.sshCommand` for SSH connections in version 2.10.
+
+On older Git versions that support `core.sshCommand`, a clone using a destination-specific SSH client may report `ssh variant 'simple' does not support setting port`. Set `ssh.variant` alongside `core.sshCommand` in the same destination-specific Git config. For Plink, set `ssh.variant=plink` so Git passes the port as `-P`.
+
 `codemux-remote` writes no agent config on the server. Codemux chats and remote tasks that run Claude Code on the server, and Claude Code typed in a Codemux terminal on it, get that server's `codemux-remote mcp` per session. To use it from another agent there, add it yourself, for example `claude mcp add --scope user codemux -- ~/.local/bin/codemux-remote mcp`. A Vexis entry for it in `~/.vexis/mcp-servers.yaml` keeps working.
 
 Older versions of `codemux-remote serve` added `codemux-remote mcp` to `~/.claude.json` as `codemux`, and keep doing so until the service is updated. On a machine where the Codemux app also runs, Codemux and `codemux-remote serve` remove that entry when they start, but only if it is exactly what was written: `codemux-remote` with the single argument `mcp` and no other settings. On a server that runs only `codemux-remote`, the entry stays. An entry you add with `claude mcp add` is never removed.

@@ -66,7 +66,7 @@ const BASE_FETCH_TIMEOUT_SECS: u64 = 10;
 /// - Skipped when there is no `origin` remote (remote-host projects are
 ///   frequently local-only) or for absolute `refs/...` bases.
 /// - `origin/<b>` is normalised to `<b>`.
-/// - `GIT_TERMINAL_PROMPT=0` so git never hangs on a credential prompt.
+/// - Non-interactive credentials and verified host keys for the default SSH command.
 /// - Killed after [`BASE_FETCH_TIMEOUT_SECS`] so a slow or unreachable
 ///   remote can't stall worktree creation.
 /// - All failures are swallowed; callers fall back to local refs.
@@ -85,11 +85,14 @@ fn fetch_origin_branch(repo_root: &Path, branch: &str) -> bool {
     if !has_origin {
         return false;
     }
-    let Ok(mut child) = crate::git::git_command()
-        .arg("-C")
+    let mut cmd = crate::git::git_command();
+    cmd.arg("-C")
         .arg(repo_root)
-        .args(["fetch", "--quiet", "--no-tags", "origin", branch])
-        .env("GIT_TERMINAL_PROMPT", "0")
+        .args(["fetch", "--quiet", "--no-tags", "origin", branch]);
+    let Ok(_ssh) = crate::ssh_policy::unattended_git(&mut cmd, None) else {
+        return false;
+    };
+    let Ok(mut child) = cmd
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
@@ -384,7 +387,8 @@ pub fn clone_repo(url: &str, target: &Path, timeout: Duration) -> Result<(), Str
     if let Some(parent) = target.parent() {
         cmd.current_dir(parent);
     }
-    non_interactive(&mut cmd, target.parent());
+    let _ssh = crate::ssh_policy::unattended_git(&mut cmd, Some(target))
+        .map_err(|e| format!("couldn't prepare unattended Git SSH: {e}"))?;
     run_capped(cmd, timeout).map(|_| ())
 }
 
@@ -405,35 +409,10 @@ pub fn ensure_origin_head(repo_root: &Path) {
     cmd.arg("-C")
         .arg(repo_root)
         .args(["remote", "set-head", "origin", "--auto"]);
-    non_interactive(&mut cmd, Some(repo_root));
+    let Ok(_ssh) = crate::ssh_policy::unattended_git(&mut cmd, None) else {
+        return;
+    };
     let _ = run_capped(cmd, ORIGIN_HEAD_TIMEOUT);
-}
-
-/// Never prompt. Over ssh that means BatchMode, and accepting a forge's
-/// host key on first contact (a fresh device has never seen github.com).
-/// A user's own ssh command (env, or `core.sshCommand` as seen from
-/// `config_dir`) wins, since `GIT_SSH_COMMAND` would override it.
-fn non_interactive(cmd: &mut Command, config_dir: Option<&Path>) {
-    cmd.env("GIT_TERMINAL_PROMPT", "0");
-    let user_ssh = std::env::var_os("GIT_SSH_COMMAND").is_some()
-        || std::env::var_os("GIT_SSH").is_some()
-        || {
-            let mut probe = crate::git::git_command();
-            if let Some(dir) = config_dir {
-                probe.current_dir(dir);
-            }
-            probe
-                .args(["config", "--get", "core.sshCommand"])
-                .output()
-                .map(|out| out.status.success() && !out.stdout.trim_ascii().is_empty())
-                .unwrap_or(false)
-        };
-    if !user_ssh {
-        cmd.env(
-            "GIT_SSH_COMMAND",
-            "ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new",
-        );
-    }
 }
 
 /// Run `cmd` to completion, or kill it (and anything it spawned, such as

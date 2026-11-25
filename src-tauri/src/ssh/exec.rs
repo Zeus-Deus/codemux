@@ -12,10 +12,10 @@ use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
 use serde::de::DeserializeOwned;
-use tokio::process::Command;
 use tokio::time::timeout;
 
 use crate::json_rpc_child::SpawnConfig;
+pub use crate::ssh_policy::sh_quote;
 
 /// Where Codemux installs its helper binaries on a host.
 pub const REMOTE_BIN_DIR: &str = "~/.local/bin";
@@ -39,27 +39,6 @@ pub fn validate_ssh_target(target: &str) -> Result<(), String> {
         return Err("SSH target can't contain spaces or control characters".into());
     }
     Ok(())
-}
-
-/// Single-quote a value for a remote shell.
-///
-/// `'` and `\` are written outside the quotes (`\'`, `\\`), so no backslash
-/// ever sits inside a quoted run. POSIX shells and fish then read the result
-/// the same way — fish treats `\'` and `\\` as escapes even inside single
-/// quotes — which keeps nested quoting intact whatever the device's login
-/// shell is.
-pub fn sh_quote(value: &str) -> String {
-    let mut out = String::with_capacity(value.len() + 2);
-    out.push('\'');
-    for c in value.chars() {
-        match c {
-            '\'' => out.push_str(r"'\''"),
-            '\\' => out.push_str(r"'\\'"),
-            c => out.push(c),
-        }
-    }
-    out.push('\'');
-    out
 }
 
 /// Quote a host path, keeping a leading `~` expandable as `"$HOME"`.
@@ -91,19 +70,18 @@ fn is_env_key(key: &str) -> bool {
         && chars.all(|c| c == '_' || c.is_ascii_alphanumeric())
 }
 
-/// Flags shared by every one-shot `ssh` call. `BatchMode` makes a missing
-/// key fail fast instead of hanging on a password prompt.
+/// Flags for a verified device command with a bounded connect time.
 pub fn one_shot_args(connect_timeout_secs: u64) -> Vec<String> {
-    vec![
-        "-o".into(),
-        "BatchMode=yes".into(),
+    let mut args: Vec<_> = crate::ssh_policy::verified_command_args()
+        .map(str::to_owned)
+        .collect();
+    args.extend([
         "-o".into(),
         format!("ConnectTimeout={connect_timeout_secs}"),
         "-o".into(),
-        "StrictHostKeyChecking=accept-new".into(),
-        "-o".into(),
         "LogLevel=ERROR".into(),
-    ]
+    ]);
+    args
 }
 
 /// Build the remote command string that runs `program args` in `cwd` with
@@ -154,7 +132,11 @@ pub fn stdio_spawn_config(
 ) -> Result<SpawnConfig, String> {
     validate_ssh_target(ssh_target)?;
     let script = remote_exec_script(program, args, env, cwd)?;
-    let mut ssh_args: Vec<String> = vec!["-T".into(), "-e".into(), "none".into()];
+    let mut ssh_args: Vec<String> = crate::ssh_policy::checked_ssh_args()
+        .into_iter()
+        .map(str::to_owned)
+        .collect();
+    ssh_args.extend(["-e".into(), "none".into()]);
     ssh_args.extend(one_shot_args(15));
     ssh_args.extend([
         "-o".into(),
@@ -166,7 +148,7 @@ pub fn stdio_spawn_config(
         script,
     ]);
     Ok(SpawnConfig {
-        program: PathBuf::from("ssh"),
+        program: PathBuf::from("sh"),
         args: ssh_args,
         // Nothing to overlay on the local ssh client; the workspace env is
         // part of the remote script.
@@ -187,11 +169,11 @@ pub async fn run_remote(
 ) -> Result<String, String> {
     validate_ssh_target(ssh_target)?;
     let connect_timeout = budget.as_secs().clamp(1, 15);
-    let mut cmd = Command::new("ssh");
+    let mut cmd = crate::ssh_policy::checked_ssh_tokio();
     cmd.args(one_shot_args(connect_timeout))
         .arg("--")
         .arg(ssh_target)
-        .arg(format!("exec sh -c {}", sh_quote(script)))
+        .arg(crate::ssh_policy::remote_sh_command(script))
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -556,12 +538,14 @@ mod tests {
             Duration::from_secs(20),
         )
         .unwrap();
-        assert_eq!(cfg.program, PathBuf::from("ssh"));
+        assert_eq!(cfg.program, PathBuf::from("sh"));
         assert!(cfg.cwd.is_none());
         let dd = cfg.args.iter().position(|a| a == "--").unwrap();
         assert_eq!(cfg.args[dd + 1], "deus@zeus");
         assert!(cfg.args[dd + 2].contains("app-server"));
         assert!(cfg.args.contains(&"BatchMode=yes".to_string()));
+        assert!(cfg.args.contains(&"StrictHostKeyChecking=yes".to_string()));
+        assert!(cfg.args.contains(&"ControlPath=none".to_string()));
     }
 
     #[test]

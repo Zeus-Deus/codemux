@@ -101,7 +101,7 @@ impl TunnelSupervisor {
             current_child: Mutex::new(None),
         });
         let task_inner = inner.clone();
-        let mut cmd = Command::new("ssh");
+        let mut cmd = crate::ssh_policy::checked_ssh_tokio();
         // The remote side ends in a long `exec sleep`, so an ssh that
         // outlives its owner would hold the tunnel and an sshd session
         // open indefinitely.

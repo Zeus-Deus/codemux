@@ -90,18 +90,21 @@ docker build -q -t "$IMAGE" "$WORK" >/dev/null
 #       (the production code shells `ssh <target>` with no -p / -i).
 docker rm -f "$CONTAINER" >/dev/null 2>&1 || true
 docker run -d --name "$CONTAINER" -p "127.0.0.1:${PORT}:22" "$IMAGE" >/dev/null
+host_key=$(docker exec "$CONTAINER" cat /etc/ssh/ssh_host_ed25519_key.pub)
+printf '%s %s\n' "$SSH_ALIAS" "$host_key" > "$WORK/known_hosts"
 mkdir -p "${HOME}/.ssh"; touch "$SSH_CONFIG"; chmod 600 "$SSH_CONFIG"
 sed -i "/$MARKER_BEGIN/,/$MARKER_END/d" "$SSH_CONFIG" 2>/dev/null || true
 cat >> "$SSH_CONFIG" <<CFG
 $MARKER_BEGIN
 Host $SSH_ALIAS
     HostName 127.0.0.1
+    HostKeyAlias $SSH_ALIAS
     Port $PORT
     User tester
     IdentityFile $WORK/key
     IdentitiesOnly yes
-    StrictHostKeyChecking no
-    UserKnownHostsFile /dev/null
+    StrictHostKeyChecking yes
+    UserKnownHostsFile $WORK/known_hosts
     LogLevel ERROR
 $MARKER_END
 CFG

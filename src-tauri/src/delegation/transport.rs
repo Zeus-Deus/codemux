@@ -99,40 +99,37 @@ impl TaskTransport for SshTransport {
         if bytes.len() > 65536 {
             return Err(TransportError::BeforeSend("remote JSON stdin exceeds 64 KiB".into()));
         }
-        let mut command = tokio::process::Command::new("ssh");
-        command.args([
-            "-T",
-            "-o",
-            "BatchMode=yes",
-            "-o",
-            "StrictHostKeyChecking=yes",
-            "-o",
-            "ConnectTimeout=10",
-            "-o",
-            "ServerAliveInterval=5",
-            "-o",
-            "ServerAliveCountMax=2",
-            "--",
-            target,
-            &remote,
-        ]);
-        command
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .kill_on_drop(true);
-        dispatch_command(command,bytes,None).await
+        dispatch_command(ssh_command(target, &remote).await?, bytes, None).await
     }
     async fn call_guarded(&self,target:&str,operation:Operation,input:Option<Value>,guard:std::sync::Arc<dyn crate::json_rpc_child::dispatch::DispatchGuard>)->Result<Value,TransportError> {
         validate_target(target).map_err(TransportError::BeforeSend)?;
         let remote=remote_command(&operation).map_err(TransportError::BeforeSend)?;
         let bytes=input.map(|v|serde_json::to_vec(&v)).transpose().map_err(|e|TransportError::BeforeSend(e.to_string()))?.unwrap_or_default();
         if bytes.len()>65536 {return Err(TransportError::BeforeSend("remote JSON stdin exceeds 64 KiB".into()));}
-        let mut command=tokio::process::Command::new("ssh");
-        command.args(["-T","-o","BatchMode=yes","-o","StrictHostKeyChecking=yes","-o","ConnectTimeout=10","-o","ServerAliveInterval=5","-o","ServerAliveCountMax=2","--",target,&remote]);
-        dispatch_command(command,bytes,Some(guard)).await
+        dispatch_command(ssh_command(target, &remote).await?, bytes, Some(guard)).await
     }
 }
+
+async fn ssh_command(target: &str, remote: &str) -> Result<tokio::process::Command, TransportError> {
+    let mut args: Vec<_> = crate::ssh_policy::verified_command_args()
+        .map(str::to_owned)
+        .collect();
+    args.extend([
+        "-o",
+        "ConnectTimeout=10",
+        "-o",
+        "ServerAliveInterval=5",
+        "-o",
+        "ServerAliveCountMax=2",
+        "--",
+        target,
+        remote,
+    ].map(str::to_owned));
+    crate::ssh_policy::checked_native_ssh(&args)
+        .await
+        .map_err(|error| TransportError::BeforeSend(error.to_string()))
+}
+
 /// Actual production dispatch owner, shared with explicit offline CLI fixtures.
 /// Leases exist only inside synchronous spawn/poll closures, never across await.
 pub(crate) async fn dispatch_command(mut command:tokio::process::Command,bytes:Vec<u8>,guard:Option<std::sync::Arc<dyn crate::json_rpc_child::dispatch::DispatchGuard>>)->Result<Value,TransportError> {

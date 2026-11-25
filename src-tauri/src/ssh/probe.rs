@@ -14,7 +14,6 @@
 use serde::{Deserialize, Serialize};
 use std::process::Stdio;
 use std::time::Duration;
-use tokio::process::Command;
 use tokio::time::timeout;
 
 use crate::ssh::exec::codemux_remote_command;
@@ -86,24 +85,19 @@ impl<'a> ProbeOptions<'a> {
 /// cause the probe to hang on a password prompt and look like a
 /// timeout to the user).
 pub fn build_probe_argv(ssh_target: &str, timeout_secs: u64) -> Vec<String> {
-    vec![
-        "-o".into(),
-        "BatchMode=yes".into(),
+    let mut args: Vec<_> = crate::ssh_policy::verified_command_args()
+        .map(str::to_owned)
+        .collect();
+    args.extend([
         "-o".into(),
         format!("ConnectTimeout={timeout_secs}"),
-        // StrictHostKeyChecking=accept-new lets a first-time probe
-        // succeed without an interactive y/n prompt. The host gets
-        // added to known_hosts as usual. Subsequent probes against
-        // a changed key still fail closed, which is the right
-        // security default.
-        "-o".into(),
-        "StrictHostKeyChecking=accept-new".into(),
         // `--` ends option parsing, so a target that starts with `-`
         // (it can arrive via account sync) is a hostname, never a flag.
         "--".into(),
         ssh_target.into(),
         probe_script(),
-    ]
+    ]);
+    args
 }
 
 /// The probe's remote command: print `uname -sm`, then the version of the
@@ -136,7 +130,7 @@ fn probe_script() -> String {
 /// `ConnectTimeout`).
 pub async fn probe_host(opts: ProbeOptions<'_>) -> ProbeOutcome {
     let argv = build_probe_argv(opts.ssh_target, opts.timeout.as_secs());
-    let mut cmd = Command::new("ssh");
+    let mut cmd = crate::ssh_policy::checked_ssh_tokio();
     for arg in &argv {
         cmd.arg(arg);
     }
@@ -231,12 +225,11 @@ mod tests {
     #[test]
     fn build_probe_argv_locks_in_batch_mode_and_timeout() {
         let argv = build_probe_argv("zeus@10.0.0.5", 8);
-        // Critical flags — losing any of these breaks the user
-        // experience (hangs on prompts, or interactive y/n on first
-        // probe).
         assert!(argv.iter().any(|a| a == "BatchMode=yes"));
         assert!(argv.iter().any(|a| a == "ConnectTimeout=8"));
-        assert!(argv.iter().any(|a| a == "StrictHostKeyChecking=accept-new"));
+        assert!(argv.iter().any(|a| a == "StrictHostKeyChecking=yes"));
+        assert!(argv.iter().any(|a| a == "ControlPath=none"));
+        assert!(argv.iter().any(|a| a == "ClearAllForwardings=yes"));
         // The target follows `--` so it can never be read as an option.
         let dd = argv.iter().position(|a| a == "--").expect("`--` before the target");
         assert_eq!(argv[dd + 1], "zeus@10.0.0.5");

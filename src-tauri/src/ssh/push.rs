@@ -152,10 +152,9 @@ pub fn build_push_rsync_argv(opts: &PushOptions<'_>) -> Vec<String> {
         "--exclude=target/".into(),
         "--exclude=dist/".into(),
         "--exclude=.next/".into(),
-        // SSH transport: reuse the user's config + agent, with the same
-        // BatchMode guard as the probe so we never hang on a prompt.
+        // Use the same verified SSH policy as the direct preflight.
         "-e".into(),
-        "ssh -o BatchMode=yes -o ConnectTimeout=10".into(),
+        format!("{} -o ConnectTimeout=10", crate::ssh_policy::verified_shell_command()),
         local,
         remote_spec,
     ]
@@ -180,7 +179,7 @@ pub fn build_pull_rsync_argv(opts: &PullOptions<'_>) -> Vec<String> {
         "--exclude=dist/".into(),
         "--exclude=.next/".into(),
         "-e".into(),
-        "ssh -o BatchMode=yes -o ConnectTimeout=10".into(),
+        format!("{} -o ConnectTimeout=10", crate::ssh_policy::verified_shell_command()),
         remote_spec,
         local,
     ]
@@ -197,11 +196,11 @@ pub async fn push_workspace(opts: PushOptions<'_>) -> PushResult {
     // Pre-create the remote directory so rsync's first transfer doesn't
     // race against a missing parent. mkdir -p is idempotent.
     let mkdir = run_with_timeout(
-        Command::new("ssh")
-            .arg("-o")
-            .arg("BatchMode=yes")
+        crate::ssh_policy::checked_ssh_tokio()
+            .args(crate::ssh_policy::verified_command_args())
             .arg("-o")
             .arg("ConnectTimeout=10")
+            .arg("--")
             .arg(opts.ssh_target)
             .arg(format!("mkdir -p {}", shell_escape(opts.remote_path))),
         opts.step_timeout,
@@ -290,11 +289,11 @@ pub async fn pull_workspace_back(opts: PullOptions<'_>) -> PullResult {
     // before: a missing path was misreported as `HostUnreachable`). Only
     // a real SSH/transport failure yields a non-zero exit → `Err` here.
     let remote_check = run_capture_with_timeout(
-        Command::new("ssh")
-            .arg("-o")
-            .arg("BatchMode=yes")
+        crate::ssh_policy::checked_ssh_tokio()
+            .args(crate::ssh_policy::verified_command_args())
             .arg("-o")
             .arg("ConnectTimeout=10")
+            .arg("--")
             .arg(opts.ssh_target)
             .arg(format!(
                 "if test -d {} ; then echo CMX_REMOTE_DIR_OK ; else echo CMX_REMOTE_DIR_MISSING ; fi",
@@ -678,6 +677,8 @@ mod tests {
         let e_idx = argv.iter().position(|a| a == "-e").expect("has -e");
         let spec = &argv[e_idx + 1];
         assert!(spec.contains("BatchMode=yes"), "spec={spec}");
+        assert!(spec.contains("StrictHostKeyChecking=yes"), "spec={spec}");
+        assert!(spec.contains("ControlPath=none"), "spec={spec}");
         assert!(spec.contains("ConnectTimeout"), "spec={spec}");
     }
 
@@ -721,6 +722,8 @@ mod tests {
             step_timeout: Duration::from_secs(60),
         };
         let argv = build_pull_rsync_argv(&opts);
+        let shell = &argv[argv.iter().position(|arg| arg == "-e").unwrap() + 1];
+        assert!(shell.contains("StrictHostKeyChecking=yes"), "shell={shell}");
         // The last two positional args must be remote-first, local-
         // second for pull (rsync convention: src then dst).
         let remote_pos = argv.iter().position(|a| a.contains("u@h:")).unwrap();
