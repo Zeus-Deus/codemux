@@ -1277,19 +1277,191 @@ fn kill_verified_browser_pid(record: &BrowserPidRecord, session: &str) {
 
 #[cfg(target_os = "macos")]
 fn close_verified_browser_pid_until(record: &BrowserPidRecord, session: &str, deadline: Instant) {
-    let socket = run_dir_for_session(session).map(|dir| dir.join(format!("{session}.sock")));
+    let dir = run_dir_for_session(session);
+    let files = dir.as_ref().and_then(|dir| capture_closed_browser_files(dir, session, record));
+    let socket = dir.as_ref().map(|dir| dir.join(format!("{session}.sock")));
     let result = socket.ok_or_else(|| "Browser control path is unavailable".to_string())
         .and_then(|path| close_verified_unix_browser_peer(
             &path, record.pid, deadline, || browser_process_matches(record, session),
         ));
     if let Err(error) = result {
         eprintln!("[codemux::browser] Could not gracefully close browser session {session}: {error}");
+        if let (Some(dir), Some(files)) = (dir.as_deref(), files.as_ref()) {
+            let _ = cleanup_closed_browser_files(dir, session, record, files, || {
+                macos_browser_process_exited(record)
+            });
+        }
         return;
     }
+    if let (Some(dir), Some(files)) = (dir.as_deref(), files.as_ref()) {
+        finish_closed_browser_files(dir, session, record, files, deadline);
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn finish_closed_browser_files(
+    dir: &std::path::Path,
+    session: &str,
+    record: &BrowserPidRecord,
+    files: &ClosedBrowserFiles,
+    deadline: Instant,
+) {
     let grace = Instant::now() + Duration::from_secs(1);
-    while browser_process_matches(record, session) && Instant::now() < grace && Instant::now() < deadline {
+    while !macos_browser_process_exited(record) && Instant::now() < grace && Instant::now() < deadline {
         std::thread::sleep(Duration::from_millis(25));
     }
+    let _ = cleanup_closed_browser_files(dir, session, record, files, || {
+        macos_browser_process_exited(record)
+    });
+}
+
+/// A successful close response precedes daemon exit. A recycled PID also
+/// identifies a different process, while a zombie is already unable to serve
+/// the old socket. A failed process query alone does not prove exit.
+#[cfg(target_os = "macos")]
+fn macos_browser_process_exited(record: &BrowserPidRecord) -> bool {
+    let Ok(pid) = i32::try_from(record.pid) else { return false };
+    let mut info = std::mem::MaybeUninit::<libc::proc_bsdinfo>::zeroed();
+    let size = std::mem::size_of::<libc::proc_bsdinfo>() as i32;
+    let read = unsafe { libc::proc_pidinfo(pid, libc::PROC_PIDTBSDINFO, 0, info.as_mut_ptr().cast(), size) };
+    if read == size {
+        let info = unsafe { info.assume_init() };
+        let start = info.pbi_start_tvsec.checked_mul(1_000_000)
+            .and_then(|secs| secs.checked_add(info.pbi_start_tvusec));
+        return start.is_some_and(|start| start != record.start_time)
+            || (start == Some(record.start_time) && info.pbi_status == libc::SZOMB);
+    }
+    (unsafe { libc::kill(pid, 0) }) == -1
+        && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
+}
+
+#[cfg(all(unix, any(test, target_os = "macos")))]
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct BrowserFileIdentity {
+    device: u64,
+    inode: u64,
+    mode: u32,
+}
+
+#[cfg(all(unix, any(test, target_os = "macos")))]
+fn browser_file_identity(path: &std::path::Path) -> Option<BrowserFileIdentity> {
+    use std::os::unix::fs::MetadataExt;
+    let meta = std::fs::symlink_metadata(path).ok()?;
+    Some(BrowserFileIdentity { device: meta.dev(), inode: meta.ino(), mode: meta.mode() })
+}
+
+#[cfg(all(unix, any(test, target_os = "macos")))]
+struct ClosedBrowserFiles {
+    pid: BrowserFileIdentity,
+    record: BrowserFileIdentity,
+    stream: Option<BrowserFileIdentity>,
+    socket: Option<BrowserFileIdentity>,
+}
+
+/// Record the exact files belonging to the connected daemon before it exits.
+/// A later process may publish new files under the same session name.
+#[cfg(all(unix, any(test, target_os = "macos")))]
+fn capture_closed_browser_files(
+    dir: &std::path::Path,
+    session: &str,
+    record: &BrowserPidRecord,
+) -> Option<ClosedBrowserFiles> {
+    use std::os::unix::fs::FileTypeExt;
+
+    if validate_session_name(session).is_err() {
+        return None;
+    }
+    let pid_path = dir.join(format!("{session}.pid"));
+    let record_path = dir.join(format!("agent-browser-{session}.pid"));
+    if read_daemon_pid_file(&pid_path) != Some(record.pid)
+        || read_browser_pid_record(&record_path).as_ref() != Some(record)
+    {
+        return None;
+    }
+    let pid = std::fs::symlink_metadata(&pid_path).ok()?;
+    let owned = std::fs::symlink_metadata(&record_path).ok()?;
+    if !pid.file_type().is_file() || !owned.file_type().is_file() {
+        return None;
+    }
+    let stream_path = dir.join(format!("{session}.stream"));
+    let socket_path = dir.join(format!("{session}.sock"));
+    let stream = std::fs::symlink_metadata(&stream_path).ok()
+        .filter(|meta| meta.file_type().is_file())
+        .and_then(|_| browser_file_identity(&stream_path));
+    let socket = std::fs::symlink_metadata(&socket_path).ok()
+        .filter(|meta| meta.file_type().is_socket())
+        .and_then(|_| browser_file_identity(&socket_path));
+    Some(ClosedBrowserFiles {
+        pid: browser_file_identity(&pid_path)?,
+        record: browser_file_identity(&record_path)?,
+        stream,
+        socket,
+    })
+}
+
+#[cfg(all(unix, any(test, target_os = "macos")))]
+fn optional_browser_file_matches(path: &std::path::Path, expected: Option<BrowserFileIdentity>) -> bool {
+    match std::fs::symlink_metadata(path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => true,
+        Ok(_) => browser_file_identity(path) == expected,
+        Err(_) => false,
+    }
+}
+
+/// Retire the files only while the old daemon is confirmed exited, its
+/// control endpoint is gone, and every remaining file is the one observed
+/// before close. The Codemux record is removed last.
+#[cfg(all(unix, any(test, target_os = "macos")))]
+fn cleanup_closed_browser_files(
+    dir: &std::path::Path,
+    session: &str,
+    record: &BrowserPidRecord,
+    files: &ClosedBrowserFiles,
+    old_exited: impl Fn() -> bool,
+) -> bool {
+    if validate_session_name(session).is_err() {
+        return false;
+    }
+    let pid_path = dir.join(format!("{session}.pid"));
+    let record_path = dir.join(format!("agent-browser-{session}.pid"));
+    let stream_path = dir.join(format!("{session}.stream"));
+    let socket_path = dir.join(format!("{session}.sock"));
+    let still_old = || {
+        old_exited()
+            && !browser_control_endpoint_ready(session, dir)
+            && read_daemon_pid_file(&pid_path) == Some(record.pid)
+            && read_browser_pid_record(&record_path).as_ref() == Some(record)
+            && browser_file_identity(&pid_path) == Some(files.pid)
+            && browser_file_identity(&record_path) == Some(files.record)
+            && optional_browser_file_matches(&stream_path, files.stream)
+            && optional_browser_file_matches(&socket_path, files.socket)
+    };
+    for (path, expected) in [
+        (&stream_path, files.stream),
+        (&socket_path, files.socket),
+        (&pid_path, Some(files.pid)),
+    ] {
+        if !still_old() {
+            return false;
+        }
+        if let Some(expected) = expected {
+            if browser_file_identity(path) == Some(expected)
+                && std::fs::remove_file(path).is_err_and(|error| error.kind() != std::io::ErrorKind::NotFound)
+            {
+                return false;
+            }
+        }
+    }
+    if !old_exited() || browser_control_endpoint_ready(session, dir)
+        || [pid_path.as_path(), stream_path.as_path(), socket_path.as_path()]
+            .iter().any(|path| !matches!(std::fs::symlink_metadata(path),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound))
+        || read_browser_pid_record(&record_path).as_ref() != Some(record)
+        || browser_file_identity(&record_path) != Some(files.record)
+    {
+        return false;
+    }
+    std::fs::remove_file(record_path).is_ok()
 }
 
 #[cfg(windows)]
@@ -3541,6 +3713,14 @@ fn execute_agent_browser_action_with_status(
     let session = session_name(browser_id);
     validate_session_name(session).map_err(BrowserActionFailure::before_launch)?;
     require_owned_browser_session(session).map_err(BrowserActionFailure::before_launch)?;
+    #[cfg(target_os = "macos")]
+    let closing_files = (action == "close").then(|| {
+        let dir = run_dir_for_session(session)?;
+        let pid = read_agent_browser_daemon_pid(session)?;
+        let record = owned_browser_pid(session, pid)?;
+        let files = capture_closed_browser_files(&dir, session, &record)?;
+        Some((dir, record, files))
+    }).flatten();
 
     #[cfg(target_os = "windows")]
     let (stdout, stderr, status_success, may_have_launched) = {
@@ -3598,6 +3778,11 @@ fn execute_agent_browser_action_with_status(
         });
     }
     if action == "close" {
+        #[cfg(target_os = "macos")]
+        if let Some((dir, record, files)) = closing_files.as_ref() {
+            finish_closed_browser_files(dir, session, record, files, Instant::now() + CLOSE_TIMEOUT);
+        }
+        #[cfg(not(target_os = "macos"))]
         clear_session_pid(session);
     } else {
         let _ = track_current_browser_daemon(session);
@@ -4262,7 +4447,20 @@ impl AgentBrowserManager {
 
         // Step 1: pop the session under the lock so nothing else races us.
         let removed = self.sessions.lock().await.remove(browser_id);
+        #[cfg(not(target_os = "macos"))]
         let had_session = removed.is_some();
+        #[cfg(target_os = "macos")]
+        let closing_files = removed.as_ref().and_then(|removed| {
+            let dir = run_dir_for_session(&session)?;
+            let record = read_browser_pid_record(&session_pid_path(&session)?)?;
+            if record.token != browser_owner_token()
+                || removed.pid.is_some_and(|pid| pid != record.pid)
+            {
+                return None;
+            }
+            let files = capture_closed_browser_files(&dir, &session, &record)?;
+            Some((dir, record, files))
+        });
 
         // Steps 2–3 spawn external processes for a verified daemon. They are compiled
         // out of unit-test builds: the close() tests assert session-map and
@@ -4298,11 +4496,26 @@ impl AgentBrowserManager {
 
         // Keep the ownership record if verified teardown failed so the
         // process-exit sweep can retry stopping the same daemon.
+        #[cfg(not(target_os = "macos"))]
+        {
         let owned_daemon_still_running = read_agent_browser_daemon_pid(&session)
             .and_then(|pid| owned_browser_pid(&session, pid))
             .is_some_and(|record| browser_process_matches(&record, &session));
         if (had_session || had_failed_attempts) && !owned_daemon_still_running {
             clear_session_pid(&session);
+        }
+        }
+        // A daemon can exit between the first ownership check and the peer
+        // close. Retire only the files captured before teardown, and keep
+        // the record if a replacement endpoint or file appeared.
+        #[cfg(target_os = "macos")]
+        {
+            let _ = had_failed_attempts;
+            if let Some((dir, record, files)) = closing_files.as_ref() {
+                let _ = cleanup_closed_browser_files(dir, &session, record, files, || {
+                    macos_browser_process_exited(record)
+                });
+            }
         }
 
         Ok(())
@@ -6512,6 +6725,71 @@ mod tests {
         server.join().unwrap();
     }
 
+    #[cfg(unix)]
+    fn closed_browser_file_fixture(
+        dir: &std::path::Path,
+        session: &str,
+        record: &BrowserPidRecord,
+    ) -> ClosedBrowserFiles {
+        use std::os::unix::net::UnixListener;
+
+        std::fs::write(dir.join(format!("{session}.pid")), record.pid.to_string()).unwrap();
+        std::fs::write(dir.join(format!("{session}.stream")), "43210").unwrap();
+        let socket = UnixListener::bind(dir.join(format!("{session}.sock"))).unwrap();
+        drop(socket);
+        std::fs::write(
+            dir.join(format!("agent-browser-{session}.pid")),
+            format!("{} {} {} {} {} v2\n", record.pid, record.start_time,
+                record.token, record.owner_pid, record.owner_start_time),
+        ).unwrap();
+        capture_closed_browser_files(dir, session, record).unwrap()
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn confirmed_browser_close_retires_only_the_captured_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let session = "browser-close-metadata";
+        let record = test_browser_record(12345, 1, browser_owner_token().to_owned());
+        let files = closed_browser_file_fixture(dir.path(), session, &record);
+        assert!(!cleanup_closed_browser_files(dir.path(), session, &record, &files, || false));
+        assert!(dir.path().join(format!("{session}.pid")).exists());
+        assert!(cleanup_closed_browser_files(dir.path(), session, &record, &files, || true));
+        for suffix in ["pid", "stream", "sock"] {
+            assert!(!dir.path().join(format!("{session}.{suffix}")).exists());
+        }
+        assert!(!dir.path().join(format!("agent-browser-{session}.pid")).exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn browser_close_metadata_cleanup_preserves_replacement_endpoint_and_record() {
+        use std::os::unix::net::UnixListener;
+
+        let dir = tempfile::tempdir().unwrap();
+        let session = "browser-close-replaced";
+        let record = test_browser_record(12345, 1, browser_owner_token().to_owned());
+        let files = closed_browser_file_fixture(dir.path(), session, &record);
+        let socket_path = dir.path().join(format!("{session}.sock"));
+        std::fs::remove_file(&socket_path).unwrap();
+        let replacement = UnixListener::bind(&socket_path).unwrap();
+        assert!(!cleanup_closed_browser_files(dir.path(), session, &record, &files, || true));
+        assert!(dir.path().join(format!("{session}.pid")).exists());
+        assert!(dir.path().join(format!("agent-browser-{session}.pid")).exists());
+        drop(replacement);
+
+        std::fs::remove_file(&socket_path).unwrap();
+        let mut changed = record.clone();
+        changed.token = uuid::Uuid::new_v4().simple().to_string();
+        std::fs::write(
+            dir.path().join(format!("agent-browser-{session}.pid")),
+            format!("{} {} {} {} {} v2\n", changed.pid, changed.start_time,
+                changed.token, changed.owner_pid, changed.owner_start_time),
+        ).unwrap();
+        assert!(!cleanup_closed_browser_files(dir.path(), session, &record, &files, || true));
+        assert!(read_browser_pid_record(&dir.path().join(format!("agent-browser-{session}.pid"))).as_ref() == Some(&changed));
+    }
+
     #[cfg(target_os = "macos")]
     #[test]
     fn macos_failed_open_daemon_fixture() {
@@ -6528,6 +6806,7 @@ mod tests {
         }
         std::thread::sleep(Duration::from_millis(750));
         std::fs::write(dir.join(format!("{session}.pid")), std::process::id().to_string()).unwrap();
+        std::fs::write(dir.join(format!("{session}.stream")), "43210").unwrap();
         let listener = UnixListener::bind(dir.join(format!("{session}.sock"))).unwrap();
         let (mut stream, _) = listener.accept().unwrap();
         stream.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
@@ -6566,6 +6845,7 @@ mod tests {
         }
         let dir = run_dir_for_session(&session).unwrap();
         let pid_path = dir.join(format!("{session}.pid"));
+        let stream_path = dir.join(format!("{session}.stream"));
         let socket_path = dir.join(format!("{session}.sock"));
         assert!(!pid_path.exists(), "fixture published its PID before rollback");
 
@@ -6582,11 +6862,12 @@ mod tests {
             let _ = daemon.wait();
         }
         assert!(stopped, "failed macOS open left its late daemon running");
+        assert!(!pid_path.exists(), "close left the old daemon PID file");
+        assert!(!stream_path.exists(), "close left the old stream file");
+        assert!(!socket_path.exists(), "close left the old control socket");
+        assert!(!session_pid_path(&session).unwrap().exists(), "close left the old Codemux record");
         assert!(!failed_stream_attempts().lock().unwrap().get(&session)
             .is_some_and(|attempts| attempts.contains(&attempt)));
-        let _ = std::fs::remove_file(pid_path);
-        let _ = std::fs::remove_file(socket_path);
-        clear_session_pid(&session);
     }
 
     #[cfg(target_os = "linux")]
