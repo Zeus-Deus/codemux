@@ -217,7 +217,7 @@ vi.mock("@/tauri/commands", () => ({
   getLocalDeviceName: vi.fn().mockResolvedValue("this-computer"),
   // Sections that share a page with the ones above.
   discoverSourceControl: vi.fn().mockResolvedValue([]),
-  listToolPermissions: vi.fn().mockResolvedValue([]),
+  listToolPermissions: vi.fn().mockResolvedValue({ rules: [], scope_errors: [] }),
   removeToolPermission: vi.fn().mockResolvedValue(undefined),
 }));
 

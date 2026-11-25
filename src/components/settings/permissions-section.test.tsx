@@ -1,6 +1,6 @@
 /// <reference types="@testing-library/jest-dom/vitest" />
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { cleanup, render, screen, waitFor } from "@testing-library/react";
+import { act, cleanup, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 
 vi.mock("@/lib/toast", () => ({
@@ -18,7 +18,7 @@ vi.mock("@/tauri/commands", () => ({
 }));
 
 import { listToolPermissions, removeToolPermission } from "@/tauri/commands";
-import type { PermissionRule } from "@/tauri/commands";
+import type { PermissionRule, ToolPermissionList } from "@/tauri/commands";
 import { toast } from "@/lib/toast";
 
 import { PermissionsSection } from "./permissions-section";
@@ -58,7 +58,7 @@ describe("PermissionsSection", () => {
   });
 
   it("renders the CLI-sharing banner", async () => {
-    vi.mocked(listToolPermissions).mockResolvedValue([]);
+    vi.mocked(listToolPermissions).mockResolvedValue({ rules: [], scope_errors: [] });
     render(<PermissionsSection projectRoot="/work/proj" />);
     await waitFor(() =>
       expect(
@@ -68,7 +68,7 @@ describe("PermissionsSection", () => {
   });
 
   it("groups rules by scope and shows tool name + rule content", async () => {
-    vi.mocked(listToolPermissions).mockResolvedValue(RULES);
+    vi.mocked(listToolPermissions).mockResolvedValue({ rules: RULES, scope_errors: [] });
     render(<PermissionsSection projectRoot="/work/proj" />);
 
     await waitFor(() => expect(screen.getByText("Bash")).toBeInTheDocument());
@@ -87,8 +87,46 @@ describe("PermissionsSection", () => {
     expect(screen.getByText("WebFetch")).toBeInTheDocument();
   });
 
+  it("keeps other scopes visible when the project settings cannot be loaded", async () => {
+    const message = "The settings file must be a regular file inside the project.";
+    vi.mocked(listToolPermissions).mockResolvedValue({
+      rules: RULES,
+      scope_errors: [{ scope: "project", message }],
+    });
+    render(<PermissionsSection projectRoot="/work/proj" />);
+
+    const rejected = await screen.findByRole("region", {
+      name: "This project (shared)",
+    });
+    expect(within(rejected).getByRole("status")).toHaveTextContent(message);
+    expect(
+      within(rejected).queryByText("No rules in this scope."),
+    ).not.toBeInTheDocument();
+    const user = screen.getByRole("region", { name: "User-wide" });
+    expect(within(user).getByText("Bash")).toBeInTheDocument();
+    const local = screen.getByRole("region", { name: "This project (gitignored)" });
+    expect(within(local).getByText("WebFetch")).toBeInTheDocument();
+    expect(screen.queryByText(/Failed to load rules:/i)).not.toBeInTheDocument();
+  });
+
+  it("shows read-only project rules and keeps user rules removable", async () => {
+    vi.mocked(listToolPermissions).mockResolvedValue({
+      rules: RULES,
+      scope_errors: [],
+      read_only_scopes: ["project", "local"],
+    });
+    render(<PermissionsSection projectRoot="/work/proj" />);
+
+    const local = await screen.findByRole("region", { name: "This project (gitignored)" });
+    expect(within(local).getByText("WebFetch")).toBeInTheDocument();
+    expect(within(local).getByText("Edit this file directly to change its rules.")).toBeInTheDocument();
+    expect(within(local).queryByRole("button", { name: "Remove rule" })).toBeNull();
+    const user = screen.getByRole("region", { name: "User-wide" });
+    expect(within(user).getAllByRole("button", { name: "Remove rule" })).toHaveLength(2);
+  });
+
   it("hides project-scoped groups when projectRoot is null", async () => {
-    vi.mocked(listToolPermissions).mockResolvedValue([RULES[0]!]);
+    vi.mocked(listToolPermissions).mockResolvedValue({ rules: [RULES[0]!], scope_errors: [] });
     render(<PermissionsSection projectRoot={null} />);
 
     await waitFor(() =>
@@ -99,7 +137,7 @@ describe("PermissionsSection", () => {
   });
 
   it("removes a rule via the confirm dialog and refetches", async () => {
-    vi.mocked(listToolPermissions).mockResolvedValue(RULES);
+    vi.mocked(listToolPermissions).mockResolvedValue({ rules: RULES, scope_errors: [] });
     vi.mocked(removeToolPermission).mockResolvedValue();
     const user = userEvent.setup();
 
@@ -119,9 +157,10 @@ describe("PermissionsSection", () => {
       screen.getByText(/Remove this permission rule\?/i),
     ).toBeInTheDocument();
 
-    vi.mocked(listToolPermissions).mockResolvedValueOnce(
-      RULES.filter((r) => !(r.tool_name === "Bash" && r.scope === "user")),
-    );
+    vi.mocked(listToolPermissions).mockResolvedValueOnce({
+      rules: RULES.filter((r) => !(r.tool_name === "Bash" && r.scope === "user")),
+      scope_errors: [],
+    });
 
     await user.click(screen.getByRole("button", { name: /^Remove rule$/i }));
 
@@ -135,7 +174,7 @@ describe("PermissionsSection", () => {
   });
 
   it("shows a toast and keeps the rule when removal fails", async () => {
-    vi.mocked(listToolPermissions).mockResolvedValue(RULES);
+    vi.mocked(listToolPermissions).mockResolvedValue({ rules: RULES, scope_errors: [] });
     vi.mocked(removeToolPermission).mockRejectedValue("disk full");
     const user = userEvent.setup();
 
@@ -183,7 +222,7 @@ describe("PermissionsSection", () => {
       scope: "from-mars" as unknown as PermissionRule["scope"],
       source_path: "/oops",
     } as PermissionRule;
-    vi.mocked(listToolPermissions).mockResolvedValue([orphan, RULES[0]!]);
+    vi.mocked(listToolPermissions).mockResolvedValue({ rules: [orphan, RULES[0]!], scope_errors: [] });
     render(<PermissionsSection projectRoot="/work/proj" />);
     await waitFor(() =>
       expect(screen.getByText("Bash")).toBeInTheDocument(),
@@ -194,7 +233,7 @@ describe("PermissionsSection", () => {
   });
 
   it("cancelling the confirm dialog does not call removeToolPermission", async () => {
-    vi.mocked(listToolPermissions).mockResolvedValue(RULES);
+    vi.mocked(listToolPermissions).mockResolvedValue({ rules: RULES, scope_errors: [] });
     vi.mocked(removeToolPermission).mockResolvedValue();
     const user = userEvent.setup();
 
@@ -217,7 +256,7 @@ describe("PermissionsSection", () => {
   });
 
   it("after a successful remove, refresh() refetches the rule list (mock invoked twice)", async () => {
-    vi.mocked(listToolPermissions).mockResolvedValue(RULES);
+    vi.mocked(listToolPermissions).mockResolvedValue({ rules: RULES, scope_errors: [] });
     vi.mocked(removeToolPermission).mockResolvedValue();
     const user = userEvent.setup();
 
@@ -239,7 +278,7 @@ describe("PermissionsSection", () => {
   });
 
   it("trash button is reachable by keyboard (N8 fix — focus-visible reveals it)", async () => {
-    vi.mocked(listToolPermissions).mockResolvedValue(RULES);
+    vi.mocked(listToolPermissions).mockResolvedValue({ rules: RULES, scope_errors: [] });
     render(<PermissionsSection projectRoot="/work/proj" />);
     await waitFor(() => expect(screen.getByText("Bash")).toBeInTheDocument());
 
@@ -262,7 +301,7 @@ describe("PermissionsSection", () => {
     // I2 regression: prior behavior left the dialog open with no
     // inline error feedback, and the user typically tried again and
     // hit a confusing "rule not found" on the second attempt.
-    vi.mocked(listToolPermissions).mockResolvedValue(RULES);
+    vi.mocked(listToolPermissions).mockResolvedValue({ rules: RULES, scope_errors: [] });
     vi.mocked(removeToolPermission).mockRejectedValue("disk full");
     const user = userEvent.setup();
 
@@ -285,7 +324,7 @@ describe("PermissionsSection", () => {
     // switched workspaces would otherwise commit the removal against
     // the new project's path with the old rule's `scope`, which
     // resolves to a different file.
-    vi.mocked(listToolPermissions).mockResolvedValue(RULES);
+    vi.mocked(listToolPermissions).mockResolvedValue({ rules: RULES, scope_errors: [] });
     const user = userEvent.setup();
 
     const { rerender } = render(
@@ -304,7 +343,7 @@ describe("PermissionsSection", () => {
   });
 
   it("changing projectRoot triggers a re-fetch with the new root", async () => {
-    vi.mocked(listToolPermissions).mockResolvedValue(RULES);
+    vi.mocked(listToolPermissions).mockResolvedValue({ rules: RULES, scope_errors: [] });
     const { rerender } = render(
       <PermissionsSection projectRoot="/work/proj" />,
     );
@@ -320,5 +359,24 @@ describe("PermissionsSection", () => {
     // Total calls should now be 2 — once for the original root, once
     // for the changed root.
     expect(listToolPermissions).toHaveBeenCalledTimes(2);
+  });
+
+  it("ignores rules from a previous project that finishes loading after a switch", async () => {
+    let finishPrevious!: (list: ToolPermissionList) => void;
+    const previous = new Promise<ToolPermissionList>((resolve) => {
+      finishPrevious = resolve;
+    });
+    vi.mocked(listToolPermissions)
+      .mockReturnValueOnce(previous)
+      .mockResolvedValueOnce({ rules: [RULES[2]!], scope_errors: [] });
+
+    const { rerender } = render(<PermissionsSection projectRoot="/work/proj" />);
+    rerender(<PermissionsSection projectRoot="/other/proj" />);
+    expect(await screen.findByText("WebFetch")).toBeInTheDocument();
+    await act(async () => {
+      finishPrevious({ rules: [RULES[0]!], scope_errors: [] });
+    });
+    expect(screen.getByText("WebFetch")).toBeInTheDocument();
+    expect(screen.queryByText("Bash")).not.toBeInTheDocument();
   });
 });
