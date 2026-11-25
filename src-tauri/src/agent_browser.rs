@@ -1823,18 +1823,23 @@ fn output_capture_and_track_browser_daemon_with_status(
 }
 
 #[cfg(not(windows))]
-fn browser_daemon_trackers() -> &'static std::sync::Mutex<HashSet<String>> {
-    static TRACKERS: OnceLock<std::sync::Mutex<HashSet<String>>> = OnceLock::new();
-    TRACKERS.get_or_init(|| std::sync::Mutex::new(HashSet::new()))
+fn browser_daemon_trackers() -> &'static std::sync::Mutex<HashMap<String, Instant>> {
+    static TRACKERS: OnceLock<std::sync::Mutex<HashMap<String, Instant>>> = OnceLock::new();
+    TRACKERS.get_or_init(|| std::sync::Mutex::new(HashMap::new()))
 }
 
 #[cfg(not(windows))]
 fn track_late_browser_daemon(session: &str) {
     let trackers = browser_daemon_trackers();
     let Ok(mut pending) = trackers.lock() else { return };
-    if !pending.insert(session.to_owned()) {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    if let Some(existing) = pending.get_mut(session) {
+        // A later action may start while an earlier screenshot's tracker is
+        // still running. Give this action its own full publication window.
+        *existing = deadline;
         return;
     }
+    pending.insert(session.to_owned(), deadline);
     drop(pending);
 
     let session = session.to_owned();
@@ -1842,11 +1847,19 @@ fn track_late_browser_daemon(session: &str) {
     let result = std::thread::Builder::new()
         .name("browser-daemon-tracker".to_owned())
         .spawn(move || {
-            let started = Instant::now();
-            while started.elapsed() < Duration::from_secs(5) {
+            loop {
                 if track_current_browser_daemon(&session_for_tracker).is_some() {
                     break;
                 }
+                let Ok(mut pending) = trackers.lock() else { return };
+                let Some(deadline) = pending.get(&session_for_tracker).copied() else { return };
+                if Instant::now() >= deadline {
+                    // Check and remove under one lock so a newer action
+                    // cannot extend the deadline between those operations.
+                    pending.remove(&session_for_tracker);
+                    return;
+                }
+                drop(pending);
                 std::thread::sleep(Duration::from_millis(50));
             }
             if let Ok(mut pending) = trackers.lock() {
@@ -1854,9 +1867,9 @@ fn track_late_browser_daemon(session: &str) {
             }
         });
     if result.is_err() {
-        if let Ok(mut pending) = trackers.lock() {
-            pending.remove(session.as_str());
-        }
+        // Without a tracker, the launch outcome is inconclusive. Keep the
+        // marker so settlement times out and preserves provisional state.
+        eprintln!("[codemux::browser] Could not start late daemon tracker for {session}");
     }
 }
 
@@ -1867,7 +1880,7 @@ async fn wait_for_late_browser_daemon_tracking(session: &str) -> bool {
         let pending = browser_daemon_trackers()
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .contains(session);
+            .contains_key(session);
         if !pending {
             return true;
         }
@@ -6049,6 +6062,19 @@ mod tests {
             command, Duration::from_secs(2), &session,
         ).unwrap();
         assert!(output.status.success());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_new_action_extends_late_daemon_tracking_for_the_same_session() {
+        let session = format!("browser-tracker-extension-{}", uuid::Uuid::new_v4().simple());
+        track_late_browser_daemon(&session);
+        let first = browser_daemon_trackers().lock().unwrap()[&session];
+        std::thread::sleep(Duration::from_millis(20));
+        track_late_browser_daemon(&session);
+        let second = browser_daemon_trackers().lock().unwrap()[&session];
+        assert!(second > first);
+        browser_daemon_trackers().lock().unwrap().remove(&session);
     }
 
     #[cfg(target_os = "linux")]
