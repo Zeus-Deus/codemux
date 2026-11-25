@@ -13481,6 +13481,61 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn codex_history_reopen_resumes_after_a_slow_server_fails() {
+        let prior = "failed-catalog-prior";
+        let key = "a".repeat(64);
+        let provider = Arc::new(PlacementProvider {
+            returned_cursor: Some(json!({"threadId": "native-codex", "toolCatalogKey": key})),
+            ..Default::default()
+        });
+        let (app, _) = placement_app(prior, None, provider.clone()).await;
+        app.manage(ObservabilityStore::default());
+        app.manage(SubagentTracker::default());
+        app.manage(RunActivityTracker::default());
+        let mcp = crate::mcp::registry::McpRegistry::default();
+        let config = crate::mcp::McpServerConfig {
+            id: "slow-failed-server".into(),
+            name: "slow-failed-server".into(),
+            sources: vec![crate::mcp::McpConfigSource::CodemuxUser],
+            command: "/no/such/mcp/server".into(),
+            args: Vec::new(),
+            env: std::collections::HashMap::new(),
+            disabled: false,
+            transport: crate::mcp::McpTransport::Stdio,
+            raw: serde_json::Value::Null,
+            project_root: None,
+            checkout_root: None,
+        };
+        mcp.set_prime_configs_for_test(vec![config.clone()]).await;
+        mcp.insert_starting_server_for_test(config.clone()).await;
+        app.manage(mcp.clone_handle());
+        let handle = app.handle().clone();
+        let pane = handle.state::<AppStateStore>()
+            .agent_chat_pane_id_for_thread(prior).unwrap();
+        let input = || serde_json::from_value::<StartSessionInput>(json!({
+            "thread_id": "failed-catalog-new",
+            "cwd": "/tmp",
+            "resume_cursor": {"resume": "native-codex", "toolCatalogKey": key},
+            "additional_directories": [],
+        })).unwrap();
+
+        let pending = agent_chat_start_session(
+            handle.clone(), pane.clone(), ProviderKind::Codex, input(), Some(prior.into()),
+        ).await;
+        assert!(pending.unwrap_err().contains("MCP tools are still starting"));
+        assert!(provider.started_cursors.lock().unwrap().is_empty());
+
+        mcp.settle_starting_server_as_errored_for_test(&config.id).await;
+        agent_chat_start_session(
+            handle, pane, ProviderKind::Codex, input(), Some(prior.into()),
+        ).await.unwrap();
+        assert_eq!(
+            *provider.started_cursors.lock().unwrap(),
+            vec![Some(json!({"resume": "native-codex", "toolCatalogKey": key}))],
+        );
+    }
+
+    #[tokio::test]
     async fn codex_rebuild_allows_a_settled_server_without_saved_tools() {
         let thread = "unavailable-catalog-chat";
         let key = "a".repeat(64);
@@ -13490,12 +13545,11 @@ mod tests {
         });
         let (app, _) = placement_app(thread, None, provider.clone()).await;
         let mcp = crate::mcp::registry::McpRegistry::default();
-        let missing = tempfile::tempdir().unwrap();
-        mcp.set_prime_configs_for_test(vec![crate::mcp::McpServerConfig {
+        let config = crate::mcp::McpServerConfig {
             id: "unavailable-catalog-server".into(),
             name: "unavailable-catalog-server".into(),
             sources: vec![crate::mcp::McpConfigSource::CodemuxUser],
-            command: missing.path().join("does-not-exist").to_string_lossy().into_owned(),
+            command: "/no/such/mcp/server".into(),
             args: Vec::new(),
             env: std::collections::HashMap::new(),
             disabled: false,
@@ -13503,13 +13557,20 @@ mod tests {
             raw: serde_json::Value::Null,
             project_root: None,
             checkout_root: None,
-        }]).await;
+        };
+        mcp.set_prime_configs_for_test(vec![config.clone()]).await;
+        mcp.insert_starting_server_for_test(config.clone()).await;
         app.manage(mcp.clone_handle());
         let handle = app.handle().clone();
         handle.state::<DatabaseStore>()
             .set_agent_chat_native_cursor(thread, "native-codex", Some(&key))
             .unwrap();
 
+        let pending = ensure_live_session(&handle, ProviderKind::Codex, &ThreadId(thread.into())).await;
+        assert!(pending.unwrap_err().contains("MCP tools are still starting"));
+        assert!(provider.started_cursors.lock().unwrap().is_empty());
+
+        mcp.settle_starting_server_as_errored_for_test(&config.id).await;
         ensure_live_session(&handle, ProviderKind::Codex, &ThreadId(thread.into()))
             .await.unwrap();
         assert!(matches!(

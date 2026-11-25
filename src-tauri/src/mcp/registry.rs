@@ -86,6 +86,31 @@ impl McpServerRuntime {
     }
 }
 
+/// Runtime bookkeeping is not part of a discovered server definition. A
+/// settled failure is reusable only while the executable, credentials, scope,
+/// and every other effective setting still match discovery.
+fn same_prime_definition(existing: &McpServerConfig, discovered: &McpServerConfig) -> bool {
+    fn effective_raw(raw: &Value) -> Option<serde_json::Map<String, Value>> {
+        let Value::Object(fields) = raw else { return None };
+        let mut fields = fields.clone();
+        fields.remove("runtimeGeneration");
+        fields.remove("pluginRegistrationToken");
+        (!fields.is_empty()).then_some(fields)
+    }
+
+    existing.id == discovered.id
+        && existing.name == discovered.name
+        && existing.sources == discovered.sources
+        && existing.command == discovered.command
+        && existing.args == discovered.args
+        && existing.env == discovered.env
+        && existing.disabled == discovered.disabled
+        && existing.transport == discovered.transport
+        && existing.project_root == discovered.project_root
+        && existing.checkout_root == discovered.checkout_root
+        && effective_raw(&existing.raw) == effective_raw(&discovered.raw)
+}
+
 /// Process-wide registry of MCP children. Stored as Tauri managed state
 /// (`tauri::Manager::manage`) so commands can reach it via
 /// `State<'_, McpRegistry>`. `Clone` is cheap (Arc bump) — used by the
@@ -1179,7 +1204,24 @@ impl McpRegistry {
                 continue;
             }
             let disabled = self.is_disabled(&cfg.id).await;
-            let row = self.ensure_started(app, cfg).await;
+            let approved = super::project_trust::fingerprint(&cfg)
+                .is_none_or(|fingerprint| super::project_trust::is_approved(app, &fingerprint));
+            let settled_failure = if !disabled && approved {
+                let inner = self.inner.lock().await;
+                inner.handles.get(&cfg.id)
+                    .filter(|handle| matches!(handle.status, McpServerStatus::Errored { .. })
+                        && same_prime_definition(&handle.config, &cfg))
+                    .map(McpServerRuntime::from_handle)
+            } else {
+                None
+            };
+            // A failed handshake leaves no tools. Do not start the same
+            // definition again on every chat retry; explicit Restart and a
+            // changed definition still take the normal start path.
+            let row = match settled_failure {
+                Some(row) => row,
+                None => self.ensure_started(app, cfg).await,
+            };
             // A previous prime may still be discovering this server. Terminal
             // failures are settled: the adapter's catalog hash decides
             // whether their absent tools change a saved Codex thread.
@@ -1205,6 +1247,18 @@ impl McpRegistry {
         let mut handle = McpServerHandle::discovered(config);
         handle.status = McpServerStatus::Starting;
         self.inner.lock().await.handles.insert(handle.config.id.clone(), handle);
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn settle_starting_server_as_errored_for_test(&self, id: &str) {
+        let mut inner = self.inner.lock().await;
+        let handle = inner.handles.get_mut(id).expect("starting server");
+        assert!(matches!(handle.status, McpServerStatus::Starting));
+        handle.status = McpServerStatus::Errored { message: "MCP initialize timed out".into() };
+        if !handle.config.raw.is_object() {
+            handle.config.raw = serde_json::json!({});
+        }
+        handle.config.raw["runtimeGeneration"] = serde_json::json!("timed-out-start");
     }
 
     async fn remember_native_scoped_sources(
@@ -2253,6 +2307,29 @@ mod tests {
             .await;
         assert!(matches!(row.status, McpServerStatus::Errored { .. }));
         assert!(row.error_message.is_some());
+    }
+
+    #[tokio::test]
+    async fn chat_prime_reuses_a_timed_out_definition_but_starts_a_changed_one() {
+        let reg = McpRegistry::new();
+        let cfg = make_config("slow", "slow", "/no/such/binary/at/all");
+        reg.set_prime_configs_for_test(vec![cfg.clone()]).await;
+        reg.insert_starting_server_for_test(cfg.clone()).await;
+        reg.settle_starting_server_as_errored_for_test(&cfg.id).await;
+
+        assert!(reg.prime_for_chat(None::<&tauri::AppHandle<tauri::Wry>>, None).await);
+        let generation = reg.inner.lock().await.handles[&cfg.id].config.raw["runtimeGeneration"].clone();
+        assert_eq!(generation, "timed-out-start");
+
+        let mut changed = cfg;
+        changed.command = "/no/such/different/binary".into();
+        reg.set_prime_configs_for_test(vec![changed.clone()]).await;
+        assert!(reg.prime_for_chat(None::<&tauri::AppHandle<tauri::Wry>>, None).await);
+        let inner = reg.inner.lock().await;
+        let handle = &inner.handles[&changed.id];
+        assert!(matches!(handle.status, McpServerStatus::Errored { .. }));
+        assert_ne!(handle.config.raw["runtimeGeneration"], generation);
+        assert_eq!(handle.config.command, changed.command);
     }
 
     #[tokio::test]
