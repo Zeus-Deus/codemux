@@ -2984,7 +2984,12 @@ mod project_trust_tests {
             let inner = reg.inner.lock().await;
             inner.cancel_calls.get(&config.id).unwrap().send_replace(true);
         }
-        let result = reg.dispatch_tool_call(&tool.prefixed_name, serde_json::json!({}), None).await;
+        let result = reg.dispatch_tool_call_scoped(
+            &tool.prefixed_name,
+            serde_json::json!({}),
+            None,
+            Some(&McpProjectScope::new(project.path())),
+        ).await;
         assert!(result.unwrap_err().contains("stopped during tools/call"));
         reg.shutdown_all().await;
     }

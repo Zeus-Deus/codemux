@@ -830,6 +830,7 @@ mod live_tests {
             command: format!("{}/mcp", server.url()), args: vec![], env: Default::default(),
             disabled: false, transport: super::super::McpTransport::Http,
             raw: json!({"headers":{"x-secret":"fixture-secret"}}), project_root: None,
+            checkout_root: None,
         };
         let approval_lock = Arc::new(Mutex::new(()));
         let (cancel, cancelled) = watch::channel(false);
