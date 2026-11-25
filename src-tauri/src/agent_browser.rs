@@ -1503,10 +1503,8 @@ async fn browser_stream_reports_attached_client(port: u16) -> Option<bool> {
         let message = socket.next().await?.ok()?;
         let text = message.to_text().ok()?;
         let status: serde_json::Value = serde_json::from_str(text).ok()?;
-        Some(
-            status.get("type")?.as_str()? == "status"
-                && status.get("connected")?.as_bool()?,
-        )
+        (status.get("type")?.as_str()? == "status")
+            .then(|| status.get("connected")?.as_bool())?
     };
     tokio::time::timeout(Duration::from_millis(800), response)
         .await
@@ -5776,6 +5774,21 @@ mod tests {
             BrowserAttachment::Inconclusive,
         );
         server.abort();
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
+            socket.send(tokio_tungstenite::tungstenite::Message::Text(
+                r#"{"type":"frame","connected":false}"#.into(),
+            )).await.unwrap();
+        });
+        assert_eq!(
+            browser_stream_attached_to_daemon(port, std::process::id(), 1).await,
+            BrowserAttachment::Inconclusive,
+        );
+        server.await.unwrap();
     }
 
     #[tokio::test]
