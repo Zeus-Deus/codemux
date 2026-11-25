@@ -40,5 +40,7 @@ mod sidecar_ping;
 mod sidecar_sdk;
 mod skills_command;
 mod skills_real_disk_smoke;
+#[cfg(target_os = "linux")]
+mod web_remote_systemd_unit;
 mod workflow_chat_script;
 mod workflow_live_canary;

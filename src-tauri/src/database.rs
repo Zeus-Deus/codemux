@@ -628,6 +628,11 @@ pub struct WebRemoteSessionRecord {
 }
 
 fn database_path() -> Option<PathBuf> {
+    #[cfg(test)]
+    if let Some(root) = crate::test_isolation::isolated_root() {
+        return Some(root.join("config").join(crate::APP_DIR_NAME).join("codemux.db"));
+    }
+
     let config = dirs::config_dir()?;
     Some(config.join(crate::APP_DIR_NAME).join("codemux.db"))
 }
