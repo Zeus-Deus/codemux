@@ -37,6 +37,10 @@ pub fn default_state_dir() -> PathBuf {
 /// setup logs and daemon secret away from other local users, and one-shot
 /// CLI calls create it as well as `serve`, so every entry point uses this.
 /// Only `dir` itself is chmodded; existing parents are left alone.
+///
+/// Creating the dir is fatal; tightening an existing one is best-effort, so
+/// a `--state-dir` this user does not own (or a mount that rejects chmod)
+/// still works as it did before, with a warning on stderr.
 pub fn ensure_private_dir(dir: &std::path::Path) -> std::io::Result<()> {
     use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
     // A bare relative file name has an empty parent: the current directory,
@@ -45,7 +49,15 @@ pub fn ensure_private_dir(dir: &std::path::Path) -> std::io::Result<()> {
         return Ok(());
     }
     std::fs::DirBuilder::new().recursive(true).mode(0o700).create(dir)?;
-    std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))
+    tighten(dir, std::fs::Permissions::from_mode(0o700));
+    Ok(())
+}
+
+/// Best-effort chmod of a state path that may predate the owner-only modes.
+pub(crate) fn tighten(path: &std::path::Path, perms: std::fs::Permissions) {
+    if let Err(e) = std::fs::set_permissions(path, perms) {
+        eprintln!("[codemux-remote] could not restrict permissions on {}: {e}", path.display());
+    }
 }
 
 /// Manifest file inside a given state-dir.

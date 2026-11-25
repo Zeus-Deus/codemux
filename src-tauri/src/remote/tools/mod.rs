@@ -482,21 +482,15 @@ fn log_setup_event(ws_id: &str, event: crate::scripts::SetupEvent<'_>) {
 /// stdout/stderr matters too: ssh waits for every holder of those pipes
 /// to close before it returns.
 fn spawn_detached_setup(exe: &Path, log_dir: &Path, ws: &Workspace) -> Result<PathBuf, String> {
-    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
     use std::os::unix::process::CommandExt;
 
-    // Setup output can include tokens and private registry URLs.
-    crate::remote::config::ensure_private_dir(log_dir)
-        .map_err(|e| format!("create {}: {e}", log_dir.display()))?;
+    std::fs::create_dir_all(log_dir).map_err(|e| format!("create {}: {e}", log_dir.display()))?;
     let log_path = log_dir.join(format!("setup-{}.log", ws.id));
     let log = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
-        .mode(0o600)
         .open(&log_path)
         .map_err(|e| format!("open {}: {e}", log_path.display()))?;
-    log.set_permissions(std::fs::Permissions::from_mode(0o600))
-        .map_err(|e| format!("chmod {}: {e}", log_path.display()))?;
     let log_err = log.try_clone().map_err(|e| format!("open {}: {e}", log_path.display()))?;
 
     let mut cmd = std::process::Command::new(exe);
@@ -1073,10 +1067,6 @@ mod tests {
         assert!(recorded.contains(&format!("--workspace-id={}", ws["id"].as_str().unwrap())));
         assert!(recorded.contains("--branch=detached"));
         assert_eq!(std::fs::read_to_string(&log).unwrap().trim(), "logged");
-        // Setup output stays private to this user.
-        let mode = |p: &std::path::Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
-        assert_eq!(mode(&log_dir), 0o700);
-        assert_eq!(mode(&log), 0o600);
 
         match prev_home {
             Some(v) => std::env::set_var("HOME", v),

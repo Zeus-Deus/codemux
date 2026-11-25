@@ -612,17 +612,18 @@ fn git_remote_origin_url(dir: &str) -> Option<String> {
 
 /// Create the database file 0600 before SQLite opens it, and tighten one an
 /// older version left at the umask default. SQLite gives its -wal and -shm
-/// files the main file's mode, so they stay private too.
+/// files the main file's mode, so they stay private too. Tightening an
+/// existing file is best-effort, like the state dir.
 fn create_private_db_file(db_path: &Path) -> Result<(), WorkspaceError> {
     use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
-    let file = std::fs::OpenOptions::new()
+    std::fs::OpenOptions::new()
         .create(true)
         .append(true)
         .mode(0o600)
         .open(db_path)
         .map_err(|e| WorkspaceError::Io(format!("create db file: {e}")))?;
-    file.set_permissions(std::fs::Permissions::from_mode(0o600))
-        .map_err(|e| WorkspaceError::Io(format!("secure db file: {e}")))
+    super::config::tighten(db_path, std::fs::Permissions::from_mode(0o600));
+    Ok(())
 }
 
 fn basename(path: &str) -> String {
