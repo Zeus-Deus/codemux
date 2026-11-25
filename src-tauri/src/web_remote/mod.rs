@@ -436,10 +436,8 @@ pub(crate) fn mint_pairing(shared: &Arc<Shared>, suggested_name: Option<String>)
     }
 }
 
-/// Result of the `web_remote_pair` control-socket command (the
-/// `codemux remote pair` CLI over SSH): a freshly minted pairing token plus
-/// the recommended endpoint's full pairing URL, so the terminal can print a
-/// scannable link + QR without the desktop GUI ever being opened.
+/// Result of trusted pairing: a freshly minted pairing token plus the
+/// recommended endpoint's full pairing URL.
 #[derive(Debug, Clone, Serialize)]
 pub struct ControlPairing {
     /// Full URL a browser opens to auto-pair, on the recommended endpoint:
@@ -477,7 +475,7 @@ pub(crate) fn control_pair_from(
     // way in is switched off (e.g. a relay-only setup).
     if !lan_enabled {
         return Err(
-            "Access on your network is off — turn on \"On my network\" in Settings, or run `codemux remote enable`"
+            "Access on your network is off — turn on \"On my network\" in Settings"
                 .to_string(),
         );
     }
@@ -513,10 +511,8 @@ pub(crate) fn control_pair_from(
     })
 }
 
-/// Mint a pairing token for the same-machine control socket (the
-/// `codemux remote pair` CLI over SSH). Reuses the shared [`mint_pairing`]
-/// token path and the endpoint enumeration, so the terminal flow and the
-/// GUI flow are the same code underneath.
+/// Mint a pairing token through a trusted in-app call. Reuses the shared
+/// [`mint_pairing`] token path and endpoint enumeration.
 pub fn control_pair<R: Runtime>(
     app: &AppHandle<R>,
     suggested_name: Option<String>,

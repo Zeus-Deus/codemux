@@ -175,19 +175,9 @@ The network door is an HTTP MCP endpoint. It is off until you turn it on, and it
 
 #### Turn it on
 
-Open **Settings → Connections → Outside assistants → Over the network** and turn it on, or run:
+Open **Settings → Connections → Outside assistants → Over the network** and turn it on. Connector administration from the CLI is temporarily unavailable while socket callers cannot prove they are the desktop owner; `codemux connector …` returns `admin_refused`.
 
-```sh
-codemux connector enable
-```
-
-Codemux listens on this computer only, on port 4378, at `http://127.0.0.1:4378/mcp`. If the port is taken, pick another one in Settings, or:
-
-```sh
-codemux connector enable --port 4379
-```
-
-`codemux connector status` shows whether it is listening, its URLs, and how many assistants are connected or waiting to sign in. `codemux connector list` names the connected ones, and `codemux connector pending` the sign-ins.
+Codemux listens on this computer only, on port 4378, at `http://127.0.0.1:4378/mcp`. If the port is taken, pick another one in Settings. Settings shows the listener, connected assistants, and sign-ins waiting for approval.
 
 #### Serve it over HTTPS
 
@@ -198,12 +188,7 @@ tailscale serve --bg 4378
 tailscale serve status
 ```
 
-`tailscale serve status` prints the HTTPS address. Save it as the **Public HTTPS origin** in Settings, or from the shell:
-
-```sh
-ORIGIN=https://desktop.example-tailnet.ts.net
-codemux connector enable --origin "$ORIGIN"
-```
+`tailscale serve status` prints the HTTPS address. Save it as the **Public HTTPS origin** in Settings.
 
 The MCP URL is then the origin plus `/mcp`. Any HTTPS reverse proxy to the local URL works too. Codemux doesn't check that the proxy is set up. Use `tailscale funnel` or a public proxy only if a hosted service really has to reach this computer from the internet.
 
@@ -224,25 +209,16 @@ codex mcp add codemux --url "$CODEMUX_URL"
 codex mcp login codemux
 ```
 
-The sign-in appears in Settings under **Assistants with access**. Approve only a sign-in you just started. Choose an access level (Read-only is the default), press **Approve**, then **Continue** in the sign-in browser. Approve within five minutes, or start the sign-in again. Or approve it from a shell on the computer running Codemux:
-
-```sh
-codemux connector pending
-codemux connector approve "$SIGN_IN_ID" --access supervised
-```
+The sign-in appears in Settings under **Assistants with access**. Approve only a sign-in you just started. Choose an access level (Read-only is the default), press **Approve**, then **Continue** in the sign-in browser. Approve within five minutes, or start the sign-in again.
 
 A sign-in renews itself while the assistant uses it. It lapses after 30 days without use. Each renewal replaces the saved refresh token. If a used one comes back more than 30 seconds later, Codemux ends the sign-in, because a copy of it is in use somewhere else. So sign in on each machine instead of copying a client's saved sign-in.
 
 #### Tokens for bots
 
-A bot that can't sign in uses a token. Create one in **Assistants with access** (Supervised is the default) or on the computer running Codemux:
-
-```sh
-codemux connector issue --label hermes-bot --access supervised
-```
+A bot that can't sign in uses a token. Create one in **Assistants with access** (Supervised is the default).
 
 - Codemux shows the token once. Store it like a password.
-- A token lasts 30 days unless you pass `--expires`, for example `--expires 90d`. The longest is 365 days.
+- A token lasts 30 days.
 - Issuing a token again for the same label replaces the old one.
 
 Hermes, on the bot's machine:
@@ -278,15 +254,7 @@ claude mcp add --scope user --transport http codemux "$CODEMUX_URL" --header "Au
 
 #### Remove an assistant
 
-Use **Revoke** in Settings, or:
-
-```sh
-codemux connector list
-codemux connector revoke hermes-bot
-codemux connector revoke --all
-```
-
-`revoke` takes a token's label or a client id from `codemux connector list`. Revoking also stops that assistant's calls in progress: its waits end, and a change it started, such as a worktree being created or an answer on its way to the worker, stops before its next step. Their receipts fail with `grant_revoked`. Turning **Over the network** off (`codemux connector disable`) pauses every network assistant: they can't connect, and they work again when you turn it back on. **Revoke all** ends them for good. Assistants on this computer aren't affected either way, because they run as you.
+Use **Revoke** in Settings. Revoking also stops that assistant's calls in progress: its waits end, and a change it started, such as a worktree being created or an answer on its way to the worker, stops before its next step. Their receipts fail with `grant_revoked`. Turning **Over the network** off in Settings pauses every network assistant: they can't connect, and they work again when you turn it back on. **Revoke all** ends them for good. Assistants on this computer aren't affected either way, because they run as you.
 
 #### What differs over the network
 
@@ -301,7 +269,7 @@ codemux connector revoke --all
 
 ### Codemux on a server
 
-Run `codemux serve` on the server. A bot on the same server uses the [On this computer](#on-this-computer) setup. A bot elsewhere uses SSH or the network door. The server has no desktop app, and Settings in a paired browser doesn't manage outside assistants, so manage the network door over SSH with `codemux connector …`.
+Run `codemux serve` on the server. A bot on the same server uses the [On this computer](#on-this-computer) setup; a bot elsewhere can use the restricted SSH setup above. The server has no desktop Settings, and socket connector administration is suspended, so a new network connector cannot be configured or approved headlessly. A connector already configured on the server may still start, but new sign-ins, tokens, and revocation require desktop Settings on that same machine until a verified headless owner path is available.
 
 ## The end-to-end flow
 

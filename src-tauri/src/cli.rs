@@ -79,7 +79,8 @@ pub enum CommandSet {
         #[command(subcommand)]
         command: thread::ThreadCommand,
     },
-    /// Run the network door that assistants on other devices sign in to
+    /// Network connector administration is temporarily unavailable via CLI;
+    /// use Settings in the desktop app
     Connector {
         #[command(subcommand)]
         command: connector::ConnectorCommand,
@@ -118,7 +119,7 @@ pub enum CommandSet {
         #[command(subcommand)]
         command: IssueCommand,
     },
-    /// Web remote-access operations
+    /// Web remote management via CLI is temporarily unavailable; use Settings
     Remote {
         #[command(subcommand)]
         command: RemoteCommand,
@@ -279,20 +280,16 @@ pub enum ConnectCommand {
 
 #[derive(Subcommand)]
 pub enum RemoteCommand {
-    /// Mint a one-time pairing code for the web remote server and print a
-    /// scannable link + terminal QR. Requires remote access to be enabled in
-    /// Settings first. Handy over SSH: pair a phone/laptop without opening
-    /// the desktop GUI.
+    /// Pairing via CLI is unavailable until socket callers have owner proof;
+    /// use Remote Access in Settings.
     Pair {
         /// Optional label for the paired device. Used as a fallback name if
         /// the connecting browser doesn't provide one of its own.
         #[arg(long)]
         name: Option<String>,
     },
-    /// Turn web remote access on (binds the server), optionally selecting which
-    /// interfaces to expose it on and the port. Prints the resulting status and
-    /// the recommended endpoint so you can immediately run `codemux remote pair`.
-    /// Requires the desktop app to be running.
+    /// Enabling via CLI is unavailable until socket callers have owner proof;
+    /// use Remote Access in Settings.
     Enable {
         /// Which interfaces to expose the server on: `all` (every interface),
         /// `tailscale` (tailnet + loopback only), or `loopback` (this machine
@@ -303,8 +300,8 @@ pub enum RemoteCommand {
         #[arg(long)]
         port: Option<u16>,
     },
-    /// Turn web remote access off — unbinds the server and severs every live
-    /// connection immediately. Requires the desktop app to be running.
+    /// Disabling via CLI is unavailable until socket callers have owner proof;
+    /// use Remote Access in Settings.
     Disable,
 }
 
@@ -1320,7 +1317,7 @@ fn print_enable_result(data: &Value) {
         println!("               {endpoint_host} ({endpoint_kind}, {secure})");
     }
     println!();
-    println!("Run `codemux remote pair` to mint a pairing code for a phone or laptop.");
+    println!("Use Remote Access in Settings to pair a phone or laptop.");
 }
 
 /// Render `text` to a compact terminal QR using the pure-Rust `qrcode`
