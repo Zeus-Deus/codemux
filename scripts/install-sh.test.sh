@@ -276,6 +276,43 @@ else
     contains "ubuntu plan is a dry run"                "$OUT" "dry run"
     not_contains "ubuntu plan does not extract"        "$OUT" "appimage-extract"
 
+    for special in '#' '?'; do
+        if [ "$special" = '#' ]; then other='?'; else other='#'; fi
+        literal_dir="${TMPROOT}/local${special}artifacts"
+        literal_deb="${literal_dir}/codemux${other}build.deb"
+        mkdir -p "$literal_dir"
+        : > "$literal_deb"
+        OUT=$(run_dry "$UBUNTU" "$literal_deb")
+        is "local path with ${special} in directory and ${other} in filename succeeds" "$?" "0"
+        contains "literal special-character path is used" "$OUT" "$literal_deb"
+        contains "literal special-character path selects deb" "$OUT" "CODEMUX_ARTIFACT is a .deb"
+    done
+
+    OUT=$(CODEMUX_SIGNATURE_URL=https://downloads.example/package.sig run_dry "$UBUNTU" "$FAKE_DEB")
+    is "signature URL cannot silently accompany a local file" "$?" "1"
+    contains "local signature URL has a clear error" "$OUT" "requires a URL in CODEMUX_ARTIFACT"
+    OUT=$(CODEMUX_SIGNATURE_URL=file:///tmp/package.sig run_dry "$UBUNTU" "https://downloads.example/package.deb")
+    is "signature URL must use http(s)" "$?" "1"
+    contains "unsupported signature URL has a clear error" "$OUT" "must be an http(s) URL"
+
+    OUT=$(CODEMUX_SIGNATURE_URL='https://signatures.example/codemux_9.9.9_amd64.deb.sig?key=signature-secret' \
+          run_dry "$UBUNTU" 'https://downloads.example/codemux_9.9.9_amd64.deb?key=artifact-secret')
+    is "authenticated URL dry run succeeds" "$?" "0"
+    contains "dry run shows the artifact download" "$OUT" "would download: <redacted URL>"
+    contains "dry run shows the signature check" "$OUT" "would verify: <authenticated artifact> against <redacted URL>"
+    not_contains "dry run hides artifact credential" "$OUT" "artifact-secret"
+    not_contains "dry run hides signature credential" "$OUT" "signature-secret"
+    for extension in deb AppImage; do
+        OUT=$(run_dry "$UBUNTU" "https://downloads.example/credential-in-filename.${extension}")
+        is "path credential ${extension} dry run succeeds" "$?" "0"
+        not_contains "path credential ${extension} stays out of the full plan" "$OUT" "credential-in-filename"
+        contains "path credential ${extension} uses a neutral staging name" "$OUT" "codemux-override.${extension}"
+    done
+    OUT=$(run_dry "$UBUNTU" 'https://downloads.example/unknown.bin?key=unknown-secret')
+    is "unknown authenticated artifact is rejected" "$?" "1"
+    contains "unknown artifact error redacts its URL" "$OUT" "from its name: <redacted URL>"
+    not_contains "unknown artifact error hides credential" "$OUT" "unknown-secret"
+
     FEDORA=$(mock_os_release fedora2 'ID=fedora' 'VERSION_ID=40' 'PRETTY_NAME="Fedora Linux 40"')
     FAKE_RPM="${TMPROOT}/codemux-9.9.9-1.x86_64.rpm"
     : > "$FAKE_RPM"
@@ -490,6 +527,402 @@ run_package_handover
 is "overlapping package upgrade succeeds" "$?" "0"
 is "overlapping install keeps the packaged binary" "$("$launcher" --help 2>/dev/null)" "native package"
 is "overlapping install keeps package resources" "$(test -d "$LIB_DIR" && echo yes)" "yes"
+
+# ── release signatures ───────────────────────────────────────────────────────
+#
+# Signatures are made here with a throwaway key in the release format (Tauri
+# updater = base64 of a minisign signature file), so these run offline.
+
+echo "release signatures"
+# Selects $OPENSSL when a usable one exists; base64 works in any of them.
+codemux_can_verify_signatures || true
+REAL_KEY=$(sed -n 's/.*"pubkey"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "${SCRIPT_DIR}/../src-tauri/tauri.conf.json" \
+    | "$OPENSSL" base64 -d -A 2>/dev/null | sed -n 2p)
+is "embedded key is the updater key" "$CODEMUX_SIGNING_KEY" "$REAL_KEY"
+
+if ! codemux_can_verify_signatures; then
+    echo "  skip (needs OpenSSL 3)"
+else
+    SIGROOT="${TMPROOT}/sig"
+    mkdir -p "$SIGROOT"
+    "$OPENSSL" genpkey -algorithm ed25519 -out "${SIGROOT}/test.pem" 2>/dev/null
+    TEST_KEY=$({ printf 'Ed\001\002\003\004\005\006\007\010'
+                 "$OPENSSL" pkey -in "${SIGROOT}/test.pem" -pubout -outform DER | tail -c 32; } | "$OPENSSL" base64 -A)
+    OTHER_KEY=$({ printf 'Ed\001\002\003\004\005\006\007\010'
+                  "$OPENSSL" genpkey -algorithm ed25519 2>/dev/null | "$OPENSSL" pkey -pubout -outform DER | tail -c 32; } | "$OPENSSL" base64 -A)
+
+    # Writes <file>.sig signed by the test key, naming <name> in the trusted comment.
+    sign_fixture() { # <file> <name>
+        local s="${SIGROOT}/work"
+        mkdir -p "$s"
+        "$OPENSSL" dgst -blake2b512 -binary "$1" > "${s}/hash"
+        "$OPENSSL" pkeyutl -sign -inkey "${SIGROOT}/test.pem" -rawin -in "${s}/hash" -out "${s}/sig"
+        local trusted
+        trusted=$(printf 'timestamp:1700000000\tfile:%s' "$2")
+        { cat "${s}/sig"; printf '%s' "$trusted"; } > "${s}/global.msg"
+        "$OPENSSL" pkeyutl -sign -inkey "${SIGROOT}/test.pem" -rawin -in "${s}/global.msg" -out "${s}/global"
+        {
+            printf 'untrusted comment: signature from tauri secret key\n'
+            { printf 'ED\001\002\003\004\005\006\007\010'; cat "${s}/sig"; } | "$OPENSSL" base64 -A
+            printf '\ntrusted comment: %s\n' "$trusted"
+            "$OPENSSL" base64 -A < "${s}/global"
+            printf '\n'
+        } | "$OPENSSL" base64 -A > "$1.sig"
+    }
+
+    verify_with() { # <key> <file> <sig> <name>
+        local d
+        d=$(mktemp -d "${SIGROOT}/v.XXXXXX")
+        ( CODEMUX_SIGNING_KEY="$1"; codemux_verify_signature "$2" "$3" "$4" "$d" )
+        printf '%s' "$?"
+    }
+
+    PKG="${SIGROOT}/codemux_9.9.9_amd64.deb"
+    printf 'genuine package\n' > "$PKG"
+    sign_fixture "$PKG" codemux_9.9.9_amd64.deb
+    is "genuine package verifies"          "$(verify_with "$TEST_KEY" "$PKG" "$PKG.sig" codemux_9.9.9_amd64.deb)" "0"
+    is "another key is refused"            "$(verify_with "$OTHER_KEY" "$PKG" "$PKG.sig" codemux_9.9.9_amd64.deb)" "1"
+    is "the real release key refuses it"   "$(verify_with "$CODEMUX_SIGNING_KEY" "$PKG" "$PKG.sig" codemux_9.9.9_amd64.deb)" "1"
+    is "a signature naming another asset is refused" \
+       "$(verify_with "$TEST_KEY" "$PKG" "$PKG.sig" codemux_9.9.8_amd64.deb)" "1"
+    TAMPERED="${SIGROOT}/tampered.deb"
+    printf 'genuine packagf\n' > "$TAMPERED"
+    is "tampered package is refused"       "$(verify_with "$TEST_KEY" "$TAMPERED" "$PKG.sig" codemux_9.9.9_amd64.deb)" "1"
+    printf 'not a signature' > "${SIGROOT}/junk.sig"
+    is "garbage signature is refused"      "$(verify_with "$TEST_KEY" "$PKG" "${SIGROOT}/junk.sig" codemux_9.9.9_amd64.deb)" "1"
+    # Re-signing the trusted comment needs the key, so editing it breaks the check.
+    "$OPENSSL" base64 -d -A < "$PKG.sig" | sed 's/file:codemux_9.9.9/file:codemux_9.9.8/' | "$OPENSSL" base64 -A > "${SIGROOT}/edited.sig"
+    is "edited trusted comment is refused" \
+       "$(verify_with "$TEST_KEY" "$PKG" "${SIGROOT}/edited.sig" codemux_9.9.8_amd64.deb)" "1"
+
+    # The whole release path with downloads served from a fixture directory:
+    # nothing may reach the package manager unless the signature holds.
+    RELEASE_DIR="${SIGROOT}/release"
+    CURL_BIN="${SIGROOT}/curl-bin"
+    mkdir -p "$RELEASE_DIR" "$CURL_BIN"
+    cat > "${CURL_BIN}/curl" <<'CURL'
+#!/bin/sh
+# Serve <url> from $FIXTURE_DIR by its last path segment.
+out=""
+globoff=0
+while [ $# -gt 1 ]; do
+    case "$1" in
+        -o) out="$2"; shift ;;
+        --globoff) globoff=1 ;;
+    esac
+    shift
+done
+if [ "${REQUIRE_GLOBOFF:-0}" = 1 ] && [ "$globoff" != 1 ]; then
+    printf 'curl: URL globbing left enabled: %s\n' "$1" >&2
+    exit 3
+fi
+if [ "${SIMULATE_DOWNLOAD_FAILURE:-0}" = 1 ]; then
+    printf 'curl: bad URL: %s\n' "$1" >&2
+    exit 3
+fi
+name="${1##*/}"; name="${name%%[?#]*}"
+if [ -n "${REQUIRED_SIGNATURE_URL:-}" ]; then
+    case "$name" in *.sig) [ "$1" = "$REQUIRED_SIGNATURE_URL" ] || exit 22 ;; esac
+fi
+src="${FIXTURE_DIR}/${name}"
+[ -f "$src" ] || exit 22
+if [ -n "$out" ]; then cp "$src" "$out"; else cat "$src"; fi
+CURL
+    chmod +x "${CURL_BIN}/curl"
+
+    # -> exit status; marker file when an installer ran. Defaults to the deb
+    # on Ubuntu; <method> forces rpm or appimage.
+    run_release_install() ( # [os-release] [method]
+        set -e
+        rm -f "${SIGROOT}/installed"
+        CODEMUX_SIGNING_KEY="$TEST_KEY"
+        FIXTURE_DIR="$RELEASE_DIR"
+        export FIXTURE_DIR
+        PATH="${CURL_BIN}:${STUB_BIN}:${PATH}"
+        CODEMUX_OS_RELEASE_PATH="${1:-$UBUNTU}"
+        CODEMUX_INSTALL_VERSION=9.9.9
+        CODEMUX_INSTALL_DIR="${TMPROOT}/opt/bin"
+        # The installer's WORKDIR lands here, cleaned up with TMPROOT.
+        TMPDIR="$SIGROOT"
+        unset CODEMUX_ARTIFACT CODEMUX_METHOD CODEMUX_SIGNATURE_URL
+        [ -z "${2:-}" ] || CODEMUX_METHOD="$2"
+        [ -z "${URL_ARTIFACT:-}" ] || CODEMUX_ARTIFACT="$URL_ARTIFACT"
+        [ -z "${URL_SIGNATURE:-}" ] || CODEMUX_SIGNATURE_URL="$URL_SIGNATURE"
+        REQUIRED_SIGNATURE_URL="${REQUIRED_SIGNATURE_URL:-}"
+        export REQUIRED_SIGNATURE_URL
+        install_native_package() { cp "$2" "${SIGROOT}/installed"; }
+        install_appimage() { cp "$1" "${SIGROOT}/installed"; }
+        install_dependencies() { :; }
+        verify_install() { :; }
+        print_next_steps() { :; }
+        if [ "${SPLIT_RELEASE_OUTPUT:-0}" = 1 ]; then
+            main > "${SIGROOT}/release.stdout" 2> "${SIGROOT}/release.stderr"
+        else
+            main > "${SIGROOT}/release.log" 2>&1
+        fi
+    )
+
+    cp "$PKG" "$PKG.sig" "$RELEASE_DIR/"
+    run_release_install
+    is "signed release installs" "$?" "0"
+    is "the verified file is what gets installed" "$(cat "${SIGROOT}/installed" 2>/dev/null)" "genuine package"
+    contains "reports the signature check" "$(cat "${SIGROOT}/release.log")" "signed with the Codemux release key"
+
+    printf 'trojaned package\n' > "${RELEASE_DIR}/codemux_9.9.9_amd64.deb"
+    run_release_install
+    is "replaced release asset fails" "$?" "1"
+    is "replaced release asset is never installed" "$(test ! -e "${SIGROOT}/installed" && echo yes)" "yes"
+    contains "explains the mismatch" "$(cat "${SIGROOT}/release.log")" "does not match its release signature"
+
+    cp "$PKG" "$RELEASE_DIR/"
+    rm -f "${RELEASE_DIR}/codemux_9.9.9_amd64.deb.sig"
+    run_release_install
+    is "missing signature fails" "$?" "1"
+    is "missing signature installs nothing" "$(test ! -e "${SIGROOT}/installed" && echo yes)" "yes"
+    contains "explains the missing signature" "$(cat "${SIGROOT}/release.log")" "cannot be verified"
+
+    # An explicit CODEMUX_ARTIFACT URL goes through the same check; only a
+    # local file is installed unchecked.
+    rm -f "$RELEASE_DIR"/*
+    cp "$PKG" "$PKG.sig" "$RELEASE_DIR/"
+    REQUIRE_GLOBOFF=1 URL_ARTIFACT="https://downloads.example/codemux_9.9.9_amd64.deb" run_release_install
+    is "signed URL artifact installs" "$?" "0"
+    is "the verified URL artifact is what gets installed" "$(cat "${SIGROOT}/installed" 2>/dev/null)" "genuine package"
+
+    # A real download failure must not echo authenticated URL components from
+    # curl's own diagnostics on either output stream.
+    SECRET_URL='https://downloads.example/fake-credential[.deb?key=fake-credential'
+    SIMULATE_DOWNLOAD_FAILURE=1 SPLIT_RELEASE_OUTPUT=1 URL_ARTIFACT="$SECRET_URL" run_release_install
+    is "failed authenticated curl download stops installation" "$?" "1"
+    is "failed authenticated curl download installs nothing" "$(test ! -e "${SIGROOT}/installed" && echo yes)" "yes"
+    not_contains "curl failure stdout hides the credential" "$(cat "${SIGROOT}/release.stdout")" "fake-credential"
+    not_contains "curl failure stderr hides the credential" "$(cat "${SIGROOT}/release.stderr")" "fake-credential"
+    contains "curl failure keeps a safe status" "$(cat "${SIGROOT}/release.stderr")" "curl exit 3"
+    contains "curl failure explains what to check" "$(cat "${SIGROOT}/release.stderr")" "Check the URL, network connection, and access credentials"
+    printf 'trojaned package\n' > "${RELEASE_DIR}/codemux_9.9.9_amd64.deb"
+    URL_ARTIFACT="https://downloads.example/codemux_9.9.9_amd64.deb" run_release_install
+    is "replaced URL artifact fails" "$?" "1"
+    is "replaced URL artifact is never installed" "$(test ! -e "${SIGROOT}/installed" && echo yes)" "yes"
+    cp "$PKG" "$RELEASE_DIR/"
+    rm -f "${RELEASE_DIR}/codemux_9.9.9_amd64.deb.sig"
+    URL_ARTIFACT="https://downloads.example/codemux_9.9.9_amd64.deb" run_release_install
+    is "URL artifact without a signature fails" "$?" "1"
+    is "URL artifact without a signature installs nothing" "$(test ! -e "${SIGROOT}/installed" && echo yes)" "yes"
+    contains "explains the missing URL signature" "$(cat "${SIGROOT}/release.log")" "cannot be verified"
+    # The asset name and <path>.sig come from the URL path, not its query or
+    # fragment, while the download keeps the URL as given.
+    cp "$PKG" "$PKG.sig" "$RELEASE_DIR/"
+    URL_ARTIFACT="https://downloads.example/codemux_9.9.9_amd64.deb?download=1#latest" run_release_install
+    is "a URL with query and fragment verifies by its path" "$?" "0"
+    is "the query URL installs the verified file" "$(cat "${SIGROOT}/installed" 2>/dev/null)" "genuine package"
+    not_contains "a URL artifact is not called unchecked" "$(cat "${SIGROOT}/release.log")" "not checked"
+
+    # An authenticated mirror may require a different query token for the
+    # signature, and may use a different signature filename. The default
+    # public sibling must fail closed in that case.
+    PACKAGE_URL="https://downloads.example/codemux_9.9.9_amd64.deb?package_token=one#latest"
+    SIGNATURE_URL="https://downloads.example/signatures/authenticated.sig?signature_token=two"
+    cp "$PKG.sig" "${RELEASE_DIR}/authenticated.sig"
+    REQUIRED_SIGNATURE_URL="$SIGNATURE_URL" URL_ARTIFACT="$PACKAGE_URL" run_release_install
+    is "query-protected signature rejects the public sibling URL" "$?" "1"
+    is "missing signature authorization installs nothing" "$(test ! -e "${SIGROOT}/installed" && echo yes)" "yes"
+    REQUIRED_SIGNATURE_URL="$SIGNATURE_URL" URL_ARTIFACT="$PACKAGE_URL" URL_SIGNATURE="$SIGNATURE_URL" run_release_install
+    is "explicit authenticated signature URL verifies" "$?" "0"
+    is "authenticated signature installs the verified file" "$(cat "${SIGROOT}/installed" 2>/dev/null)" "genuine package"
+    contains "authenticated signature reports verification" "$(cat "${SIGROOT}/release.log")" "signed with the Codemux release key"
+    printf 'not a signature\n' > "${RELEASE_DIR}/authenticated.sig"
+    REQUIRED_SIGNATURE_URL="$SIGNATURE_URL" URL_ARTIFACT="$PACKAGE_URL" URL_SIGNATURE="$SIGNATURE_URL" run_release_install
+    is "bad authenticated signature fails" "$?" "1"
+    is "bad authenticated signature installs nothing" "$(test ! -e "${SIGROOT}/installed" && echo yes)" "yes"
+
+    # The same gate on the rpm (zypper --allow-unsigned-rpm) and AppImage paths.
+    SUSE_LEAP=$(mock_os_release leap 'ID="opensuse-leap"' 'ID_LIKE="suse opensuse"' 'VERSION_ID="15.6"')
+    for kind in rpm appimage; do
+        if [ "$kind" = "rpm" ]; then os="$SUSE_LEAP"; else os="$UBUNTU"; fi
+        name=$(codemux_artifact_name "$kind" 9.9.9)
+        rm -f "$RELEASE_DIR"/*
+        printf 'genuine %s\n' "$kind" > "${RELEASE_DIR}/${name}"
+        sign_fixture "${RELEASE_DIR}/${name}" "$name"
+        run_release_install "$os" "$kind"
+        is "signed ${kind} installs" "$?" "0"
+        is "the verified ${kind} is what gets installed" "$(cat "${SIGROOT}/installed" 2>/dev/null)" "genuine ${kind}"
+
+        printf 'trojaned %s\n' "$kind" > "${RELEASE_DIR}/${name}"
+        run_release_install "$os" "$kind"
+        is "replaced ${kind} fails" "$?" "1"
+        is "replaced ${kind} is never installed" "$(test ! -e "${SIGROOT}/installed" && echo yes)" "yes"
+
+        rm -f "${RELEASE_DIR}/${name}.sig"
+        run_release_install "$os" "$kind"
+        is "${kind} without a signature fails" "$?" "1"
+        is "${kind} without a signature installs nothing" "$(test ! -e "${SIGROOT}/installed" && echo yes)" "yes"
+    done
+
+    # A signature for one kind does not pass for another.
+    deb_name=$(codemux_artifact_name deb 9.9.9)
+    rpm_name=$(codemux_artifact_name rpm 9.9.9)
+    rm -f "$RELEASE_DIR"/*
+    printf 'genuine deb\n' > "${RELEASE_DIR}/${rpm_name}"
+    sign_fixture "${RELEASE_DIR}/${rpm_name}" "$deb_name"
+    run_release_install "$SUSE_LEAP" rpm
+    is "a deb signature does not pass an rpm" "$?" "1"
+    is "the mislabelled rpm is never installed" "$(test ! -e "${SIGROOT}/installed" && echo yes)" "yes"
+
+    # wget instead of curl downloads and checks the same way.
+    WGET_BIN="${SIGROOT}/wget-bin"
+    mkdir -p "$WGET_BIN"
+    cat > "${WGET_BIN}/wget" <<'WGET'
+#!/bin/sh
+# Serve <url> from $FIXTURE_DIR by its last path segment; -O - or -qO- is stdout.
+out="-"
+while [ $# -gt 1 ]; do
+    case "$1" in -O) out="$2"; shift ;; -qO-) out="-" ;; esac
+    shift
+done
+url="${1%%#*}"
+name="${url##*/}"; name="${name%%\?*}"
+if [ -n "${REQUIRED_SIGNATURE_URL:-}" ]; then
+    case "$name" in *.sig) [ "$1" = "$REQUIRED_SIGNATURE_URL" ] || exit 8 ;; esac
+fi
+if [ "${SIMULATE_DOWNLOAD_FAILURE:-0}" = 1 ]; then
+    printf 'wget: bad URL: %s\n' "$1" >&2
+    exit 8
+fi
+src="${FIXTURE_DIR}/${name}"
+[ -f "$src" ] || exit 8
+if [ "$out" = "-" ]; then cat "$src"; else cp "$src" "$out"; fi
+WGET
+    chmod +x "${WGET_BIN}/wget"
+    # The real curl stays on PATH, so hide it for these runs.
+    have() { case "$1" in curl) return 1 ;; esac; command -v "$1" >/dev/null 2>&1; }
+    CURL_BIN="$WGET_BIN"
+    rm -f "$RELEASE_DIR"/*
+    cp "$PKG" "$PKG.sig" "$RELEASE_DIR/"
+    cp "$PKG.sig" "${RELEASE_DIR}/authenticated.sig"
+    run_release_install
+    is "signed release installs via wget" "$?" "0"
+    is "wget path installs the verified file" "$(cat "${SIGROOT}/installed" 2>/dev/null)" "genuine package"
+    REQUIRED_SIGNATURE_URL="$SIGNATURE_URL" URL_ARTIFACT="$PACKAGE_URL" URL_SIGNATURE="$SIGNATURE_URL" run_release_install
+    is "authenticated signature verifies via wget" "$?" "0"
+    is "wget installs the authenticated verified file" "$(cat "${SIGROOT}/installed" 2>/dev/null)" "genuine package"
+    SIMULATE_DOWNLOAD_FAILURE=1 SPLIT_RELEASE_OUTPUT=1 URL_ARTIFACT="$SECRET_URL" run_release_install
+    is "failed authenticated wget download stops installation" "$?" "1"
+    is "failed authenticated wget download installs nothing" "$(test ! -e "${SIGROOT}/installed" && echo yes)" "yes"
+    not_contains "wget failure stdout hides the credential" "$(cat "${SIGROOT}/release.stdout")" "fake-credential"
+    not_contains "wget failure stderr hides the credential" "$(cat "${SIGROOT}/release.stderr")" "fake-credential"
+    contains "wget failure keeps a safe status" "$(cat "${SIGROOT}/release.stderr")" "wget exit 8"
+    contains "wget failure explains what to check" "$(cat "${SIGROOT}/release.stderr")" "Check the URL, network connection, and access credentials"
+    printf 'trojaned package\n' > "${RELEASE_DIR}/codemux_9.9.9_amd64.deb"
+    run_release_install
+    is "replaced asset via wget fails" "$?" "1"
+    is "replaced asset via wget is never installed" "$(test ! -e "${SIGROOT}/installed" && echo yes)" "yes"
+    have() { command -v "$1" >/dev/null 2>&1; }
+fi
+
+# ── which OpenSSL does the check ─────────────────────────────────────────────
+
+echo "openssl selection"
+OSSL="${TMPROOT}/openssl-fakes"
+mkdir -p "${OSSL}/old" "${OSSL}/fips" "${OSSL}/none" "${OSSL}/leap"
+# OpenSSL 1.1.1: pkeyutl has no -rawin.
+printf '#!/bin/sh\ncase "$1" in version) echo "OpenSSL 1.1.1w  11 Sep 2023" ;; pkeyutl) echo "Usage: pkeyutl [options] -in file" >&2 ;; esac\nexit 0\n' > "${OSSL}/old/openssl"
+# OpenSSL 3 in FIPS-only mode: -rawin exists, BLAKE2b is refused.
+printf '#!/bin/sh\ncase "$1" in pkeyutl) echo " -rawin  raw input" >&2; exit 0 ;; esac\nexit 1\n' > "${OSSL}/fips/openssl"
+chmod +x "${OSSL}/old/openssl" "${OSSL}/fips/openssl"
+cp "${OSSL}/old/openssl" "${OSSL}/leap/openssl"
+# The binary the installer's own probe picks (openssl-3 beside an old
+# openssl, for example), not whatever `openssl` comes first on PATH.
+REAL_OPENSSL=""
+if codemux_can_verify_signatures; then REAL_OPENSSL=$(command -v "$OPENSSL" || true); fi
+[ -z "$REAL_OPENSSL" ] || ln -s "$REAL_OPENSSL" "${OSSL}/leap/openssl-3"
+
+probe() { # <dir on PATH> [CODEMUX_OPENSSL] -> "<status> <OPENSSL> <problem>"
+    # Unset first so a probe that reads state it never set fails under set -u.
+    ( unset OPENSSL_PROBLEM OPENSSL_PROBLEM_BIN
+      PATH="$1"; CODEMUX_OPENSSL="${2:-}"; OPENSSL=openssl
+      codemux_can_verify_signatures; printf '%s %s %s' "$?" "${OPENSSL##*/}" "$OPENSSL_PROBLEM" )
+}
+is "no openssl is missing"            "$(probe "${OSSL}/none")" "1 openssl missing"
+is "openssl 1.1.1 is old"             "$(probe "${OSSL}/old")"  "1 openssl old"
+is "FIPS-only openssl lacks algorithms" "$(probe "${OSSL}/fips")" "1 openssl algorithms"
+is "CODEMUX_OPENSSL is the only one tried" "$(probe "${OSSL}/none" "${OSSL}/old/openssl")" "1 openssl old"
+if [ -n "$REAL_OPENSSL" ] && codemux_can_verify_signatures; then
+    is "Leap's openssl-3 is used beside an old openssl" "$(probe "${OSSL}/leap")" "0 openssl-3 "
+    is "CODEMUX_OPENSSL picks a binary off PATH" "$(probe "${OSSL}/none" "$REAL_OPENSSL")" "0 ${REAL_OPENSSL##*/} "
+fi
+
+tools_out() { # <family> <PATH dir> [priv] [dry run] -> output of require_signature_tools
+    ( DRY_RUN="${4:-1}" PRIV="${3:-sudo}" FAMILY="$1"
+      PATH="${2}:${STUB_BIN}"
+      fetch_text() { echo "network used" >&2; }
+      require_signature_tools; echo "status=$?" ) 2>&1 || echo "status=$?"
+}
+OUT=$(tools_out suse "${OSSL}/old")
+contains "Leap dry run plans openssl-3" "$OUT" "would run: sudo zypper --non-interactive install openssl-3"
+contains "Leap dry run carries on" "$OUT" "status=0"
+OUT=$(tools_out debian "${OSSL}/none")
+contains "dry run shows the apt-get update" "$OUT" "would run: sudo env DEBIAN_FRONTEND=noninteractive apt-get update -qq"
+contains "dry run shows the openssl install" "$OUT" "would run: sudo env DEBIAN_FRONTEND=noninteractive apt-get install -y openssl"
+OUT=$(tools_out debian "${OSSL}/old")
+not_contains "an old openssl on Debian is not reinstalled" "$OUT" "would run"
+contains "an old openssl is named as old" "$OUT" "needs OpenSSL 3 or newer"
+contains "the old version is shown" "$OUT" "OpenSSL 1.1.1w"
+not_contains "an old openssl is not called missing" "$OUT" "was not found"
+contains "dry run says a real run stops" "$OUT" "a real run would stop here"
+OUT=$(tools_out fedora "${OSSL}/fips" sudo 0)
+contains "FIPS-only openssl is explained" "$OUT" "refuses BLAKE2b-512 or Ed25519"
+contains "the workaround is named" "$OUT" "CODEMUX_ARTIFACT=/path/to/package"
+contains "a real run stops" "$OUT" "status=1"
+
+OUT=$( (
+    DRY_RUN=0 PRIV=none
+    codemux_can_verify_signatures() { OPENSSL_PROBLEM=missing; return 1; }
+    fetch_text() { echo "network used" >&2; }
+    require_signature_tools
+) 2>&1)
+contains "no OpenSSL 3 stops before downloading" "$OUT" "needs the OpenSSL 3 command-line tool"
+not_contains "no OpenSSL 3 downloads nothing" "$OUT" "network used"
+
+OUT=$(env -u CODEMUX_INSTALL_SH_NO_MAIN NO_COLOR=1 PATH="${STUB_BIN}:${PATH}" \
+      CODEMUX_OS_RELEASE_PATH="$UBUNTU" CODEMUX_INSTALL_VERSION=9.9.9 \
+      CODEMUX_INSTALL_DIR="${TMPROOT}/opt/bin" \
+      bash "$INSTALL_SH" --dry-run 2>&1)
+contains "dry run plans the signature check" "$OUT" "would verify: codemux_9.9.9_amd64.deb against <redacted URL>"
+# A fresh installer process on a host with no openssl at all (minimal
+# container images): every tool on PATH except openssl and sudo.
+NOSSL_BIN="${TMPROOT}/no-openssl-bin"
+mkdir -p "$NOSSL_BIN"
+_old_ifs="$IFS"; IFS=:
+for _dir in $PATH; do
+    [ -d "$_dir" ] || continue
+    for _tool in "$_dir"/*; do
+        _name="${_tool##*/}"
+        case "$_name" in openssl|openssl-3|sudo) continue ;; esac
+        [ -x "$_tool" ] && [ ! -e "${NOSSL_BIN}/${_name}" ] && ln -s "$_tool" "${NOSSL_BIN}/${_name}"
+    done
+done
+IFS="$_old_ifs"
+no_openssl_dry() { # <PATH> -> output of a pinned --dry-run on Ubuntu
+    env -i HOME="${TMPROOT}/home" NO_COLOR=1 PATH="$1" \
+        CODEMUX_OS_RELEASE_PATH="$UBUNTU" CODEMUX_INSTALL_VERSION=9.9.9 \
+        CODEMUX_INSTALL_DIR="${TMPROOT}/opt/bin" \
+        bash "$INSTALL_SH" --dry-run 2>&1
+}
+if [ "$(id -u)" != "0" ] && ! PATH="$NOSSL_BIN" command -v openssl >/dev/null 2>&1; then
+    OUT=$(no_openssl_dry "${STUB_BIN}:${NOSSL_BIN}")
+    not_contains "no openssl with sudo: no unbound variable" "$OUT" "unbound variable"
+    contains "no openssl with sudo plans the openssl install" "$OUT" "would run: sudo env DEBIAN_FRONTEND=noninteractive apt-get install -y openssl"
+    contains "no openssl with sudo still plans the check" "$OUT" "would verify: codemux_9.9.9_amd64.deb"
+    OUT=$(no_openssl_dry "$NOSSL_BIN")
+    not_contains "no openssl without root: no unbound variable" "$OUT" "unbound variable"
+    contains "no openssl without root explains what is missing" "$OUT" "which was not found"
+    contains "no openssl without root names the workaround" "$OUT" "CODEMUX_ARTIFACT=/path/to/package"
+else
+    echo "  skip (no-openssl runs need a non-root user)"
+fi
+
+OUT=$(run_dry "$UBUNTU" "$FAKE_DEB")
+contains "a local CODEMUX_ARTIFACT warns it is unverified" "$OUT" "signature is not checked"
 
 # ── syntax ───────────────────────────────────────────────────────────────────
 
