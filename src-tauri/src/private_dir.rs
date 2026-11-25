@@ -16,7 +16,10 @@ pub fn user_private_dir(name: &str) -> io::Result<PathBuf> {
 
 /// The first root in `roots` that yields a safe `<root>/<app>/<name>`.
 fn user_private_dir_in(roots: &[PathBuf], name: &str) -> io::Result<PathBuf> {
-    let mut error = io::Error::new(io::ErrorKind::NotFound, "no per-user directory is available");
+    let mut error = io::Error::new(
+        io::ErrorKind::NotFound,
+        "no per-user directory is available",
+    );
     for root in roots {
         match private_dir_under(root, name) {
             Ok(dir) => return Ok(dir),
@@ -29,7 +32,10 @@ fn user_private_dir_in(roots: &[PathBuf], name: &str) -> io::Result<PathBuf> {
 /// Never the shared temp dir: only the user's own runtime and cache dirs.
 #[cfg_attr(test, allow(dead_code))]
 fn production_roots() -> Vec<PathBuf> {
-    [dirs::runtime_dir(), dirs::cache_dir()].into_iter().flatten().collect()
+    [dirs::runtime_dir(), dirs::cache_dir()]
+        .into_iter()
+        .flatten()
+        .collect()
 }
 
 #[cfg(not(test))]
@@ -181,7 +187,10 @@ fn euid() -> u32 {
 fn not_private(path: &Path) -> io::Error {
     io::Error::new(
         io::ErrorKind::PermissionDenied,
-        format!("{} is not a private directory owned by this user", path.display()),
+        format!(
+            "{} is not a private directory owned by this user",
+            path.display()
+        ),
     )
 }
 
@@ -198,13 +207,68 @@ pub(crate) fn create_private_file(path: &Path) -> io::Result<std::fs::File> {
     options.open(path)
 }
 
+/// POSIX shell steps for creating or checking a private directory below
+/// `$HOME` on the machine that will use it. Walk from `/` so a symlink or a
+/// writable ancestor cannot redirect even the first `mkdir`. Sticky,
+/// root/user-owned ancestors (such as `/tmp`) are safe to descend through.
+/// Callers append their file operation to this script while `cmx_dir` names
+/// the verified leaf. `parts` are internal, literal directory names.
+#[cfg(unix)]
+pub(crate) fn shell_private_dir_guard(parts: &[&str], create: bool) -> String {
+    let mut script = String::from(
+        r#"umask 077
+cmx_check_ancestor() {
+  [ -d "$1" ] && [ ! -L "$1" ] || return 1
+  [ -O "$1" ] || [ "$(find "$1" -prune -uid 0 -print)" = "$1" ] || return 1
+  cmx_bad=$(find "$1" -prune \( -perm -020 -o -perm -002 \) ! -perm -1000 -print) || return 1
+  [ -z "$cmx_bad" ]
+}
+cmx_check_owned() {
+  [ -d "$1" ] && [ ! -L "$1" ] && [ -O "$1" ] || return 1
+  cmx_bad=$(find "$1" -prune \( -perm -020 -o -perm -002 \) -print) || return 1
+  [ -z "$cmx_bad" ]
+}
+case "$HOME" in /*) ;; *) exit 1 ;; esac
+cmx_dir=/
+cmx_check_ancestor "$cmx_dir" || exit 1
+cmx_rest=${HOME#/}
+while [ -n "$cmx_rest" ]; do
+  cmx_part=${cmx_rest%%/*}
+  case "$cmx_part" in ''|.|..) exit 1 ;; esac
+  cmx_dir="${cmx_dir%/}/$cmx_part"
+  cmx_check_ancestor "$cmx_dir" || exit 1
+  case "$cmx_rest" in */*) cmx_rest=${cmx_rest#*/} ;; *) cmx_rest= ;; esac
+done
+cmx_check_owned "$cmx_dir" || exit 1
+"#,
+    );
+    for part in parts {
+        debug_assert!(part
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.')));
+        script.push_str(&format!("cmx_dir=\"$cmx_dir/{part}\"\n"));
+        if create {
+            script.push_str("if [ ! -e \"$cmx_dir\" ] && [ ! -L \"$cmx_dir\" ]; then mkdir -m 700 \"$cmx_dir\" || exit 1; fi\n");
+        }
+        script.push_str("cmx_check_owned \"$cmx_dir\" || exit 1\n");
+    }
+    if create {
+        script.push_str("chmod 700 \"$cmx_dir\" || exit 1\n");
+    }
+    script
+}
+
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
 
     fn mode(path: &Path) -> u32 {
-        std::fs::symlink_metadata(path).unwrap().permissions().mode() & 0o777
+        std::fs::symlink_metadata(path)
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777
     }
 
     #[test]
@@ -252,7 +316,10 @@ mod tests {
         assert!(ensure_private_dir(root.path(), "shared").is_err());
         assert_eq!(mode(&shared), 0o777, "a refused directory is left alone");
         assert!(ensure_private_dir(&shared, "inner").is_err());
-        assert!(!shared.join("inner").exists(), "nothing is created under a refused parent");
+        assert!(
+            !shared.join("inner").exists(),
+            "nothing is created under a refused parent"
+        );
 
         let elsewhere = tempfile::tempdir().unwrap();
         std::os::unix::fs::symlink(elsewhere.path(), root.path().join("link")).unwrap();
@@ -265,7 +332,10 @@ mod tests {
         let path = root.path().join("file");
         drop(create_private_file(&path).unwrap());
         assert_eq!(mode(&path), 0o600);
-        assert!(create_private_file(&path).is_err(), "an existing file is never reused");
+        assert!(
+            create_private_file(&path).is_err(),
+            "an existing file is never reused"
+        );
 
         let target = root.path().join("target");
         std::fs::write(&target, "keep").unwrap();
@@ -304,7 +374,10 @@ mod tests {
         std::fs::create_dir(&open).unwrap();
         std::fs::set_permissions(&open, std::fs::Permissions::from_mode(0o777)).unwrap();
         assert!(private_dir_under(&open.join("runtime/deeper"), "things").is_err());
-        assert!(!open.join("runtime").exists(), "checks run before anything is created");
+        assert!(
+            !open.join("runtime").exists(),
+            "checks run before anything is created"
+        );
     }
 
     #[test]
@@ -313,7 +386,12 @@ mod tests {
         let root = base.path().join("cache/nested");
         let dir = private_dir_under(&root, "things").unwrap();
         let base = std::fs::canonicalize(base.path()).unwrap();
-        assert_eq!(dir, base.join("cache/nested").join(crate::APP_DIR_NAME).join("things"));
+        assert_eq!(
+            dir,
+            base.join("cache/nested")
+                .join(crate::APP_DIR_NAME)
+                .join("things")
+        );
         assert_eq!(mode(&base.join("cache")), 0o700);
         assert_eq!(mode(&base.join("cache/nested")), 0o700);
     }
@@ -325,7 +403,8 @@ mod tests {
         // The root's last folder already exists as a symlink: it resolves,
         // so the target is checked like any root. A symlink further down is
         // refused because the app folder must be a real directory.
-        std::os::unix::fs::symlink(elsewhere.path(), base.path().join(crate::APP_DIR_NAME)).unwrap();
+        std::os::unix::fs::symlink(elsewhere.path(), base.path().join(crate::APP_DIR_NAME))
+            .unwrap();
         assert!(private_dir_under(base.path(), "things").is_err());
         assert!(!elsewhere.path().join("things").exists());
     }
@@ -338,7 +417,13 @@ mod tests {
         let link = base.path().join("link");
         std::os::unix::fs::symlink(&target, &link).unwrap();
         let dir = private_dir_under(&link, "things").unwrap();
-        assert_eq!(dir, std::fs::canonicalize(&target).unwrap().join(crate::APP_DIR_NAME).join("things"));
+        assert_eq!(
+            dir,
+            std::fs::canonicalize(&target)
+                .unwrap()
+                .join(crate::APP_DIR_NAME)
+                .join("things")
+        );
     }
 
     #[test]
