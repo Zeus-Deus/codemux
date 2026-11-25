@@ -46,6 +46,21 @@ function readFonts(): string {
     .join("\n");
 }
 
+function canonicalLinkRequest(value: string): string | null {
+  // Keep a page from making the confirmation itself unwieldy. The parent
+  // displays and opens the same browser-normalized address.
+  if (value.length > 8192) return null;
+  try {
+    const url = new URL(value);
+    if ((url.protocol !== "http:" && url.protocol !== "https:") || url.username || url.password) {
+      return null;
+    }
+    return url.href;
+  } catch {
+    return null;
+  }
+}
+
 /** The active app theme and fonts, as handed to HTML renders. Stable until
  *  the theme or a font stack changes. */
 export function useHtmlRenderTheme(): HtmlRenderTheme {
@@ -129,12 +144,13 @@ function HtmlRenderDocument({
         setContentHeight(height);
         return;
       }
-      const url = readHtmlRenderLinkRequest(event.data);
+      const requestedUrl = readHtmlRenderLinkRequest(event.data);
+      const url = requestedUrl === undefined ? null : canonicalLinkRequest(requestedUrl);
       // Frame scripts can forge open-link messages, even after an unrelated
       // click. The parent owns the confirmation and keeps the first request
       // until the reader chooses what to do with it.
       if (
-        url !== undefined &&
+        url !== null &&
         pendingUrlRef.current === null &&
         document.activeElement === frame &&
         navigator.userActivation?.isActive !== false
@@ -171,8 +187,8 @@ function HtmlRenderDocument({
         }}
       />
       <AlertDialog open={pendingUrl !== null} onOpenChange={(open) => !open && dismissLink()}>
-        <AlertDialogContent>
-          <AlertDialogHeader>
+        <AlertDialogContent className="flex max-h-[calc(100dvh-2rem)] flex-col overflow-hidden">
+          <AlertDialogHeader className="min-h-0 overflow-y-auto">
             <AlertDialogMedia>
               <ExternalLink aria-hidden="true" />
             </AlertDialogMedia>
@@ -181,10 +197,16 @@ function HtmlRenderDocument({
               This page asked to open a link. Check the address before continuing.
             </AlertDialogDescription>
           </AlertDialogHeader>
-          <div className="select-text break-all rounded-lg bg-muted px-3 py-2 font-mono text-label text-muted-foreground">
-            {pendingUrl}
+          <div className="min-h-0 overflow-y-auto rounded-lg bg-muted px-3 py-2 text-label">
+            <div className="text-muted-foreground">Destination</div>
+            <bdi dir="ltr" className="block select-text break-all font-mono text-foreground [unicode-bidi:isolate]">
+              {pendingUrl === null ? null : new URL(pendingUrl).origin}
+            </bdi>
+            <bdi dir="ltr" className="mt-1 block select-text break-all font-mono text-muted-foreground [unicode-bidi:isolate]">
+              {pendingUrl}
+            </bdi>
           </div>
-          <AlertDialogFooter>
+          <AlertDialogFooter className="shrink-0">
             <AlertDialogCancel>Cancel</AlertDialogCancel>
             <AlertDialogAction
               onClick={() => {

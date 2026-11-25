@@ -115,6 +115,44 @@ describe("HtmlRenderFrame", () => {
     expect(mocks.openExternalUrl).not.toHaveBeenCalled();
   });
 
+  it("shows and opens the canonical destination, rejecting credentials and malformed URLs", async () => {
+    render(<HtmlRenderFrame item={renderCall()} />);
+    const frame = screen.getByTitle<HTMLIFrameElement>("Weekly turns");
+    frame.focus();
+    postLink(frame, "https://trusted.example@evil.example/private");
+    postLink(frame, "https://[invalid");
+    expect(screen.queryByRole("alertdialog")).toBeNull();
+
+    postLink(frame, "https://example.com/a/../review");
+    const dialog = screen.getByRole("alertdialog");
+    expect(dialog).toHaveTextContent("Destination");
+    expect(dialog).toHaveTextContent("https://example.com/review");
+    expect(dialog.querySelectorAll('bdi[dir="ltr"]')).toHaveLength(2);
+    fireEvent.click(screen.getByRole("button", { name: "Open link" }));
+    await waitFor(() => expect(mocks.openExternalUrl).toHaveBeenCalledWith("https://example.com/review"));
+  });
+
+  it("keeps actions visible while a long address scrolls in a short viewport", () => {
+    const previousHeight = window.innerHeight;
+    Object.defineProperty(window, "innerHeight", { configurable: true, value: 240 });
+    try {
+      render(<HtmlRenderFrame item={renderCall()} />);
+      const frame = screen.getByTitle<HTMLIFrameElement>("Weekly turns");
+      frame.focus();
+      postLink(frame, `https://example.com/${"x".repeat(7000)}`);
+      const dialog = screen.getByRole("alertdialog");
+      expect(dialog.className).toContain("max-h-[calc(100dvh-2rem)]");
+      expect(dialog.querySelector(".overflow-y-auto")).not.toBeNull();
+      expect(screen.getByRole("button", { name: "Cancel" })).toBeVisible();
+      expect(screen.getByRole("button", { name: "Open link" })).toBeVisible();
+      fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
+      postLink(frame, `https://example.com/${"x".repeat(8200)}`);
+      expect(screen.queryByRole("alertdialog")).toBeNull();
+    } finally {
+      Object.defineProperty(window, "innerHeight", { configurable: true, value: previousHeight });
+    }
+  });
+
   it("posts new font stacks to an open page without reloading it", async () => {
     render(<HtmlRenderFrame item={renderCall()} />);
     const frame = screen.getByTitle<HTMLIFrameElement>("Weekly turns");
