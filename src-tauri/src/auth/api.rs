@@ -70,6 +70,15 @@ pub(crate) fn build_signup_body(email: &str, secret: &AuthSecret, name: &str) ->
 
 // ── Public API ───────────────────────────────────────────────────
 
+// Credential-bearing POST bodies must never be replayed to a redirect target.
+// reqwest otherwise follows 307/308 and resends the AuthSecret JSON body.
+fn auth_client() -> Result<reqwest::Client, String> {
+    reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .map_err(|e| format!("Create authentication client: {e}"))
+}
+
 /// POST `/api/auth/desktop/signin` with `{email, password: auth_secret}`.
 /// The `secret` parameter is an `AuthSecret` — the compiler guarantees
 /// the callsite has already run `derive_auth_secret(password, email)`
@@ -81,12 +90,16 @@ pub(crate) async fn login_email_api(
     let base = api_base_url()?;
     let url = format!("{base}/api/auth/desktop/signin");
 
-    let resp = reqwest::Client::new()
+    let resp = auth_client()?
         .post(&url)
         .json(&build_signin_body(email, secret))
         .send()
         .await
         .map_err(|e| format!("Request failed: {e}"))?;
+
+    if resp.status().is_redirection() {
+        return Err("Authentication endpoint redirected; credentials were not resent".into());
+    }
 
     if !resp.status().is_success() {
         let body: serde_json::Value = resp.json().await.unwrap_or_default();
@@ -110,12 +123,16 @@ pub(crate) async fn signup_email_api(
     let base = api_base_url()?;
     let url = format!("{base}/api/auth/desktop/signup");
 
-    let resp = reqwest::Client::new()
+    let resp = auth_client()?
         .post(&url)
         .json(&build_signup_body(email, secret, name))
         .send()
         .await
         .map_err(|e| format!("Request failed: {e}"))?;
+
+    if resp.status().is_redirection() {
+        return Err("Authentication endpoint redirected; credentials were not resent".into());
+    }
 
     if !resp.status().is_success() {
         let body: serde_json::Value = resp.json().await.unwrap_or_default();
@@ -358,5 +375,41 @@ mod tests {
             !stderr_out.contains(DISTINCTIVE_PASSWORD),
             "raw password leaked to stderr during signup:\n{stderr_out}"
         );
+    }
+    #[tokio::test]
+    #[serial_test::serial(mockserver)]
+    async fn auth_secret_posts_do_not_follow_redirects() {
+        let mut origin = mockito::Server::new_async().await;
+        let mut sink = mockito::Server::new_async().await;
+        let sink_hit = sink.mock("POST", "/capture").expect(0).create_async().await;
+        let target = format!("{}/capture", sink.url());
+        let signin = origin
+            .mock("POST", "/api/auth/desktop/signin")
+            .with_status(307)
+            .with_header("location", target.as_str())
+            .create_async()
+            .await;
+        let signup = origin
+            .mock("POST", "/api/auth/desktop/signup")
+            .with_status(308)
+            .with_header("location", target.as_str())
+            .create_async()
+            .await;
+
+        let previous_url = std::env::var("CODEMUX_API_URL").ok();
+        std::env::set_var("CODEMUX_API_URL", origin.url());
+        let secret = derive_auth_secret(DISTINCTIVE_PASSWORD, DISTINCTIVE_EMAIL).unwrap();
+        let signin_result = login_email_api(DISTINCTIVE_EMAIL, &secret).await;
+        let signup_result = signup_email_api(DISTINCTIVE_EMAIL, &secret, DISTINCTIVE_NAME).await;
+        match previous_url {
+            Some(url) => std::env::set_var("CODEMUX_API_URL", url),
+            None => std::env::remove_var("CODEMUX_API_URL"),
+        }
+
+        assert!(signin_result.unwrap_err().contains("redirected"));
+        assert!(signup_result.unwrap_err().contains("redirected"));
+        signin.assert_async().await;
+        signup.assert_async().await;
+        sink_hit.assert_async().await;
     }
 }
