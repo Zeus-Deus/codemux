@@ -2077,14 +2077,11 @@ pub(crate) async fn dispatch_request_as<R: Runtime>(
                         let db: State<'_, crate::database::DatabaseStore> = app.state();
                         let port = crate::scripts::allocate_workspace_port(&ws_id);
                         let folder = std::path::Path::new(&cwd);
-                        let paths = std::sync::Arc::new(
-                            crate::config::workspace_config::LifecyclePaths::resolve(folder)?,
-                        );
+                        let paths = crate::config::workspace_config::LifecyclePaths::resolve(folder)?;
                         let config = paths.automatic_config(&db);
-                        let checkpoint = paths.guard(crate::workspace_service::Checkpoint::default());
                         crate::scripts::run_setup_pipeline(
-                            paths.workspace(), paths.root(), &title, &ws_id, &app, Some(&config),
-                            branch.as_deref(), Some(port), &checkpoint,
+                            crate::scripts::ScriptLocation::Checked(&paths), &title, &ws_id, &app, Some(&config),
+                            branch.as_deref(), Some(port), &crate::workspace_service::Checkpoint::default(),
                         )?;
                         Ok::<_, String>(serde_json::json!({ "workspace_id": ws_id, "status": "complete" }))
                     })

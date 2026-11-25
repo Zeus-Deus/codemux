@@ -737,6 +737,7 @@ fn build_core_app<R: tauri::Runtime>(
         .manage(resource_metrics::ResourceMonitorState::default())
         .manage(scrollback::ScrollbackCache::default())
         .manage(auth::AuthState::default())
+        .manage(commands::database::ProjectScriptsReviews::default())
         .manage(skills_sync::SyncEngine::new())
         .manage(commands::agent_chat::ProviderRegistry::new())
         .manage(agent_control::NativeControlState::default())

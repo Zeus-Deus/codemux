@@ -1,4 +1,4 @@
-use crate::config::workspace_config::{find_git_root, WorkspaceConfig};
+use crate::config::workspace_config::{find_git_root, LifecyclePaths, WorkspaceConfig};
 use crate::workspace_service::Checkpoint;
 use serde::Serialize;
 use std::io::Write;
@@ -279,8 +279,10 @@ pub fn run_setup_scripts<R: Runtime>(
     );
 
     run_setup_pipeline(
-        workspace_path,
-        &resolve_root_path(workspace_path),
+        ScriptLocation::Explicit {
+            workspace: workspace_path,
+            root: &resolve_root_path(workspace_path),
+        },
         workspace_name,
         workspace_id,
         app_handle,
@@ -291,12 +293,52 @@ pub fn run_setup_scripts<R: Runtime>(
     )
 }
 
+pub(crate) enum ScriptLocation<'a> {
+    Explicit { workspace: &'a Path, root: &'a Path },
+    Checked(&'a LifecyclePaths),
+}
+
+impl ScriptLocation<'_> {
+    fn workspace(&self) -> &Path {
+        match self {
+            Self::Explicit { workspace, .. } => workspace,
+            Self::Checked(paths) => paths.workspace(),
+        }
+    }
+
+    fn root(&self) -> &Path {
+        match self {
+            Self::Explicit { root, .. } => root,
+            Self::Checked(paths) => paths.root(),
+        }
+    }
+
+    fn check(&self, checkpoint: &Checkpoint) -> Result<(), String> {
+        checkpoint.check()?;
+        if let Self::Checked(paths) = self {
+            paths.check()?;
+        }
+        Ok(())
+    }
+
+    fn copy_includes(&self, patterns: &[String]) -> Result<Option<IncludeResult>, String> {
+        if let Self::Checked(paths) = self {
+            if !paths.permits_include_copy() {
+                return Ok(None);
+            }
+            // The Git lookup may have waited. Confirm the directories still
+            // match before reading source files or applying the copy.
+            paths.check()?;
+        }
+        process_worktree_includes(self.root(), self.workspace(), patterns).map(Some)
+    }
+}
+
 /// Apply includes and run the selected commands. The guard is checked before
 /// the include copy and again before starting each command.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn run_setup_pipeline<R: Runtime>(
-    workspace_path: &Path,
-    root_path: &Path,
+    location: ScriptLocation<'_>,
     workspace_name: &str,
     workspace_id: &str,
     app_handle: &AppHandle<R>,
@@ -305,14 +347,14 @@ pub(crate) fn run_setup_pipeline<R: Runtime>(
     port: Option<u16>,
     checkpoint: &Checkpoint,
 ) -> Result<(), String> {
-    checkpoint.check().map_err(|refusal| {
+    location.check(checkpoint).map_err(|refusal| {
         report_setup_stopped(app_handle, workspace_id, config, &refusal)
     })?;
     let setting_patterns = config.map_or(&[][..], |config| config.worktree_includes.as_slice());
 
     // Step 1: Process worktree includes (copy gitignored files from main worktree)
-    match process_worktree_includes(root_path, workspace_path, setting_patterns) {
-        Ok(result) => {
+    match location.copy_includes(setting_patterns) {
+        Ok(Some(result)) => {
             let _ = app_handle.emit(
                 "worktree-includes-applied",
                 WorktreeIncludesApplied {
@@ -322,6 +364,7 @@ pub(crate) fn run_setup_pipeline<R: Runtime>(
                 },
             );
         }
+        Ok(None) => {}
         Err(e) => {
             eprintln!("[codemux::scripts] worktree includes error: {e}");
         }
@@ -338,11 +381,10 @@ pub(crate) fn run_setup_pipeline<R: Runtime>(
     };
 
     run_checked_setup_commands(
-        workspace_path,
+        location,
         workspace_name,
         workspace_id,
         config,
-        root_path,
         branch,
         port,
         checkpoint,
@@ -393,11 +435,10 @@ pub fn run_setup_commands(
     notify: &mut dyn FnMut(SetupEvent<'_>),
 ) -> Result<(), String> {
     run_checked_setup_commands(
-        workspace_path,
+        ScriptLocation::Explicit { workspace: workspace_path, root: root_path },
         workspace_name,
         workspace_id,
         config,
-        root_path,
         branch,
         port,
         &Checkpoint::default(),
@@ -411,11 +452,10 @@ pub fn run_setup_commands(
 /// command starts, and setup fails as [`stop_setup`] reports.
 #[allow(clippy::too_many_arguments)]
 fn run_checked_setup_commands(
-    workspace_path: &Path,
+    location: ScriptLocation<'_>,
     workspace_name: &str,
     workspace_id: &str,
     config: &WorkspaceConfig,
-    root_path: &Path,
     branch: Option<&str>,
     port: Option<u16>,
     checkpoint: &Checkpoint,
@@ -428,16 +468,16 @@ fn run_checked_setup_commands(
     eprintln!(
         "[codemux::scripts] Running {} setup command(s) for workspace {workspace_id} (root={})",
         config.setup.len(),
-        root_path.display()
+        location.root().display()
     );
 
-    let mut env_vars = script_env(workspace_path, root_path, branch, port);
+    let mut env_vars = script_env(location.workspace(), location.root(), branch, port);
     env_vars.push(("CODEMUX_WORKSPACE_NAME", workspace_name.to_string()));
     env_vars.push(("CODEMUX_WORKSPACE_ID", workspace_id.to_string()));
     let total = config.setup.len();
 
     for (index, command) in config.setup.iter().enumerate() {
-        if let Err(refusal) = checkpoint.check() {
+        if let Err(refusal) = location.check(checkpoint) {
             return Err(stop_setup(command, &refusal, notify));
         }
         notify(SetupEvent::Progress {
@@ -446,8 +486,8 @@ fn run_checked_setup_commands(
             total,
         });
 
-        let output = run_script_command(command, workspace_path, &env_vars, SETUP_SCRIPT)
-            .map_err(|e| format!("Failed to run setup command `{command}`: {e}"))?;
+        let output = run_script_command(command, &location, &env_vars, SETUP_SCRIPT)
+            .map_err(|e| stop_setup(command, &e.to_string(), notify))?;
 
         if !output.status.success() {
             let stdout = String::from_utf8_lossy(&output.stdout).to_string();
@@ -559,8 +599,7 @@ fn frontend_events<'a, R: Runtime>(
 /// whoever asked for the close lost their authority (`checkpoint`), no
 /// further command starts.
 pub(crate) fn run_teardown_scripts(
-    workspace_path: &Path,
-    root_path: &Path,
+    paths: &LifecyclePaths,
     workspace_name: &str,
     workspace_id: &str,
     commands: &[String],
@@ -570,15 +609,16 @@ pub(crate) fn run_teardown_scripts(
         return Ok(());
     }
 
-    let mut env_vars = script_env(workspace_path, root_path, None, None);
+    let location = ScriptLocation::Checked(paths);
+    let mut env_vars = script_env(location.workspace(), location.root(), None, None);
     env_vars.push(("CODEMUX_WORKSPACE_NAME", workspace_name.to_string()));
     env_vars.push(("CODEMUX_WORKSPACE_ID", workspace_id.to_string()));
 
     for command in commands {
-        checkpoint
-            .check()
+        location
+            .check(checkpoint)
             .map_err(|refusal| format!("{refusal}; teardown stopped before `{command}`"))?;
-        let output = run_script_command(command, workspace_path, &env_vars, TEARDOWN_SCRIPT)
+        let output = run_script_command(command, &location, &env_vars, TEARDOWN_SCRIPT)
             .map_err(|e| format!("Failed to run teardown command `{command}`: {e}"))?;
 
         if !output.status.success() {
@@ -617,17 +657,24 @@ const TEARDOWN_SCRIPT: &str = "teardown-script";
 /// and a person's terminal is the owner, as for anything they type there.
 /// Agents cannot start it: no socket command or tool does, and typing into a
 /// terminal is admin.
-fn run_script_command(command: &str, folder: &Path, env: &[(&str, String)], kind: &str) -> std::io::Result<Output> {
+fn run_script_command(
+    command: &str,
+    location: &ScriptLocation<'_>,
+    env: &[(&str, String)],
+    kind: &str,
+) -> std::io::Result<Output> {
     let mut cmd = crate::execution::host_command("sh");
     cmd.arg("-c")
         .arg(command)
-        .current_dir(folder)
         .envs(env.iter().map(|(key, value)| (*key, value)))
         .env(crate::control_identity::AGENT_PROCESS_ENV, kind)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    let child = cmd.spawn()?;
+    let child = match location {
+        ScriptLocation::Explicit { workspace, .. } => cmd.current_dir(workspace).spawn(),
+        ScriptLocation::Checked(paths) => paths.spawn(&mut cmd),
+    }?;
     crate::control_identity::register_agent_process(child.id());
     child.wait_with_output()
 }
@@ -703,7 +750,10 @@ mod tests {
             let (folder, config) = (dir.path().to_path_buf(), config.clone());
             let run = std::thread::spawn(move || match name {
                 "setup" => run_setup_commands(&folder, "ws", "ws-1", &config, &folder, None, None, &mut |_| {}),
-                _ => run_teardown_scripts(&folder, &folder, "ws", "ws-1", &config.teardown, &Checkpoint::default()),
+                _ => run_teardown_scripts(
+                    &LifecyclePaths::resolve(&folder).unwrap(), "ws", "ws-1",
+                    &config.teardown, &Checkpoint::default(),
+                ),
             });
             let out = dir.path().join(format!("{name}.out"));
             let deadline = Instant::now() + Duration::from_secs(20);
@@ -745,8 +795,9 @@ mod tests {
         };
 
         let config = WorkspaceConfig { setup: commands.clone(), ..Default::default() };
+        let paths = LifecyclePaths::resolve(dir.path()).unwrap();
         let mut failed = Vec::new();
-        let error = run_checked_setup_commands(dir.path(), "ws", "ws-1", &config, dir.path(), None, None, &once(), &mut |event| {
+        let error = run_checked_setup_commands(ScriptLocation::Checked(&paths), "ws", "ws-1", &config, None, None, &once(), &mut |event| {
             if let SetupEvent::Failed { command, stderr, exit_code, .. } = event {
                 failed.push((command.to_string(), stderr.to_string(), exit_code));
             }
@@ -758,7 +809,7 @@ mod tests {
         assert!(!dir.path().join("two").exists());
 
         fs::remove_file(dir.path().join("one")).unwrap();
-        let error = run_teardown_scripts(dir.path(), dir.path(), "ws", "ws-1", &commands, &once()).unwrap_err();
+        let error = run_teardown_scripts(&paths, "ws", "ws-1", &commands, &once()).unwrap_err();
         assert_eq!(error, "grant_revoked: withdrawn; teardown stopped before `touch two`");
         assert!(dir.path().join("one").exists());
         assert!(!dir.path().join("two").exists());
@@ -767,11 +818,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn lifecycle_commands_stop_after_workspace_or_project_directory_changes() {
-        use crate::config::workspace_config::LifecyclePaths;
-        use std::sync::{
-            atomic::{AtomicUsize, Ordering},
-            Arc,
-        };
+        use std::sync::atomic::{AtomicUsize, Ordering};
 
         for check_workspace in [true, false] {
             let fixture = tempfile::tempdir().unwrap();
@@ -784,28 +831,28 @@ mod tests {
                 format!("gitdir: {}", project.join(".git/worktrees/fixture").display()),
             )
             .unwrap();
-            let paths = Arc::new(LifecyclePaths::resolve(&workspace).unwrap());
+            let paths = LifecyclePaths::resolve(&workspace).unwrap();
             let replace = if check_workspace { workspace.clone() } else { project };
             let backup = fixture.path().join("previous");
             let checks = AtomicUsize::new(0);
-            let checkpoint = paths.guard(Checkpoint::new(move || {
+            let checkpoint = Checkpoint::new(move || {
                 if checks.fetch_add(1, Ordering::SeqCst) == 1 {
                     fs::rename(&replace, &backup).unwrap();
                     fs::create_dir(&replace).unwrap();
                 }
                 Ok(())
-            }));
+            });
             let commands = vec!["touch first".to_string(), "touch second".to_string()];
 
             let error = if check_workspace {
                 let config = WorkspaceConfig { setup: commands, ..Default::default() };
                 run_checked_setup_commands(
-                    paths.workspace(), "ws", "ws-1", &config, paths.root(),
+                    ScriptLocation::Checked(&paths), "ws", "ws-1", &config,
                     None, None, &checkpoint, &mut |_| {},
                 ).unwrap_err()
             } else {
                 run_teardown_scripts(
-                    paths.workspace(), paths.root(), "ws", "ws-1", &commands, &checkpoint,
+                    &paths, "ws", "ws-1", &commands, &checkpoint,
                 ).unwrap_err()
             };
 
@@ -813,6 +860,64 @@ mod tests {
             assert!(error.contains(&format!("{changed} directory changed")), "{error}");
             assert!(workspace.join("first").exists() || fixture.path().join("previous/first").exists());
             assert!(!workspace.join("second").exists());
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn automatic_setup_child_uses_the_held_directory_after_progress() {
+        let fixture = tempfile::tempdir().unwrap();
+        let workspace = fixture.path().join("workspace");
+        let previous = fixture.path().join("previous");
+        fs::create_dir(&workspace).unwrap();
+        let paths = LifecyclePaths::resolve(&workspace).unwrap();
+        let config = WorkspaceConfig {
+            setup: vec!["touch marker".into()],
+            ..Default::default()
+        };
+        run_checked_setup_commands(
+            ScriptLocation::Checked(&paths), "ws", "ws-1", &config, None, None,
+            &Checkpoint::default(), &mut |event| {
+                if matches!(event, SetupEvent::Progress { .. }) {
+                    fs::rename(&workspace, &previous).unwrap();
+                    fs::create_dir(&workspace).unwrap();
+                }
+            },
+        )
+        .unwrap();
+        assert!(previous.join("marker").exists());
+        assert!(!workspace.join("marker").exists());
+    }
+
+    #[test]
+    fn automatic_includes_independently_require_a_registered_linked_checkout() {
+        let fixture = tempfile::tempdir().unwrap();
+        let project = fixture.path().join("project");
+        let registered = fixture.path().join("registered");
+        let unrelated = fixture.path().join("unrelated");
+        fs::create_dir(&project).unwrap();
+        fs::create_dir(&unrelated).unwrap();
+        let run_git = |args: &[&str]| {
+            let result = crate::git::git_command()
+                .current_dir(&project).args(args).output().unwrap();
+            assert!(result.status.success(), "{result:?}");
+        };
+        run_git(&["init"]);
+        run_git(&[
+            "-c", "user.name=Fixture", "-c", "user.email=fixture@example.test",
+            "-c", "commit.gpgsign=false", "commit", "--allow-empty", "-m", "initial",
+        ]);
+        run_git(&["worktree", "add", "--detach", registered.to_str().unwrap()]);
+        fs::copy(registered.join(".git"), unrelated.join(".git")).unwrap();
+        fs::write(project.join(".env"), "FIXTURE=sample").unwrap();
+
+        let db = crate::database::init_test_database();
+        for (checkout, allowed) in [(&registered, true), (&unrelated, false)] {
+            let paths = LifecyclePaths::resolve(checkout).unwrap();
+            assert!(paths.saved_config(&db).is_none());
+            let copy = ScriptLocation::Checked(&paths).copy_includes(&[]).unwrap();
+            assert_eq!(copy.is_some(), allowed);
+            assert_eq!(checkout.join(".env").exists(), allowed);
         }
     }
 

@@ -275,6 +275,62 @@ pub struct DatabaseStore {
     conn: Mutex<Connection>,
 }
 
+pub(crate) const REVIEWED_PROJECT_CHANGED: &str =
+    "The reviewed project changed. Reopen Settings and review the scripts again.";
+
+#[cfg(unix)]
+pub(crate) struct ReviewedProjectRoot {
+    path: PathBuf,
+    directory: std::fs::File,
+}
+
+#[cfg(unix)]
+impl ReviewedProjectRoot {
+    fn open(path: PathBuf) -> std::io::Result<Self> {
+        let directory = cap_std::fs::Dir::open_ambient_dir(&path, cap_std::ambient_authority())?;
+        Ok(Self { path, directory: directory.into_std_file() })
+    }
+
+    pub(crate) fn path(&self) -> &Path {
+        &self.path
+    }
+
+    fn identity(&self) -> Option<ProjectDirectoryId> {
+        ProjectDirectoryId::from_metadata(&self.directory.metadata().ok()?)
+    }
+}
+
+#[cfg(unix)]
+#[derive(Serialize, Deserialize, PartialEq, Eq, Clone, Copy)]
+struct ProjectDirectoryId {
+    device: u64,
+    inode: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    created: Option<std::time::Duration>,
+}
+
+#[cfg(unix)]
+impl ProjectDirectoryId {
+    fn from_metadata(metadata: &std::fs::Metadata) -> Option<Self> {
+        use std::os::unix::fs::MetadataExt;
+        metadata.is_dir().then(|| Self {
+            device: metadata.dev(),
+            inode: metadata.ino(),
+            created: metadata.created().ok()
+                .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok()),
+        })
+    }
+}
+
+#[cfg(unix)]
+#[derive(Serialize, Deserialize)]
+struct ReviewedProjectScripts {
+    #[serde(flatten)]
+    scripts: ProjectScripts,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    reviewed_directory: Option<ProjectDirectoryId>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RecentProject {
     pub path: String,
@@ -1570,7 +1626,10 @@ impl DatabaseStore {
     }
 
     pub fn set_setting(&self, key: &str, value: &str) -> Result<(), String> {
-        let conn = self.conn.lock().unwrap();
+        Self::write_setting(&self.conn.lock().unwrap(), key, value)
+    }
+
+    fn write_setting(conn: &Connection, key: &str, value: &str) -> Result<(), String> {
         conn.execute(
             "INSERT INTO settings (user_id, key, value, updated_at) VALUES ('local', ?1, ?2, datetime('now'))
              ON CONFLICT(user_id, key) DO UPDATE SET value = ?2, updated_at = datetime('now')",
@@ -1669,15 +1728,28 @@ impl DatabaseStore {
 
     pub fn get_project_scripts(&self, project_root: &str) -> Option<ProjectScripts> {
         match dunce::canonicalize(project_root) {
-            Ok(path) => self.get_project_scripts_at(&path),
-            Err(_) => self
-                .get_setting(&format!("project.scripts:{project_root}"))
-                .and_then(|value| serde_json::from_str(&value).ok()),
+            Ok(path) => self.get_project_scripts_at(&path, None),
+            Err(_) => {
+                let saved = self.get_setting(&format!("project.scripts:{project_root}"))?;
+                #[cfg(unix)]
+                {
+                    let saved: ReviewedProjectScripts = serde_json::from_str(&saved).ok()?;
+                    saved.reviewed_directory.is_none().then_some(saved.scripts)
+                }
+                #[cfg(not(unix))]
+                serde_json::from_str(&saved).ok()
+            }
         }
     }
 
     /// Load settings for a root already resolved and validated by the caller.
-    pub(crate) fn get_project_scripts_at(&self, project_root: &Path) -> Option<ProjectScripts> {
+    pub(crate) fn get_project_scripts_at(
+        &self,
+        project_root: &Path,
+        held_directory: Option<&std::fs::File>,
+    ) -> Option<ProjectScripts> {
+        #[cfg(not(unix))]
+        let _ = held_directory;
         let key = format!("project.scripts:{}", project_root.to_str()?);
         let conn = self.conn.lock().unwrap();
         let saved: Option<String> = conn
@@ -1689,6 +1761,21 @@ impl DatabaseStore {
             .optional()
             .ok()?;
         if let Some(value) = saved {
+            #[cfg(unix)]
+            {
+                let saved: ReviewedProjectScripts = serde_json::from_str(&value).ok()?;
+                if let Some(expected) = saved.reviewed_directory {
+                    let metadata = match held_directory {
+                        Some(directory) => directory.metadata(),
+                        None => std::fs::metadata(project_root),
+                    }.ok()?;
+                    if ProjectDirectoryId::from_metadata(&metadata)? != expected {
+                        return None;
+                    }
+                }
+                return Some(saved.scripts);
+            }
+            #[cfg(not(unix))]
             return serde_json::from_str(&value).ok();
         }
         #[cfg(windows)]
@@ -1703,11 +1790,9 @@ impl DatabaseStore {
     pub(crate) fn legacy_project_scripts_for_review(
         &self,
         project_root: &str,
-    ) -> Option<(ProjectScripts, PathBuf)> {
+    ) -> Option<(ProjectScripts, ReviewedProjectRoot)> {
         let canonical = dunce::canonicalize(project_root).ok()?;
-        if !canonical.is_dir() {
-            return None;
-        }
+        let root = ReviewedProjectRoot::open(canonical).ok()?;
         let legacy_rows = {
             let conn = self.conn.lock().unwrap();
             let mut statement = conn
@@ -1721,29 +1806,38 @@ impl DatabaseStore {
                 .ok()?;
             rows.collect::<Result<Vec<_>, _>>().ok()?
         };
+        let mut canonical_draft = None;
+        let mut selected_draft = None;
         let mut candidate: Option<ProjectScripts> = None;
         let mut ambiguous = false;
         for (key, value) in legacy_rows {
             let old_path = key.strip_prefix("project.scripts:")?;
-            if canonical.to_str() == Some(old_path)
-                || !dunce::canonicalize(old_path).is_ok_and(|path| path == canonical)
-            {
+            if root.path.to_str() == Some(old_path) {
+                // A reviewed entry whose directory was replaced can be reviewed again.
+                if let Ok(stored) = serde_json::from_str::<ReviewedProjectScripts>(&value) {
+                    if stored.reviewed_directory.is_some() {
+                        canonical_draft = Some(stored.scripts);
+                    }
+                }
                 continue;
             }
-            let Ok(scripts) = serde_json::from_str(&value) else {
+            if !dunce::canonicalize(old_path).is_ok_and(|path| path == root.path) {
+                continue;
+            }
+            let Ok(scripts) = serde_json::from_str::<ProjectScripts>(&value) else {
                 continue;
             };
             if old_path == project_root {
-                // The user selected this particular legacy spelling.
-                return Some((scripts, canonical));
+                selected_draft = Some(scripts);
+                continue;
             }
             ambiguous |= candidate.as_ref().is_some_and(|previous| previous != &scripts);
             candidate = Some(scripts);
         }
-        if ambiguous {
-            return None;
-        }
-        candidate.map(|scripts| (scripts, canonical))
+        canonical_draft
+            .or(selected_draft)
+            .or_else(|| if ambiguous { None } else { candidate })
+            .map(|scripts| (scripts, root))
     }
 
     pub fn set_project_scripts(
@@ -1759,20 +1853,65 @@ impl DatabaseStore {
         self.write_project_scripts(project_root, scripts)
     }
 
-    /// An explicit review saves to the directory that Settings displayed.
+    /// Save to the held directory shown by Settings. The persisted identity
+    /// also prevents a later replacement at the same pathname from inheriting
+    /// the reviewed commands.
+    #[cfg(unix)]
     pub(crate) fn save_reviewed_project_scripts(
         &self,
-        path: &str,
+        root: &ReviewedProjectRoot,
         scripts: &ProjectScripts,
     ) -> Result<(), String> {
-        let canonical = dunce::canonicalize(path)
-            .map_err(|error| format!("Could not resolve the reviewed project: {error}"))?;
-        if canonical.to_str() != Some(path) || !canonical.is_dir() {
-            return Err("The reviewed project path changed. Reopen Settings and review the scripts again.".into());
+        let identity = root.identity().ok_or(REVIEWED_PROJECT_CHANGED)?;
+        let canonical = dunce::canonicalize(&root.path).map_err(|_| REVIEWED_PROJECT_CHANGED)?;
+        if canonical != root.path
+            || ReviewedProjectRoot::open(canonical).ok().and_then(|current| current.identity())
+                != Some(identity)
+        {
+            return Err(REVIEWED_PROJECT_CHANGED.into());
         }
-        self.write_project_scripts(path, scripts)
+        let path = root.path.to_str().ok_or("Project root is not valid Unicode")?;
+        let key = format!("project.scripts:{path}");
+        let value = serde_json::to_string(&ReviewedProjectScripts {
+            scripts: scripts.clone(),
+            reviewed_directory: Some(identity),
+        }).map_err(|error| error.to_string())?;
+        self.set_setting(&key, &value)
     }
 
+    #[cfg(unix)]
+    fn write_project_scripts(&self, project_root: &str, scripts: &ProjectScripts) -> Result<(), String> {
+        let key = format!("project.scripts:{project_root}");
+        let mut conn = self.conn.lock().unwrap();
+        let transaction = conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .map_err(|error| error.to_string())?;
+        let previous: Option<String> = transaction.query_row(
+            "SELECT value FROM settings WHERE user_id = 'local' AND key = ?1",
+            params![key],
+            |row| row.get(0),
+        ).optional().map_err(|error| error.to_string())?;
+        let reviewed_directory = previous.as_deref()
+            .and_then(|value| serde_json::from_str::<ReviewedProjectScripts>(value).ok())
+            .and_then(|stored| stored.reviewed_directory);
+        if let Some(expected) = reviewed_directory {
+            // An ordinary edit of a reviewed row must preserve its binding.
+            let actual = std::fs::symlink_metadata(project_root).ok()
+                .and_then(|metadata| ProjectDirectoryId::from_metadata(&metadata));
+            if actual != Some(expected) {
+                return Err(REVIEWED_PROJECT_CHANGED.into());
+            }
+        }
+
+        let value = serde_json::to_string(&ReviewedProjectScripts {
+            scripts: scripts.clone(),
+            reviewed_directory,
+        }).map_err(|error| error.to_string())?;
+        Self::write_setting(&transaction, &key, &value)?;
+        transaction.commit().map_err(|error| error.to_string())
+    }
+
+    #[cfg(not(unix))]
     fn write_project_scripts(&self, project_root: &str, scripts: &ProjectScripts) -> Result<(), String> {
         let key = format!("project.scripts:{project_root}");
         let value = serde_json::to_string(scripts).map_err(|e| e.to_string())?;

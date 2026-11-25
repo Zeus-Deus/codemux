@@ -1943,12 +1943,11 @@ async fn close_workspace_tracked<R: tauri::Runtime>(
                 commands,
             };
             if !teardown.commands.is_empty() && !attempt.already_ran(&teardown) {
-                let paths = Arc::new(paths);
-                let (title, id, checkpoint) = (ws_title.clone(), workspace_id.clone(), paths.guard(checkpoint.clone()));
+                let (title, id, checkpoint) = (ws_title.clone(), workspace_id.clone(), checkpoint.clone());
                 let running = attempt.clone();
                 torn_down = tokio::task::spawn_blocking(move || {
                     crate::scripts::run_teardown_scripts(
-                        paths.workspace(), paths.root(), &title, &id, &teardown.commands, &checkpoint,
+                        &paths, &title, &id, &teardown.commands, &checkpoint,
                     )?;
                     running.set_teardown(Some(teardown));
                     Ok(())
@@ -3613,7 +3612,7 @@ fn spawn_setup_scripts<R: tauri::Runtime>(
     checkpoint: &Checkpoint,
 ) {
     let paths = match crate::config::workspace_config::LifecyclePaths::resolve(workspace_path) {
-        Ok(paths) => Arc::new(paths),
+        Ok(paths) => paths,
         Err(error) => {
             eprintln!("[codemux::scripts] Setup failed for workspace {workspace_id}: {error}");
             return;
@@ -3635,13 +3634,13 @@ fn spawn_setup_scripts<R: tauri::Runtime>(
 
     let ws_id = workspace_id.to_string();
     let app2 = app.clone();
-    let checkpoint = paths.guard(checkpoint.background());
+    let checkpoint = checkpoint.background();
 
     std::thread::spawn(move || {
         // Wait for frontend to mount the overlay and register event listeners.
         std::thread::sleep(std::time::Duration::from_millis(500));
         if let Err(error) = crate::scripts::run_setup_pipeline(
-            paths.workspace(), paths.root(), &ws_title, &ws_id, &app2, Some(&config),
+            crate::scripts::ScriptLocation::Checked(&paths), &ws_title, &ws_id, &app2, Some(&config),
             ws_branch.as_deref(), Some(port), &checkpoint,
         ) {
             eprintln!("[codemux::scripts] Setup failed for workspace {ws_id}: {error}");

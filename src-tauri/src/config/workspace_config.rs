@@ -1,10 +1,9 @@
 use crate::database::DatabaseStore;
-use crate::workspace_service::Checkpoint;
 use cap_std::{ambient_authority, fs::Dir};
 use serde::{Deserialize, Serialize};
 use std::fs::File;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::process::{Child, Command};
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct WorkspaceConfig {
@@ -121,7 +120,7 @@ impl LifecyclePaths {
         &self.root
     }
 
-    fn check(&self) -> Result<(), String> {
+    pub(crate) fn check(&self) -> Result<(), String> {
         if !directory_unchanged(&self.cwd, &self.cwd_dir) {
             return Err("Workspace directory changed after lifecycle commands were selected".into());
         }
@@ -135,16 +134,38 @@ impl LifecyclePaths {
         Ok(())
     }
 
-    pub(crate) fn guard(self: &Arc<Self>, checkpoint: Checkpoint) -> Checkpoint {
-        let paths = Arc::clone(self);
-        Checkpoint::new(move || {
-            checkpoint.check()?;
-            paths.check()
-        })
+    #[cfg(unix)]
+    pub(crate) fn spawn(&self, cmd: &mut Command) -> std::io::Result<Child> {
+        use std::os::fd::AsRawFd;
+        use std::os::unix::process::CommandExt;
+
+        let cwd = self.cwd_dir.try_clone()?;
+        // SAFETY: The descriptor stays open through the callback. The child
+        // only calls async-signal-safe fchdir and reads errno on failure.
+        unsafe {
+            cmd.pre_exec(move || {
+                if libc::fchdir(cwd.as_raw_fd()) == 0 {
+                    Ok(())
+                } else {
+                    Err(std::io::Error::last_os_error())
+                }
+            });
+        }
+        cmd.spawn()
+    }
+
+    #[cfg(windows)]
+    pub(crate) fn spawn(&self, cmd: &mut Command) -> std::io::Result<Child> {
+        let _directories = lock_workspace_path(&self.cwd, &self.cwd_dir)?;
+        cmd.current_dir(&self.cwd).spawn()
     }
 
     pub(crate) fn saved_config(&self, db: &DatabaseStore) -> Option<WorkspaceConfig> {
-        read_saved_config_at(&self.checkout, &self.root, db)
+        read_saved_config_at(&self.checkout, &self.root, Some(&self.root_dir), db)
+    }
+
+    pub(crate) fn permits_include_copy(&self) -> bool {
+        self.checkout == self.root || is_registered_checkout(&self.checkout, &self.root)
     }
 
     /// Repository configuration still supplies include patterns. Only
@@ -188,6 +209,40 @@ fn same_directory(left: &File, right: &File) -> std::io::Result<bool> {
     Ok(file_id(left)? == file_id(right)?)
 }
 
+#[cfg(windows)]
+fn lock_workspace_path(path: &Path, expected: &File) -> std::io::Result<Vec<File>> {
+    use std::fs::OpenOptions;
+    use std::io::{Error, ErrorKind};
+    use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS,
+        FILE_FLAG_OPEN_REPARSE_POINT, FILE_LIST_DIRECTORY, FILE_READ_ATTRIBUTES, FILE_SHARE_READ,
+    };
+
+    // CreateProcess takes a pathname. Hold each component from the volume
+    // root down, excluding writers and renames, until that call returns.
+    let mut ancestors: Vec<_> = path.ancestors().collect();
+    let mut held = Vec::with_capacity(ancestors.len());
+    let changed = || Error::other("Workspace directory changed before starting the command");
+    while let Some(directory) = ancestors.pop() {
+        let handle = OpenOptions::new()
+            .access_mode(FILE_LIST_DIRECTORY | FILE_READ_ATTRIBUTES)
+            .share_mode(FILE_SHARE_READ)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
+            .open(directory)?;
+        let metadata = handle.metadata()?;
+        if !metadata.is_dir() || metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+            return Err(changed());
+        }
+        held.push(handle);
+    }
+    let leaf = held.last().ok_or_else(|| Error::new(ErrorKind::InvalidInput, "Missing workspace directory"))?;
+    if !same_directory(leaf, expected)? {
+        return Err(changed());
+    }
+    Ok(held)
+}
+
 fn resolve_project_paths(cwd: &Path) -> std::io::Result<(PathBuf, PathBuf)> {
     let checkout = find_git_checkout(cwd).unwrap_or(cwd);
     let root = match resolve_worktree_git_file(&checkout.join(".git")) {
@@ -203,27 +258,30 @@ pub(crate) fn read_saved_config(workspace_path: &Path, db: &DatabaseStore) -> Op
         return None;
     }
     let (checkout, root) = resolve_project_paths(&cwd).ok()?;
-    read_saved_config_at(&checkout, &root, db)
+    read_saved_config_at(&checkout, &root, None, db)
 }
 
 fn read_saved_config_at(
     checkout: &Path,
     root: &Path,
+    held_root: Option<&File>,
     db: &DatabaseStore,
 ) -> Option<WorkspaceConfig> {
-    let scripts = db.get_project_scripts_at(root)?;
-    // A .git file is untrusted. Even a linked directory inside the main
-    // tree must be registered as this project's worktree to inherit consent.
-    if checkout != root
-        && !crate::git::git_list_worktrees(root)
-            .ok()?
-            .into_iter()
-            .filter(|worktree| !worktree.is_bare)
-            .any(|worktree| dunce::canonicalize(&worktree.path).is_ok_and(|path| path == checkout))
-    {
+    let scripts = db.get_project_scripts_at(root, held_root)?;
+    if checkout != root && !is_registered_checkout(checkout, root) {
         return None;
     }
     Some(saved_workspace_config(scripts))
+}
+
+fn is_registered_checkout(checkout: &Path, root: &Path) -> bool {
+    // A .git file alone cannot authorize access to a different project.
+    crate::git::git_list_worktrees(root).is_ok_and(|worktrees| {
+        worktrees.into_iter().any(|worktree| {
+            !worktree.is_bare
+                && dunce::canonicalize(&worktree.path).is_ok_and(|path| path == checkout)
+        })
+    })
 }
 
 fn saved_workspace_config(scripts: crate::database::ProjectScripts) -> WorkspaceConfig {
@@ -239,6 +297,24 @@ fn saved_workspace_config(scripts: crate::database::ProjectScripts) -> Workspace
 mod tests {
     use super::*;
     use std::fs;
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_workspace_launch_locks_ancestors_and_refuses_a_replaced_directory() {
+        let fixture = tempfile::tempdir().unwrap();
+        let ancestor = fixture.path().join("project");
+        let cwd = ancestor.join("workspace");
+        let moved = fixture.path().join("previous");
+        fs::create_dir_all(&cwd).unwrap();
+        let paths = LifecyclePaths::resolve(&cwd).unwrap();
+        let held = lock_workspace_path(&paths.cwd, &paths.cwd_dir).unwrap();
+        assert!(fs::rename(&ancestor, &moved).is_err());
+        drop(held);
+
+        fs::rename(&ancestor, &moved).unwrap();
+        fs::create_dir_all(&cwd).unwrap();
+        assert!(lock_workspace_path(&paths.cwd, &paths.cwd_dir).is_err());
+    }
 
     #[test]
     fn test_read_config_from_workspace_dir() {
@@ -444,64 +520,6 @@ mod tests {
 
         let explicit = read_effective_config(dir.path(), &db).unwrap();
         assert_eq!(explicit.setup, ["repo-setup"]);
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn legacy_project_script_paths_require_review_before_running() {
-        let dir = tempfile::tempdir().unwrap();
-        let project = dir.path().join("project");
-        let alias = dir.path().join("old-project");
-        fs::create_dir(&project).unwrap();
-        std::os::unix::fs::symlink(&project, &alias).unwrap();
-        let project = dunce::canonicalize(&project).unwrap();
-
-        let db = crate::database::init_test_database();
-        let scripts = crate::database::ProjectScripts {
-            setup: vec!["setup fixture".into()],
-            teardown: vec!["teardown fixture".into()],
-            run: Some("run fixture".into()),
-            ..Default::default()
-        };
-        db.set_setting(
-            &format!("project.scripts:{}", alias.display()),
-            &serde_json::to_string(&scripts).unwrap(),
-        )
-        .unwrap();
-
-        let (draft, reviewed_root) = db
-            .legacy_project_scripts_for_review(project.to_str().unwrap())
-            .unwrap();
-        assert_eq!(&draft, &scripts);
-        assert_eq!(reviewed_root, project);
-        assert!(read_saved_config(&project, &db).is_none());
-        assert!(read_saved_config(&alias, &db).is_none());
-
-        db.save_reviewed_project_scripts(reviewed_root.to_str().unwrap(), &draft)
-            .unwrap();
-        let automatic = LifecyclePaths::resolve(&project).unwrap().automatic_config(&db);
-        assert_eq!(automatic.setup, scripts.setup);
-        assert_eq!(automatic.teardown, scripts.teardown);
-        assert_eq!(automatic.run, scripts.run);
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn reviewed_scripts_cannot_follow_a_replaced_canonical_path() {
-        let dir = tempfile::tempdir().unwrap();
-        let project = dir.path().join("project");
-        let other = dir.path().join("other");
-        fs::create_dir(&project).unwrap();
-        fs::create_dir(&other).unwrap();
-        let reviewed = dunce::canonicalize(&project).unwrap();
-        fs::remove_dir(&project).unwrap();
-        std::os::unix::fs::symlink(&other, &project).unwrap();
-
-        let db = crate::database::init_test_database();
-        assert!(db
-            .save_reviewed_project_scripts(reviewed.to_str().unwrap(), &Default::default())
-            .is_err());
-        assert!(read_saved_config(&other, &db).is_none());
     }
 
     #[test]

@@ -1161,6 +1161,7 @@ describe("Settings → Projects", () => {
       run: "npm run dev",
       worktree_includes: [],
       review_root: "/private/tmp/proj",
+      review_id: "fixture-review",
     });
     render(<SettingsView />);
 
@@ -1178,8 +1179,29 @@ describe("Settings → Projects", () => {
       teardown: ["npm run cleanup"],
       run: "npm run dev",
       worktree_includes: [],
-    }, true);
+    }, "fixture-review");
     await waitFor(() => expect(save).not.toBeInTheDocument());
+  });
+
+  it("disables saving after the reviewed directory changes", async () => {
+    vi.mocked(commands.getProjectScriptsForReview).mockResolvedValueOnce({
+      setup: ["npm ci"],
+      teardown: [],
+      run: null,
+      worktree_includes: [],
+      review_root: "/private/tmp/proj",
+      review_id: "fixture-invalidated-review",
+    });
+    vi.mocked(commands.setProjectScripts)
+      .mockRejectedValueOnce("The reviewed project changed. Reopen Settings and review the scripts again.");
+    render(<SettingsView />);
+
+    fireEvent.click(await screen.findByRole("button", { name: "Save reviewed scripts" }));
+    expect(await screen.findByRole("alert")).toHaveTextContent("The reviewed project changed.");
+    const setup = screen.getByPlaceholderText("e.g. npm install");
+    expect(setup).toBeDisabled();
+    fireEvent.blur(setup);
+    expect(commands.setProjectScripts).toHaveBeenCalledTimes(1);
   });
 
   it("cannot save the previous project's values while the new project is loading", async () => {

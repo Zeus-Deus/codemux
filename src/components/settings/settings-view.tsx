@@ -1794,7 +1794,7 @@ export function SettingsView() {
   currentScriptsRoot.current = scriptsRoot;
   const [loadedScriptsRoot, setLoadedScriptsRoot] = useState<string | null>(null);
   const [scriptsLoadError, setScriptsLoadError] = useState<string | null>(null);
-  const [reviewRoot, setReviewRoot] = useState<string | null>(null);
+  const [scriptReview, setScriptReview] = useState<{ root: string; id: string } | null>(null);
   const [reviewSaving, setReviewSaving] = useState(false);
   const scriptsReady = loadedScriptsRoot === scriptsRoot && savedScripts.current?.root === scriptsRoot;
   const [savedField, setSavedField] = useState<ProjectField | "review" | null>(null);
@@ -1811,7 +1811,7 @@ export function SettingsView() {
     savedScripts.current = null;
     setLoadedScriptsRoot(null);
     setScriptsLoadError(null);
-    setReviewRoot(null);
+    setScriptReview(null);
     setReviewSaving(false);
     setSetupScripts("");
     setTeardownScripts("");
@@ -1828,11 +1828,17 @@ export function SettingsView() {
     const readScripts = isRemoteClient() ? getProjectScripts : getProjectScriptsForReview;
     readScripts(scriptsRoot).then((scripts) => {
       if (stale) return;
-      setReviewRoot(
-        scripts && "review_root" in scripts && typeof scripts.review_root === "string"
-          ? scripts.review_root
-          : null,
-      );
+      if (scripts && "review_root" in scripts && scripts.review_root !== undefined) {
+        if (
+          typeof scripts.review_root !== "string" ||
+          !("review_id" in scripts) ||
+          typeof scripts.review_id !== "string"
+        ) {
+          setScriptsLoadError("Could not verify the project for script review.");
+          return;
+        }
+        setScriptReview({ root: scripts.review_root, id: scripts.review_id });
+      }
       const setup = scripts?.setup.join("\n") ?? "";
       const teardown = scripts?.teardown.join("\n") ?? "";
       const run = scripts?.run ?? "";
@@ -1867,7 +1873,7 @@ export function SettingsView() {
     const owner = savedScripts.current;
     if (!scriptsRoot || !scriptsReady || owner?.root !== scriptsRoot) return;
     const reviewing = field === "review";
-    if (reviewing !== Boolean(reviewRoot) || reviewSaving) return;
+    if (reviewing !== Boolean(scriptReview) || reviewSaving) return;
     const root = scriptsRoot;
     const generation = owner.generation;
     const scripts = projectScriptsFrom(
@@ -1882,19 +1888,27 @@ export function SettingsView() {
     const saveGeneration = ++scriptSaveGeneration.current;
     const stillCurrent = () => currentScriptsRoot.current === root &&
       scriptsGeneration.current === generation && scriptSaveGeneration.current === saveGeneration;
-    const saved = reviewRoot ? setProjectScripts(reviewRoot, scripts, true) : setProjectScripts(root, scripts);
+    const saved = scriptReview
+      ? setProjectScripts(scriptReview.root, scripts, scriptReview.id)
+      : setProjectScripts(root, scripts);
     saved
       .then(() => {
         if (!stillCurrent()) return;
         savedScripts.current = { root, generation, snapshot };
-        setReviewRoot(null);
+        setScriptReview(null);
         setSavedField(field);
         setSavedVisible(true);
         if (savedTimer.current) clearTimeout(savedTimer.current);
         savedTimer.current = setTimeout(() => setSavedVisible(false), 1500);
       })
       .catch((error) => {
-        if (stillCurrent()) reportFailure(`Couldn't save ${basename(root)}'s scripts`)(error);
+        if (!stillCurrent()) return;
+        if (reviewing) {
+          setScriptReview(null);
+          setLoadedScriptsRoot(null);
+          setScriptsLoadError(String(error));
+        }
+        reportFailure(`Couldn't save ${basename(root)}'s scripts`)(error);
       })
       .finally(() => {
         if (reviewing && stillCurrent()) setReviewSaving(false);
@@ -2815,7 +2829,7 @@ export function SettingsView() {
           <div>
             <SectionHeader
               title="Projects"
-              description={reviewRoot
+              description={scriptReview
                 ? "Lifecycle scripts and worktree files for each project."
                 : "Lifecycle scripts and worktree files for each project. Changes save when you leave a field."}
               action={
@@ -2845,12 +2859,12 @@ export function SettingsView() {
                 </p>
               </SettingsCard>
             )}
-            {scriptsReady && reviewRoot && (
+            {scriptsReady && scriptReview && (
               <SettingsCard className="mb-6 space-y-3">
                 <p className="text-body-sm text-muted-foreground">
                   These scripts were saved under an earlier path. Review them below before
                   saving them for this project.
-                  <code className="mt-1 block break-all font-mono">{reviewRoot}</code>
+                  <code className="mt-1 block break-all font-mono">{scriptReview.root}</code>
                 </p>
                 <Button
                   variant="outline"
