@@ -22,18 +22,22 @@ use serde::{Deserialize, Serialize};
 
 /// Step 8 Stage 2 — content tier thresholds. Mirrors the locked
 /// research decision: full inline for files ≤200KB AND ≤1500 lines;
-/// first-50 + outline for anything larger.
+/// bounded first-50 preview + outline for anything larger.
 const FULL_CONTENT_BYTES_LIMIT: u64 = 200 * 1024;
 const FULL_CONTENT_LINE_LIMIT: usize = 1500;
 const TRUNCATED_PREVIEW_LINES: usize = 50;
 const BINARY_SNIFF_BYTES: usize = 8 * 1024;
+/// A workspace file can be much larger than the attachment preview. Stop
+/// scanning after this many text bytes instead of loading the whole file.
+const MAX_ATTACHMENT_TEXT_BYTES: usize = 8 * 1024 * 1024;
+const MAX_ATTACHMENT_PREVIEW_BYTES: usize = 32 * 1024;
+const MAX_ATTACHMENT_OUTLINE_ENTRIES: usize = 200;
 
 /// Step 8 Stage 3 — folder-tree rendering caps. Walking is bounded by
-/// the caller's `max_depth`; truncation kicks in at this many entries
-/// to keep injected blocks budget-friendly. The walker itself
-/// continues so `item_count` reflects the true total — only the
-/// rendered tree is cut.
+/// depth and visits; the rendered tree uses at most this many entries.
 const FOLDER_TREE_MAX_ENTRIES: usize = 100;
+const FOLDER_WALK_MAX_VISITS: usize = 10_000;
+const FOLDER_WALK_MAX_DEPTH: usize = 8;
 
 /// Convert a `Path` (or path string) to a forward-slash-separated string
 /// for the frontend. On Linux/macOS this is a no-op. On Windows the
@@ -417,16 +421,17 @@ pub struct FolderAttachmentInfo {
     pub relative_path: Option<String>,
     /// Pre-rendered unicode tree, depth-bounded by the caller's
     /// `max_depth`. Truncated at FOLDER_TREE_MAX_ENTRIES with a
-    /// trailing "… N more entries" marker; `item_count` reports the
-    /// true total before truncation.
+    /// trailing marker. `item_count` is a lower bound when the walk cap
+    /// stops enumeration.
     pub tree: String,
     pub item_count: usize,
+    pub item_count_lower_bound: bool,
 }
 
 /// Read a folder for attachment. Walks the directory depth-bounded
 /// (caller-supplied `max_depth`), respects `.gitignore` via the same
 /// `ignore` walker as the file list, renders a unicode-tree preview,
-/// and reports the true item count even when the tree is truncated.
+/// and reports the item count seen before the bounded walk stops.
 #[tauri::command]
 pub async fn read_folder_for_attachment(
     absolute_path: String,
@@ -445,13 +450,24 @@ fn read_folder_for_attachment_blocking(
     cwd: Option<String>,
     max_depth: usize,
 ) -> Result<FolderAttachmentInfo, String> {
+    read_folder_for_attachment_with_limit(absolute_path, cwd, max_depth, FOLDER_WALK_MAX_VISITS)
+}
+
+fn read_folder_for_attachment_with_limit(
+    absolute_path: String,
+    cwd: Option<String>,
+    max_depth: usize,
+    max_visits: usize,
+) -> Result<FolderAttachmentInfo, String> {
     let path = Path::new(&absolute_path);
     if !path.is_dir() {
         return Err(format!("not a directory: {absolute_path}"));
     }
-    let depth = max_depth.max(1);
+    let depth = max_depth.clamp(1, FOLDER_WALK_MAX_DEPTH);
 
     let mut entries: Vec<(PathBuf, bool)> = Vec::new();
+    let mut item_count_lower_bound = false;
+    let mut visits = 0;
     let walker = WalkBuilder::new(path)
         .hidden(false)
         .git_ignore(true)
@@ -463,7 +479,17 @@ fn read_folder_for_attachment_blocking(
         .max_depth(Some(depth))
         .build();
     for result in walker {
-        let Ok(entry) = result else { continue };
+        // Count every yielded visit, including the root and errors. A hostile
+        // folder must not make a 100-entry preview enumerate millions of paths.
+        if visits >= max_visits {
+            item_count_lower_bound = true;
+            break;
+        }
+        visits += 1;
+        let Ok(entry) = result else {
+            item_count_lower_bound = true;
+            continue;
+        };
         // The walker emits the root itself first — skip it; we only
         // want descendants.
         if entry.depth() == 0 {
@@ -508,7 +534,7 @@ fn read_folder_for_attachment_blocking(
     });
 
     let item_count = entries.len();
-    let tree = render_tree(path, &entries, FOLDER_TREE_MAX_ENTRIES);
+    let tree = render_tree(path, &entries, FOLDER_TREE_MAX_ENTRIES, item_count_lower_bound);
 
     let relative_path = cwd
         .as_deref()
@@ -528,15 +554,20 @@ fn read_folder_for_attachment_blocking(
         relative_path,
         tree,
         item_count,
+        item_count_lower_bound,
     })
 }
 
 /// Render a sorted entry list as a unicode tree. Each line carries
 /// the appropriate `├──`, `└──`, or `│   ` prefix based on its
 /// relationship to siblings at the same depth.
-fn render_tree(root: &Path, entries: &[(PathBuf, bool)], cap: usize) -> String {
+fn render_tree(root: &Path, entries: &[(PathBuf, bool)], cap: usize, count_lower_bound: bool) -> String {
     if entries.is_empty() {
-        return "(empty)".to_string();
+        return if count_lower_bound {
+            "(no scanned entries; additional entries may be omitted)".to_string()
+        } else {
+            "(empty)".to_string()
+        };
     }
 
     // For a tree renderer to compute the right prefix at each depth,
@@ -544,8 +575,8 @@ fn render_tree(root: &Path, entries: &[(PathBuf, bool)], cap: usize) -> String {
     // child group. Walk the sorted list and, for each entry, find
     // whether the next entry shares the same parent — if not, this
     // entry is the last sibling.
-    let mut last_at_depth: Vec<bool> = Vec::with_capacity(entries.len());
-    for i in 0..entries.len() {
+    let mut last_at_depth: Vec<bool> = Vec::with_capacity(entries.len().min(cap));
+    for i in 0..entries.len().min(cap) {
         let (cur, _) = &entries[i];
         let cur_parent = cur.parent();
         let mut is_last = true;
@@ -623,7 +654,13 @@ fn render_tree(root: &Path, entries: &[(PathBuf, bool)], cap: usize) -> String {
 
     if truncated {
         let more = entries.len() - cap;
-        out.push(format!("… {more} more entries"));
+        out.push(if count_lower_bound {
+            format!("… {more} more scanned entries; additional entries may be omitted")
+        } else {
+            format!("… {more} more entries")
+        });
+    } else if count_lower_bound {
+        out.push("… additional entries may be omitted".to_string());
     }
 
     out.join("\n")
@@ -642,6 +679,9 @@ pub struct FileAttachmentInfo {
     pub absolute_path: String,
     pub relative_path: Option<String>,
     pub line_count: usize,
+    /// True when scanning stopped at the text-byte limit; `line_count`
+    /// then counts only the scanned prefix.
+    pub line_count_lower_bound: bool,
     pub bytes: u64,
     pub language: Option<String>,
     pub is_text: bool,
@@ -651,7 +691,7 @@ pub struct FileAttachmentInfo {
 }
 
 /// Read a file for attachment. Full content for small files
-/// (≤200KB AND ≤1500 lines); first-50 + outline for larger files.
+/// (≤200KB AND ≤1500 lines); bounded preview + outline for larger files.
 /// Binary files return `is_text: false` with empty content. Errors
 /// only on actual I/O failures (missing path, permission denied) —
 /// not on "file too large" or "binary" since both are normal cases
@@ -681,7 +721,7 @@ fn read_file_for_attachment_blocking(
 
     let file = std::fs::File::open(path)
         .map_err(|e| format!("read failed for {absolute_path}: {e}"))?;
-    let raw = read_attachment_bytes(file)
+    let (raw, line_count_lower_bound) = read_attachment_bytes(file)
         .map_err(|e| format!("read failed for {absolute_path}: {e}"))?;
 
     let language = path
@@ -707,6 +747,7 @@ fn read_file_for_attachment_blocking(
             absolute_path,
             relative_path,
             line_count: 0,
+            line_count_lower_bound: false,
             bytes,
             language,
             is_text: false,
@@ -721,14 +762,17 @@ fn read_file_for_attachment_blocking(
     let content = String::from_utf8_lossy(&raw).into_owned();
     let line_count = content.lines().count();
 
-    let fits_inline =
-        bytes <= FULL_CONTENT_BYTES_LIMIT && line_count <= FULL_CONTENT_LINE_LIMIT;
+    let fits_inline = !line_count_lower_bound
+        && bytes <= FULL_CONTENT_BYTES_LIMIT
+        && content.len() <= FULL_CONTENT_BYTES_LIMIT as usize
+        && line_count <= FULL_CONTENT_LINE_LIMIT;
 
     if fits_inline {
         return Ok(FileAttachmentInfo {
             absolute_path,
             relative_path,
             line_count,
+            line_count_lower_bound: false,
             bytes,
             language: language.clone(),
             is_text: true,
@@ -739,17 +783,14 @@ fn read_file_for_attachment_blocking(
     }
 
     // Truncated path — preview + outline.
-    let preview: String = content
-        .lines()
-        .take(TRUNCATED_PREVIEW_LINES)
-        .collect::<Vec<_>>()
-        .join("\n");
+    let preview = bounded_preview(&content);
     let outline = extract_outline(&content, language.as_deref());
 
     Ok(FileAttachmentInfo {
         absolute_path,
         relative_path,
         line_count,
+        line_count_lower_bound,
         bytes,
         language,
         is_text: true,
@@ -759,18 +800,49 @@ fn read_file_for_attachment_blocking(
     })
 }
 
-fn read_attachment_bytes(mut reader: impl Read) -> std::io::Result<Vec<u8>> {
+fn read_attachment_bytes(mut reader: impl Read) -> std::io::Result<(Vec<u8>, bool)> {
     let mut raw = Vec::new();
     reader
         .by_ref()
         .take(BINARY_SNIFF_BYTES as u64)
         .read_to_end(&mut raw)?;
-    // Binary attachments only expose metadata. Text still needs a full
-    // read for exact line counts and outlines beyond the preview.
-    if !is_binary(&raw) {
-        reader.read_to_end(&mut raw)?;
+    // Binary attachments only expose metadata. Text reads at most one byte
+    // beyond the cap so a growing file is bounded even if metadata is stale.
+    if is_binary(&raw) {
+        return Ok((raw, false));
     }
-    Ok(raw)
+    reader
+        .take((MAX_ATTACHMENT_TEXT_BYTES + 1 - raw.len()) as u64)
+        .read_to_end(&mut raw)?;
+    let lower_bound = raw.len() > MAX_ATTACHMENT_TEXT_BYTES;
+    raw.truncate(MAX_ATTACHMENT_TEXT_BYTES);
+    Ok((raw, lower_bound))
+}
+
+fn bounded_preview(content: &str) -> String {
+    let mut preview = String::new();
+    let mut first = true;
+    for line in content.lines().take(TRUNCATED_PREVIEW_LINES) {
+        let separator = usize::from(!first);
+        let room = MAX_ATTACHMENT_PREVIEW_BYTES.saturating_sub(preview.len() + separator);
+        if room == 0 {
+            break;
+        }
+        if separator != 0 {
+            preview.push('\n');
+        }
+        first = false;
+        if line.len() > room {
+            let mut end = room;
+            while !line.is_char_boundary(end) {
+                end -= 1;
+            }
+            preview.push_str(&line[..end]);
+            break;
+        }
+        preview.push_str(line);
+    }
+    preview
 }
 
 fn is_binary(bytes: &[u8]) -> bool {
@@ -856,27 +928,13 @@ fn extract_outline(content: &str, language: Option<&str>) -> Vec<OutlineEntry> {
     let Some(spec) = select_outline(language) else {
         return Vec::new();
     };
-    // Pre-compute byte-offset → line-number map by walking the content
-    // once. Outline regex matches give us byte offsets via `caps.get(0)
-    // .start()`; converting through this map keeps line lookup O(1)
-    // per match instead of re-scanning the prefix per match.
-    let line_starts: Vec<usize> = std::iter::once(0)
-        .chain(
-            content
-                .char_indices()
-                .filter_map(|(i, c)| if c == '\n' { Some(i + 1) } else { None }),
-        )
-        .collect();
-
-    let line_for_offset = |offset: usize| -> usize {
-        match line_starts.binary_search(&offset) {
-            Ok(idx) => idx + 1,
-            Err(idx) => idx, // first index strictly greater → that's our 1-indexed line
-        }
-    };
-
     let mut out = Vec::new();
+    let mut scanned_to = 0;
+    let mut line = 1;
     for caps in spec.re.captures_iter(content) {
+        if out.len() >= MAX_ATTACHMENT_OUTLINE_ENTRIES {
+            break;
+        }
         let Some(name_match) = caps.get(spec.name_capture) else {
             continue;
         };
@@ -892,15 +950,17 @@ fn extract_outline(content: &str, language: Option<&str>) -> Vec<OutlineEntry> {
         if kind.is_empty() {
             continue;
         }
-        let name = name_match.as_str().trim().to_string();
+        let name: String = name_match.as_str().trim().chars().take(160).collect();
         if name.is_empty() {
             continue;
         }
         let offset = caps.get(0).map(|m| m.start()).unwrap_or(0);
+        line += content[scanned_to..offset].bytes().filter(|b| *b == b'\n').count();
+        scanned_to = offset;
         out.push(OutlineEntry {
             kind,
             name,
-            line: line_for_offset(offset),
+            line,
         });
     }
     out
@@ -1368,8 +1428,9 @@ mod tests {
         let mut prefix = vec![b'x'; BINARY_SNIFF_BYTES];
         prefix[BINARY_SNIFF_BYTES - 1] = 0;
         let header = std::io::Cursor::new(&prefix);
-        let raw = read_attachment_bytes(header.chain(UnreadableTail)).unwrap();
+        let (raw, lower_bound) = read_attachment_bytes(header.chain(UnreadableTail)).unwrap();
         assert_eq!(raw, prefix);
+        assert!(!lower_bound);
         assert!(is_binary(&raw));
     }
 
@@ -1379,9 +1440,38 @@ mod tests {
         // Preserve the existing boundary: a NUL immediately after the
         // sniff window does not classify an attachment as binary.
         content[BINARY_SNIFF_BYTES] = 0;
-        let raw = read_attachment_bytes(std::io::Cursor::new(&content)).unwrap();
+        let (raw, lower_bound) = read_attachment_bytes(std::io::Cursor::new(&content)).unwrap();
         assert_eq!(raw, content);
+        assert!(!lower_bound);
         assert!(!is_binary(&raw));
+    }
+
+    #[test]
+    fn attachment_text_stops_reading_an_unbounded_source() {
+        let (raw, lower_bound) = read_attachment_bytes(std::io::repeat(b'x')).unwrap();
+        assert_eq!(raw.len(), MAX_ATTACHMENT_TEXT_BYTES);
+        assert!(lower_bound);
+        assert!(bounded_preview(&String::from_utf8(raw).unwrap()).len() <= MAX_ATTACHMENT_PREVIEW_BYTES);
+    }
+
+    #[test]
+    fn attachment_outline_limits_declarations_without_losing_line_numbers() {
+        let content = (0..500)
+            .map(|n| format!("fn item_{n}() {{}}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let outline = extract_outline(&content, Some("rs"));
+        assert_eq!(outline.len(), MAX_ATTACHMENT_OUTLINE_ENTRIES);
+        assert_eq!(outline.last().unwrap().line, MAX_ATTACHMENT_OUTLINE_ENTRIES);
+    }
+
+    #[test]
+    fn attachment_preview_preserves_blank_lines_and_utf8_at_the_byte_limit() {
+        let content = format!("\n\n{}", "é".repeat(MAX_ATTACHMENT_PREVIEW_BYTES));
+        let preview = bounded_preview(&content);
+        assert!(preview.starts_with("\n\n"));
+        assert!(preview.len() <= MAX_ATTACHMENT_PREVIEW_BYTES);
+        assert!(preview.is_char_boundary(preview.len()));
     }
 
     #[tokio::test]
@@ -1869,6 +1959,7 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(info.item_count, 150);
+        assert!(!info.item_count_lower_bound);
         assert!(
             info.tree.contains("more entries"),
             "truncation marker missing: tree starts with {}",
@@ -1876,6 +1967,57 @@ mod tests {
         );
         // The "more" line wraps the truncated count.
         assert!(info.tree.contains("50 more"));
+    }
+
+    #[test]
+    fn read_folder_bounds_walks_before_sorting_or_rendering() {
+        let dir = tempdir().unwrap();
+        for i in 0..20 {
+            fs::write(dir.path().join(format!("file_{i:03}.txt")), "x").unwrap();
+        }
+        let info = read_folder_for_attachment_with_limit(
+            dir.path().to_string_lossy().into_owned(),
+            None,
+            1,
+            4,
+        ).unwrap();
+        assert!(info.item_count_lower_bound);
+        assert!(info.item_count <= 3, "the root counts against the visit budget");
+        assert!(info.tree.contains("additional entries may be omitted"));
+    }
+
+    #[test]
+    fn bounded_folder_with_no_scanned_entries_is_not_reported_empty() {
+        let dir = tempdir().unwrap();
+        fs::write(dir.path().join("file.txt"), "x").unwrap();
+        let info = read_folder_for_attachment_with_limit(
+            dir.path().to_string_lossy().into_owned(),
+            None,
+            1,
+            0,
+        )
+        .unwrap();
+        assert_eq!(info.item_count, 0);
+        assert!(info.item_count_lower_bound);
+        assert!(info.tree.contains("additional entries may be omitted"));
+    }
+
+    #[test]
+    fn read_folder_clamps_untrusted_depth() {
+        let dir = tempdir().unwrap();
+        let mut nested = dir.path().to_path_buf();
+        for depth in 1..=FOLDER_WALK_MAX_DEPTH + 1 {
+            nested.push(format!("level_{depth}"));
+            fs::create_dir(&nested).unwrap();
+        }
+        let info = read_folder_for_attachment_blocking(
+            dir.path().to_string_lossy().into_owned(),
+            None,
+            usize::MAX,
+        )
+        .unwrap();
+        assert_eq!(info.item_count, FOLDER_WALK_MAX_DEPTH);
+        assert!(!info.tree.contains(&format!("level_{}", FOLDER_WALK_MAX_DEPTH + 1)));
     }
 
     #[tokio::test]

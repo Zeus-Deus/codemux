@@ -241,10 +241,12 @@ export function AttachmentChip({
     typeof metadata.lineCount === "number";
   const lineCountLabel =
     typeof metadata.lineCount === "number" && !isTruncatedFile
-      ? `${metadata.lineCount}L`
+      ? `${metadata.lineCountLowerBound ? "≥" : ""}${metadata.lineCount}L`
       : null;
   const truncationLabel = isTruncatedFile
-    ? `first 50/${metadata.lineCount}L`
+    ? metadata.lineCountLowerBound
+      ? `preview/≥${metadata.lineCount}L`
+      : `preview/${metadata.lineCount}L`
     : null;
   const tokenEstimate = estimateTokens(attachment);
   const showExpand =
@@ -444,6 +446,7 @@ export function AttachmentChip({
         {attachment.kind === "file" &&
           typeof metadata.lineCount === "number" && (
           <div className="text-caption opacity-70">
+            {metadata.lineCountLowerBound ? "At least " : ""}
             {metadata.lineCount.toLocaleString()} lines
             {typeof metadata.bytes === "number"
               ? ` · ${metadata.bytes.toLocaleString()} bytes`

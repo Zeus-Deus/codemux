@@ -2146,6 +2146,7 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
             metadata: {
               label: filename,
               lineCount: info.lineCount,
+              lineCountLowerBound: info.lineCountLowerBound,
               bytes: info.bytes,
               isTruncated: info.truncated,
               isLoading: false,

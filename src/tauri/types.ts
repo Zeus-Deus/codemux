@@ -1720,7 +1720,9 @@ export interface FolderAttachmentInfo {
    *  `max_depth`. Truncated at 100 entries with a trailing
    *  "… N more entries" marker. */
   tree: string;
+  /** Exact unless the backend stopped at its folder-walk limit. */
   itemCount: number;
+  itemCountLowerBound?: boolean;
 }
 
 /** Backend response for `read_file_for_attachment` (Step 8 Stage 2).
@@ -1732,8 +1734,9 @@ export interface FileAttachmentInfo {
   absolutePath: string;
   /** Path relative to `cwd` if the file is under it; else null. */
   relativePath: string | null;
-  /** Total line count of the file (not of the truncated preview). */
+  /** Total line count, or count of the scanned prefix when bounded. */
   lineCount: number;
+  lineCountLowerBound?: boolean;
   /** File size in bytes. */
   bytes: number;
   /** File extension as a hint for code fences. `null` for extension-less files. */
