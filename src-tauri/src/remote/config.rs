@@ -33,8 +33,9 @@ pub fn default_state_dir() -> PathBuf {
 }
 
 /// Create a private state directory, or verify an existing one. An older
-/// default state directory is ours to tighten; an existing custom directory
-/// may be shared with other tools, so its mode is never changed here.
+/// default state directory can be tightened if other users could read but
+/// not modify it. An existing custom directory may be shared with other
+/// tools, so its mode is never changed here.
 pub fn ensure_private_dir(dir: &std::path::Path) -> std::io::Result<()> {
     open_private_dir(dir).map(|_| ())
 }
@@ -81,12 +82,12 @@ fn open_private_dir_with_default(
 
     // SQLite opens the registry and its WAL by pathname. A private leaf is
     // insufficient if another user can replace an ancestor between this
-    // check and SQLite's open. Check the supplied path and its resolved
-    // target from the filesystem root, so symlinks are safe only when their
-    // entries and targets cannot be replaced by another user.
+    // check and SQLite's open. Walk every symlink hop, including targets
+    // hidden by later symlinks, before using that pathname.
     ensure_stable_ancestors(dir)?;
 
-    // Check and, for the known default only, chmod the opened directory.
+    // Check and, for a nonwritable known default only, chmod the opened
+    // directory.
     // Resolve the final component relative to its parent without following
     // a symlink, including when the supplied path has a trailing separator.
     let normalized: PathBuf = dir.components().collect();
@@ -119,6 +120,15 @@ fn open_private_dir_with_default(
                 dir.display()
             )));
         }
+        // A formerly readable default root is safe to tighten when its
+        // parent is stable. A writable one could contain planted entries,
+        // so it needs user inspection before any automatic migration.
+        if meta.permissions().mode() & 0o022 != 0 {
+            return Err(Error::new(ErrorKind::PermissionDenied, format!(
+                "default state directory {} is writable by other users; inspect its contents, then chmod it to 0700 before retrying",
+                dir.display()
+            )));
+        }
         opened
             .open(".")?
             .into_std()
@@ -130,26 +140,28 @@ fn open_private_dir_with_default(
 fn ensure_stable_ancestors(dir: &std::path::Path) -> std::io::Result<()> {
     use std::io::{Error, ErrorKind};
     use std::os::unix::fs::MetadataExt;
-    use std::path::{Component, Path};
+    use std::path::Component;
 
-    let absolute = if dir.is_absolute() {
+    let mut candidate = if dir.is_absolute() {
         dir.to_path_buf()
     } else {
         std::env::current_dir()?.join(dir)
     };
-    let resolved = std::fs::canonicalize(&absolute)?;
     let uid = unsafe { libc::geteuid() };
-    for path in [&absolute, &resolved] {
+    for _ in 0..40 {
         let mut prefix = std::path::PathBuf::new();
-        for component in path.components() {
-            if matches!(component, Component::ParentDir) {
-                return Err(Error::new(
-                    ErrorKind::InvalidInput,
-                    "state directory path cannot contain '..'",
-                ));
+        let mut components = candidate.components();
+        let mut next = None;
+        while let Some(component) = components.next() {
+            match component {
+                Component::CurDir => continue,
+                Component::ParentDir => {
+                    prefix.pop();
+                    continue;
+                }
+                _ => prefix.push(component.as_os_str()),
             }
-            prefix.push(component.as_os_str());
-            if prefix == Path::new("/") {
+            if prefix == std::path::Path::new("/") {
                 continue;
             }
             let meta = std::fs::symlink_metadata(&prefix)?;
@@ -159,17 +171,36 @@ fn ensure_stable_ancestors(dir: &std::path::Path) -> std::io::Result<()> {
                     format!("state directory ancestor {} is owned by another user", prefix.display()),
                 ));
             }
+            if meta.file_type().is_symlink() {
+                let target = std::fs::read_link(&prefix)?;
+                let mut resolved = if target.is_absolute() {
+                    target
+                } else {
+                    prefix.parent().unwrap().join(target)
+                };
+                resolved.push(components.as_path());
+                next = Some(resolved);
+                break;
+            }
             // A sticky directory protects an entry owned by this user (or
             // root), as /tmp does for a user-owned temporary directory.
-            if meta.is_dir() && meta.mode() & 0o022 != 0 && meta.mode() & 0o1000 == 0 {
+            if !components.as_path().as_os_str().is_empty()
+                && meta.is_dir()
+                && meta.mode() & 0o022 != 0
+                && meta.mode() & 0o1000 == 0
+            {
                 return Err(Error::new(
                     ErrorKind::PermissionDenied,
                     format!("state directory ancestor {} can be replaced by another user", prefix.display()),
                 ));
             }
         }
+        match next {
+            Some(resolved) => candidate = resolved,
+            None => return Ok(()),
+        }
     }
-    Ok(())
+    Err(Error::new(ErrorKind::InvalidInput, "too many state directory symlinks"))
 }
 
 /// Manifest file inside a given state-dir.
@@ -247,6 +278,18 @@ mod tests {
     }
 
     #[test]
+    fn writable_older_default_root_requires_manual_migration() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("default");
+        std::fs::create_dir(&root).unwrap();
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o775)).unwrap();
+
+        let error = ensure_private_dir_with_default(&root, &root).unwrap_err();
+        assert!(error.to_string().contains("inspect its contents"), "{error}");
+        assert_eq!(mode(&root), 0o775);
+    }
+
+    #[test]
     fn state_dir_symlink_cannot_redirect_chmod() {
         let temp = tempfile::tempdir().unwrap();
         let shared = temp.path().join("shared");
@@ -286,6 +329,27 @@ mod tests {
         std::os::unix::fs::symlink(&state, &link).unwrap();
 
         let error = ensure_private_dir_with_default(&link, &temp.path().join("default"))
+            .unwrap_err();
+        assert!(error.to_string().contains("can be replaced"), "{error}");
+    }
+
+    #[test]
+    fn intermediate_symlink_chain_cannot_hide_a_replaceable_ancestor() {
+        let temp = tempfile::tempdir().unwrap();
+        let safe = temp.path().join("safe");
+        let shared = temp.path().join("shared");
+        let target = temp.path().join("target");
+        let state = target.join("state");
+        for dir in [&safe, &shared, &state] {
+            std::fs::create_dir_all(dir).unwrap();
+        }
+        std::fs::set_permissions(&shared, std::fs::Permissions::from_mode(0o777)).unwrap();
+        std::fs::set_permissions(&state, std::fs::Permissions::from_mode(0o700)).unwrap();
+        std::os::unix::fs::symlink(&target, shared.join("relay")).unwrap();
+        std::os::unix::fs::symlink(shared.join("relay"), safe.join("link")).unwrap();
+
+        let via_chain = safe.join("link/state");
+        let error = ensure_private_dir_with_default(&via_chain, &temp.path().join("default"))
             .unwrap_err();
         assert!(error.to_string().contains("can be replaced"), "{error}");
     }
