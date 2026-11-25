@@ -71,33 +71,51 @@ pub struct ProjectScriptsReview {
 }
 
 struct SelectedProject {
-    id: String,
     selection: String,
     root: ReviewedProjectRoot,
+    scripts: ProjectScripts,
     needs_review: bool,
 }
 
+const MAX_PROJECT_SCRIPTS_REVIEWS: usize = 64;
+
 #[derive(Default)]
 pub struct ProjectScriptsReviews {
-    // Settings displays one selected project at a time. A new read replaces
-    // the previous review and releases its directory handle.
-    pending: std::sync::Mutex<Option<SelectedProject>>,
+    // Each editor releases its selection when it closes or switches project.
+    pending: std::sync::Mutex<HashMap<String, SelectedProject>>,
 }
 
 impl ProjectScriptsReviews {
     fn read(&self, db: &DatabaseStore, path: &str) -> Result<ProjectScriptsReview, String> {
         let mut pending = self.pending.lock().map_err(|_| REVIEWED_PROJECT_CHANGED)?;
-        *pending = None;
+        if pending.len() >= MAX_PROJECT_SCRIPTS_REVIEWS {
+            return Err("Too many open project script editors. Close one and try again.".into());
+        }
         let (scripts, root, needs_review) = db.project_scripts_for_settings(path)?;
         let id = uuid::Uuid::new_v4().to_string();
         let review_root = needs_review.then(|| root.path().to_path_buf());
-        *pending = Some(SelectedProject {
-            id: id.clone(),
-            selection: path.to_string(),
-            root,
-            needs_review,
-        });
-        Ok(ProjectScriptsReview { scripts, review_root, review_id: id })
+        pending.insert(
+            id.clone(),
+            SelectedProject {
+                selection: path.to_string(),
+                root,
+                scripts: scripts.clone(),
+                needs_review,
+            },
+        );
+        Ok(ProjectScriptsReview {
+            scripts,
+            review_root,
+            review_id: id,
+        })
+    }
+
+    fn discard(&self, review_id: &str) -> Result<(), String> {
+        self.pending
+            .lock()
+            .map_err(|_| REVIEWED_PROJECT_CHANGED)?
+            .remove(review_id);
+        Ok(())
     }
 
     fn save(
@@ -109,20 +127,21 @@ impl ProjectScriptsReviews {
         reviewed: bool,
     ) -> Result<(), String> {
         let mut pending = self.pending.lock().map_err(|_| REVIEWED_PROJECT_CHANGED)?;
-        let selected = pending.as_mut().ok_or(REVIEWED_PROJECT_CHANGED)?;
+        let selected = pending.get_mut(review_id).ok_or(REVIEWED_PROJECT_CHANGED)?;
         let expected_path = if reviewed {
             selected.root.path().to_str().ok_or(REVIEWED_PROJECT_CHANGED)?
         } else {
             &selected.selection
         };
-        if selected.id != review_id || selected.needs_review != reviewed || path != expected_path {
+        if selected.needs_review != reviewed || path != expected_path {
             return Err(REVIEWED_PROJECT_CHANGED.into());
         }
         if !selected.root.matches_path(Path::new(&selected.selection)) {
-            *pending = None;
+            pending.remove(review_id);
             return Err(REVIEWED_PROJECT_CHANGED.into());
         }
-        db.save_reviewed_project_scripts(&selected.root, scripts, reviewed)?;
+        db.save_reviewed_project_scripts(&selected.root, scripts, &selected.scripts, reviewed)?;
+        selected.scripts.clone_from(scripts);
         selected.needs_review = false;
         Ok(())
     }
@@ -135,6 +154,23 @@ pub fn get_project_scripts_for_review(
     path: String,
 ) -> Result<ProjectScriptsReview, String> {
     reviews.read(&db, &path)
+}
+
+#[tauri::command]
+pub fn discard_project_scripts_review(
+    reviews: State<'_, ProjectScriptsReviews>,
+    review_id: String,
+) -> Result<(), String> {
+    reviews.discard(&review_id)
+}
+
+#[tauri::command]
+pub fn set_project_run_script(
+    db: State<'_, DatabaseStore>,
+    path: String,
+    run: String,
+) -> Result<(), String> {
+    db.set_project_run_script(&path, run)
 }
 
 #[tauri::command]
@@ -202,12 +238,12 @@ mod tests {
         assert!(db.get_project_scripts(path).is_none());
         let stale_id = review(&reviews, &db, &root);
         let id = review(&reviews, &db, &root);
-        assert!(reviews.save(&db, path, &stale_id, &scripts, true).is_err());
         let mut edited = scripts.clone();
         edited.setup = vec!["reviewed setup".into()];
         reviews.save(&db, path, &id, &edited, true).unwrap();
         assert_eq!(db.get_project_scripts(path), Some(edited.clone()));
         assert!(reviews.save(&db, path, &id, &scripts, true).is_err());
+        assert!(reviews.save(&db, path, &stale_id, &scripts, true).is_err());
 
         edited.run = Some("edited run".into());
         db.set_project_scripts(path, &edited).unwrap();
@@ -223,6 +259,48 @@ mod tests {
         assert_eq!(preview.scripts, edited);
         reviews.save(&db, path, &preview.review_id, &edited, true).unwrap();
         assert_eq!(db.get_project_scripts(path), Some(edited));
+    }
+
+    #[test]
+    fn editors_and_run_form_preserve_one_anothers_script_changes() {
+        let fixture = tempfile::tempdir().unwrap();
+        let root = dunce::canonicalize(fixture.path()).unwrap();
+        let path = root.to_str().unwrap();
+        let db = crate::database::init_test_database();
+        let reviews = ProjectScriptsReviews::default();
+
+        let setup_editor = reviews.read(&db, path).unwrap();
+        let teardown_editor = reviews.read(&db, path).unwrap();
+        assert_ne!(setup_editor.review_id, teardown_editor.review_id);
+
+        db.set_project_run_script(path, "npm run dev".into())
+            .unwrap();
+        let mut setup = setup_editor.scripts;
+        setup.setup.push("npm ci".into());
+        reviews
+            .save(&db, path, &setup_editor.review_id, &setup, false)
+            .unwrap();
+        reviews.discard(&setup_editor.review_id).unwrap();
+        assert!(reviews
+            .save(&db, path, &setup_editor.review_id, &setup, false)
+            .is_err());
+
+        let mut teardown = teardown_editor.scripts;
+        teardown.teardown.push("npm run cleanup".into());
+        reviews
+            .save(&db, path, &teardown_editor.review_id, &teardown, false)
+            .unwrap();
+        db.set_project_run_script(path, "npm run start".into())
+            .unwrap();
+        assert_eq!(
+            db.get_project_scripts(path),
+            Some(ProjectScripts {
+                setup: vec!["npm ci".into()],
+                teardown: vec!["npm run cleanup".into()],
+                run: Some("npm run start".into()),
+                ..Default::default()
+            }),
+        );
     }
 
     #[cfg(unix)]
@@ -298,6 +376,8 @@ mod tests {
             &serde_json::to_string(&scripts).unwrap(),
         )
         .unwrap();
+        assert!(db.get_project_scripts(path).is_none());
+        assert!(db.set_project_run_script(path, "npm run dev".into()).is_err());
         assert!(db.get_project_scripts(path).is_none());
         let reviews = ProjectScriptsReviews::default();
         let preview = reviews.read(&db, path).unwrap();

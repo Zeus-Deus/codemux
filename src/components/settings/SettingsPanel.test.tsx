@@ -173,6 +173,7 @@ vi.mock("@/tauri/commands", () => ({
   setAiResolverStrategy: vi.fn().mockResolvedValue(undefined),
   getProjectScripts: vi.fn().mockResolvedValue(null),
   getProjectScriptsForReview: vi.fn().mockResolvedValue(null),
+  discardProjectScriptsReview: vi.fn().mockResolvedValue(undefined),
   setProjectScripts: vi.fn().mockResolvedValue(undefined),
   getWorkspaceConfig: vi.fn().mockResolvedValue(null),
   hasCodemuxinclude: vi.fn().mockResolvedValue(false),
@@ -1254,6 +1255,9 @@ describe("Settings → Projects", () => {
       { workspace_id: "ws-1", project_root: "/tmp/proj" },
       { workspace_id: "ws-2", project_root: "/tmp/other" },
     ];
+    vi.mocked(commands.getProjectScriptsForReview).mockResolvedValueOnce({
+      setup: [], teardown: [], run: null, worktree_includes: [], review_id: "fixture-project-a",
+    });
     let resolveSave!: () => void;
     vi.mocked(commands.setProjectScripts).mockReturnValueOnce(new Promise((resolve) => { resolveSave = resolve; }));
     render(<SettingsView />);
@@ -1263,11 +1267,24 @@ describe("Settings → Projects", () => {
     fireEvent.blur(setup);
     await chooseOtherProject();
     await waitFor(() => expect(setup).toBeEnabled());
+    expect(commands.discardProjectScriptsReview).not.toHaveBeenCalledWith("fixture-project-a");
     resolveSave();
+    await waitFor(() => expect(commands.discardProjectScriptsReview).toHaveBeenCalledWith("fixture-project-a"));
     await waitFor(() => expect(screen.getAllByText("Saved").filter((el) => !el.closest("[aria-hidden='true']"))).toHaveLength(0));
 
     fireEvent.blur(setup);
     expect(commands.setProjectScripts).toHaveBeenCalledTimes(1);
+  });
+
+  it("discards a review returned after the editor closes", async () => {
+    let resolveReview!: (scripts: Awaited<ReturnType<typeof commands.getProjectScriptsForReview>>) => void;
+    vi.mocked(commands.getProjectScriptsForReview)
+      .mockReturnValueOnce(new Promise((resolve) => { resolveReview = resolve; }));
+    const view = render(<SettingsView />);
+    await waitFor(() => expect(commands.getProjectScriptsForReview).toHaveBeenCalled());
+    view.unmount();
+    resolveReview({ setup: [], teardown: [], run: null, worktree_includes: [], review_id: "fixture-late" });
+    await waitFor(() => expect(commands.discardProjectScriptsReview).toHaveBeenCalledWith("fixture-late"));
   });
 
   it("reports a failed save and keeps the edit dirty", async () => {

@@ -101,6 +101,7 @@ import {
   setAiResolverStrategy,
   getProjectScripts,
   getProjectScriptsForReview,
+  discardProjectScriptsReview,
   setProjectScripts,
   getWorkspaceConfig,
   hasCodemuxinclude,
@@ -1792,6 +1793,7 @@ export function SettingsView() {
     generation: number;
     snapshot: string;
     reviewId?: string;
+    pendingSaves: Set<Promise<void>>;
   } | null>(null);
   const scriptsGeneration = useRef(0);
   const scriptSaveGeneration = useRef(0);
@@ -1830,10 +1832,20 @@ export function SettingsView() {
     // A slow answer for the previously chosen project must not land in
     // the form after the user picked another one.
     let stale = false;
+    let selectionReviewId: string | undefined;
+    const discardReview = (reviewId: string) => {
+      void discardProjectScriptsReview(reviewId).catch(console.error);
+    };
     const readScripts = isRemoteClient() ? getProjectScripts : getProjectScriptsForReview;
     readScripts(scriptsRoot).then((scripts) => {
-      if (stale) return;
-      const reviewId = scripts && "review_id" in scripts ? scripts.review_id : undefined;
+      const reviewId = scripts && "review_id" in scripts && typeof scripts.review_id === "string"
+        ? scripts.review_id
+        : undefined;
+      if (stale) {
+        if (reviewId) discardReview(reviewId);
+        return;
+      }
+      selectionReviewId = reviewId;
       if (scripts && "review_root" in scripts && scripts.review_root !== undefined) {
         if (
           typeof scripts.review_root !== "string" ||
@@ -1856,7 +1868,8 @@ export function SettingsView() {
         root: scriptsRoot,
         generation,
         snapshot: JSON.stringify(projectScriptsFrom(setup, teardown, run, includes)),
-        reviewId: typeof reviewId === "string" ? reviewId : undefined,
+        reviewId,
+        pendingSaves: new Set(),
       };
       setLoadedScriptsRoot(scriptsRoot);
     }).catch((error) => {
@@ -1872,6 +1885,12 @@ export function SettingsView() {
       stale = true;
       ++scriptsGeneration.current;
       ++scriptSaveGeneration.current;
+      const reviewId = selectionReviewId;
+      if (reviewId) {
+        const owner = savedScripts.current;
+        const pendingSaves = owner?.generation === generation ? owner.pendingSaves : [];
+        void Promise.allSettled(pendingSaves).then(() => discardReview(reviewId));
+      }
     };
   }, [pageSections, scriptsRoot]);
 
@@ -1899,6 +1918,7 @@ export function SettingsView() {
       : owner.reviewId
         ? setProjectScripts(root, scripts, owner.reviewId)
         : setProjectScripts(root, scripts);
+    owner.pendingSaves.add(saved);
     saved
       .then(() => {
         if (!stillCurrent()) return;
@@ -1919,6 +1939,7 @@ export function SettingsView() {
         reportFailure(`Couldn't save ${basename(root)}'s scripts`)(error);
       })
       .finally(() => {
+        owner.pendingSaves.delete(saved);
         if (reviewing && stillCurrent()) setReviewSaving(false);
       });
   };

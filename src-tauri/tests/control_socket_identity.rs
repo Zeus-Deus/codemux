@@ -126,7 +126,17 @@ impl Serve {
         serde_json::from_str(&reply).unwrap_or_else(|_| panic!("`codemux json {command}` printed {reply:?}:\n{}", self.log()))
     }
 
-    fn save_project_scripts(&self, project: &Path, scripts: Value) {
+    fn save_project_scripts(&self, project: &Path, mut scripts: Value) {
+        use std::os::unix::fs::MetadataExt;
+
+        let project = dunce::canonicalize(project).unwrap();
+        let directory = std::fs::metadata(&project).unwrap();
+        scripts["reviewed_directory"] = json!({
+            "device": directory.dev(),
+            "inode": directory.ino(),
+            "created": directory.created().ok()
+                .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok()),
+        });
         let db_path = self.root.path().join("config").join(codemux_lib::APP_DIR_NAME).join("codemux.db");
         let db = rusqlite::Connection::open(db_path).unwrap();
         db.busy_timeout(Duration::from_secs(5)).unwrap();

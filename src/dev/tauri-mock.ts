@@ -7756,10 +7756,18 @@ const handlers: Record<string, Handler> = {
     ...(handlers.get_project_scripts(a) as ProjectScripts),
     review_id: `fixture-project:${a.path}`,
   }),
+  discard_project_scripts_review: () => null,
   // Kept in memory so the titlebar Run button flips from "Set Run" to
   // "Run" after a command is picked in its popover.
   set_project_scripts: (a) => {
     mockProjectScripts.set(a.path as string, a.scripts as ProjectScripts);
+    return null;
+  },
+  set_project_run_script: (a) => {
+    mockProjectScripts.set(a.path as string, {
+      ...(handlers.get_project_scripts(a) as ProjectScripts),
+      run: a.run as string,
+    });
     return null;
   },
   detect_run_candidates: () => [

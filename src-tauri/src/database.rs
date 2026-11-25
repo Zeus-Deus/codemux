@@ -23,6 +23,7 @@ mod project_script_paths;
 #[cfg(unix)]
 pub(crate) mod daemon_closes;
 mod layout_closes;
+mod lifecycle_worktrees;
 
 /// Merge every session row matching `group` (an `agent_chat_sessions`
 /// predicate over `?1 = key`) into `survivor` (`?2`), which must match it
@@ -333,7 +334,7 @@ impl ReviewedProjectRoot {
 
 #[cfg(unix)]
 #[derive(Serialize, Deserialize, PartialEq, Eq, Clone, Copy)]
-struct ProjectDirectoryId {
+pub(crate) struct ProjectDirectoryId {
     device: u64,
     inode: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -342,7 +343,7 @@ struct ProjectDirectoryId {
 
 #[cfg(unix)]
 impl ProjectDirectoryId {
-    fn from_file(directory: &std::fs::File) -> Option<Self> {
+    pub(crate) fn from_file(directory: &std::fs::File) -> Option<Self> {
         use std::os::unix::fs::MetadataExt;
         let metadata = directory.metadata().ok()?;
         metadata.is_dir().then(|| Self {
@@ -356,7 +357,7 @@ impl ProjectDirectoryId {
 
 #[cfg(windows)]
 #[derive(Serialize, Deserialize, PartialEq, Eq, Clone, Copy)]
-struct ProjectDirectoryId {
+pub(crate) struct ProjectDirectoryId {
     volume: u64,
     file_id: [u8; 16],
     created: u64,
@@ -364,7 +365,7 @@ struct ProjectDirectoryId {
 
 #[cfg(windows)]
 impl ProjectDirectoryId {
-    fn from_file(directory: &std::fs::File) -> Option<Self> {
+    pub(crate) fn from_file(directory: &std::fs::File) -> Option<Self> {
         use std::os::windows::fs::MetadataExt;
         let metadata = directory.metadata().ok()?;
         if !metadata.is_dir() {
@@ -743,6 +744,7 @@ fn database_path() -> Option<PathBuf> {
 }
 
 fn create_schema(conn: &Connection) -> Result<(), String> {
+    conn.execute_batch(lifecycle_worktrees::SCHEMA).map_err(|error| error.to_string())?;
     conn.execute_batch(agent_control::SCHEMA).map_err(|e| e.to_string())?;
     mcp_connector::migrate(conn)?;
     conn.execute_batch(local_sessions::SCHEMA).map_err(|e|e.to_string())?;
@@ -1875,17 +1877,65 @@ impl DatabaseStore {
         if needs_review || !root.matches_path(Path::new(project_root)) {
             return Err(REVIEWED_PROJECT_CHANGED.into());
         }
-        self.save_reviewed_project_scripts(&root, scripts, false)
+        self.update_bound_project_scripts(&root, false, |_| scripts.clone())
     }
 
-    /// Save to the held directory shown by Settings. The persisted identity
-    /// also prevents a later replacement at the same pathname from inheriting
-    /// the reviewed commands.
+    pub(crate) fn set_project_run_script(
+        &self,
+        project_root: &str,
+        run: String,
+    ) -> Result<(), String> {
+        let (_, root, needs_review) = self.project_scripts_for_settings(project_root)?;
+        if needs_review {
+            return Err(
+                "Review saved project scripts in Settings before changing the Run command.".into(),
+            );
+        }
+        if !root.matches_path(Path::new(project_root)) {
+            return Err(REVIEWED_PROJECT_CHANGED.into());
+        }
+        self.update_bound_project_scripts(&root, false, |mut current| {
+            current.run = Some(run);
+            current
+        })
+    }
+
+    /// Merge edits from one Settings editor into the current commands. An
+    /// explicit approval writes the reviewed configuration as a whole.
     pub(crate) fn save_reviewed_project_scripts(
         &self,
         root: &ReviewedProjectRoot,
         scripts: &ProjectScripts,
+        baseline: &ProjectScripts,
         reviewed: bool,
+    ) -> Result<(), String> {
+        self.update_bound_project_scripts(root, reviewed, |mut current| {
+            if reviewed {
+                return scripts.clone();
+            }
+            if scripts.setup != baseline.setup {
+                current.setup.clone_from(&scripts.setup);
+            }
+            if scripts.teardown != baseline.teardown {
+                current.teardown.clone_from(&scripts.teardown);
+            }
+            if scripts.run != baseline.run {
+                current.run.clone_from(&scripts.run);
+            }
+            if scripts.worktree_includes != baseline.worktree_includes {
+                current.worktree_includes.clone_from(&scripts.worktree_includes);
+            }
+            current
+        })
+    }
+
+    /// Read and update the project's commands in one transaction, using the
+    /// held directory to enforce the same local consent checks for each writer.
+    fn update_bound_project_scripts(
+        &self,
+        root: &ReviewedProjectRoot,
+        reviewed: bool,
+        update: impl FnOnce(ProjectScripts) -> ProjectScripts,
     ) -> Result<(), String> {
         let identity = root.identity().ok_or(REVIEWED_PROJECT_CHANGED)?;
         if !root.matches_path(&root.path) {
@@ -1897,26 +1947,31 @@ impl DatabaseStore {
         let transaction = conn
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
             .map_err(|error| error.to_string())?;
-        if !reviewed {
-            let previous: Option<String> = transaction.query_row(
+        let previous = transaction
+            .query_row(
                 "SELECT value FROM settings WHERE user_id = 'local' AND key = ?1",
                 params![key],
-                |row| row.get(0),
-            ).optional().map_err(|error| error.to_string())?;
-            // Ordinary edits must preserve the previously verified binding.
-            if previous.is_some_and(|value| {
-                serde_json::from_str::<ReviewedProjectScripts>(&value)
-                    .ok()
-                    .and_then(|stored| stored.reviewed_directory) != Some(identity)
-            }) {
-                return Err(REVIEWED_PROJECT_CHANGED.into());
-            }
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(|error| error.to_string())?
+            .map(|value| serde_json::from_str::<ReviewedProjectScripts>(&value))
+            .transpose()
+            .map_err(|error| error.to_string())?;
+        let already_bound = previous
+            .as_ref()
+            .is_some_and(|saved| saved.reviewed_directory == Some(identity));
+        // A review that was needed at load time becomes stale when another
+        // editor approves the same directory. Ordinary edits require consent.
+        if (reviewed && already_bound) || (!reviewed && previous.is_some() && !already_bound) {
+            return Err(REVIEWED_PROJECT_CHANGED.into());
         }
 
         let value = serde_json::to_string(&ReviewedProjectScripts {
-            scripts: scripts.clone(),
+            scripts: update(previous.map(|saved| saved.scripts).unwrap_or_default()),
             reviewed_directory: Some(identity),
-        }).map_err(|error| error.to_string())?;
+        })
+        .map_err(|error| error.to_string())?;
         Self::write_setting(&transaction, &key, &value)?;
         transaction.commit().map_err(|error| error.to_string())
     }

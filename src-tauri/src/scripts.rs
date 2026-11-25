@@ -129,7 +129,7 @@ pub fn process_worktree_includes(
         .map_err(|error| format!("Open include source: {error}"))?;
     let destination = Dir::open_ambient_dir(worktree_path, cap_std::ambient_authority())
         .map_err(|error| format!("Open include destination: {error}"))?;
-    copy_worktree_includes(&source, &destination, setting_patterns, |git| {
+    copy_worktree_includes(&source, &destination, setting_patterns, true, |git| {
         git.current_dir(root_path).output()
     })
 }
@@ -138,6 +138,7 @@ fn copy_worktree_includes(
     source: &Dir,
     destination: &Dir,
     setting_patterns: &[String],
+    include_nested: bool,
     list_files: impl FnOnce(&mut std::process::Command) -> io::Result<Output>,
 ) -> Result<IncludeResult, String> {
     let mut patterns = tempfile::NamedTempFile::new()
@@ -205,6 +206,11 @@ fn copy_worktree_includes(
             std::str::from_utf8(raw_path)
                 .map_err(|error| format!("Invalid worktree include path: {error}"))?,
         );
+        // A nested destination directory can move outside the checkout even
+        // while its handle is open. Automatic copies stay at the held root.
+        if !include_nested && path.components().count() != 1 {
+            continue;
+        }
         if copy_include(source, destination, path)
             .map_err(|error| format!("Copy worktree include {}: {error}", path.display()))?
         {
@@ -400,7 +406,7 @@ impl ScriptLocation<'_> {
         Ok(())
     }
 
-    fn copy_includes(&self, patterns: &[String]) -> Result<Option<IncludeResult>, String> {
+    pub(crate) fn copy_includes(&self, patterns: &[String]) -> Result<Option<IncludeResult>, String> {
         if let Self::Checked(paths) = self {
             if !paths.permits_include_copy() {
                 return Ok(None);
@@ -415,6 +421,7 @@ impl ScriptLocation<'_> {
                 &directories.source,
                 &directories.destination,
                 patterns,
+                false,
                 |git| {
                     git.stdout(Stdio::piped())
                         .stderr(Stdio::piped())
@@ -1021,14 +1028,19 @@ mod tests {
         fs::create_dir(&unrelated).unwrap();
         fs::copy(registered.join(".git"), unrelated.join(".git")).unwrap();
         fs::write(project.join(".env"), "FIXTURE=sample").unwrap();
+        fs::write(project.join(".codemuxinclude"), ".env\nsettings/private.env\n").unwrap();
+        fs::create_dir(project.join("settings")).unwrap();
+        fs::write(project.join("settings/private.env"), "FIXTURE=nested").unwrap();
 
         let db = crate::database::init_test_database();
         for (checkout, allowed) in [(&registered, true), (&unrelated, false)] {
-            let paths = LifecyclePaths::resolve(checkout).unwrap();
+            let mut paths = LifecyclePaths::resolve(checkout).unwrap();
+            assert_eq!(paths.bind_to_workspace(&db, "workspace").is_ok(), allowed);
             assert!(paths.saved_config(&db).is_none());
             let copy = ScriptLocation::Checked(&paths).copy_includes(&[]).unwrap();
             assert_eq!(copy.is_some(), allowed);
             assert_eq!(checkout.join(".env").exists(), allowed);
+            assert!(!checkout.join("settings").exists());
         }
     }
 
@@ -1044,7 +1056,9 @@ mod tests {
         fs::write(project.join(".codemuxinclude"), "fixture.env\n").unwrap();
         fs::write(project.join("fixture.env"), "FIXTURE=sample").unwrap();
 
-        let paths = LifecyclePaths::resolve(&checkout).unwrap();
+        let db = crate::database::init_test_database();
+        let mut paths = LifecyclePaths::resolve(&checkout).unwrap();
+        paths.bind_to_workspace(&db, "workspace").unwrap();
         assert!(paths.permits_include_copy());
         let directories = paths.include_directories().unwrap();
         fs::rename(&project, &moved_project).unwrap();
@@ -1053,16 +1067,21 @@ mod tests {
         fs::create_dir(&checkout).unwrap();
         fs::write(project.join(".codemuxinclude"), "replacement.env\n").unwrap();
 
-        let result =
-            copy_worktree_includes(&directories.source, &directories.destination, &[], |git| {
+        let result = copy_worktree_includes(
+            &directories.source,
+            &directories.destination,
+            &[],
+            false,
+            |git| {
                 git.stdin(Stdio::null())
                     .stdout(Stdio::piped())
                     .stderr(Stdio::piped());
                 paths
                     .spawn_in_include_source(git, &directories)?
                     .wait_with_output()
-            })
-            .unwrap();
+            },
+        )
+        .unwrap();
         assert_eq!(result.source, IncludeSource::File);
         assert_eq!(result.copied, ["fixture.env"]);
         assert_eq!(

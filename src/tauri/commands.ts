@@ -775,12 +775,18 @@ export const getProjectScriptsForReview = (path: string) =>
     { path },
   );
 
+export const discardProjectScriptsReview = (reviewId: string) =>
+  invoke<void>("discard_project_scripts_review", { reviewId });
+
 export const setProjectScripts = (
   path: string,
   scripts: ProjectScripts,
   reviewId?: string,
   reviewed?: boolean,
 ) => invoke<void>("set_project_scripts", { path, scripts, reviewId, reviewed });
+
+export const setProjectRunScript = (path: string, run: string) =>
+  invoke<void>("set_project_run_script", { path, run });
 
 export const runProjectDevCommand = (workspaceId: string, forceNew?: boolean) =>
   invoke<void>("run_project_dev_command", { workspaceId, forceNew: forceNew ?? false });

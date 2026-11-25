@@ -2,7 +2,7 @@ use crate::agent_browser::AgentBrowserManager;
 use crate::config::{
     read_shell_appearance_or_default,
     read_theme_colors_or_default,
-    workspace_config::WorkspaceConfig,
+    workspace_config::{LifecyclePaths, WorkspaceConfig},
     ShellAppearance,
     ThemeColors,
 };
@@ -231,6 +231,7 @@ pub(crate) async fn open_workspace_impl<R: tauri::Runtime>(
         WorktreeWorkspaceClaim::Adopted(existing) => return reopened(&app, &state, &request, existing),
         WorktreeWorkspaceClaim::Created(id) => id,
     };
+    let lifecycle = bind_workspace_lifecycle(&db, &workspace_id.0, LifecyclePaths::resolve(&repo_path));
 
     // Set project root (resolve through git root for worktree grouping)
     let project_root = crate::config::workspace_config::find_git_root(&repo_path)
@@ -241,7 +242,7 @@ pub(crate) async fn open_workspace_impl<R: tauri::Runtime>(
     terminal::spawn_missing_ptys_for_workspace(app.clone(), &workspace_id.0);
 
     // Run setup scripts in background thread
-    spawn_setup_scripts(&app, &state, &db, &workspace_id.0, &repo_path, checkpoint);
+    spawn_setup_scripts(&app, &state, &db, &workspace_id.0, lifecycle, checkpoint);
 
     crate::state::emit_app_state(&app);
     Ok(OpenedWorkspace {
@@ -520,6 +521,7 @@ async fn create_empty_workspace_impl<R: tauri::Runtime>(
         Some(chat) => state.materialize_chat_workspace(repo_path.clone(), chat, select),
         None => state.create_empty_workspace_at_path_with_selection(repo_path.clone(), select),
     };
+    let lifecycle = bind_workspace_lifecycle(&db, &workspace_id.0, LifecyclePaths::resolve(&repo_path));
 
     let project_root = crate::config::workspace_config::find_git_root(&repo_path)
         .unwrap_or_else(|| repo_path.clone());
@@ -531,7 +533,7 @@ async fn create_empty_workspace_impl<R: tauri::Runtime>(
     // scripts. Git metadata still populates
     // (cheap, harmless for non-repo paths).
     if !skip_setup.unwrap_or(false) {
-        spawn_setup_scripts(&app, &state, &db, &workspace_id.0, &repo_path, &Checkpoint::default());
+        spawn_setup_scripts(&app, &state, &db, &workspace_id.0, lifecycle, &Checkpoint::default());
     }
 
     crate::state::emit_app_state(&app);
@@ -622,6 +624,7 @@ pub async fn create_workspace_with_preset<R: tauri::Runtime>(
             select.unwrap_or(true),
         ),
     };
+    let lifecycle = bind_workspace_lifecycle(&db, &workspace_id.0, LifecyclePaths::resolve(&repo_path));
 
     state.set_workspace_project_root(&workspace_id.0, repo_path.display().to_string());
     populate_git_info_async(&state, &workspace_id.0, repo_path.clone()).await;
@@ -639,7 +642,7 @@ pub async fn create_workspace_with_preset<R: tauri::Runtime>(
     }
 
     // Run setup scripts in background thread
-    spawn_setup_scripts(&app, &state, &db, &workspace_id.0, &repo_path, &Checkpoint::default());
+    spawn_setup_scripts(&app, &state, &db, &workspace_id.0, lifecycle, &Checkpoint::default());
 
     crate::state::emit_app_state(&app);
     Ok(workspace_id.0)
@@ -821,7 +824,7 @@ pub(crate) async fn create_worktree_checked<R: tauri::Runtime>(
     // `git worktree add -b` forks the repo's checked-out branch, so that is
     // read BEFORE the add. A reused on-disk worktree keeps whatever it was
     // forked from originally, which we can't know, so it records nothing.
-    let (worktree_path, base_branch, made_here) = {
+    let (worktree_path, base_branch, made_here, lifecycle) = {
         let repo_path = repo_path.clone();
         let branch = branch.clone();
         tokio::task::spawn_blocking(move || {
@@ -849,7 +852,10 @@ pub(crate) async fn create_worktree_checked<R: tauri::Runtime>(
                 None
             };
             crate::git::git_create_worktree(repo, &branch, new_branch, start.as_deref(), pr_number)
-                .map(|path| (path, base_branch, made_here))
+                .map(|path| {
+                    let lifecycle = LifecyclePaths::resolve_fresh_worktree(Path::new(&path), repo);
+                    (path, base_branch, made_here, lifecycle)
+                })
         })
         .await
         .map_err(|e| format!("git_create_worktree task join failed: {e}"))??
@@ -949,6 +955,7 @@ pub(crate) async fn create_worktree_checked<R: tauri::Runtime>(
         }
         WorktreeWorkspaceClaim::Created(id) => id,
     };
+    let lifecycle = bind_workspace_lifecycle(&db, &workspace_id.0, lifecycle);
 
     state.set_workspace_project_root(&workspace_id.0, repo_path.clone());
     state.set_workspace_base_branch(&workspace_id.0, base_branch.clone());
@@ -983,7 +990,7 @@ pub(crate) async fn create_worktree_checked<R: tauri::Runtime>(
     }
 
     // Run setup scripts in background thread
-    spawn_setup_scripts(&app, &state, &db, &workspace_id.0, &wt_path_buf, checkpoint);
+    spawn_setup_scripts(&app, &state, &db, &workspace_id.0, lifecycle, checkpoint);
 
     // Auto-launch agent preset if requested
     if let Some(PresetLaunch {
@@ -1165,16 +1172,20 @@ async fn import_worktree_workspace_checked<R: tauri::Runtime>(
     // Read before the workspace exists, so a requester whose authority was
     // withdrawn during the read leaves nothing behind: no workspace, no
     // terminal, no setup.
-    let git_info = {
+    let (git_info, lifecycle) = {
         let path = wt_path_buf.clone();
-        tokio::task::spawn_blocking(move || gather_workspace_git_info(&path))
-            .await
-            .unwrap_or_default()
+        tokio::task::spawn_blocking(move || {
+            let lifecycle = LifecyclePaths::resolve_linked_checkout(&path);
+            (gather_workspace_git_info(&path), lifecycle)
+        })
+        .await
+        .unwrap_or_else(|error| (WorkspaceGitInfo::default(), Err(error.to_string())))
     };
     #[cfg(test)]
     open_pause::reached(&wt_path_buf).await;
     checkpoint.check()?;
     let workspace_id = state.create_workspace_with_layout_with_selection(wt_path_buf.clone(), layout, select);
+    let lifecycle = bind_workspace_lifecycle(db, &workspace_id.0, lifecycle);
 
     state.set_workspace_worktree(&workspace_id.0, worktree_path.clone(), branch);
 
@@ -1196,7 +1207,7 @@ async fn import_worktree_workspace_checked<R: tauri::Runtime>(
         terminal::spawn_pty_for_session(app.clone(), session_id);
     }
 
-    spawn_setup_scripts(&app, &state, &db, &workspace_id.0, &wt_path_buf, checkpoint);
+    spawn_setup_scripts(&app, &state, db, &workspace_id.0, lifecycle, checkpoint);
 
     crate::state::emit_app_state(&app);
     Ok(workspace_id.0)
@@ -1935,7 +1946,13 @@ async fn close_workspace_tracked<R: tauri::Runtime>(
     let mut torn_down = Ok(());
     if !force && !hermes_pending {
         if let Some(paths) = teardown.and_then(|folder| {
-            crate::config::workspace_config::LifecyclePaths::resolve(Path::new(&folder)).ok()
+            LifecyclePaths::resolve_for_workspace(
+                Path::new(&folder),
+                db,
+                &workspace_id,
+                worktree_path.is_some(),
+            )
+            .ok()
         }) {
             let commands = paths.saved_config(db).map(|config| config.teardown).unwrap_or_default();
             let teardown = CompletedTeardown {
@@ -3599,6 +3616,16 @@ pub fn open_in_editor(editor_id: String, path: String) -> Result<(), String> {
 
 // ---- Setup/teardown scripts ----
 
+fn bind_workspace_lifecycle(
+    db: &crate::database::DatabaseStore,
+    workspace_id: &str,
+    paths: Result<LifecyclePaths, String>,
+) -> Result<LifecyclePaths, String> {
+    let mut paths = paths?;
+    paths.bind_to_workspace(db, workspace_id)?;
+    Ok(paths)
+}
+
 /// Spawn setup scripts in a background thread so workspace creation isn't blocked.
 /// Runs the full pipeline: .codemuxinclude file copy + setup commands. The
 /// create has returned by then, so it asks `checkpoint`'s
@@ -3608,10 +3635,10 @@ fn spawn_setup_scripts<R: tauri::Runtime>(
     state: &AppStateStore,
     db: &crate::database::DatabaseStore,
     workspace_id: &str,
-    workspace_path: &Path,
+    paths: Result<LifecyclePaths, String>,
     checkpoint: &Checkpoint,
 ) {
-    let paths = match crate::config::workspace_config::LifecyclePaths::resolve(workspace_path) {
+    let paths = match paths {
         Ok(paths) => paths,
         Err(error) => {
             eprintln!("[codemux::scripts] Setup failed for workspace {workspace_id}: {error}");

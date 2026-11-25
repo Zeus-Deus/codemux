@@ -26,6 +26,9 @@ use std::path::Path;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
+use crate::config::workspace_config::{read_workspace_config, LifecyclePaths};
+use crate::scripts::ScriptLocation;
+
 use super::identity::Identity;
 use super::pty::PtyManager;
 use super::workspace::{Workspace, WorkspaceStore};
@@ -304,6 +307,9 @@ pub fn worktree_create(params: &Value, store: &WorkspaceStore) -> ToolResult {
         input.base.as_deref(),
     )
     .map_err(ToolError::invalid)?;
+    let include_paths = created.created.then(|| {
+        LifecyclePaths::resolve_fresh_worktree(&created.worktree_path, &created.repo_root)
+    });
     let path = created.worktree_path.to_string_lossy().to_string();
     let repo_root = created.repo_root.to_string_lossy().to_string();
 
@@ -326,11 +332,7 @@ pub fn worktree_create(params: &Value, store: &WorkspaceStore) -> ToolResult {
 
     // Copy includes for a new checkout. Running repository setup on this
     // host is a separate, explicit CLI action.
-    let setup = if created.created {
-        provision_worktree_workspace(&ws)
-    } else {
-        Value::Null
-    };
+    let setup = include_paths.map_or(Value::Null, |paths| provision_worktree_workspace(&ws, paths));
 
     Ok(json!({
         "workspace": ws,
@@ -341,22 +343,15 @@ pub fn worktree_create(params: &Value, store: &WorkspaceStore) -> ToolResult {
 }
 
 /// Copy worktree includes and report repository setup commands for review.
-fn provision_worktree_workspace(ws: &Workspace) -> Value {
-    let workspace_path = std::path::PathBuf::from(&ws.path);
-    let root_path = crate::scripts::resolve_root_path(&workspace_path);
-    let config = crate::config::workspace_config::read_workspace_config(&workspace_path);
+fn provision_worktree_workspace(ws: &Workspace, paths: Result<LifecyclePaths, String>) -> Value {
+    let config = read_workspace_config(Path::new(&ws.path));
 
     // Step 1: worktree includes (file → setting is desktop-only → defaults).
-    let setting_patterns = config
-        .as_ref()
-        .map(|c| c.worktree_includes.clone())
-        .unwrap_or_default();
-    let includes_copied = match crate::scripts::process_worktree_includes(
-        &root_path,
-        &workspace_path,
-        &setting_patterns,
-    ) {
-        Ok(result) => result.copied,
+    let setting_patterns = config.as_ref().map_or(&[][..], |c| &c.worktree_includes);
+    let includes_copied = match paths.and_then(|paths| {
+        ScriptLocation::Checked(&paths).copy_includes(setting_patterns)
+    }) {
+        Ok(result) => result.map_or_else(Vec::new, |includes| includes.copied),
         Err(e) => {
             eprintln!(
                 "[codemux-remote] worktree includes failed for workspace {}: {e}",

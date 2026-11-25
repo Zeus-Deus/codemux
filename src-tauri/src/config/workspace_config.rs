@@ -1,4 +1,4 @@
-use crate::database::DatabaseStore;
+use crate::database::{DatabaseStore, ProjectDirectoryId};
 #[cfg(unix)]
 use cap_std::ambient_authority;
 use cap_std::fs::Dir;
@@ -97,7 +97,20 @@ pub(crate) struct LifecyclePaths {
     checkout: PathBuf,
     cwd_dir: File,
     root_dir: File,
+    checkout_dir: Option<File>,
+    worktree_id: Option<LifecycleWorktreeId>,
 }
+
+#[derive(Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) struct LifecycleWorktreeId {
+    workspace: ProjectDirectoryId,
+    checkout: ProjectDirectoryId,
+    project: ProjectDirectoryId,
+    registration: ProjectDirectoryId,
+}
+
+const UNVERIFIED_WORKTREE: &str =
+    "Worktree identity could not be verified for automatic workspace actions";
 
 pub(crate) struct LifecycleIncludeDirectories {
     pub(crate) source: Dir,
@@ -118,9 +131,67 @@ impl LifecyclePaths {
             .map_err(|error| format!("Could not resolve project directory: {error}"))?;
         let root_dir = open_directory(&root)
             .map_err(|error| format!("Could not open project directory: {error}"))?;
-        let paths = Self { cwd, root, checkout, cwd_dir, root_dir };
+        let checkout_dir = (checkout != cwd && checkout != root)
+            .then(|| open_directory(&checkout))
+            .transpose()
+            .map_err(|error| format!("Could not open linked checkout directory: {error}"))?;
+        let paths = Self { cwd, root, checkout, cwd_dir, root_dir, checkout_dir, worktree_id: None };
         paths.check()?;
         Ok(paths)
+    }
+
+    pub(crate) fn resolve_linked_checkout(workspace_path: &Path) -> Result<Self, String> {
+        let paths = Self::resolve(workspace_path)?;
+        if paths.checkout == paths.root {
+            return Err(UNVERIFIED_WORKTREE.into());
+        }
+        Ok(paths)
+    }
+
+    pub(crate) fn resolve_fresh_worktree(
+        workspace_path: &Path,
+        expected_project: &Path,
+    ) -> Result<Self, String> {
+        let mut paths = Self::resolve_linked_checkout(workspace_path)?;
+        let expected_root = dunce::canonicalize(expected_project)
+            .ok()
+            .and_then(|path| resolve_project_paths(&path).ok())
+            .map(|(_, root)| root);
+        if expected_root.as_deref() != Some(paths.root()) {
+            return Err(UNVERIFIED_WORKTREE.into());
+        }
+        paths.worktree_id = Some(paths.verified_worktree_id().ok_or(UNVERIFIED_WORKTREE)?);
+        paths.check()?;
+        Ok(paths)
+    }
+
+    pub(crate) fn resolve_for_workspace(
+        workspace_path: &Path,
+        db: &DatabaseStore,
+        workspace_id: &str,
+        expects_worktree: bool,
+    ) -> Result<Self, String> {
+        let mut paths = Self::resolve(workspace_path)?;
+        paths.worktree_id = db.lifecycle_worktree_id(workspace_id)?;
+        if paths.worktree_id.is_none() && (expects_worktree || paths.checkout != paths.root) {
+            return Err(UNVERIFIED_WORKTREE.into());
+        }
+        paths.check()?;
+        Ok(paths)
+    }
+
+    /// Called only for a newly created local workspace, including one which
+    /// adopts an existing linked checkout. A persisted binding is never replaced.
+    pub(crate) fn bind_to_workspace(&mut self, db: &DatabaseStore, workspace_id: &str) -> Result<(), String> {
+        self.check()?;
+        if self.worktree_id.is_none() && self.checkout != self.root {
+            self.worktree_id = Some(self.verified_worktree_id().ok_or(UNVERIFIED_WORKTREE)?);
+        }
+        if let Some(identity) = &self.worktree_id {
+            db.bind_lifecycle_worktree(workspace_id, identity)?;
+        }
+        self.worktree_id = db.lifecycle_worktree_id(workspace_id)?;
+        self.check()
     }
 
     pub(crate) fn workspace(&self) -> &Path {
@@ -142,7 +213,29 @@ impl LifecyclePaths {
         {
             return Err("Project directory changed after lifecycle commands were selected".into());
         }
+        if let Some(expected) = &self.worktree_id {
+            if self.verified_worktree_id().as_ref() != Some(expected) {
+                return Err(UNVERIFIED_WORKTREE.into());
+            }
+        }
         Ok(())
+    }
+
+    fn verified_worktree_id(&self) -> Option<LifecycleWorktreeId> {
+        if self.checkout == self.root {
+            return None;
+        }
+        let checkout_dir = self.checkout_dir.as_ref().unwrap_or(&self.cwd_dir);
+        if !directory_unchanged(&self.checkout, checkout_dir) {
+            return None;
+        }
+        let registration = registered_checkout(&self.checkout, &self.root)?;
+        Some(LifecycleWorktreeId {
+            workspace: ProjectDirectoryId::from_file(&self.cwd_dir)?,
+            checkout: ProjectDirectoryId::from_file(checkout_dir)?,
+            project: ProjectDirectoryId::from_file(&self.root_dir)?,
+            registration: ProjectDirectoryId::from_file(&open_directory(&registration).ok()?)?,
+        })
     }
 
     #[cfg(unix)]
@@ -157,11 +250,15 @@ impl LifecyclePaths {
     }
 
     pub(crate) fn saved_config(&self, db: &DatabaseStore) -> Option<WorkspaceConfig> {
-        read_saved_config_at(&self.checkout, &self.root, Some(&self.root_dir), db)
+        if self.checkout != self.root && self.worktree_id.is_none() {
+            return None;
+        }
+        self.check().ok()?;
+        db.get_project_scripts_at(&self.root, Some(&self.root_dir)).map(saved_workspace_config)
     }
 
     pub(crate) fn permits_include_copy(&self) -> bool {
-        self.checkout != self.root && is_registered_checkout(&self.checkout, &self.root)
+        self.cwd == self.checkout && self.worktree_id.is_some() && self.check().is_ok()
     }
 
     #[cfg(unix)]
@@ -174,10 +271,15 @@ impl LifecyclePaths {
 
     #[cfg(windows)]
     pub(crate) fn include_directories(&self) -> std::io::Result<LifecycleIncludeDirectories> {
+        use windows_sys::Win32::Storage::FileSystem::{FILE_SHARE_READ, FILE_SHARE_WRITE};
+
         // Windows capability filesystem operations use paths internally.
-        // Keep the roots and their ancestors locked through the full copy.
+        // Keep names locked through the copy. Publishing a file also needs
+        // write sharing on the destination directory.
         let source_path_lock = lock_workspace_path(&self.root, &self.root_dir)?;
-        let destination_path_lock = lock_workspace_path(&self.cwd, &self.cwd_dir)?;
+        let destination_path_lock = lock_workspace_path_with_leaf_sharing(
+            &self.cwd, &self.cwd_dir, FILE_SHARE_READ | FILE_SHARE_WRITE,
+        )?;
         Ok(LifecycleIncludeDirectories {
             source: Dir::from_std_file(source_path_lock.leaf.try_clone()?),
             destination: Dir::from_std_file(destination_path_lock.leaf.try_clone()?),
@@ -300,6 +402,17 @@ struct WorkspacePathLock {
 
 #[cfg(windows)]
 fn lock_workspace_path(path: &Path, expected: &File) -> std::io::Result<WorkspacePathLock> {
+    use windows_sys::Win32::Storage::FileSystem::FILE_SHARE_READ;
+
+    lock_workspace_path_with_leaf_sharing(path, expected, FILE_SHARE_READ)
+}
+
+#[cfg(windows)]
+fn lock_workspace_path_with_leaf_sharing(
+    path: &Path,
+    expected: &File,
+    leaf_sharing: u32,
+) -> std::io::Result<WorkspacePathLock> {
     use std::io::{Error, ErrorKind};
     use windows_sys::Win32::Storage::FileSystem::FILE_SHARE_READ;
 
@@ -309,7 +422,8 @@ fn lock_workspace_path(path: &Path, expected: &File) -> std::io::Result<Workspac
     let mut held = Vec::with_capacity(ancestors.len());
     let changed = || Error::other("Workspace directory changed before starting the command");
     while let Some(directory) = ancestors.pop() {
-        held.push(open_windows_directory(directory, FILE_SHARE_READ)?);
+        let sharing = if ancestors.is_empty() { leaf_sharing } else { FILE_SHARE_READ };
+        held.push(open_windows_directory(directory, sharing)?);
     }
     let leaf = held.pop().ok_or_else(|| Error::new(ErrorKind::InvalidInput, "Missing workspace directory"))?;
     if !same_directory(&leaf, expected)? {
@@ -333,30 +447,40 @@ pub(crate) fn read_saved_config(workspace_path: &Path, db: &DatabaseStore) -> Op
         return None;
     }
     let (checkout, root) = resolve_project_paths(&cwd).ok()?;
-    read_saved_config_at(&checkout, &root, None, db)
+    if checkout != root {
+        registered_checkout(&checkout, &root)?;
+    }
+    db.get_project_scripts_at(&root, None).map(saved_workspace_config)
 }
 
-fn read_saved_config_at(
-    checkout: &Path,
-    root: &Path,
-    held_root: Option<&File>,
-    db: &DatabaseStore,
-) -> Option<WorkspaceConfig> {
-    let scripts = db.get_project_scripts_at(root, held_root)?;
-    if checkout != root && !is_registered_checkout(checkout, root) {
+fn read_git_link(path: &Path, prefix: &str) -> Option<PathBuf> {
+    if !std::fs::symlink_metadata(path).ok()?.is_file() {
         return None;
     }
-    Some(saved_workspace_config(scripts))
+    let text = std::fs::read_to_string(path).ok()?;
+    let target = text.strip_prefix(prefix)?.trim_end_matches(['\r', '\n']);
+    (!target.is_empty()).then(|| PathBuf::from(target))
 }
 
-fn is_registered_checkout(checkout: &Path, root: &Path) -> bool {
-    // A .git file alone cannot authorize access to a different project.
-    crate::git::git_list_worktrees(root).is_ok_and(|worktrees| {
-        worktrees.into_iter().any(|worktree| {
-            !worktree.is_bare
-                && dunce::canonicalize(&worktree.path).is_ok_and(|path| path == checkout)
-        })
-    })
+fn registered_checkout(checkout: &Path, root: &Path) -> Option<PathBuf> {
+    let marker = checkout.join(".git");
+    let registration = dunce::canonicalize(checkout.join(read_git_link(&marker, "gitdir: ")?)).ok()?;
+    let git_dir = root.join(".git");
+    let registrations = git_dir.join("worktrees");
+    if registration.parent()? != registrations
+        || dunce::canonicalize(&registrations).ok()? != registrations
+    {
+        return None;
+    }
+    let back_link = read_git_link(&registration.join("gitdir"), "")?;
+    let common = read_git_link(&registration.join("commondir"), "")?;
+    if dunce::canonicalize(registration.join(back_link)).ok()? != marker
+        || dunce::canonicalize(registration.join(common)).ok()? != git_dir
+        || !crate::git::lists_active_worktree(&git_dir, checkout)
+    {
+        return None;
+    }
+    Some(registration)
 }
 
 fn saved_workspace_config(scripts: crate::database::ProjectScripts) -> WorkspaceConfig {
@@ -385,10 +509,13 @@ mod tests {
         let held = lock_workspace_path(&paths.cwd, &paths.cwd_dir).unwrap();
         assert!(fs::rename(&ancestor, &moved).is_err());
         drop(held);
+        let path = paths.cwd.clone();
+        drop(paths);
 
         fs::rename(&ancestor, &moved).unwrap();
         fs::create_dir_all(&cwd).unwrap();
-        assert!(lock_workspace_path(&paths.cwd, &paths.cwd_dir).is_err());
+        let original = open_directory(&moved.join("workspace")).unwrap();
+        assert!(lock_workspace_path(&path, &original).is_err());
     }
 
     #[test]
@@ -658,11 +785,41 @@ mod tests {
         assert_eq!(inherited.setup, scripts.setup);
         assert_eq!(inherited.teardown, scripts.teardown);
 
-        // Moving the checkout by hand leaves Git's registration at its old
-        // path, so it cannot use the main project's automatic commands.
+        assert!(LifecyclePaths::resolve_for_workspace(&nested, &db, "workspace", true).is_err());
+        LifecyclePaths::resolve(&nested)
+            .unwrap()
+            .bind_to_workspace(&db, "workspace")
+            .unwrap();
+        let restored = LifecyclePaths::resolve_for_workspace(&nested, &db, "workspace", true)
+            .unwrap()
+            .saved_config(&db)
+            .unwrap();
+        assert_eq!(restored.setup, scripts.setup);
+        assert_eq!(restored.teardown, scripts.teardown);
+
+        // Another valid entry in the same repo cannot lend its Git pointer.
+        let marker = fs::read(linked.join(".git")).unwrap();
+        let other = project.join("other");
+        run_git(&["worktree", "add", "--detach", other.to_str().unwrap()]);
+        fs::copy(other.join(".git"), linked.join(".git")).unwrap();
+        assert!(read_saved_config(&nested, &db).is_none());
+        assert!(LifecyclePaths::resolve_for_workspace(&nested, &db, "workspace", true).is_err());
+        fs::write(linked.join(".git"), &marker).unwrap();
+
+        // Git still accepts this path when a directory returns with the
+        // original Git pointer. Automatic commands also require its identity.
         let moved = project.join("relocated");
         fs::rename(&linked, &moved).unwrap();
         assert!(read_saved_config(&moved.join("src/feature"), &db).is_none());
+        fs::create_dir_all(&nested).unwrap();
+        fs::write(linked.join(".git"), marker).unwrap();
+        assert!(read_saved_config(&nested, &db).is_some());
+        assert!(LifecyclePaths::resolve_for_workspace(&nested, &db, "workspace", true).is_err());
+        assert!(LifecyclePaths::resolve(&nested)
+            .unwrap()
+            .bind_to_workspace(&db, "workspace")
+            .is_err());
+        assert!(LifecyclePaths::resolve_for_workspace(&nested, &db, "workspace", true).is_err());
     }
 }
 
