@@ -467,6 +467,19 @@ enum FolderRuleSource {
     GitExclude,
 }
 
+enum RuleReadError {
+    Io(String),
+    Rejected(String),
+}
+
+impl RuleReadError {
+    fn into_message(self) -> String {
+        match self {
+            Self::Io(message) | Self::Rejected(message) => message,
+        }
+    }
+}
+
 struct FolderWalkFilter {
     rules: HashMap<PathBuf, FolderRuleSet>,
     global_rules: Option<Gitignore>,
@@ -517,8 +530,12 @@ impl FolderWalkFilter {
         .into_iter()
         .flatten()
         {
-            let Some(bytes) = Self::read_bounded_file(&file, rule_bytes, true)? else {
-                continue;
+            // Git treats unreadable optional config sources as unavailable.
+            // Budget and file-shape violations still reject the preview.
+            let bytes = match Self::read_bounded_file(&file, rule_bytes, true) {
+                Ok(Some(bytes)) => bytes,
+                Ok(None) | Err(RuleReadError::Io(_)) => continue,
+                Err(RuleReadError::Rejected(message)) => return Err(message),
             };
             if let Some(path) = Self::config_exclude_path(&bytes, home.as_deref()) {
                 exclude = Some(path);
@@ -530,8 +547,10 @@ impl FolderWalkFilter {
         let Some(file) = exclude.or_else(|| xdg.map(|xdg| xdg.join("git/ignore"))) else {
             return Ok(None);
         };
-        let Some(bytes) = Self::read_bounded_file(&file, rule_bytes, true)? else {
-            return Ok(None);
+        let bytes = match Self::read_bounded_file(&file, rule_bytes, true) {
+            Ok(Some(bytes)) => bytes,
+            Ok(None) | Err(RuleReadError::Io(_)) => return Ok(None),
+            Err(RuleReadError::Rejected(message)) => return Err(message),
         };
         Self::compile_rule_bytes(&cwd, &file, &bytes, rule_lines).map(Some)
     }
@@ -620,7 +639,8 @@ impl FolderWalkFilter {
         }
         // The picker follows linked-worktree pointer symlinks. This read is
         // still capped and validates the opened handle as a regular file.
-        let bytes = Self::read_bounded_file(&dot_git, &mut self.rule_bytes, true)?
+        let bytes = Self::read_bounded_file(&dot_git, &mut self.rule_bytes, true)
+            .map_err(RuleReadError::into_message)?
             .ok_or_else(|| format!("missing attachment Git directory: {}", dot_git.display()))?;
         let git_dir_line = Self::rule_line(&bytes)?
             .ok_or_else(|| format!("invalid attachment Git directory: {}", dot_git.display()))?;
@@ -646,7 +666,8 @@ impl FolderWalkFilter {
             &commondir_file,
             &mut self.rule_bytes,
             true,
-        )?;
+        )
+        .map_err(RuleReadError::into_message)?;
         let common_dir = if let Some(commondir_bytes) = commondir_bytes {
             let commondir_line = Self::rule_line(&commondir_bytes)?.ok_or_else(|| {
                 format!(
@@ -674,7 +695,9 @@ impl FolderWalkFilter {
     }
 
     fn load_rule_file(&mut self, dir: &Path, file: &Path) -> Result<Option<Gitignore>, String> {
-        let Some(bytes) = Self::read_bounded_file(file, &mut self.rule_bytes, false)? else {
+        let bytes = Self::read_bounded_file(file, &mut self.rule_bytes, false)
+            .map_err(RuleReadError::into_message)?;
+        let Some(bytes) = bytes else {
             return Ok(None);
         };
         let matcher = Self::compile_rule_bytes(dir, file, &bytes, &mut self.rule_lines)?;
@@ -788,7 +811,7 @@ impl FolderWalkFilter {
         file: &Path,
         rule_bytes: &mut u64,
         allow_symlinks: bool,
-    ) -> Result<Option<Vec<u8>>, String> {
+    ) -> Result<Option<Vec<u8>>, RuleReadError> {
         #[cfg(unix)]
         if allow_symlinks && file == Path::new("/dev/null") {
             return Ok(None);
@@ -805,71 +828,73 @@ impl FolderWalkFilter {
             Ok(metadata) => metadata,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
             Err(error) => {
-                return Err(format!(
+                return Err(RuleReadError::Io(format!(
                     "cannot inspect attachment ignore rules at {}: {error}",
                     file.display()
-                ));
+                )));
             }
         };
         if !metadata.is_file() {
-            return Err(format!(
+            return Err(RuleReadError::Rejected(format!(
                 "attachment ignore rules are not a regular file: {}",
                 file.display()
-            ));
+            )));
         }
         if metadata.len() > MAX_ATTACHMENT_IGNORE_FILE_BYTES {
-            return Err(format!(
+            return Err(RuleReadError::Rejected(format!(
                 "attachment ignore rule file exceeds 1 MiB: {}",
                 file.display()
-            ));
+            )));
         }
         let reader = open_bounded_file(file, allow_symlinks).map_err(|error| {
-            format!(
+            RuleReadError::Io(format!(
                 "cannot read attachment ignore rules at {}: {error}",
                 file.display()
-            )
+            ))
         })?;
         let opened_metadata = reader.metadata().map_err(|error| {
-            format!(
+            RuleReadError::Io(format!(
                 "cannot inspect attachment ignore rules at {}: {error}",
                 file.display()
-            )
+            ))
         })?;
         if !opened_metadata.is_file()
             || (!allow_symlinks && opened_metadata.file_type().is_symlink())
         {
-            return Err(format!(
+            return Err(RuleReadError::Rejected(format!(
                 "attachment ignore rules are not a regular file: {}",
                 file.display()
-            ));
+            )));
         }
         if opened_metadata.len() > MAX_ATTACHMENT_IGNORE_FILE_BYTES {
-            return Err(format!(
+            return Err(RuleReadError::Rejected(format!(
                 "attachment ignore rule file exceeds 1 MiB: {}",
                 file.display()
-            ));
+            )));
         }
         let mut bytes = Vec::new();
         reader
             .take(MAX_ATTACHMENT_IGNORE_FILE_BYTES + 1)
             .read_to_end(&mut bytes)
             .map_err(|error| {
-                format!(
+                RuleReadError::Io(format!(
                     "cannot read attachment ignore rules at {}: {error}",
                     file.display()
-                )
+                ))
             })?;
         if bytes.len() as u64 > MAX_ATTACHMENT_IGNORE_FILE_BYTES {
-            return Err(format!(
+            return Err(RuleReadError::Rejected(format!(
                 "attachment ignore rule file exceeds 1 MiB: {}",
                 file.display()
-            ));
+            )));
         }
         *rule_bytes = rule_bytes.saturating_add(
             metadata.len().max(opened_metadata.len()).max(bytes.len() as u64),
         );
         if *rule_bytes > MAX_ATTACHMENT_IGNORE_TOTAL_BYTES {
-            return Err("attachment ignore rules exceed 4 MiB in total".to_string());
+            return Err(RuleReadError::Rejected(
+                "attachment ignore rules exceed 4 MiB in total".to_string(),
+            ));
         }
         Ok(Some(bytes))
     }
@@ -3147,6 +3172,62 @@ mod tests {
         )
         .unwrap_err();
         assert!(error.contains("ignore rule file exceeds 1 MiB"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unreadable_optional_git_config_uses_picker_fallback() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempdir().unwrap();
+        let xdg = dir.path().join("xdg");
+        fs::create_dir_all(xdg.join("git")).unwrap();
+        fs::write(xdg.join("git/ignore"), "*.secret\n").unwrap();
+        let system_config = dir.path().join("unreadable-system-config");
+        fs::write(&system_config, "[core]\n").unwrap();
+        fs::set_permissions(&system_config, fs::Permissions::from_mode(0o000)).unwrap();
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "commands::project_files::tests::unreadable_config_fallback_child",
+                "--nocapture",
+            ])
+            .env("CODEMUX_ATTACHMENT_UNREADABLE_CONFIG_CHILD", "1")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_SYSTEM", system_config)
+            .env("XDG_CONFIG_HOME", xdg)
+            .env("HOME", dir.path())
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "stdout: {}\nstderr: {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unreadable_config_fallback_child() {
+        if std::env::var_os("CODEMUX_ATTACHMENT_UNREADABLE_CONFIG_CHILD").is_none() {
+            return;
+        }
+        let dir = tempdir().unwrap();
+        fs::create_dir(dir.path().join(".git")).unwrap();
+        fs::write(dir.path().join("hidden.secret"), "x").unwrap();
+        fs::write(dir.path().join("visible.txt"), "x").unwrap();
+        let picked = walk_project(dir.path());
+        assert!(picked.paths.iter().any(|path| path == "visible.txt"));
+        assert!(!picked.paths.iter().any(|path| path == "hidden.secret"));
+        let info = read_folder_for_attachment_blocking(
+            dir.path().to_string_lossy().into_owned(),
+            None,
+            1,
+        )
+        .unwrap();
+        assert!(info.tree.contains("visible.txt"));
+        assert!(!info.tree.contains("hidden.secret"));
     }
 
     #[test]
