@@ -20,10 +20,13 @@ ENV container=docker \
 RUN dnf -y install \
       systemd dbus-daemon dbus-broker polkit \
       openssh-server \
-      sudo curl iproute procps-ng shadow-utils file sqlite \
+      sudo curl iproute procps-ng shadow-utils file sqlite socat \
  && dnf clean all \
  && ssh-keygen -A \
  && systemctl enable sshd
+
+COPY mock-api-loopback.service /etc/systemd/system/mock-api-loopback.service
+RUN systemctl enable mock-api-loopback.service
 
 # Container-hostile boot units. Unlike the Debian image, Fedora's presets are
 # already lean, so masking the handful that fail is enough — and logind is
