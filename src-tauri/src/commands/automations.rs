@@ -505,15 +505,35 @@ fn interpret_repo_probe(stdout: &str) -> bool {
     stdout.contains(REPO_PROBE_MARKER)
 }
 
-fn repo_access_probe_script(remote: &str) -> Option<String> {
+fn repo_access_probe_command(remote: &str) -> Option<String> {
+    // Probe the same credential-free URL the automation stores.
+    let remote = crate::project_identity::redact_remote_url(remote);
     // Older Git versions do not accept -- here. Refuse option-like remotes
     // and keep the URL inside a single-quoted shell argument.
     if remote.starts_with('-') || remote.contains('\'') {
         return None;
     }
-    Some(crate::ssh_policy::unattended_git_script(&format!(
+    let script = crate::ssh_policy::unattended_git_script(&format!(
         "git ls-remote --heads '{remote}' >/dev/null 2>&1 && echo {REPO_PROBE_MARKER}"
-    )))
+    ));
+    Some(format!("exec sh -c {}", crate::ssh_policy::shell_quote(&script)))
+}
+
+async fn run_repo_access_probe(
+    ssh_target: &str,
+    remote_command: String,
+) -> std::io::Result<std::process::Output> {
+    let mut args: Vec<_> = crate::ssh_policy::verified_command_args()
+        .map(str::to_owned)
+        .collect();
+    args.extend(["-o", "ConnectTimeout=10", "--", ssh_target].map(str::to_owned));
+    args.push(remote_command);
+    crate::ssh_policy::checked_ssh_with_args(&args)
+        .await?
+        .stdin(std::process::Stdio::null())
+        .kill_on_drop(true)
+        .output()
+        .await
 }
 
 /// Check whether the automation's host can reach its project repo.
@@ -563,7 +583,7 @@ pub async fn automations_check_repo_access(
             })
         }
     };
-    let Some(script) = repo_access_probe_script(&remote) else {
+    let Some(command) = repo_access_probe_command(&remote) else {
         return Ok(RepoAccessResult {
             ok: false,
             message: "The project's git remote URL is invalid.".to_string(),
@@ -575,33 +595,10 @@ pub async fn automations_check_repo_access(
         .find(|h| h.id == host_id)
         .ok_or_else(|| format!("Host not found: {host_id}"))?;
 
-    let probe = tokio::time::timeout(std::time::Duration::from_secs(20), async {
-        use std::process::Stdio;
-        use tokio::io::AsyncWriteExt;
-
-        let mut args: Vec<_> = crate::ssh_policy::verified_command_args()
-            .map(str::to_owned)
-            .collect();
-        args.extend(
-            ["-o", "ConnectTimeout=10", "--", host.ssh_target.as_str(), "sh -s"]
-                .map(str::to_owned),
-        );
-        let mut command = crate::ssh_policy::checked_ssh_with_args(&args).await?;
-        command
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .kill_on_drop(true);
-        let mut child = command.spawn()?;
-        let mut stdin = child.stdin.take().expect("piped SSH stdin");
-        let send = async move {
-            let result = stdin.write_all(script.as_bytes()).await;
-            drop(stdin);
-            result
-        };
-        let ((), output) = tokio::try_join!(send, child.wait_with_output())?;
-        Ok::<_, std::io::Error>(output)
-    })
+    let probe = tokio::time::timeout(
+        std::time::Duration::from_secs(20),
+        run_repo_access_probe(&host.ssh_target, command),
+    )
     .await;
 
     match probe {
@@ -639,15 +636,21 @@ mod tests {
     use super::*;
 
     #[cfg(unix)]
-    #[test]
-    fn repo_access_probe_rejects_options_and_accepts_a_local_repository() {
+    #[tokio::test]
+    async fn repo_access_probe_rejects_options_and_works_with_ssh_stdin_disabled() {
+        use std::os::unix::fs::PermissionsExt;
+
         if crate::test_isolation::isolated(
-            "commands::automations::tests::repo_access_probe_rejects_options_and_accepts_a_local_repository",
+            "commands::automations::tests::repo_access_probe_rejects_options_and_works_with_ssh_stdin_disabled",
         ) {
             return;
         }
-        assert!(repo_access_probe_script("--heads").is_none());
-        assert!(repo_access_probe_script("a'b").is_none());
+        assert!(repo_access_probe_command("--heads").is_none());
+        assert!(repo_access_probe_command("a'b").is_none());
+        let redacted = repo_access_probe_command("https://fixture-user:fixture-password@fixture.invalid/repo")
+            .unwrap();
+        assert!(redacted.contains("https://fixture.invalid/repo"));
+        assert!(!redacted.contains("fixture-password"));
 
         let root = tempfile::tempdir().unwrap();
         let init = crate::git::git_command()
@@ -656,11 +659,30 @@ mod tests {
             .output()
             .unwrap();
         assert!(init.status.success(), "{init:?}");
-        let script = repo_access_probe_script("./origin.git").unwrap();
-        let result = std::process::Command::new("sh")
-            .current_dir(root.path())
-            .args(["-c", &script])
-            .output()
+        let ssh = root.path().join("ssh");
+        std::fs::write(
+            &ssh,
+            r#"#!/bin/sh
+if [ "$1" = -G ]; then printf 'stdinnull yes\n'; exit 0; fi
+while [ "$#" -gt 0 ] && [ "$1" != -- ]; do shift; done
+[ "$#" -eq 3 ] && [ "$2" = no-stdin-device ] || exit 2
+cd "$CODEMUX_REPO_PROBE_FIXTURE" || exit 2
+exec /bin/sh -c "$3" </dev/null
+"#,
+        )
+        .unwrap();
+        std::fs::set_permissions(ssh, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let path = std::env::var_os("PATH").unwrap_or_default();
+        let path = std::env::join_paths(
+            std::iter::once(root.path().to_owned()).chain(std::env::split_paths(&path)),
+        )
+        .unwrap();
+        std::env::set_var("PATH", path);
+        std::env::set_var("CODEMUX_REPO_PROBE_FIXTURE", root.path());
+
+        let command = repo_access_probe_command("./origin.git").unwrap();
+        let result = run_repo_access_probe("no-stdin-device", command)
+            .await
             .unwrap();
         assert!(result.status.success(), "{result:?}");
         assert!(interpret_repo_probe(&String::from_utf8_lossy(&result.stdout)));

@@ -26,7 +26,9 @@ const PROXY_JUMP_ERROR: &str =
 // OpenSSH uses the first proxy directive it encounters. A leading
 // ProxyCommand pins the checked route and suppresses any later ProxyJump.
 const CHECKED_SSH: &str = r#"
-config=$(ssh -G "$@" </dev/null) || exit 255
+# Forwarding rules are irrelevant to route selection. OpenSSH 7.2 also
+# cannot dump Unix-socket forwards safely.
+config=$(ssh -G -o ClearAllForwardings=yes "$@" </dev/null) || exit 255
 cr=$(printf "\r")
 proxycommand=none
 while IFS= read -r setting; do
@@ -91,7 +93,7 @@ pub(crate) async fn checked_native_ssh(
     let output = tokio::time::timeout(
         std::time::Duration::from_secs(5),
         probe
-            .arg("-G")
+            .args(["-G", "-o", "ClearAllForwardings=yes"])
             .args(args)
             .stdin(Stdio::null())
             .kill_on_drop(true)
@@ -139,7 +141,7 @@ pub(crate) fn verified_shell_command() -> String {
     )
 }
 
-fn shell_quote(value: &str) -> String {
+pub(crate) fn shell_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\\''"))
 }
 
@@ -481,6 +483,7 @@ mod unattended_git_tests {
             &ssh,
             r#"#!/bin/sh
 if [ "$1" = -G ]; then
+    [ "$2" = -o ] && [ "$3" = ClearAllForwardings=yes ] || exit 2
     if [ "$FIXTURE_ROUTE" = jump ]; then
         printf 'proxyjump relay-fixture\n'
     elif [ "$FIXTURE_ROUTE" = command ]; then
@@ -492,6 +495,14 @@ expected=ProxyCommand=none
 [ "$FIXTURE_ROUTE" != command ] || expected='ProxyCommand=user-fixture %h %p'
 [ "$1" = -o ] && [ "$2" = "$expected" ] || exit 2
 [ "$3" = -T ] || exit 2
+forwarding=no
+for arg do
+    case $arg in
+        ClearAllForwardings=yes) exit 2 ;;
+        /tmp/fixture-local.sock:/tmp/fixture-remote.sock) forwarding=yes ;;
+    esac
+done
+[ "$forwarding" = yes ] || exit 2
 printf 'transport started\n'
 "#,
         )
@@ -506,8 +517,14 @@ printf 'transport started\n'
             checked_ssh()
                 .env("PATH", &path)
                 .env("FIXTURE_ROUTE", route)
-                .args(verified_command_args())
-                .args(["--", "destination", "fixture"])
+                .args(VERIFIED_HOST_ARGS)
+                .args([
+                    "-L",
+                    "/tmp/fixture-local.sock:/tmp/fixture-remote.sock",
+                    "--",
+                    "destination",
+                    "fixture",
+                ])
                 .output()
                 .unwrap()
         };
