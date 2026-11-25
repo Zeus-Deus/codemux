@@ -831,8 +831,44 @@ fn open_private_key_dir(parent: &Path) -> Result<std::fs::File, String> {
     open_key_dir(parent, KeyDirAccess::PrivateCreate)
 }
 
+/// An open directory entry is not durable until its containing directory is
+/// synced. Reopen the validated handle for directory I/O; O_PATH/O_SEARCH
+/// traversal handles themselves cannot be fsynced.
+#[cfg(unix)]
+fn sync_pinned_key_parent(parent: &std::fs::File) -> Result<(), String> {
+    use std::os::fd::{AsRawFd, FromRawFd};
+    use std::os::unix::fs::MetadataExt;
+
+    let dot = std::ffi::CString::new(".").expect("static directory name has no NUL");
+    let fd = unsafe {
+        libc::openat(
+            parent.as_raw_fd(),
+            dot.as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )
+    };
+    if fd < 0 {
+        return Err(format!("open iroh key parent for sync: {}", std::io::Error::last_os_error()));
+    }
+    let readable = unsafe { std::fs::File::from_raw_fd(fd) };
+    let expected = parent.metadata().map_err(|e| format!("inspect iroh key parent: {e}"))?;
+    let actual = readable.metadata().map_err(|e| format!("inspect iroh key sync handle: {e}"))?;
+    if actual.dev() != expected.dev() || actual.ino() != expected.ino() {
+        return Err("iroh key parent changed before sync".to_string());
+    }
+    readable.sync_all().map_err(|e| format!("sync iroh key parent directory: {e}"))
+}
+
 #[cfg(unix)]
 fn open_key_dir(parent: &Path, access: KeyDirAccess) -> Result<std::fs::File, String> {
+    open_key_dir_with_parents(parent, access).map(|(directory, _)| directory)
+}
+
+#[cfg(unix)]
+fn open_key_dir_with_parents(
+    parent: &Path,
+    access: KeyDirAccess,
+) -> Result<(std::fs::File, Vec<std::fs::File>), String> {
     use std::collections::VecDeque;
     use std::ffi::{CString, OsString};
     use std::os::fd::{AsRawFd, FromRawFd};
@@ -1020,7 +1056,7 @@ fn open_key_dir(parent: &Path, access: KeyDirAccess) -> Result<std::fs::File, St
             return Err("iroh key directory permissions remain unsafe".to_string());
         }
         check_key_acl(&search_handle, "iroh key directory", KeyAclScope::Ancestor)?;
-        return Ok(search_handle);
+        return Ok((search_handle, directories));
     }
     let dot = std::ffi::CString::new(".").expect("static directory name has no NUL");
     let fd = unsafe {
@@ -1071,7 +1107,7 @@ fn open_key_dir(parent: &Path, access: KeyDirAccess) -> Result<std::fs::File, St
         return Err("iroh key directory permissions remain unsafe".to_string());
     }
     check_key_acl(&directory, "iroh key directory", scope)?;
-    Ok(directory)
+    Ok((directory, directories))
 }
 
 /// Open the fixed private child relative to the validated app-data root.
@@ -1404,13 +1440,14 @@ fn load_or_create_secret_key() -> Result<SecretKey, String> {
 fn load_or_create_secret_key_at(path: &Path) -> Result<SecretKey, String> {
     let parent = path.parent().ok_or("iroh key path has no parent")?;
     #[cfg(unix)]
-    let legacy_root = if let Some(legacy) = legacy_key_file_path(path) {
-        Some(open_key_dir(
+    let (legacy_root, root_parents) = if let Some(legacy) = legacy_key_file_path(path) {
+        let (root, parents) = open_key_dir_with_parents(
             legacy.parent().ok_or("legacy iroh key has no parent")?,
             KeyDirAccess::AncestorCreate,
-        )?)
+        )?;
+        (Some(root), parents)
     } else {
-        None
+        (None, Vec::new())
     };
     #[cfg(unix)]
     let directory = if let Some(root) = legacy_root.as_ref() {
@@ -1449,6 +1486,16 @@ fn load_or_create_secret_key_at(path: &Path) -> Result<SecretKey, String> {
     #[cfg(not(unix))]
     if let Some(key) = migrate_legacy_secret_key(path)? {
         return Ok(key);
+    }
+    // The key file and its private directory are synced by persist_secret_key_in.
+    // A fresh identity has no legacy recovery copy, so also flush the private
+    // directory's entry in the app-data root before advertising its node ID.
+    #[cfg(unix)]
+    if let Some(root) = legacy_root.as_ref() {
+        sync_pinned_key_parent(root)?;
+        for parent in root_parents.iter().rev() {
+            sync_pinned_key_parent(parent)?;
+        }
     }
     let key = SecretKey::generate();
     #[cfg(unix)]
@@ -2105,6 +2152,77 @@ mod tests {
         std::fs::write(&private_path, b"incomplete replacement").unwrap();
         assert_eq!(persisted_node_id_at(&private_path).as_deref(), Some(node_id.as_str()));
         assert_eq!(load_or_create_secret_key_at(&private_path).unwrap().public(), key.public());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn iroh_identity_key_first_start_persists_through_new_app_root() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("codemux").join(KEY_DIR).join(KEY_FILE);
+        assert!(!path.parent().unwrap().parent().unwrap().exists());
+
+        let created = load_or_create_secret_key_at(&path).unwrap();
+        assert!(path.exists());
+        assert_eq!(load_or_create_secret_key_at(&path).unwrap().public(), created.public());
+        let node_id = created.public().to_string();
+        assert_eq!(persisted_node_id_at(&path).as_deref(), Some(node_id.as_str()));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn iroh_identity_key_fresh_creation_needs_syncable_app_root() {
+        use std::os::unix::fs::PermissionsExt;
+
+        if unsafe { libc::geteuid() } == 0 {
+            return;
+        }
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("codemux");
+        std::fs::create_dir(&root).unwrap();
+        let path = root.join(KEY_DIR).join(KEY_FILE);
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o300)).unwrap();
+        let result = load_or_create_secret_key_at(&path);
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let error = result.unwrap_err();
+        assert!(error.contains("for sync"), "{error}");
+        assert!(!path.exists(), "no fresh identity is published without parent sync");
+
+        let legacy_key = SecretKey::generate();
+        let legacy = root.join(KEY_FILE);
+        std::fs::write(&legacy, crate::auth::encrypt_data(&legacy_key.to_bytes()).unwrap()).unwrap();
+        std::fs::set_permissions(&legacy, std::fs::Permissions::from_mode(0o600)).unwrap();
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o300)).unwrap();
+        let migrated = load_or_create_secret_key_at(&path);
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert_eq!(migrated.unwrap().public(), legacy_key.public());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn iroh_identity_key_new_app_root_needs_syncable_parent() {
+        use std::os::unix::fs::PermissionsExt;
+
+        if unsafe { libc::geteuid() } == 0 {
+            return;
+        }
+        let temp = tempfile::tempdir().unwrap();
+        let parent = temp.path().join("search-only");
+        std::fs::create_dir(&parent).unwrap();
+        let path = parent.join("codemux").join(KEY_DIR).join(KEY_FILE);
+        std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o300)).unwrap();
+        let result = load_or_create_secret_key_at(&path);
+        std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let error = result.unwrap_err();
+        assert!(error.contains("for sync"), "{error}");
+        assert!(!path.exists(), "no fresh identity is published without ancestor sync");
+
+        // A retry must not treat the unsynced but still-present app-data
+        // directory as durable merely because this invocation did not create it.
+        std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o300)).unwrap();
+        let retry = load_or_create_secret_key_at(&path);
+        std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(retry.unwrap_err().contains("for sync"));
+        assert!(!path.exists());
     }
 
     #[cfg(unix)]
