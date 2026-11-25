@@ -505,9 +505,51 @@ fn dechunk(mut data: &[u8]) -> Option<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Instant;
     use crate::web_remote::{auth, server};
     use tokio::net::{TcpListener, TcpStream};
     use tokio_tungstenite::{tungstenite, WebSocketStream};
+
+    #[test]
+    fn proxy_unrelated_process_fixture() {
+        if std::env::var_os("CODEMUX_PROXY_UNRELATED_TEST_CHILD").is_some() {
+            std::thread::sleep(Duration::from_secs(30));
+        }
+    }
+
+    struct UnrelatedProcess(std::process::Child);
+
+    impl Drop for UnrelatedProcess {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
+    fn unrelated_live_identity(port: u16) -> (UnrelatedProcess, BrowserStreamIdentity) {
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "web_remote::proxy::tests::proxy_unrelated_process_fixture"])
+            .env("CODEMUX_PROXY_UNRELATED_TEST_CHILD", "1")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        let started = Instant::now();
+        loop {
+            if let Some(identity) = crate::agent_browser::test_process_stream_identity(port, child.id()) {
+                std::thread::sleep(Duration::from_millis(100));
+                if child.try_wait().unwrap().is_none() {
+                    return (UnrelatedProcess(child), identity);
+                }
+            }
+            if child.try_wait().unwrap().is_some() || started.elapsed() >= Duration::from_secs(3) {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("unrelated process did not expose a live identity");
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
 
     #[test]
     fn remote_proxy_exposes_only_the_browser_pane_api() {
@@ -582,10 +624,9 @@ mod tests {
                 .expect("proxy must close a rejected peer")
                 .unwrap()
         });
-        let mut stale_identity = crate::agent_browser::current_process_stream_identity(port);
-        stale_identity.start_time += 1;
+        let (unrelated, identity) = unrelated_live_identity(port);
         let response = forward(
-            stale_identity,
+            identity,
             &Method::POST,
             "command",
             None,
@@ -593,8 +634,32 @@ mod tests {
             br#"{"action":"stream_status"}"#,
         )
         .await;
+        let received = server.await.unwrap();
+        drop(unrelated);
         assert!(response.is_err());
-        assert_eq!(server.await.unwrap(), 0, "rejected peer received request bytes");
+        assert_eq!(received, 0, "rejected peer received request bytes");
+    }
+
+    #[tokio::test]
+    async fn websocket_peer_check_sends_no_handshake_to_unrelated_listener() {
+        let daemon = bind_test_daemon().await;
+        let port = daemon.local_addr().unwrap().port();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = daemon.accept().await.unwrap();
+            let mut buf = [0; 1];
+            tokio::time::timeout(Duration::from_secs(2), stream.read(&mut buf))
+                .await
+                .expect("rejected socket must close before a WebSocket handshake")
+                .unwrap()
+        });
+        let (unrelated, identity) = unrelated_live_identity(port);
+        // bridge_ws uses this verified connection before client_async writes
+        // the WebSocket upgrade, so rejection here must send no handshake.
+        let connection = crate::agent_browser::connect_verified_stream_peer(identity).await;
+        let received = server.await.unwrap();
+        drop(unrelated);
+        assert!(connection.is_err());
+        assert_eq!(received, 0, "rejected peer received WebSocket handshake bytes");
     }
 
     #[tokio::test]

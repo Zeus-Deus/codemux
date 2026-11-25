@@ -1483,13 +1483,17 @@ fn refresh_stream_session_identity(
 
 #[cfg(test)]
 pub(crate) fn current_process_stream_identity(port: u16) -> BrowserStreamIdentity {
-    let pid = std::process::id();
-    BrowserStreamIdentity {
+    test_process_stream_identity(port, std::process::id()).expect("test process start time")
+}
+
+#[cfg(test)]
+pub(crate) fn test_process_stream_identity(port: u16, pid: u32) -> Option<BrowserStreamIdentity> {
+    Some(BrowserStreamIdentity {
         port,
         pid,
-        start_time: process_start_time(pid).expect("test process start time"),
+        start_time: process_start_time(pid)?,
         generation: 1,
-    }
+    })
 }
 
 fn session_name(browser_id: &str) -> &str {
@@ -3040,7 +3044,9 @@ impl AgentBrowserManager {
     pub(crate) async fn verified_stream_identity(&self, browser_id: &str) -> Result<BrowserStreamIdentity, String> {
         let session = session_name(browser_id).to_owned();
         validate_session_name(&session)?;
-        let _lifecycle = browser_lifecycle_gate(&session).lock_owned().await;
+        // Status probes must run while a long open/wait command owns the
+        // lifecycle gate. Check the published state again after verifying
+        // the daemon instead of making the pane wait for that command.
         let (port, generation) = {
             let sessions = self.sessions.lock().await;
             let stream = sessions.get(browser_id)
@@ -3050,6 +3056,18 @@ impl AgentBrowserManager {
             }
             (stream.port, stream.stream_generation)
         };
+        #[cfg(test)]
+        let test_identity = self.test_stream_ports.lock().await.get(&port).copied();
+        #[cfg(test)]
+        if let Some(identity) = test_identity {
+            let sessions = self.sessions.lock().await;
+            if identity.generation == generation && sessions.get(browser_id).is_some_and(|stream| {
+                stream.running && stream.port == port && stream.stream_generation == generation
+            }) {
+                return Ok(identity);
+            }
+            return Err("Browser session changed during ownership check".into());
+        }
         let record = tokio::task::spawn_blocking(move || {
             require_owned_browser_session(&session)?;
             let dir = run_dir_for_session(&session)
@@ -4478,6 +4496,34 @@ mod tests {
         let reused_identity = refresh_stream_session_identity(&mut stream, &reused_pid);
         assert_eq!(reused_identity.pid, identity.pid);
         assert_ne!(reused_identity.generation, identity.generation);
+    }
+
+    #[tokio::test]
+    async fn published_stream_identity_stays_available_during_long_command() {
+        let manager = AgentBrowserManager::new();
+        let session = format!("browser-status-{}", uuid::Uuid::new_v4().simple());
+        let identity = current_process_stream_identity(9223);
+        manager.sessions.lock().await.insert(session.clone(), StreamSession {
+            port: identity.port,
+            running: true,
+            pid: Some(identity.pid),
+            pid_start_time: Some(identity.start_time),
+            stream_generation: identity.generation,
+            last_seen_at: None,
+        });
+        manager.allow_test_stream_port(identity.port).await;
+
+        // An automation worker holds this gate during a long open/wait.
+        let command = browser_lifecycle_gate(&session).lock_owned().await;
+        let observed = tokio::time::timeout(
+            Duration::from_secs(1),
+            manager.verified_stream_identity(&session),
+        )
+        .await
+        .expect("status identity was blocked by the automation command")
+        .unwrap();
+        assert_eq!(observed, identity);
+        drop(command);
     }
 
     #[cfg(not(target_os = "windows"))]
