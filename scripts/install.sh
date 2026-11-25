@@ -22,9 +22,10 @@
 #                              where the app already exports it (see
 #                              codemux_pinned_version below)
 #   CODEMUX_ARTIFACT           path or URL to a .deb / .rpm / .AppImage; skips
-#                              version resolution and download-by-name entirely,
-#                              and is installed as given, without a signature
-#                              check
+#                              version resolution and download-by-name entirely.
+#                              A URL must come with <url>.sig and passes the
+#                              same signature check as a release download; a
+#                              local file is installed as given, unchecked
 #   CODEMUX_INSTALL_DIR        bin directory for the AppImage fallback
 #                              (default: /usr/local/bin, or ~/.local/bin non-root)
 #   CODEMUX_NO_DEPS=1          never touch the package manager for dependencies
@@ -429,8 +430,8 @@ Environment
   CODEMUX_INSTALL_VERSION  version or tag to install (CODEMUX_VERSION also
                          works outside a Codemux terminal)
   CODEMUX_ARTIFACT       path or URL to a .deb / .rpm / .AppImage to install
-                         as given (release downloads are signature-checked;
-                         this one is not)
+                         (a URL is signature-checked against <url>.sig like
+                         a release download; a local file is not checked)
   CODEMUX_INSTALL_DIR    bin directory for the AppImage fallback
   CODEMUX_NO_DEPS=1      never touch the package manager for dependencies
   CODEMUX_METHOD         force deb | rpm | appimage
@@ -1101,14 +1102,21 @@ main() {
 
     _artifact=""
     if [ -n "${CODEMUX_ARTIFACT:-}" ]; then
-        warn "CODEMUX_ARTIFACT is installed as given; its signature is not checked"
         case "$CODEMUX_ARTIFACT" in
             http://*|https://*)
+                # A download is checked like any release package: <url>.sig
+                # must sign it under its own file name. Only a file already on
+                # this machine is the user's own call.
+                require_signature_tools
+                _name=$(basename "$CODEMUX_ARTIFACT")
                 step "Downloading the artifact you pointed at"
-                _artifact="${WORKDIR}/$(basename "$CODEMUX_ARTIFACT")"
+                _artifact="${WORKDIR}/${_name}"
                 download_to "$CODEMUX_ARTIFACT" "$_artifact"
+                say ""
+                verify_release_artifact "$_artifact" "$CODEMUX_ARTIFACT" "$_name"
                 ;;
             *)
+                warn "CODEMUX_ARTIFACT is a local file, installed as given; its signature is not checked"
                 [ -f "$CODEMUX_ARTIFACT" ] || die "CODEMUX_ARTIFACT not found: ${CODEMUX_ARTIFACT}"
                 _artifact=$(cd "$(dirname "$CODEMUX_ARTIFACT")" && pwd)/$(basename "$CODEMUX_ARTIFACT")
                 step "Using local artifact"

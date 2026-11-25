@@ -506,29 +506,29 @@ if ! codemux_can_verify_signatures; then
 else
     SIGROOT="${TMPROOT}/sig"
     mkdir -p "$SIGROOT"
-    openssl genpkey -algorithm ed25519 -out "${SIGROOT}/test.pem" 2>/dev/null
+    "$OPENSSL" genpkey -algorithm ed25519 -out "${SIGROOT}/test.pem" 2>/dev/null
     TEST_KEY=$({ printf 'Ed\001\002\003\004\005\006\007\010'
-                 openssl pkey -in "${SIGROOT}/test.pem" -pubout -outform DER | tail -c 32; } | openssl base64 -A)
+                 "$OPENSSL" pkey -in "${SIGROOT}/test.pem" -pubout -outform DER | tail -c 32; } | "$OPENSSL" base64 -A)
     OTHER_KEY=$({ printf 'Ed\001\002\003\004\005\006\007\010'
-                  openssl genpkey -algorithm ed25519 2>/dev/null | openssl pkey -pubout -outform DER | tail -c 32; } | openssl base64 -A)
+                  "$OPENSSL" genpkey -algorithm ed25519 2>/dev/null | "$OPENSSL" pkey -pubout -outform DER | tail -c 32; } | "$OPENSSL" base64 -A)
 
     # Writes <file>.sig signed by the test key, naming <name> in the trusted comment.
     sign_fixture() { # <file> <name>
         local s="${SIGROOT}/work"
         mkdir -p "$s"
-        openssl dgst -blake2b512 -binary "$1" > "${s}/hash"
-        openssl pkeyutl -sign -inkey "${SIGROOT}/test.pem" -rawin -in "${s}/hash" -out "${s}/sig"
+        "$OPENSSL" dgst -blake2b512 -binary "$1" > "${s}/hash"
+        "$OPENSSL" pkeyutl -sign -inkey "${SIGROOT}/test.pem" -rawin -in "${s}/hash" -out "${s}/sig"
         local trusted
         trusted=$(printf 'timestamp:1700000000\tfile:%s' "$2")
         { cat "${s}/sig"; printf '%s' "$trusted"; } > "${s}/global.msg"
-        openssl pkeyutl -sign -inkey "${SIGROOT}/test.pem" -rawin -in "${s}/global.msg" -out "${s}/global"
+        "$OPENSSL" pkeyutl -sign -inkey "${SIGROOT}/test.pem" -rawin -in "${s}/global.msg" -out "${s}/global"
         {
             printf 'untrusted comment: signature from tauri secret key\n'
-            { printf 'ED\001\002\003\004\005\006\007\010'; cat "${s}/sig"; } | openssl base64 -A
+            { printf 'ED\001\002\003\004\005\006\007\010'; cat "${s}/sig"; } | "$OPENSSL" base64 -A
             printf '\ntrusted comment: %s\n' "$trusted"
-            openssl base64 -A < "${s}/global"
+            "$OPENSSL" base64 -A < "${s}/global"
             printf '\n'
-        } | openssl base64 -A > "$1.sig"
+        } | "$OPENSSL" base64 -A > "$1.sig"
     }
 
     verify_with() { # <key> <file> <sig> <name>
@@ -552,7 +552,7 @@ else
     printf 'not a signature' > "${SIGROOT}/junk.sig"
     is "garbage signature is refused"      "$(verify_with "$TEST_KEY" "$PKG" "${SIGROOT}/junk.sig" codemux_9.9.9_amd64.deb)" "1"
     # Re-signing the trusted comment needs the key, so editing it breaks the check.
-    openssl base64 -d -A < "$PKG.sig" | sed 's/file:codemux_9.9.9/file:codemux_9.9.8/' | openssl base64 -A > "${SIGROOT}/edited.sig"
+    "$OPENSSL" base64 -d -A < "$PKG.sig" | sed 's/file:codemux_9.9.9/file:codemux_9.9.8/' | "$OPENSSL" base64 -A > "${SIGROOT}/edited.sig"
     is "edited trusted comment is refused" \
        "$(verify_with "$TEST_KEY" "$PKG" "${SIGROOT}/edited.sig" codemux_9.9.8_amd64.deb)" "1"
 
@@ -591,6 +591,7 @@ CURL
         TMPDIR="$SIGROOT"
         unset CODEMUX_ARTIFACT CODEMUX_METHOD
         [ -z "${2:-}" ] || CODEMUX_METHOD="$2"
+        [ -z "${URL_ARTIFACT:-}" ] || CODEMUX_ARTIFACT="$URL_ARTIFACT"
         install_native_package() { cp "$2" "${SIGROOT}/installed"; }
         install_appimage() { cp "$1" "${SIGROOT}/installed"; }
         install_dependencies() { :; }
@@ -617,6 +618,25 @@ CURL
     is "missing signature fails" "$?" "1"
     is "missing signature installs nothing" "$(test ! -e "${SIGROOT}/installed" && echo yes)" "yes"
     contains "explains the missing signature" "$(cat "${SIGROOT}/release.log")" "cannot be verified"
+
+    # An explicit CODEMUX_ARTIFACT URL goes through the same check; only a
+    # local file is installed unchecked.
+    rm -f "$RELEASE_DIR"/*
+    cp "$PKG" "$PKG.sig" "$RELEASE_DIR/"
+    URL_ARTIFACT="https://downloads.example/codemux_9.9.9_amd64.deb" run_release_install
+    is "signed URL artifact installs" "$?" "0"
+    is "the verified URL artifact is what gets installed" "$(cat "${SIGROOT}/installed" 2>/dev/null)" "genuine package"
+    printf 'trojaned package\n' > "${RELEASE_DIR}/codemux_9.9.9_amd64.deb"
+    URL_ARTIFACT="https://downloads.example/codemux_9.9.9_amd64.deb" run_release_install
+    is "replaced URL artifact fails" "$?" "1"
+    is "replaced URL artifact is never installed" "$(test ! -e "${SIGROOT}/installed" && echo yes)" "yes"
+    cp "$PKG" "$RELEASE_DIR/"
+    rm -f "${RELEASE_DIR}/codemux_9.9.9_amd64.deb.sig"
+    URL_ARTIFACT="https://downloads.example/codemux_9.9.9_amd64.deb" run_release_install
+    is "URL artifact without a signature fails" "$?" "1"
+    is "URL artifact without a signature installs nothing" "$(test ! -e "${SIGROOT}/installed" && echo yes)" "yes"
+    contains "explains the missing URL signature" "$(cat "${SIGROOT}/release.log")" "cannot be verified"
+    not_contains "a URL artifact is not called unchecked" "$(cat "${SIGROOT}/release.log")" "not checked"
 
     # The same gate on the rpm (zypper --allow-unsigned-rpm) and AppImage paths.
     SUSE_LEAP=$(mock_os_release leap 'ID="opensuse-leap"' 'ID_LIKE="suse opensuse"' 'VERSION_ID="15.6"')
