@@ -194,8 +194,16 @@ fn wait_with_timeout(
 /// group-killed common case). Joining only on the success path is safe
 /// because the child has fully exited there.
 fn spawn_wait_collect(
+    command: std::process::Command,
+    timeout: Duration,
+) -> std::io::Result<std::process::Output> {
+    spawn_wait_collect_with_child(command, timeout, |_| Ok(()))
+}
+
+fn spawn_wait_collect_with_child(
     mut command: std::process::Command,
     timeout: Duration,
+    on_spawn: impl FnOnce(&std::process::Child) -> std::io::Result<()>,
 ) -> std::io::Result<std::process::Output> {
     #[cfg(unix)]
     {
@@ -205,6 +213,11 @@ fn spawn_wait_collect(
         command.process_group(0);
     }
     let mut child = command.spawn()?;
+    if let Err(error) = on_spawn(&child) {
+        kill_timed_out_child(&mut child);
+        let _ = child.wait();
+        return Err(error);
+    }
     let out_reader = child.stdout.take().map(drain_stream);
     let err_reader = child.stderr.take().map(drain_stream);
 
@@ -268,8 +281,9 @@ const MAX_STREAM_PORT: u16 = 9299;
 /// Stop only browser daemons launched by this app process. A matching process
 /// name or listening port does not establish ownership.
 pub fn kill_stream_daemons() {
-    let Some(dir) = run_dir() else { return };
-    kill_owned_browser_daemons_in(&dir);
+    for dir in browser_runtime_dirs() {
+        kill_owned_browser_daemons_in(&dir);
+    }
 }
 
 fn kill_owned_browser_daemons_in(dir: &std::path::Path) {
@@ -290,16 +304,32 @@ fn kill_owned_browser_daemons_in(dir: &std::path::Path) {
 }
 
 /// Directory where codemux stores per-session runtime files (PID + log
-/// files for each agent-browser daemon). Windows uses a new private directory
-/// because older releases created `~/.codemux/run` with an inherited ACL.
+/// files for each agent-browser daemon). Unix uses a private directory under
+/// XDG_RUNTIME_DIR when a session's home-based socket path would be too long.
+/// Windows uses a
+/// new private directory because older releases created `~/.codemux/run`
+/// with an inherited ACL.
 ///
-/// The directory is created lazily on first use. Returns `None` if no
-/// home directory is discoverable — callers should treat that as "skip
-/// log/PID-file integration" rather than fail the whole flow.
+/// The directory is created lazily on first use. Returns `None` when neither
+/// a usable runtime root nor a home directory is available.
 pub fn run_dir() -> Option<PathBuf> {
-    let dir = browser_run_dir_for(&dirs::home_dir()?);
-    prepare_run_dir(&dir)?;
-    Some(dir)
+    run_dir_for_session("default")
+}
+
+fn run_dir_for_session(session: &str) -> Option<PathBuf> {
+    validate_session_name(session).ok()?;
+    #[cfg(unix)]
+    {
+        let runtime_root = std::env::var_os("XDG_RUNTIME_DIR").map(PathBuf::from);
+        let home = dirs::home_dir();
+        return run_dir_for_roots(home.as_deref(), runtime_root.as_deref(), session);
+    }
+    #[cfg(not(unix))]
+    {
+        let dir = browser_run_dir_for(&dirs::home_dir()?);
+        prepare_run_dir(&dir)?;
+        Some(dir)
+    }
 }
 
 #[cfg(windows)]
@@ -310,6 +340,75 @@ fn browser_run_dir_for(home: &std::path::Path) -> PathBuf {
 #[cfg(not(windows))]
 fn browser_run_dir_for(home: &std::path::Path) -> PathBuf {
     home.join(".codemux").join("run")
+}
+
+#[cfg(unix)]
+fn private_runtime_run_dir(runtime_root: &std::path::Path) -> Option<PathBuf> {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    if !runtime_root.is_absolute() {
+        return None;
+    }
+    let meta = std::fs::symlink_metadata(runtime_root).ok()?;
+    if !meta.is_dir()
+        || meta.file_type().is_symlink()
+        || meta.uid() != unsafe { libc::geteuid() }
+        || meta.permissions().mode() & 0o077 != 0
+    {
+        return None;
+    }
+    Some(runtime_root.join("codemux-browser"))
+}
+
+#[cfg(unix)]
+fn run_dir_for_roots(home: Option<&std::path::Path>, runtime_root: Option<&std::path::Path>, session: &str) -> Option<PathBuf> {
+    let home_dir = home.map(browser_run_dir_for);
+    if let Some(home_dir) = &home_dir {
+        if browser_socket_path_fits(home_dir, session) && prepare_run_dir(home_dir).is_some() {
+            return Some(home_dir.clone());
+        }
+    }
+    if let Some(short_dir) = runtime_root.and_then(private_runtime_run_dir) {
+        if browser_socket_path_fits(&short_dir, session) && prepare_run_dir(&short_dir).is_some() {
+            return Some(short_dir);
+        }
+    }
+    let home_dir = home_dir?;
+    prepare_run_dir(&home_dir)?;
+    Some(home_dir)
+}
+
+fn browser_runtime_dirs() -> Vec<PathBuf> {
+    #[cfg(unix)]
+    {
+        let mut dirs = Vec::new();
+        if let Some(home) = dirs::home_dir() {
+            let home_dir = browser_run_dir_for(&home);
+            if prepare_run_dir(&home_dir).is_some() {
+                dirs.push(home_dir);
+            }
+        }
+        if let Some(short_dir) = std::env::var_os("XDG_RUNTIME_DIR")
+            .as_deref()
+            .map(std::path::Path::new)
+            .and_then(private_runtime_run_dir)
+        {
+            if prepare_run_dir(&short_dir).is_some() && !dirs.contains(&short_dir) {
+                dirs.push(short_dir);
+            }
+        }
+        dirs
+    }
+    #[cfg(not(unix))]
+    {
+        run_dir().into_iter().collect()
+    }
+}
+
+#[cfg(unix)]
+fn browser_socket_path_fits(dir: &std::path::Path, session: &str) -> bool {
+    use std::os::unix::ffi::OsStrExt;
+    dir.join(format!("{session}.sock")).as_os_str().as_bytes().len() <= 103
 }
 
 fn prepare_run_dir(dir: &std::path::Path) -> Option<()> {
@@ -406,14 +505,14 @@ fn open_session_log(path: &std::path::Path) -> Option<std::fs::File> {
 /// teardown and by `new_with_adoption()` for safe restart adoption.
 pub fn session_pid_path(session_name: &str) -> Option<PathBuf> {
     validate_session_name(session_name).ok()?;
-    Some(run_dir()?.join(format!("agent-browser-{session_name}.pid")))
+    Some(run_dir_for_session(session_name)?.join(format!("agent-browser-{session_name}.pid")))
 }
 
 /// Path to the per-session stderr log file. Captured during daemon
 /// spawn so the next investigation has a paper trail.
 fn session_log_path(session_name: &str) -> Option<PathBuf> {
     validate_session_name(session_name).ok()?;
-    Some(run_dir()?.join(format!("agent-browser-{session_name}.log")))
+    Some(run_dir_for_session(session_name)?.join(format!("agent-browser-{session_name}.log")))
 }
 
 /// Read the agent-browser daemon's own PID file in our private run directory.
@@ -421,7 +520,7 @@ fn session_log_path(session_name: &str) -> Option<PathBuf> {
 /// socket and PID file cannot silently move to XDG_RUNTIME_DIR or HOME.
 fn agent_browser_daemon_pid_path(session_name: &str) -> Option<PathBuf> {
     validate_session_name(session_name).ok()?;
-    Some(run_dir()?.join(format!("{session_name}.pid")))
+    Some(run_dir_for_session(session_name)?.join(format!("{session_name}.pid")))
 }
 
 fn read_agent_browser_daemon_pid(session_name: &str) -> Option<u32> {
@@ -447,7 +546,7 @@ fn read_daemon_pid_file(path: &std::path::Path) -> Option<u32> {
 
 #[cfg(windows)]
 fn cleanup_stale_browser_lock_files(session: &str, pid: u32) {
-    let Some(dir) = run_dir() else { return };
+    let Some(dir) = run_dir_for_session(session) else { return };
     cleanup_stale_browser_lock_files_in(&dir, session, pid);
 }
 
@@ -493,7 +592,13 @@ fn browser_owner_token() -> &'static str {
 }
 
 fn set_browser_owner_env(command: &mut std::process::Command, session: &str) -> Result<(), String> {
-    let socket_dir = run_dir().ok_or("Cannot prepare private browser control directory")?;
+    let socket_dir = run_dir_for_session(session).ok_or("Cannot prepare private browser control directory")?;
+    #[cfg(unix)]
+    if !browser_socket_path_fits(&socket_dir, session) {
+        return Err(format!(
+            "Browser session {session} exceeds the 103-byte Unix control socket path limit"
+        ));
+    }
     command
         .env("CODEMUX_BROWSER_OWNER", browser_owner_token())
         .env("CODEMUX_BROWSER_SESSION", session)
@@ -600,14 +705,17 @@ fn browser_control_port(session: &str, dir: &std::path::Path) -> u16 {
     std::fs::read_to_string(path)
         .ok()
         .and_then(|value| value.trim().parse::<u16>().ok())
-        .unwrap_or_else(|| {
-            // agent-browser v0.24.0 uses the session hash if its .port file
-            // is absent, unreadable, or invalid.
-            let hash = session.chars().fold(0i32, |hash, ch| {
-                hash.wrapping_shl(5).wrapping_sub(hash).wrapping_add(ch as i32)
-            });
-            49152 + (hash.unsigned_abs() % 16383) as u16
-        })
+        .unwrap_or_else(|| browser_control_fallback_port(session))
+}
+
+#[cfg(windows)]
+fn browser_control_fallback_port(session: &str) -> u16 {
+    // agent-browser v0.24.0 uses the session hash if its .port file is
+    // absent, unreadable, or invalid.
+    let hash = session.chars().fold(0i32, |hash, ch| {
+        hash.wrapping_shl(5).wrapping_sub(hash).wrapping_add(ch as i32)
+    });
+    49152 + (hash.unsigned_abs() % 16383) as u16
 }
 
 #[cfg(windows)]
@@ -617,7 +725,7 @@ fn browser_control_listener_owned_by_pid(session: &str, dir: &std::path::Path, p
 
 fn require_owned_browser_session(session: &str) -> Result<(), String> {
     validate_session_name(session)?;
-    let dir = run_dir().ok_or("Cannot prepare private browser control directory")?;
+    let dir = run_dir_for_session(session).ok_or("Cannot prepare private browser control directory")?;
     require_owned_browser_session_in(session, &dir)
 }
 
@@ -677,13 +785,79 @@ fn stop_owned_browser_daemon(session: &str, record: &BrowserPidRecord, bin: &str
             let _ = output_capture_with_timeout(cmd, CLOSE_TIMEOUT);
         }
     }
+    #[cfg(windows)]
+    if let Some(handle) = open_verified_browser_handle(record, session) {
+        kill_verified_browser_handle(&handle, record.pid);
+        cleanup_owned_browser_lock_files(session, record.pid);
+    }
+    #[cfg(not(windows))]
     if browser_process_matches(record, session) {
         kill_verified_browser_pid(record, session);
     }
-    #[cfg(windows)]
-    cleanup_owned_browser_lock_files(session, record.pid);
 }
 
+#[cfg(windows)]
+fn open_verified_browser_handle(record: &BrowserPidRecord, session: &str) -> Option<std::os::windows::io::OwnedHandle> {
+    use std::os::windows::io::FromRawHandle;
+    use windows_sys::Win32::System::Threading::{OpenProcess, WaitForSingleObject, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_TERMINATE, PROCESS_SYNCHRONIZE};
+    use windows_sys::Win32::Foundation::WAIT_TIMEOUT;
+
+    let raw = unsafe {
+        OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_TERMINATE | PROCESS_SYNCHRONIZE, 0, record.pid)
+    };
+    if raw.is_null() {
+        return None;
+    }
+    let handle = unsafe { std::os::windows::io::OwnedHandle::from_raw_handle(raw) };
+    if process_creation_seconds(raw)? != record.start_time
+        || unsafe { WaitForSingleObject(raw, 0) } != WAIT_TIMEOUT
+        || !browser_process_matches(record, session)
+    {
+        return None;
+    }
+    // Keeping this handle open prevents Windows from recycling the PID even
+    // if the daemon exits before its descendants are torn down.
+    Some(handle)
+}
+
+#[cfg(windows)]
+fn process_creation_seconds(handle: windows_sys::Win32::Foundation::HANDLE) -> Option<u64> {
+    use windows_sys::Win32::Foundation::FILETIME;
+    use windows_sys::Win32::System::Threading::GetProcessTimes;
+
+    let mut created = FILETIME { dwLowDateTime: 0, dwHighDateTime: 0 };
+    let mut exited = created;
+    let mut kernel = created;
+    let mut user = created;
+    if unsafe { GetProcessTimes(handle, &mut created, &mut exited, &mut kernel, &mut user) } == 0 {
+        return None;
+    }
+    let ticks = (u64::from(created.dwHighDateTime) << 32) | u64::from(created.dwLowDateTime);
+    (ticks / 10_000_000).checked_sub(11_644_473_600)
+}
+
+#[cfg(windows)]
+fn kill_verified_browser_handle(handle: &std::os::windows::io::OwnedHandle, pid: u32) {
+    use std::os::windows::io::AsRawHandle;
+    use std::os::windows::process::CommandExt;
+    use windows_sys::Win32::System::Threading::{TerminateProcess, WaitForSingleObject};
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
+    // The retained process handle keeps `pid` reserved while taskkill walks
+    // its Chromium children. Terminate the verified process through that same
+    // handle even if taskkill fails or the daemon outlives its children.
+    let mut cmd = std::process::Command::new("taskkill");
+    cmd.args(["/PID", &pid.to_string(), "/T", "/F"])
+        .creation_flags(CREATE_NO_WINDOW);
+    let _ = output_capture_with_timeout(cmd, PROC_CONTROL_TIMEOUT);
+    let raw = handle.as_raw_handle();
+    unsafe {
+        TerminateProcess(raw, 1);
+        WaitForSingleObject(raw, 1_000);
+    }
+}
+
+#[cfg(not(windows))]
 fn kill_verified_browser_pid(record: &BrowserPidRecord, session: &str) {
     #[cfg(unix)]
     {
@@ -699,10 +873,6 @@ fn kill_verified_browser_pid(record: &BrowserPidRecord, session: &str) {
             // the escalation signal.
             unsafe { libc::kill(pid, libc::SIGKILL) };
         }
-    }
-    #[cfg(windows)]
-    if browser_process_matches(record, session) {
-        kill_pid(record.pid);
     }
 }
 
@@ -763,8 +933,8 @@ fn clear_session_pid(session_name: &str) {
     }
 }
 
-/// Windows teardown after verifying the browser daemon identity. `/T` stops
-/// Chromium children and `/F` forces termination of that process tree.
+/// Process-tree helper for other managed Windows children. Browser daemons
+/// use `kill_verified_browser_handle` so their PID stays reserved.
 #[cfg(windows)]
 pub(crate) fn kill_pid(pid: u32) {
     if pid == 0 {
@@ -1056,7 +1226,8 @@ fn extract_eval_result(stdout: &str) -> String {
 /// 1. System PATH — covers AUR `agent-browser` package and manual installs
 /// 2. Tauri sidecar — bundled next to the executable in AppImage/deb/rpm
 /// 3. node_modules — dev mode (`npm run tauri dev`)
-/// 4. npx fallback — always works if Node.js + npm are present
+/// 4. npx fallback on Unix. Windows control requires a native executable so
+///    a timed-out command cannot leave a wrapper child using a retired relay.
 #[cfg_attr(target_os = "windows", allow(unreachable_code))]
 fn resolve_binary() -> String {
     // 1. System PATH (AUR/system package, cargo install, manual install).
@@ -1124,9 +1295,8 @@ fn resolve_binary() -> String {
         if let Ok(path) = which::which("agent-browser") {
             return path.to_string_lossy().to_string();
         }
-        // (d) Last-resort npx fallback. Use `npx.cmd` (not `npx`) because
-        //     CreateProcessW won't auto-append `.cmd`. `which::which("npx")`
-        //     resolves to the right shim with PATHEXT, so prefer it.
+        // (d) Preserve the legacy fallback value for diagnostics. Verified
+        //     Windows control rejects wrappers if no native binary was found.
         if let Ok(npx_path) = which::which("npx") {
             return format!("{} agent-browser", npx_path.to_string_lossy());
         }
@@ -1199,13 +1369,8 @@ fn resolve_binary() -> String {
     "npx agent-browser".to_string()
 }
 
-/// Split `resolve_binary()`'s return value into `(program, prefix_args)` so it
-/// can drive `Command::new(...).args(...)` directly on Windows. The function
-/// either returns a single binary path (most installs / dev) or a path to npx
-/// followed by the fixed `agent-browser` argument.
-/// In the npx case we want the spawn to be `npx -> agent-browser <action> ...`,
-/// not `Command::new("npx agent-browser")` which Windows treats as a single
-/// (nonexistent) executable name.
+/// Separate the legacy npx fallback from a native path so the verified
+/// Windows runner can reject wrappers before starting a command.
 #[cfg(target_os = "windows")]
 fn split_resolved_binary(bin: &str) -> (String, Vec<String>) {
     let trimmed = bin.trim();
@@ -1214,6 +1379,25 @@ fn split_resolved_binary(bin: &str) -> (String, Vec<String>) {
     } else {
         (trimmed.to_string(), Vec::new())
     }
+}
+
+#[cfg(target_os = "windows")]
+fn native_browser_program(bin: &str) -> std::io::Result<String> {
+    let (program, prefix_args) = split_resolved_binary(bin);
+    if !prefix_args.is_empty() || !program.to_ascii_lowercase().ends_with(".exe") {
+        return Err(std::io::Error::other("A native agent-browser binary is required for verified Windows control"));
+    }
+    Ok(program)
+}
+
+#[cfg(target_os = "windows")]
+fn relay_cli_argv(argv: &[String], session: &str, alias: &str) -> std::io::Result<Vec<String>> {
+    let mut cli_argv = argv.to_vec();
+    let session_arg = cli_argv.iter().enumerate().rposition(|(index, arg)| {
+        arg == "--session" && cli_argv.get(index + 1).is_some_and(|value| value == session)
+    }).ok_or_else(|| std::io::Error::other("Browser CLI command has no session argument"))?;
+    cli_argv[session_arg + 1] = alias.to_owned();
+    Ok(cli_argv)
 }
 
 /// Locate a Chromium-based browser executable on Windows. agent-browser
@@ -1511,10 +1695,93 @@ fn build_agent_browser_argv_groups(
     Ok(groups)
 }
 
-/// Spawn agent-browser directly (no shell) on Windows with the standard
-/// stream-port + stealth env vars wired up. Used by the cfg-gated Windows
-/// branches at every shell-out site so we don't depend on Git Bash being
-/// installed for runtime browser control.
+#[cfg(target_os = "windows")]
+static BROWSER_DAEMON_START_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+#[cfg(target_os = "windows")]
+fn ensure_owned_browser_daemon(bin: &str, session: &str, stream_port: u16, timeout: Duration) -> std::io::Result<BrowserPidRecord> {
+    use std::os::windows::process::CommandExt;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
+    // Serialize the missing-PID check and direct spawn across callers. A
+    // second daemon for the same session would race on both lock files. The
+    // lock wait consumes the caller's startup budget just like readiness.
+    let started = Instant::now();
+    let _start_guard = loop {
+        if started.elapsed() >= timeout {
+            return Err(std::io::Error::new(std::io::ErrorKind::TimedOut, "Browser daemon startup timed out"));
+        }
+        match BROWSER_DAEMON_START_LOCK.try_lock() {
+            Ok(guard) => break guard,
+            Err(std::sync::TryLockError::Poisoned(_)) => {
+                return Err(std::io::Error::other("Browser daemon start lock was poisoned"));
+            }
+            Err(std::sync::TryLockError::WouldBlock) => {
+                std::thread::sleep(Duration::from_millis(10).min(timeout.saturating_sub(started.elapsed())));
+            }
+        }
+    };
+    require_owned_browser_session(session).map_err(std::io::Error::other)?;
+    if let Some(pid) = read_agent_browser_daemon_pid(session) {
+        return owned_browser_pid(session, pid)
+            .ok_or_else(|| std::io::Error::other("Browser daemon identity changed"));
+    }
+
+    // Starting daemon mode directly avoids sending the first `open` command
+    // through the CLI's unauthenticated port lookup. The relay below handles
+    // that command only after the daemon is ready and identified.
+    let program = native_browser_program(bin)?;
+    let mut cmd = std::process::Command::new(program);
+    set_browser_owner_env(&mut cmd, session).map_err(std::io::Error::other)?;
+    cmd.env("AGENT_BROWSER_DAEMON", "1")
+        .env("AGENT_BROWSER_SESSION", session)
+        .env("AGENT_BROWSER_STREAM_PORT", stream_port.to_string())
+        .env("AGENT_BROWSER_ARGS", STEALTH_CHROMIUM_ARGS)
+        .env("AGENT_BROWSER_USER_AGENT", stealth_user_agent())
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .creation_flags(CREATE_NO_WINDOW);
+    if let Some(path) = find_chromium_browser_path() {
+        cmd.env("AGENT_BROWSER_EXECUTABLE_PATH", path);
+    }
+    if let Some(log) = session_log_path(session).as_deref().and_then(open_session_log) {
+        cmd.stderr(log);
+    } else {
+        cmd.stderr(std::process::Stdio::null());
+    }
+    let mut child = cmd.spawn()?;
+    loop {
+        if let Some(pid) = read_agent_browser_daemon_pid(session) {
+            if pid == child.id() {
+                if let Some(record) = owned_browser_pid(session, pid) {
+                    if connect_verified_browser_control(session, &record).is_ok() {
+                        return Ok(record);
+                    }
+                }
+            }
+        }
+        if let Some(status) = child.try_wait()? {
+            if let Some(dir) = run_dir_for_session(session) {
+                cleanup_stale_browser_lock_files_in(&dir, session, child.id());
+            }
+            return Err(std::io::Error::other(format!("Browser daemon exited before control startup: {status}")));
+        }
+        if started.elapsed() >= timeout {
+            let pid = child.id();
+            let _ = child.kill();
+            let _ = child.wait();
+            if let Some(dir) = run_dir_for_session(session) {
+                cleanup_stale_browser_lock_files_in(&dir, session, pid);
+            }
+            return Err(std::io::Error::new(std::io::ErrorKind::TimedOut, "Browser daemon control startup timed out"));
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+/// Run the CLI against a private relay. The CLI resolves its control port a
+/// second time when it sends a command, so a listener check made before
+/// spawning it cannot authorize the connection it actually uses.
 #[cfg(target_os = "windows")]
 fn run_agent_browser_native(
     bin: &str,
@@ -1524,18 +1791,39 @@ fn run_agent_browser_native(
     discard_stderr: bool,
     timeout: Duration,
 ) -> std::io::Result<std::process::Output> {
-    let (program, prefix_args) = split_resolved_binary(bin);
-    let mut cmd = std::process::Command::new(&program);
-    for a in &prefix_args {
-        cmd.arg(a);
+    let started = Instant::now();
+    let record = ensure_owned_browser_daemon(bin, session, stream_port, timeout)?;
+    let remaining = timeout.saturating_sub(started.elapsed());
+    if remaining.is_zero() {
+        return Err(std::io::Error::new(std::io::ErrorKind::TimedOut, "Browser command startup timed out"));
     }
-    for a in argv {
+    let mut relay = VerifiedBrowserRelay::new(session, record, remaining)?;
+    run_agent_browser_native_raw(bin, argv, session, stream_port, discard_stderr, remaining, &mut relay)
+}
+
+/// Spawn the native CLI using the relay's private control directory.
+#[cfg(target_os = "windows")]
+fn run_agent_browser_native_raw(
+    bin: &str,
+    argv: &[String],
+    session: &str,
+    stream_port: u16,
+    discard_stderr: bool,
+    timeout: Duration,
+    relay: &mut VerifiedBrowserRelay,
+) -> std::io::Result<std::process::Output> {
+    let program = native_browser_program(bin)?;
+    let mut cmd = std::process::Command::new(&program);
+    let cli_argv = relay_cli_argv(argv, session, &relay.cli_session)?;
+    for a in &cli_argv {
         cmd.arg(a);
     }
     set_browser_owner_env(&mut cmd, session).map_err(std::io::Error::other)?;
+    cmd.env("AGENT_BROWSER_SOCKET_DIR", &relay.directory.path);
     cmd.env("AGENT_BROWSER_STREAM_PORT", stream_port.to_string())
         .env("AGENT_BROWSER_ARGS", STEALTH_CHROMIUM_ARGS)
-        .env("AGENT_BROWSER_USER_AGENT", stealth_user_agent());
+        .env("AGENT_BROWSER_USER_AGENT", stealth_user_agent())
+        .env_remove("AGENT_BROWSER_DAEMON");
     cmd.stdout(std::process::Stdio::piped());
     if discard_stderr {
         cmd.stderr(std::process::Stdio::null());
@@ -1544,7 +1832,313 @@ fn run_agent_browser_native(
     }
     // Hard timeout + kill so a wedged agent-browser.exe can't block the
     // calling task forever (issue #96).
-    spawn_wait_collect(cmd, timeout)
+    spawn_wait_collect_with_child(cmd, timeout, |child| relay.register_cli(child))
+}
+
+#[cfg(windows)]
+fn connect_verified_browser_control(
+    session: &str,
+    record: &BrowserPidRecord,
+) -> std::io::Result<(std::net::TcpStream, std::os::windows::io::OwnedHandle)> {
+    let process = open_verified_browser_handle(record, session)
+        .ok_or_else(|| std::io::Error::other("Browser daemon identity changed"))?;
+    let dir = run_dir_for_session(session).ok_or_else(|| std::io::Error::other("Cannot prepare private browser control directory"))?;
+    let port = browser_control_port(session, &dir);
+    let address = std::net::SocketAddr::from(([127, 0, 0, 1], port));
+    let stream = std::net::TcpStream::connect_timeout(&address, Duration::from_millis(500))?;
+    if !connected_control_peer_owned_by_pid(&stream, record.pid) {
+        return Err(std::io::Error::other("Browser control connection belongs to another process"));
+    }
+    Ok((stream, process))
+}
+
+/// Query the server side of this established TCP connection. Checking its
+/// listener before connect would authorize a different peer after a restart.
+#[cfg(windows)]
+fn connected_control_peer_owned_by_pid(stream: &std::net::TcpStream, pid: u32) -> bool {
+    connected_tcp_peer_pid(stream) == Some(pid)
+}
+
+#[cfg(windows)]
+fn connected_tcp_peer_pid(stream: &std::net::TcpStream) -> Option<u32> {
+    use windows_sys::Win32::NetworkManagement::IpHelper::{
+        GetExtendedTcpTable, MIB_TCPROW_OWNER_PID, MIB_TCP_STATE_ESTAB, TCP_TABLE_OWNER_PID_CONNECTIONS,
+    };
+    use windows_sys::Win32::Networking::WinSock::AF_INET;
+
+    let (Ok(std::net::SocketAddr::V4(peer)), Ok(std::net::SocketAddr::V4(local))) =
+        (stream.peer_addr(), stream.local_addr())
+    else {
+        return None;
+    };
+    let row_matches = |row: MIB_TCPROW_OWNER_PID| {
+        row.dwState == MIB_TCP_STATE_ESTAB as u32
+            && row.dwLocalAddr == u32::from_ne_bytes(peer.ip().octets())
+            && u16::from_be(row.dwLocalPort as u16) == peer.port()
+            && row.dwRemoteAddr == u32::from_ne_bytes(local.ip().octets())
+            && u16::from_be(row.dwRemotePort as u16) == local.port()
+    };
+
+    for _ in 0..3 {
+        let mut size = 0u32;
+        unsafe {
+            GetExtendedTcpTable(std::ptr::null_mut(), &mut size, 0, u32::from(AF_INET), TCP_TABLE_OWNER_PID_CONNECTIONS, 0);
+        }
+        if size < std::mem::size_of::<u32>() as u32 {
+            return None;
+        }
+        let mut table = vec![0u8; size as usize];
+        let status = unsafe {
+            GetExtendedTcpTable(table.as_mut_ptr().cast(), &mut size, 0, u32::from(AF_INET), TCP_TABLE_OWNER_PID_CONNECTIONS, 0)
+        };
+        if status == 0 && table.len() >= std::mem::size_of::<u32>() {
+            let entries = unsafe { std::ptr::read_unaligned(table.as_ptr().cast::<u32>()) } as usize;
+            let row_size = std::mem::size_of::<MIB_TCPROW_OWNER_PID>();
+            let available = (table.len() - std::mem::size_of::<u32>()) / row_size;
+            for index in 0..entries.min(available) {
+                let row = unsafe {
+                    std::ptr::read_unaligned(table.as_ptr().add(4 + index * row_size).cast::<MIB_TCPROW_OWNER_PID>())
+                };
+                if row_matches(row) {
+                    return Some(row.dwOwningPid);
+                }
+            }
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    None
+}
+
+#[cfg(windows)]
+struct RelayDirectory {
+    path: PathBuf,
+    port_file: PathBuf,
+}
+
+#[cfg(windows)]
+impl Drop for RelayDirectory {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.port_file);
+        let _ = std::fs::remove_dir(&self.path);
+    }
+}
+
+#[cfg(windows)]
+struct VerifiedBrowserRelay {
+    directory: RelayDirectory,
+    cli_session: String,
+    port: u16,
+    _listener_guard: std::net::TcpListener,
+    port_guard: Option<std::fs::File>,
+    directory_guard: Option<clack_private_fs::PrivateDirectory>,
+    expected_cli_pid: std::sync::Arc<std::sync::atomic::AtomicU32>,
+    _cli_process: Option<std::os::windows::io::OwnedHandle>,
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    worker: Option<std::thread::JoinHandle<()>>,
+}
+
+#[cfg(windows)]
+impl VerifiedBrowserRelay {
+    fn new(session: &str, record: BrowserPidRecord, timeout: Duration) -> std::io::Result<Self> {
+        use std::io::{Read, Write};
+        use std::os::windows::fs::OpenOptionsExt;
+        use windows_sys::Win32::Storage::FileSystem::FILE_SHARE_READ;
+
+        let base = run_dir_for_session(session).ok_or_else(|| std::io::Error::other("Cannot prepare private browser control directory"))?;
+        let (cli_session, listener) = (0..32).find_map(|_| {
+            let alias = format!("relay-{}", uuid::Uuid::new_v4().simple());
+            let port = browser_control_fallback_port(&alias);
+            std::net::TcpListener::bind(("127.0.0.1", port)).ok().map(|listener| (alias, listener))
+        }).ok_or_else(|| std::io::Error::other("No free browser relay control port"))?;
+        let path = base.join(format!("relay-{}", uuid::Uuid::new_v4().simple()));
+        clack_private_fs::create_dir(&path)?;
+        let directory = RelayDirectory {
+            port_file: path.join(format!("{cli_session}.port")),
+            path,
+        };
+        let directory_guard = clack_private_fs::require_private_directory(&directory.path)?;
+        // Keep the port bound until the CLI has exited even if the worker
+        // thread fails. The alias hash resolves to this same port if the CLI
+        // cannot read its `.port` file.
+        let listener_guard = listener.try_clone()?;
+        let port = listener.local_addr()?.port();
+        let mut file = clack_private_fs::create_new_file(&directory.port_file)?;
+        write!(file, "{port}")?;
+        file.sync_all()?;
+        drop(file);
+        clack_private_fs::require_private_file(&directory.port_file)?;
+        // Deny write/delete sharing for the CLI's entire lifetime. A changed
+        // valid `.port` file would otherwise redirect its next connection.
+        let mut port_guard = std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(FILE_SHARE_READ)
+            .open(&directory.port_file)?;
+        let mut contents = String::new();
+        port_guard.read_to_string(&mut contents)?;
+        if contents.trim().parse::<u16>() != Ok(port) {
+            return Err(std::io::Error::other("Browser relay port file changed during setup"));
+        }
+        listener.set_nonblocking(true)?;
+
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let expected_cli_pid = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let worker_stop = stop.clone();
+        let worker_cli_pid = expected_cli_pid.clone();
+        let session = session.to_owned();
+        let worker = std::thread::spawn(move || {
+            while !worker_stop.load(Ordering::Acquire) {
+                match listener.accept() {
+                    Ok((mut client, _)) => {
+                        let expected_pid = (0..20).find_map(|_| {
+                            let pid = worker_cli_pid.load(Ordering::Acquire);
+                            if pid != 0 { Some(pid) } else {
+                                std::thread::sleep(Duration::from_millis(5));
+                                None
+                            }
+                        });
+                        let Some(expected_pid) = expected_pid else { continue };
+                        if connected_tcp_peer_pid(&client) != Some(expected_pid) {
+                            continue;
+                        }
+                        let session = session.clone();
+                        let record = record.clone();
+                        std::thread::spawn(move || {
+                            if relay_browser_command(&mut client, &session, &record, expected_pid, timeout).is_err() {
+                                let _ = client.set_write_timeout(Some(Duration::from_secs(1)));
+                                let _ = client.write_all(b"{\"success\":false,\"error\":\"Browser control peer verification failed\"}\n");
+                            }
+                        });
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+        Ok(Self { directory, cli_session, port, _listener_guard: listener_guard, port_guard: Some(port_guard), directory_guard: Some(directory_guard), expected_cli_pid, _cli_process: None, stop, worker: Some(worker) })
+    }
+
+    fn register_cli(&mut self, child: &std::process::Child) -> std::io::Result<()> {
+        use std::os::windows::io::{AsRawHandle, BorrowedHandle};
+
+        // Duplicate the Child's process handle before its wait completes.
+        // Keeping this handle in the relay prevents its PID from being reused
+        // while the listener is accepting command connections.
+        let borrowed = unsafe { BorrowedHandle::borrow_raw(child.as_raw_handle()) };
+        let process = borrowed.try_clone_to_owned()?;
+        if process_creation_seconds(process.as_raw_handle()).is_none() {
+            return Err(std::io::Error::other("Cannot identify browser CLI process"));
+        }
+        self._cli_process = Some(process);
+        self.expected_cli_pid.store(child.id(), Ordering::Release);
+        Ok(())
+    }
+}
+
+#[cfg(windows)]
+impl Drop for VerifiedBrowserRelay {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Release);
+        let _ = std::net::TcpStream::connect(("127.0.0.1", self.port));
+        if let Some(worker) = self.worker.take() {
+            let _ = worker.join();
+        }
+        self.port_guard.take();
+        self.directory_guard.take();
+    }
+}
+
+#[cfg(windows)]
+fn write_browser_control_with_deadline(
+    stream: &mut std::net::TcpStream,
+    mut bytes: &[u8],
+    deadline: Instant,
+) -> std::io::Result<()> {
+    use std::io::Write;
+
+    while !bytes.is_empty() {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(std::io::Error::new(std::io::ErrorKind::TimedOut, "Browser control write timed out"));
+        }
+        stream.set_write_timeout(Some(remaining.min(Duration::from_secs(5))))?;
+        let written = stream.write(bytes)?;
+        if written == 0 {
+            return Err(std::io::Error::from(std::io::ErrorKind::WriteZero));
+        }
+        bytes = &bytes[written..];
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn relay_browser_command(
+    client: &mut std::net::TcpStream,
+    session: &str,
+    record: &BrowserPidRecord,
+    expected_cli_pid: u32,
+    timeout: Duration,
+) -> std::io::Result<()> {
+    use std::io::{BufRead, BufReader, Read};
+    const MAX_REQUEST_BYTES: usize = 4 * 1024 * 1024;
+    const MAX_RESPONSE_BYTES: usize = 64 * 1024 * 1024;
+
+    if connected_tcp_peer_pid(client) != Some(expected_cli_pid) {
+        return Err(std::io::Error::other("Browser CLI connection changed owner"));
+    }
+    let request_deadline = Instant::now() + Duration::from_secs(5);
+    let mut request = Vec::new();
+    loop {
+        let remaining = request_deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(std::io::Error::other("Browser command request timed out"));
+        }
+        client.set_read_timeout(Some(remaining))?;
+        let mut chunk = [0u8; 4096];
+        let read = client.read(&mut chunk)?;
+        if read == 0 {
+            if request.is_empty() {
+                return Ok(()); // CLI readiness probe
+            }
+            return Err(std::io::Error::other("Incomplete browser command"));
+        }
+        let end = chunk[..read].iter().position(|byte| *byte == b'\n').map(|index| index + 1);
+        let take = end.unwrap_or(read);
+        if request.len() + take > MAX_REQUEST_BYTES {
+            return Err(std::io::Error::other("Browser command exceeds request limit"));
+        }
+        request.extend_from_slice(&chunk[..take]);
+        if end.is_some() {
+            break;
+        }
+    }
+    let (mut upstream, _process) = connect_verified_browser_control(session, record)?;
+    write_browser_control_with_deadline(&mut upstream, &request, Instant::now() + Duration::from_secs(5))?;
+    let response_deadline = Instant::now() + timeout;
+    let mut reader = BufReader::new(upstream);
+    let mut response_bytes = 0usize;
+    loop {
+        let remaining = response_deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(std::io::Error::other("Browser command response timed out"));
+        }
+        reader.get_ref().set_read_timeout(Some(remaining))?;
+        let chunk = reader.fill_buf()?;
+        if chunk.is_empty() {
+            return Err(std::io::Error::other("Browser daemon closed without a complete response"));
+        }
+        let end = chunk.iter().position(|byte| *byte == b'\n').map(|index| index + 1);
+        let take = end.unwrap_or(chunk.len());
+        response_bytes = response_bytes.checked_add(take)
+            .filter(|bytes| *bytes <= MAX_RESPONSE_BYTES)
+            .ok_or_else(|| std::io::Error::other("Browser response exceeds size limit"))?;
+        write_browser_control_with_deadline(client, &chunk[..take], response_deadline)?;
+        reader.consume(take);
+        if end.is_some() {
+            return Ok(());
+        }
+    }
 }
 
 #[cfg(not(target_os = "windows"))]
@@ -1814,18 +2408,15 @@ impl AgentBrowserManager {
     /// Keep live records and discard only records whose PID no longer exists.
     /// Ownership is checked again before any later action or kill.
     fn reconcile_runtime_files() {
-        let Some(dir) = run_dir() else {
-            return;
-        };
-        let Ok(entries) = std::fs::read_dir(&dir) else {
-            return;
-        };
-        for entry in entries.flatten() {
-            let path = entry.path();
-            let Some(_session) = session_from_pid_path(&path) else { continue };
-            let Some(record) = read_browser_pid_record(&path) else { continue };
-            if !pid_alive(record.pid) {
-                let _ = std::fs::remove_file(&path);
+        for dir in browser_runtime_dirs() {
+            let Ok(entries) = std::fs::read_dir(&dir) else { continue };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                let Some(_session) = session_from_pid_path(&path) else { continue };
+                let Some(record) = read_browser_pid_record(&path) else { continue };
+                if !pid_alive(record.pid) {
+                    let _ = std::fs::remove_file(&path);
+                }
             }
         }
     }
@@ -2333,45 +2924,18 @@ impl AgentBrowserManager {
 
             #[cfg(target_os = "windows")]
             {
-                // The Windows native runner already has a discard_stderr knob;
-                // when log capture is desired we run the spawn manually so we
-                // can redirect to the file directly.
-                if let Some(log) = log_file {
-                    use std::os::windows::process::CommandExt;
-                    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-                    let (program, prefix_args) = split_resolved_binary(&bin);
-                    let mut cmd = std::process::Command::new(&program);
-                    for a in &prefix_args {
-                        cmd.arg(a);
-                    }
-                    let mut argv: Vec<String> = windows_executable_path_args();
-                    argv.extend([
-                        "open".into(),
-                        "about:blank".into(),
-                        "--headless".into(),
-                        "--session".into(),
-                        session.clone(),
-                    ]);
-                    for a in &argv {
-                        cmd.arg(a);
-                    }
-                    set_browser_owner_env(&mut cmd, &session)?;
-                    cmd.env("AGENT_BROWSER_STREAM_PORT", port.to_string())
-                        .env("AGENT_BROWSER_ARGS", STEALTH_CHROMIUM_ARGS)
-                        .env("AGENT_BROWSER_USER_AGENT", stealth_user_agent())
-                        .stderr(log)
-                        .creation_flags(CREATE_NO_WINDOW);
-                    let _ = launch_status_with_timeout(cmd, OPEN_TIMEOUT);
-                } else {
-                    let mut argv: Vec<String> = windows_executable_path_args();
-                    argv.extend([
-                        "open".into(),
-                        "about:blank".into(),
-                        "--headless".into(),
-                        "--session".into(),
-                        session.clone(),
-                    ]);
-                    let _ = run_agent_browser_native(&bin, &argv, &session, port, false, OPEN_TIMEOUT);
+                use std::io::Write;
+                let mut argv: Vec<String> = windows_executable_path_args();
+                argv.extend([
+                    "open".into(),
+                    "about:blank".into(),
+                    "--headless".into(),
+                    "--session".into(),
+                    session.clone(),
+                ]);
+                let result = run_agent_browser_native(&bin, &argv, &session, port, false, OPEN_TIMEOUT);
+                if let (Some(mut log), Ok(output)) = (log_file, &result) {
+                    let _ = log.write_all(&output.stderr);
                 }
             }
             #[cfg(not(target_os = "windows"))]
@@ -2500,6 +3064,23 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
+    fn browser_start_lock_obeys_caller_timeout() {
+        let guard = BROWSER_DAEMON_START_LOCK.lock().unwrap();
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let result = ensure_owned_browser_daemon("unused.exe", "browser-lock-timeout", 0, Duration::from_millis(30))
+                .map(|_| ())
+                .map_err(|error| error.kind());
+            let _ = sender.send(result);
+        });
+        let result = receiver.recv_timeout(Duration::from_secs(5));
+        drop(guard);
+        worker.join().unwrap();
+        assert_eq!(result.unwrap(), Err(std::io::ErrorKind::TimedOut));
+    }
+
+    #[cfg(windows)]
+    #[test]
     fn control_listener_must_belong_to_browser_daemon() {
         let temp = tempfile::tempdir().unwrap();
         let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
@@ -2570,14 +3151,17 @@ mod tests {
         let port = unrelated.local_addr().unwrap().port();
         std::fs::write(&port_path, port.to_string()).unwrap();
         assert!(!browser_control_listener_owned_by_pid(&session, &dir, pid));
+        assert!(connect_verified_browser_control(&session, &record).is_err());
 
         let marker = temp.path().join("close-called");
         let fake_cli = temp.path().join("close-marker.cmd");
         std::fs::write(&fake_cli, "@echo off\r\necho called>\"%~dp0close-called\"\r\n").unwrap();
         let bin = fake_cli.to_str().unwrap();
         let close_args = ["close".into(), "--session".into(), session.clone()];
-        run_agent_browser_native(bin, &close_args, &session, 0, true, Duration::from_secs(2))
-            .unwrap();
+        let mut fake_command = std::process::Command::new(bin);
+        fake_command.args(&close_args);
+        set_browser_owner_env(&mut fake_command, &session).unwrap();
+        assert!(launch_status_with_timeout(fake_command, Duration::from_secs(2)).unwrap().success());
         assert!(marker.exists(), "test CLI must reveal a close invocation");
         std::fs::remove_file(&marker).unwrap();
 
@@ -2589,6 +3173,44 @@ mod tests {
             assert!(stopped_waiting.elapsed() < Duration::from_secs(3), "verified daemon must stop");
             std::thread::sleep(Duration::from_millis(25));
         }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn identifies_the_peer_of_an_established_control_connection() {
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let script = format!(
+            "$client = [Net.Sockets.TcpClient]::new('127.0.0.1', {port}); Start-Sleep -Seconds 10"
+        );
+        let mut child = std::process::Command::new("powershell.exe")
+            .args(["-NoProfile", "-NonInteractive", "-Command", &script])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        let child_pid = child.id();
+        listener.set_nonblocking(true).unwrap();
+        let started = Instant::now();
+        let server = loop {
+            match listener.accept() {
+                Ok((server, _)) => break server,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    if started.elapsed() >= Duration::from_secs(5) {
+                        let status = child.try_wait().unwrap();
+                        let _ = child.kill();
+                        let _ = child.wait();
+                        panic!("PowerShell TCP fixture did not connect: {status:?}");
+                    }
+                    std::thread::sleep(Duration::from_millis(25));
+                }
+                Err(error) => panic!("TCP fixture accept failed: {error}"),
+            }
+        };
+        let peer_pid = connected_tcp_peer_pid(&server);
+        let _ = child.kill();
+        let _ = child.wait();
+        assert_eq!(peer_pid, Some(child_pid));
     }
 
     #[cfg(unix)]
@@ -3042,6 +3664,19 @@ mod tests {
         let (program, prefix) = split_resolved_binary("npx agent-browser");
         assert_eq!(program, "npx");
         assert_eq!(prefix, vec!["agent-browser".to_string()]);
+        assert!(native_browser_program("npx.cmd agent-browser").is_err());
+        assert!(native_browser_program(r"C:\Tools\agent-browser.cmd").is_err());
+        assert_eq!(native_browser_program(r"C:\Tools\agent-browser.exe").unwrap(), r"C:\Tools\agent-browser.exe");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn relay_rewrites_only_the_cli_transport_session() {
+        let args = ["eval".into(), "--session".into(), "real".into(), "--session".into(), "real".into()];
+        let rewritten = relay_cli_argv(&args, "real", "relay-private").unwrap();
+        assert_eq!(rewritten[2], "real");
+        assert_eq!(rewritten[4], "relay-private");
+        assert!(relay_cli_argv(&["open".into()], "real", "relay-private").is_err());
     }
 
     #[cfg(target_os = "windows")]
@@ -3360,9 +3995,39 @@ mod tests {
             s.ends_with("agent-browser-ws-layout-test.pid"),
             "unexpected pid path filename: {s}"
         );
-        assert!(
-            s.contains(".codemux"),
-            "pid file should live under the browser runtime directory, got: {s}"
+        assert!(path.starts_with(run_dir_for_session("ws-layout-test").unwrap()), "PID file must live in the browser runtime directory: {s}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn long_home_uses_short_private_runtime_for_browser_socket() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        let runtime_root = temp.path().join("rt");
+        std::fs::create_dir(&runtime_root).unwrap();
+        std::fs::set_permissions(&runtime_root, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let home = temp.path().join("long-home-segment-".repeat(8));
+        let session = "browser-long-home";
+        assert!(!browser_socket_path_fits(&browser_run_dir_for(&home), session));
+
+        let dir = run_dir_for_roots(Some(&home), Some(&runtime_root), session).unwrap();
+        assert_eq!(dir, runtime_root.join("codemux-browser"));
+        assert_eq!(run_dir_for_roots(None, Some(&runtime_root), session), Some(dir.clone()));
+        assert!(browser_socket_path_fits(&dir, session));
+        assert_eq!(std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777, 0o700);
+
+        let fallback_home = temp.path().join("home");
+        std::fs::create_dir(&fallback_home).unwrap();
+        assert_eq!(
+            run_dir_for_roots(Some(&fallback_home), Some(&runtime_root), session),
+            Some(browser_run_dir_for(&fallback_home)),
+            "existing sessions that fit under home must stay in their original runtime directory"
+        );
+        std::fs::set_permissions(&runtime_root, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(
+            run_dir_for_roots(Some(&fallback_home), Some(&runtime_root), session),
+            Some(browser_run_dir_for(&fallback_home))
         );
     }
 
