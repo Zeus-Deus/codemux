@@ -61,6 +61,10 @@ describe("dirname", () => {
   it("returns the parent directory for POSIX paths", () => {
     expect(dirname("/a/b/c.md")).toBe("/a/b");
     expect(dirname("/README.md")).toBe("/");
+    expect(dirname("/docs/report\\draft.md")).toBe("/docs");
+    expect(resolveAssetSrc("./image.png", "/docs/report\\draft.md")).toBe(
+      "mock-asset:/docs/image.png",
+    );
   });
 
   it("returns the parent directory for Windows paths", () => {
