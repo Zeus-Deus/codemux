@@ -4,16 +4,15 @@
 //! Companion to `serve_persisted_config.rs` (which covers the
 //! already-configured box). Scope resolution is: an
 //! explicit `--scope` wins; no flag on an already-enabled config keeps its
-//! scope; no flag on first run defaults to `all` — the away-from-home SSH case,
-//! where nothing else would be reachable. This asserts the third branch
+//! scope; no flag on first run defaults to `loopback`. An SSH tunnel or relay
+//! can carry traffic to the local listener. This asserts the third branch
 //! end-to-end, and that the enable writes back a row matching the live server
 //! (so the next boot restores the same thing).
 //!
 //! Isolation: as in the sibling tests, every state dir is repointed at a
 //! throwaway tempdir before the app boots. `--port` is an ephemeral free port
-//! and the server is disabled again at the end, so the all-interfaces bind
-//! this branch performs by design is short-lived and never reuses the real
-//! default port.
+//! and the server is disabled again at the end, so the loopback bind never
+//! reuses the real default port.
 //!
 //! Unix-only: `tauri::test` needs WebView2Loader.dll at process startup on
 //! Windows (same gate as the other headless-serve tests).
@@ -105,11 +104,11 @@ fn serve_first_run_defaults_and_persists_what_it_bound() {
     ))
     .expect("first-run serve startup should bind");
 
-    // First-run scope default is `all`; the explicit `--port` is honoured.
+    // First-run scope default is loopback; the explicit `--port` is honoured.
     assert_eq!(
         result.status.bind_scope,
-        web_remote::BIND_SCOPE_ALL,
-        "first run with no --scope binds every interface (the SSH case)"
+        web_remote::BIND_SCOPE_LOOPBACK,
+        "first run with no --scope binds only loopback"
     );
     assert_eq!(result.status.port, port);
     assert!(result.status.running);
@@ -127,7 +126,7 @@ fn serve_first_run_defaults_and_persists_what_it_bound() {
     };
     assert!(persisted.enabled, "the enable is persisted");
     assert_eq!(persisted.port, port);
-    assert_eq!(persisted.bind_scope, web_remote::BIND_SCOPE_ALL);
+    assert_eq!(persisted.bind_scope, web_remote::BIND_SCOPE_LOOPBACK);
     assert!(
         !persisted.relay_mode_enabled,
         "no relay was requested, so none is persisted"

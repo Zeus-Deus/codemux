@@ -12,6 +12,7 @@ import {
   BIND_SCOPE_OPTIONS,
   bindScopeLabel,
   bindScopeOf,
+  browserPairingEndpoints,
   classifyOriginHost,
   composePairUrl,
   connectedSessionCount,
@@ -155,6 +156,25 @@ describe("pairing URL composition", () => {
       ])?.host,
     ).toBe("127.0.0.1");
     expect(pickPrimaryEndpoint([])).toBeNull();
+  });
+
+  it("does not use a relay descriptor as a browser pairing address", () => {
+    const loopback = ep({
+      kind: "loopback",
+      group: "this_device",
+      host: "127.0.0.1",
+      url: "http://127.0.0.1:4377",
+    });
+    const relay = ep({
+      kind: "iroh",
+      group: "from_anywhere",
+      host: "node-id",
+      url: "iroh://node-id",
+      recommended: true,
+    });
+    expect(browserPairingEndpoints([loopback, relay])).toEqual([loopback]);
+    expect(pickPrimaryEndpoint([loopback, relay])).toEqual(loopback);
+    expect(pickPrimaryEndpoint([relay])).toBeNull();
   });
 });
 
@@ -367,10 +387,9 @@ describe("bind scope", () => {
     }
   });
 
-  it("defaults a status with no bind_scope to 'all'", () => {
-    // A config persisted before the field existed omits it on the wire.
-    expect(bindScopeOf(status([]))).toBe("all");
-    expect(bindScopeOf(null)).toBe("all");
+  it("defaults a status with no bind_scope to loopback", () => {
+    expect(bindScopeOf(status([]))).toBe("loopback");
+    expect(bindScopeOf(null)).toBe("loopback");
   });
 
   it("reflects an explicit bind_scope", () => {
@@ -530,7 +549,7 @@ describe("describeExposure", () => {
       describeExposure(
         base({ lan_enabled: true, relay_mode_enabled: true, relay_running: true }),
       ),
-    ).toMatch(/listens on every network interface.*from anywhere/);
+    ).toMatch(/listens on this device only.*from anywhere/);
     expect(
       describeExposure(base({ lan_enabled: false, relay_mode_enabled: false })),
     ).toMatch(/Nothing can reach this machine yet/);
@@ -572,7 +591,7 @@ describe("describeExposure", () => {
     const lanUp = describeExposure(
       base({ lan_enabled: true, relay_mode_enabled: true, relay_running: false }),
     );
-    expect(lanUp).toMatch(/listens on every network interface/);
+    expect(lanUp).toMatch(/listens on this device only/);
     expect(lanUp).toMatch(/From-anywhere access isn't working right now/);
     expect(lanUp).not.toMatch(/reach it from anywhere/);
     // Both down.
@@ -598,9 +617,10 @@ describe("describeExposure", () => {
         base({ enabled: false, lan_enabled: true, bind_scope: "tailscale" }),
       ),
     ).toMatch(/Turning this on starts a server that listens on your Tailscale address/);
-    // A legacy status without `lan_enabled` still had its listener.
+    // A legacy status without `lan_enabled` still had its listener, now
+    // defaulting to loopback when the scope is missing.
     expect(describeExposure(base({ enabled: false }))).toMatch(
-      /every network interface/,
+      /this device only/,
     );
   });
 });

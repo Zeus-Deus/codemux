@@ -68,6 +68,7 @@ import { SectionHeader } from "./settings-primitives";
 import {
   approvedSessions,
   BIND_SCOPE_OPTIONS,
+  browserPairingEndpoints,
   bindScopeLabel,
   bindScopeOf,
   composePairUrl,
@@ -279,8 +280,12 @@ function PairingPanel({
   onRegenerate: () => void;
   regenerating: boolean;
 }) {
+  const browserEndpoints = useMemo(
+    () => browserPairingEndpoints(endpoints),
+    [endpoints],
+  );
   const [selectedHost, setSelectedHost] = useState<string | null>(
-    () => pickPrimaryEndpoint(endpoints)?.host ?? null,
+    () => pickPrimaryEndpoint(browserEndpoints)?.host ?? null,
   );
   const [remainingMs, setRemainingMs] = useState(() =>
     msUntil(pairing.expires_at),
@@ -289,10 +294,10 @@ function PairingPanel({
   // Re-pick a sensible default whenever the endpoint set changes (e.g. the
   // server just came up and enumerated its interfaces).
   useEffect(() => {
-    if (!endpoints.some((e) => e.host === selectedHost)) {
-      setSelectedHost(pickPrimaryEndpoint(endpoints)?.host ?? null);
+    if (!browserEndpoints.some((e) => e.host === selectedHost)) {
+      setSelectedHost(pickPrimaryEndpoint(browserEndpoints)?.host ?? null);
     }
-  }, [endpoints, selectedHost]);
+  }, [browserEndpoints, selectedHost]);
 
   // 1 Hz countdown.
   useEffect(() => {
@@ -304,16 +309,20 @@ function PairingPanel({
   }, [pairing.expires_at]);
 
   const selected =
-    endpoints.find((e) => e.host === selectedHost) ??
-    pickPrimaryEndpoint(endpoints);
+    browserEndpoints.find((e) => e.host === selectedHost) ??
+    pickPrimaryEndpoint(browserEndpoints);
   const fullUrl = selected ? composePairUrl(selected, pairing) : null;
-  const qrSvg = useQrSvg(fullUrl);
+  const localOnly = selected?.kind === "loopback";
+  const qrSvg = useQrSvg(localOnly ? null : fullUrl);
   const expired = remainingMs <= 0;
 
   // Same curated grouping as the "Reachable at" list: real endpoints inline,
   // stray "other" addresses collapsed behind a disclosure. Docker/virtual
   // interfaces never reach the frontend, so they can't appear here either.
-  const grouped = useMemo(() => groupEndpoints(endpoints), [endpoints]);
+  const grouped = useMemo(
+    () => groupEndpoints(browserEndpoints),
+    [browserEndpoints],
+  );
   const inlineEndpoints = grouped
     .filter((g) => !g.collapsible)
     .flatMap((g) => g.endpoints);
@@ -340,33 +349,35 @@ function PairingPanel({
   return (
     <div className="rounded-lg border border-border/60 bg-muted/30 p-4">
       <div className="flex flex-col gap-4 sm:flex-row">
-        {/* QR plate — always dark-on-white for camera scannability. */}
-        <div className="shrink-0 self-center sm:self-start">
-          <div
-            className={cn(
-              "flex h-[168px] w-[168px] items-center justify-center rounded-lg bg-white p-2.5 shadow-sm ring-1 ring-black/5",
-              expired && "opacity-30",
-            )}
-          >
-            {qrSvg ? (
-              <div
-                className="h-full w-full [&>svg]:h-full [&>svg]:w-full"
-                // Self-generated, trusted SVG string.
-                dangerouslySetInnerHTML={{ __html: qrSvg }}
-                aria-label="Pairing QR code"
-                role="img"
-              />
-            ) : (
-              <span className="text-label text-muted-foreground">No endpoint</span>
-            )}
+        {/* A loopback QR cannot be opened by another device. */}
+        {!localOnly && (
+          <div className="shrink-0 self-center sm:self-start">
+            <div
+              className={cn(
+                "flex h-[168px] w-[168px] items-center justify-center rounded-lg bg-white p-2.5 shadow-sm ring-1 ring-black/5",
+                expired && "opacity-30",
+              )}
+            >
+              {qrSvg ? (
+                <div
+                  className="h-full w-full [&>svg]:h-full [&>svg]:w-full"
+                  // Self-generated, trusted SVG string.
+                  dangerouslySetInnerHTML={{ __html: qrSvg }}
+                  aria-label="Pairing QR code"
+                  role="img"
+                />
+              ) : (
+                <span className="text-label text-muted-foreground">No endpoint</span>
+              )}
+            </div>
           </div>
-        </div>
+        )}
 
         <div className="min-w-0 flex-1 space-y-3">
           <div>
             <div className="flex items-center justify-between gap-2">
               <p className="text-body font-semibold text-foreground">
-                Scan or share this link
+                {localOnly ? "Open this link here" : "Scan or share this link"}
               </p>
               <span
                 className={cn(
@@ -378,16 +389,22 @@ function PairingPanel({
               </span>
             </div>
             <p className="mt-1 text-body-sm leading-relaxed text-subtle-foreground">
-              One-time link — it pairs a single device, then can't be reused.
-              Open it on your phone or laptop to connect.
+              {localOnly
+                ? "This address works only on this device or through a local tunnel. Open the link here; another device cannot scan it directly."
+                : "One-time link — it pairs a single device, then can't be reused. Open it on your phone or laptop to connect."}
             </p>
+            {selected && !selected.secure && (
+              <p className="mt-1 text-body-sm leading-relaxed text-status-attention">
+                Network observers can read this pairing secret and session traffic over plain HTTP. Use a trusted network or HTTPS.
+              </p>
+            )}
           </div>
 
           {/* Endpoint chooser — a QR is scanned from a phone, so it should
               target a reachable network address, not loopback. Grouped the
               same way as "Reachable at": inline chips for the useful
               endpoints, an "Other addresses" disclosure for the rest. */}
-          {endpoints.length > 1 && (
+          {browserEndpoints.length > 1 && (
             <div className="space-y-1.5">
               {inlineEndpoints.length > 0 && (
                 <div className="flex flex-wrap gap-1.5">
@@ -845,6 +862,7 @@ export function RemoteAccessSection() {
   const [sessionBusy, setSessionBusy] = useState<string | null>(null);
   const [revokingAll, setRevokingAll] = useState(false);
   const [confirmRevokeAll, setConfirmRevokeAll] = useState(false);
+  const [confirmAllNetworks, setConfirmAllNetworks] = useState(false);
 
   const refreshEndpoints = useCallback(async () => {
     try {
@@ -1024,7 +1042,11 @@ export function RemoteAccessSection() {
   // A web-client rebind is settling (or has cut this device off): freeze the
   // listener controls so a second change can't stack on the in-flight one.
   const rebindBusy = rebindPhase !== null;
-  const primaryEndpoint = pickPrimaryEndpoint(endpoints);
+  const directEndpoints = useMemo(
+    () => browserPairingEndpoints(endpoints),
+    [endpoints],
+  );
+  const primaryEndpoint = pickPrimaryEndpoint(directEndpoints);
 
   /** After a change that (re)starts the listener, say so if it didn't come up. */
   const reportLanOutcome = useCallback(
@@ -1196,7 +1218,7 @@ export function RemoteAccessSection() {
     [enterCutoff, reconcileAfterRebind],
   );
 
-  const handleSetScope = useCallback(
+  const applySetScope = useCallback(
     async (next: WebRemoteBindScope) => {
       if (next === bindScope) return;
 
@@ -1235,6 +1257,17 @@ export function RemoteAccessSection() {
       }
     },
     [applyScopeRemote, bindScope, refreshEndpoints, reportLanOutcome, transport],
+  );
+
+  const handleSetScope = useCallback(
+    (next: WebRemoteBindScope) => {
+      if (next === "all" && next !== bindScope) {
+        setConfirmAllNetworks(true);
+        return;
+      }
+      void applySetScope(next);
+    },
+    [applySetScope, bindScope],
   );
 
   const applyLan = useCallback(
@@ -1758,15 +1791,16 @@ export function RemoteAccessSection() {
                 {pairing ? (
                   <PairingPanel
                     pairing={pairing}
-                    endpoints={endpoints}
+                    endpoints={directEndpoints}
                     regenerating={pairingPending}
                     onRegenerate={handleCreatePairing}
                   />
                 ) : (
                   <div className="flex items-center justify-between gap-4">
                     <p className="text-body-sm leading-relaxed text-muted-foreground">
-                      Create a one-time link, then scan its QR code or open it
-                      on the other device.
+                      {primaryEndpoint?.kind === "loopback"
+                        ? "Create a one-time link to open on this device or through a local tunnel."
+                        : "Create a one-time link, then scan its QR code or open it on the other device."}
                     </p>
                     <Button
                       type="button"
@@ -1782,16 +1816,16 @@ export function RemoteAccessSection() {
                 )}
               </div>
 
-              {endpoints.length > 0 && (
+              {directEndpoints.length > 0 && (
                 <details className="group">
                   <summary className="flex w-fit cursor-pointer list-none items-center gap-1 text-label font-medium text-muted-foreground marker:content-none hover:text-foreground">
                     <span className="transition-transform duration-150 group-open:rotate-90">
                       ›
                     </span>
-                    Reachable at ({endpoints.length})
+                    Reachable at ({directEndpoints.length})
                   </summary>
                   <div className="mt-3">
-                    <GroupedEndpoints endpoints={endpoints} />
+                    <GroupedEndpoints endpoints={directEndpoints} />
                   </div>
                 </details>
               )}
@@ -2001,6 +2035,32 @@ export function RemoteAccessSection() {
           <AlertDialogFooter>
             <AlertDialogCancel>Cancel</AlertDialogCancel>
             <AlertDialogAction onClick={confirmCutoff}>Continue</AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
+
+      <AlertDialog open={confirmAllNetworks} onOpenChange={setConfirmAllNetworks}>
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogTitle>Expose remote access on all networks?</AlertDialogTitle>
+            <AlertDialogDescription>
+              This opens a plain HTTP listener on every network interface.
+              Someone who can observe the network could intercept pairing
+              links, session credentials, and control traffic. Use a trusted
+              network or use an HTTPS proxy with direct access to this port
+              blocked.
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogCancel>Cancel</AlertDialogCancel>
+            <AlertDialogAction
+              onClick={() => {
+                setConfirmAllNetworks(false);
+                void applySetScope("all");
+              }}
+            >
+              Expose on all networks
+            </AlertDialogAction>
           </AlertDialogFooter>
         </AlertDialogContent>
       </AlertDialog>

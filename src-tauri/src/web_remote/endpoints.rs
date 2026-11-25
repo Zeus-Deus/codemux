@@ -409,7 +409,10 @@ fn push_interface_endpoints(ifaces: &[(String, IpAddr)], port: u16, out: &mut Ve
 /// is a public IPv4 would otherwise recommend nothing and fall back to a
 /// useless `127.0.0.1` pairing URL. Loopback-only (nowhere to reach from)
 /// still leaves nothing marked.
-fn mark_recommended(out: &mut [Endpoint]) {
+pub(super) fn mark_recommended(out: &mut [Endpoint]) {
+    for endpoint in out.iter_mut() {
+        endpoint.recommended = false;
+    }
     let idx = out
         .iter()
         .position(|e| e.kind == "magicdns")
