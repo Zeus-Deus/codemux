@@ -61,6 +61,9 @@ CODEMUX_RELEASES_URL="https://github.com/${CODEMUX_REPO_SLUG}/releases"
 # Every release asset ships a `<asset>.sig` made with its secret half, which
 # lives only in the protected release environment, so a package swapped on the
 # release page after the fact fails this check just as it fails the updater's.
+# It proves who built a package and which asset it is, not that it is the
+# newest release: whoever can mark an older signed release "latest" can still
+# steer an unpinned install to it.
 CODEMUX_SIGNING_KEY="RWQojvM96tHVIz/Dg68uFnUaG41lwxWJ1FtKErbIA9aSYfSs0ZXICm2t"
 
 # ── Output helpers ───────────────────────────────────────────────────────────
@@ -252,6 +255,7 @@ codemux_can_verify_signatures() {
 codemux_probe_openssl() { # <binary>
     if ! have "$1"; then
         OPENSSL_PROBLEM="missing"
+        OPENSSL_PROBLEM_BIN="$1"
         return 1
     fi
     # Captured rather than piped into `grep -q`, which can SIGPIPE openssl and
@@ -270,7 +274,7 @@ codemux_probe_openssl() { # <binary>
     fi
     OPENSSL="$1"
     OPENSSL_PROBLEM=""
-OPENSSL_PROBLEM_BIN=""
+    OPENSSL_PROBLEM_BIN=""
     return 0
 }
 
@@ -332,6 +336,7 @@ DRY_RUN=0
 WORKDIR=""
 OPENSSL="openssl"   # see codemux_can_verify_signatures
 OPENSSL_PROBLEM=""
+OPENSSL_PROBLEM_BIN=""
 PRIV="none"          # root | sudo | none
 FAMILY="unknown"
 METHOD=""

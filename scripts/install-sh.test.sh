@@ -697,7 +697,9 @@ REAL_OPENSSL=$(command -v openssl || true)
 [ -z "$REAL_OPENSSL" ] || ln -s "$REAL_OPENSSL" "${OSSL}/leap/openssl-3"
 
 probe() { # <dir on PATH> [CODEMUX_OPENSSL] -> "<status> <OPENSSL> <problem>"
-    ( PATH="$1"; CODEMUX_OPENSSL="${2:-}"; OPENSSL=openssl
+    # Unset first so a probe that reads state it never set fails under set -u.
+    ( unset OPENSSL_PROBLEM OPENSSL_PROBLEM_BIN
+      PATH="$1"; CODEMUX_OPENSSL="${2:-}"; OPENSSL=openssl
       codemux_can_verify_signatures; printf '%s %s %s' "$?" "${OPENSSL##*/}" "$OPENSSL_PROBLEM" )
 }
 is "no openssl is missing"            "$(probe "${OSSL}/none")" "1 openssl missing"
@@ -746,6 +748,39 @@ OUT=$(env -u CODEMUX_INSTALL_SH_NO_MAIN NO_COLOR=1 PATH="${STUB_BIN}:${PATH}" \
       CODEMUX_INSTALL_DIR="${TMPROOT}/opt/bin" \
       bash "$INSTALL_SH" --dry-run 2>&1)
 contains "dry run plans the signature check" "$OUT" "would verify: codemux_9.9.9_amd64.deb against https://github.com/Zeus-Deus/codemux/releases/download/v9.9.9/codemux_9.9.9_amd64.deb.sig"
+# A fresh installer process on a host with no openssl at all (minimal
+# container images): every tool on PATH except openssl and sudo.
+NOSSL_BIN="${TMPROOT}/no-openssl-bin"
+mkdir -p "$NOSSL_BIN"
+_old_ifs="$IFS"; IFS=:
+for _dir in $PATH; do
+    [ -d "$_dir" ] || continue
+    for _tool in "$_dir"/*; do
+        _name="${_tool##*/}"
+        case "$_name" in openssl|openssl-3|sudo) continue ;; esac
+        [ -x "$_tool" ] && [ ! -e "${NOSSL_BIN}/${_name}" ] && ln -s "$_tool" "${NOSSL_BIN}/${_name}"
+    done
+done
+IFS="$_old_ifs"
+no_openssl_dry() { # <PATH> -> output of a pinned --dry-run on Ubuntu
+    env -i HOME="${TMPROOT}/home" NO_COLOR=1 PATH="$1" \
+        CODEMUX_OS_RELEASE_PATH="$UBUNTU" CODEMUX_INSTALL_VERSION=9.9.9 \
+        CODEMUX_INSTALL_DIR="${TMPROOT}/opt/bin" \
+        bash "$INSTALL_SH" --dry-run 2>&1
+}
+if [ "$(id -u)" != "0" ] && ! PATH="$NOSSL_BIN" command -v openssl >/dev/null 2>&1; then
+    OUT=$(no_openssl_dry "${STUB_BIN}:${NOSSL_BIN}")
+    not_contains "no openssl with sudo: no unbound variable" "$OUT" "unbound variable"
+    contains "no openssl with sudo plans the openssl install" "$OUT" "would run: sudo env DEBIAN_FRONTEND=noninteractive apt-get install -y openssl"
+    contains "no openssl with sudo still plans the check" "$OUT" "would verify: codemux_9.9.9_amd64.deb"
+    OUT=$(no_openssl_dry "$NOSSL_BIN")
+    not_contains "no openssl without root: no unbound variable" "$OUT" "unbound variable"
+    contains "no openssl without root explains what is missing" "$OUT" "which was not found"
+    contains "no openssl without root names the workaround" "$OUT" "CODEMUX_ARTIFACT=/path/to/package"
+else
+    echo "  skip (no-openssl runs need a non-root user)"
+fi
+
 OUT=$(run_dry "$UBUNTU" "$FAKE_DEB")
 contains "a local CODEMUX_ARTIFACT warns it is unverified" "$OUT" "signature is not checked"
 
