@@ -3,6 +3,7 @@ import { createIrohConnection } from "./iroh-connection";
 import { DeviceRegistryError, type DeviceGrant } from "./device-registry";
 import { encodeFrame, FrameDecoder, KIND_TEXT } from "./iroh-codec";
 import type { IrohByteStream, IrohDialer } from "./iroh-transport";
+import { RemoteTransport } from "./transport";
 
 const enc = new TextEncoder();
 const dec = new TextDecoder();
@@ -207,7 +208,7 @@ describe("createIrohConnection ticket minting", () => {
     await tick();
     // Desktop fatally rejects the grant.
     streams[0].deliver(
-      encodeFrame(KIND_TEXT, enc.encode(JSON.stringify({ t: "unauthorized", reason: "invalid_session" }))),
+      encodeFrame(KIND_TEXT, enc.encode(JSON.stringify({ t: "unauthorized", reason: "grant_invalid" }))),
     );
     await tick();
     expect(onPending).not.toHaveBeenCalled();
@@ -216,6 +217,67 @@ describe("createIrohConnection ticket minting", () => {
       method: "POST",
     });
     expect(res.status).toBe(401);
+  });
+
+  it("retries a verifier outage with a fresh grant and nonce", async () => {
+    vi.useFakeTimers();
+    const { dialer, streams } = capturingDialer();
+    const connectDevice = vi.fn(async (_deviceId: string, nonce: string) => ({
+      ...grant(),
+      grant: `grant-for-${nonce}`,
+    }));
+    const onUnauthorized = vi.fn();
+    const onPending = vi.fn();
+    let attempt = 0;
+    const deps = createIrohConnection({
+      registry: { connectDevice },
+      deviceId: "d1",
+      dialer,
+      onPending,
+      nonceFactory: () => `nonce-${++attempt}`,
+    });
+    const transport = new RemoteTransport({
+      baseUrl: "https://app.local",
+      getToken: () => null,
+      deps,
+      hooks: {
+        onChannelMessage: vi.fn(),
+        onEvent: vi.fn(),
+        onStatusChange: vi.fn(),
+        onUnauthorized,
+      },
+    });
+    const ready = transport.connect();
+    void ready.catch(() => {}); // Cleanup can close an incomplete connection.
+    try {
+      await vi.advanceTimersByTimeAsync(0);
+      expect(streams[0].firstFrame().json).toMatchObject({
+        t: "hello-account",
+        grant: "grant-for-nonce-1",
+        nonce: "nonce-1",
+      });
+
+      // Verifier unavailability closes the stream before any handshake reply.
+      streams[0].close();
+      await vi.advanceTimersByTimeAsync(999);
+      expect(connectDevice).toHaveBeenCalledTimes(1);
+      await vi.advanceTimersByTimeAsync(1);
+      expect(connectDevice).toHaveBeenCalledTimes(2);
+      expect(streams[1].firstFrame().json).toMatchObject({
+        t: "hello-account",
+        grant: "grant-for-nonce-2",
+        nonce: "nonce-2",
+      });
+      streams[1].deliver(
+        encodeFrame(KIND_TEXT, enc.encode(JSON.stringify({ t: "welcome", session_id: "session" }))),
+      );
+      await ready;
+      expect(onUnauthorized).not.toHaveBeenCalled();
+      expect(onPending).not.toHaveBeenCalled();
+    } finally {
+      transport.close();
+      vi.useRealTimers();
+    }
   });
 
   it("treats a pending rejection as transient (keeps minting, calls onPending)", async () => {

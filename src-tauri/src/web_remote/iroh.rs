@@ -63,18 +63,20 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use axum::extract::ws::Message;
-use iroh::endpoint::{presets, Connection, RecvStream, SendStream};
+use iroh::endpoint::{presets, Connection, QuicTransportConfig, RecvStream, SendStream};
 use iroh::{Endpoint, SecretKey};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use tauri::{AppHandle, Manager, Runtime};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
-use tokio::sync::{mpsc, watch};
+use tokio::sync::{mpsc, watch, Semaphore};
+use tokio::time::timeout;
 
 use super::server::OutboundRx;
-use super::Shared;
+use super::{ListenerLife, Shared};
 use crate::database::DatabaseStore;
 use crate::web_remote::auth::{self, AuthedSession};
 
@@ -84,6 +86,9 @@ pub const IROH_ALPN: &[u8] = b"codemux/web-remote/0";
 
 /// File (under the app data dir) holding the machine-guarded iroh identity key.
 const KEY_FILE: &str = "web-remote-iroh.key";
+const MAX_RELAY_CONNECTIONS: usize = 64;
+const MAX_HANDSHAKE_LEN: usize = 8 * 1024;
+const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 
 // ── Kind-tagged, length-delimited codec ─────────────────────────────
 
@@ -144,14 +149,24 @@ pub fn encode_frame(kind: u8, payload: &[u8]) -> Vec<u8> {
 /// boundary-less QUIC byte stream. Feed it arbitrary read chunks with
 /// [`push`](Self::push); pull complete frames with
 /// [`next_frame`](Self::next_frame).
-#[derive(Default)]
 pub struct FrameDecoder {
     buf: Vec<u8>,
+    max_frame_len: usize,
+}
+
+impl Default for FrameDecoder {
+    fn default() -> Self {
+        Self::with_limit(MAX_FRAME_LEN)
+    }
 }
 
 impl FrameDecoder {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    fn with_limit(max_frame_len: usize) -> Self {
+        Self { buf: Vec::new(), max_frame_len }
     }
 
     /// Append freshly read bytes.
@@ -171,7 +186,7 @@ impl FrameDecoder {
             return Err(CodecError::UnknownKind(kind));
         }
         let len = u32::from_be_bytes([self.buf[1], self.buf[2], self.buf[3], self.buf[4]]) as usize;
-        if len > MAX_FRAME_LEN {
+        if len > self.max_frame_len {
             return Err(CodecError::FrameTooLarge(len));
         }
         if self.buf.len() < HEADER_LEN + len {
@@ -353,9 +368,10 @@ struct AccountHello {
 pub enum AccountHandshakeReject {
     /// The first frame was not a well-formed `hello-account` control frame.
     Malformed,
-    /// The control plane did not vouch for the grant (bad signature, expired,
-    /// or the verify call itself failed) — `valid:false` or a network error.
+    /// The verifier explicitly rejected the grant with `valid:false`.
     Unverified,
+    /// The verifier could not answer. Close the stream to let the client retry.
+    VerifierUnavailable,
     /// The grant is for a different device's `node_id` than this desktop's.
     WrongNode,
     /// The grant's account `uid` is not the desktop's signed-in user (or the
@@ -375,10 +391,11 @@ pub enum AccountHandshakeReject {
 }
 
 impl AccountHandshakeReject {
-    fn code(&self) -> &'static str {
-        match self {
+    fn code(&self) -> Option<&'static str> {
+        Some(match self {
             AccountHandshakeReject::Malformed => "malformed_handshake",
             AccountHandshakeReject::Unverified => "grant_invalid",
+            AccountHandshakeReject::VerifierUnavailable => return None,
             AccountHandshakeReject::WrongNode => "wrong_device",
             AccountHandshakeReject::WrongAccount => "account_mismatch",
             AccountHandshakeReject::NonceMismatch => "nonce_mismatch",
@@ -386,16 +403,16 @@ impl AccountHandshakeReject {
             AccountHandshakeReject::Revoked => "session_revoked",
             AccountHandshakeReject::Pending { .. } => "pending_approval",
             AccountHandshakeReject::Internal(_) => "internal_error",
-        }
+        })
     }
 }
 
-fn account_reject_frame_bytes(reject: &AccountHandshakeReject) -> Vec<u8> {
-    let mut reply = json!({ "t": "unauthorized", "reason": reject.code() });
+fn account_reject_frame_bytes(reject: &AccountHandshakeReject) -> Option<Vec<u8>> {
+    let mut reply = json!({ "t": "unauthorized", "reason": reject.code()? });
     if let AccountHandshakeReject::Pending { browser_label } = reject {
         reply["browser_label"] = json!(browser_label);
     }
-    reply.to_string().into_bytes()
+    Some(reply.to_string().into_bytes())
 }
 
 /// Whether a first frame is a `hello-account` frame (the account/relay path).
@@ -469,20 +486,27 @@ struct GrantIdentity {
 /// Call the control plane's grant-verify endpoint. This is a machine-to-machine
 /// check — the grant is the sole credential, so no user bearer is sent. Reuses
 /// the same `CODEMUX_API_URL` base every other API call reads.
-async fn verify_grant(base: &str, grant: &str) -> Result<GrantVerifyResponse, String> {
+async fn verify_grant(
+    base: &str,
+    grant: &str,
+    deadline: Duration,
+) -> Option<GrantVerifyResponse> {
     let url = format!("{base}/api/devices/grant/verify");
-    let resp = reqwest::Client::new()
+    let client = reqwest::Client::builder()
+        .timeout(deadline)
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .ok()?;
+    let response = client
         .post(&url)
         .json(&json!({ "grant": grant }))
         .send()
         .await
-        .map_err(|e| format!("grant verify request failed: {e}"))?;
-    if !resp.status().is_success() {
-        return Err(format!("grant verify returned {}", resp.status()));
+        .ok()?;
+    if !response.status().is_success() {
+        return None;
     }
-    resp.json::<GrantVerifyResponse>()
-        .await
-        .map_err(|e| format!("grant verify parse failed: {e}"))
+    response.json::<GrantVerifyResponse>().await.ok()
 }
 
 /// Pure accept/reject matrix for a verified grant, given this desktop's own
@@ -530,14 +554,15 @@ fn evaluate_grant(
 /// and a pending session refuses the stream (the desktop approves it in the
 /// device list, then the browser reconnects).
 ///
-/// Takes `db` + `own_node_id` explicitly (rather than reaching through an
-/// `AppHandle`) so the full network + mint path is unit-testable with a mocked
-/// verify endpoint and an in-memory DB.
+/// Takes the database and verifier settings explicitly, so the full network
+/// and mint path can be tested against a local verifier and an in-memory DB.
 async fn authorize_account_handshake(
     db: &DatabaseStore,
     shared: &Arc<Shared>,
     own_node_id: &str,
     hello: &AccountHello,
+    api_base: &str,
+    verify_deadline: Duration,
 ) -> Result<String, AccountHandshakeReject> {
     if hello.browser_key.len() != auth::TOKEN_BYTES * 2
         || !hello.browser_key.bytes().all(|c| matches!(c, b'0'..=b'9' | b'a'..=b'f'))
@@ -545,10 +570,9 @@ async fn authorize_account_handshake(
         return Err(AccountHandshakeReject::BrowserKeyRequired);
     }
 
-    let base = crate::auth::api_base_url();
-    let resp = verify_grant(&base, &hello.grant)
+    let resp = verify_grant(api_base, &hello.grant, verify_deadline)
         .await
-        .map_err(|_| AccountHandshakeReject::Unverified)?;
+        .ok_or(AccountHandshakeReject::VerifierUnavailable)?;
 
     // Read account and approval state after the network await.
     let own_user_id = crate::auth::load_cached_user(db).map(|u| u.id);
@@ -659,6 +683,7 @@ pub fn persisted_node_id() -> Option<String> {
 struct RunningIroh {
     endpoint: Endpoint,
     accept: tauri::async_runtime::JoinHandle<()>,
+    shutdown: watch::Sender<bool>,
 }
 
 /// Owns the (optional) running iroh endpoint. Lives inside [`Shared`] so the
@@ -715,6 +740,12 @@ pub(crate) async fn start<R: Runtime>(app: &AppHandle<R>, shared: &Arc<Shared>) 
     let endpoint = Endpoint::builder(presets::N0)
         .secret_key(key)
         .alpns(vec![IROH_ALPN.to_vec()])
+        .transport_config(
+            QuicTransportConfig::builder()
+                .max_concurrent_bidi_streams(1u32.into())
+                .max_concurrent_uni_streams(0u32.into())
+                .build(),
+        )
         .bind()
         .await
         .map_err(|e| format!("iroh endpoint bind failed: {e}"))?;
@@ -729,14 +760,17 @@ pub(crate) async fn start<R: Runtime>(app: &AppHandle<R>, shared: &Arc<Shared>) 
         let cfg = shared.config.lock().unwrap();
         let wanted = super::relay_wanted(&cfg);
         if wanted {
+            let (shutdown, life) = watch::channel(false);
             let accept = tauri::async_runtime::spawn(accept_loop(
                 app.clone(),
                 shared.clone(),
                 endpoint.clone(),
+                ListenerLife(life),
             ));
             let running = RunningIroh {
                 endpoint: endpoint.clone(),
                 accept,
+                shutdown,
             };
             shared.iroh.install(running, node_id.clone());
         }
@@ -778,6 +812,7 @@ pub(crate) async fn start<R: Runtime>(app: &AppHandle<R>, shared: &Arc<Shared>) 
 /// [`ConnectionRegistry`]: super::server::ConnectionRegistry
 pub(crate) fn stop(shared: &Arc<Shared>) {
     if let Some(running) = shared.iroh.take() {
+        running.shutdown.send_replace(true);
         running.accept.abort();
         let endpoint = running.endpoint;
         tauri::async_runtime::spawn(async move {
@@ -789,33 +824,73 @@ pub(crate) fn stop(shared: &Arc<Shared>) {
 // ── Accept + connection bridge ──────────────────────────────────────
 
 /// Accept incoming iroh connections until the endpoint closes.
-async fn accept_loop<R: Runtime>(app: AppHandle<R>, shared: Arc<Shared>, endpoint: Endpoint) {
+async fn accept_loop<R: Runtime>(
+    app: AppHandle<R>,
+    shared: Arc<Shared>,
+    endpoint: Endpoint,
+    life: ListenerLife,
+) {
+    let connections = Arc::new(Semaphore::new(MAX_RELAY_CONNECTIONS));
     while let Some(incoming) = endpoint.accept().await {
+        let Ok(permit) = connections.clone().try_acquire_owned() else {
+            incoming.refuse();
+            continue;
+        };
         let app = app.clone();
         let shared = shared.clone();
+        let life = life.clone();
         tauri::async_runtime::spawn(async move {
-            match incoming.await {
-                Ok(conn) => handle_connection(app, shared, conn).await,
-                Err(e) => eprintln!("[codemux::web_remote] iroh incoming connection failed: {e}"),
+            let _permit = permit;
+            if let Ok(Ok(conn)) = timeout(HANDSHAKE_TIMEOUT, incoming).await {
+                handle_connection(app, shared, conn, life).await;
             }
         });
     }
 }
 
-/// One accepted iroh connection. A connection may carry several bi-streams;
-/// each bi-stream is an independent web-remote "socket" (its own handshake, its
-/// own registry entry), mirroring how each WS upgrade is one socket.
-async fn handle_connection<R: Runtime>(app: AppHandle<R>, shared: Arc<Shared>, conn: Connection) {
-    loop {
-        match conn.accept_bi().await {
-            Ok((send, recv)) => {
-                let app = app.clone();
-                let shared = shared.clone();
-                tauri::async_runtime::spawn(handle_bi_stream(app, shared, send, recv));
-            }
-            // The connection closed (or errored) — stop accepting its streams.
-            Err(_) => break,
+/// One QUIC connection carries the browser's one control stream.
+async fn handle_connection<R: Runtime>(
+    app: AppHandle<R>,
+    shared: Arc<Shared>,
+    conn: Connection,
+    life: ListenerLife,
+) {
+    if let Ok(Ok((send, recv))) = timeout(HANDSHAKE_TIMEOUT, conn.accept_bi()).await {
+        handle_bi_stream(app, shared, &conn, send, recv, life).await;
+    }
+    conn.close(0u32.into(), b"control stream closed");
+}
+
+async fn reject_handshake(
+    conn: &Connection,
+    send: &mut SendStream,
+    life: &mut ListenerLife,
+    payload: &[u8],
+) {
+    let delivery = timeout(HANDSHAKE_TIMEOUT, async {
+        if write_frame(send, KIND_TEXT, payload).await.is_ok() && send.finish().is_ok() {
+            // A QUIC ACK only confirms receipt by the transport. The browser
+            // closes the connection after decoding the denial.
+            conn.closed().await;
         }
+    });
+    tokio::select! {
+        biased;
+        _ = life.stopped() => {}
+        _ = delivery => {}
+    }
+}
+
+async fn reject_account_handshake(
+    conn: &Connection,
+    send: &mut SendStream,
+    life: &mut ListenerLife,
+    reject: &AccountHandshakeReject,
+) {
+    // A verifier outage ends the connection without a denial frame. Browsers
+    // can use their usual transport retry and mint a fresh grant and nonce.
+    if let Some(payload) = account_reject_frame_bytes(reject) {
+        reject_handshake(conn, send, life, &payload).await;
     }
 }
 
@@ -827,18 +902,20 @@ async fn handle_connection<R: Runtime>(app: AppHandle<R>, shared: Arc<Shared>, c
 async fn handle_bi_stream<R: Runtime>(
     app: AppHandle<R>,
     shared: Arc<Shared>,
+    conn: &Connection,
     mut send: SendStream,
     mut recv: RecvStream,
+    mut life: ListenerLife,
 ) {
-    let mut decoder = FrameDecoder::new();
+    let mut decoder = FrameDecoder::with_limit(MAX_HANDSHAKE_LEN);
     let mut readbuf = vec![0u8; 16 * 1024];
 
     // 1. Handshake: the first frame either presents an existing session token
     //    (LAN/Tailscale path) or an account connection grant (from-anywhere
-    //    path). The `t` field routes it; each path resolves to a `session_id`
-    //    the stream then binds to, or writes an `unauthorized` frame and closes.
-    let handshake = match read_frame(&mut recv, &mut decoder, &mut readbuf).await {
-        Ok(Some(f)) => f,
+    //    path). The `t` field routes it; an admitted stream binds to its
+    //    session ID. Definitive denials send an `unauthorized` frame.
+    let handshake = match timeout(HANDSHAKE_TIMEOUT, read_frame(&mut recv, &mut decoder, &mut readbuf)).await {
+        Ok(Ok(Some(f))) => f,
         _ => return, // stream ended / codec error before a handshake arrived
     };
     let session_id = if is_account_handshake(&handshake) {
@@ -850,15 +927,20 @@ async fn handle_bi_stream<R: Runtime>(
             Some(h) => h,
             None => {
                 let reject = AccountHandshakeReject::Malformed;
-                let _ =
-                    write_frame(&mut send, KIND_TEXT, &account_reject_frame_bytes(&reject)).await;
-                let _ = send.finish();
+                reject_account_handshake(conn, &mut send, &mut life, &reject).await;
                 return;
             }
         };
         let admit = {
             let db = app.state::<DatabaseStore>();
-            authorize_account_handshake(&db, &shared, &own_node_id, &hello).await
+            let api_base = crate::auth::api_base_url();
+            tokio::select! {
+                biased;
+                _ = life.stopped() => return,
+                result = authorize_account_handshake(
+                    &db, &shared, &own_node_id, &hello, &api_base, HANDSHAKE_TIMEOUT,
+                ) => result,
+            }
         };
         match admit {
             Ok(id) => id,
@@ -866,9 +948,7 @@ async fn handle_bi_stream<R: Runtime>(
                 if matches!(reject, AccountHandshakeReject::Pending { .. }) {
                     super::emit_state_changed(&app);
                 }
-                let _ =
-                    write_frame(&mut send, KIND_TEXT, &account_reject_frame_bytes(&reject)).await;
-                let _ = send.finish();
+                reject_account_handshake(conn, &mut send, &mut life, &reject).await;
                 return;
             }
         }
@@ -882,8 +962,7 @@ async fn handle_bi_stream<R: Runtime>(
         match session {
             Ok(s) => s.id,
             Err(reject) => {
-                let _ = write_frame(&mut send, KIND_TEXT, &reject_frame_bytes(&reject)).await;
-                let _ = send.finish();
+                reject_handshake(conn, &mut send, &mut life, &reject_frame_bytes(&reject)).await;
                 return;
             }
         }
@@ -896,10 +975,28 @@ async fn handle_bi_stream<R: Runtime>(
     let conn_id = shared
         .connections
         .register(&session_id, crate::web_remote::server::Transport::Relay, out_tx.clone(), close_tx.clone());
+    if !life.live() || !super::server::session_active(&app, &session_id) {
+        shared.connections.unregister(conn_id);
+        return;
+    }
     super::emit_state_changed(&app);
 
     // 3. Acknowledge, then hand the send half to the writer task.
-    let _ = write_frame(&mut send, KIND_TEXT, &welcome_frame_bytes(&session_id)).await;
+    let welcome = timeout(HANDSHAKE_TIMEOUT, async {
+        write_frame(&mut send, KIND_TEXT, &welcome_frame_bytes(&session_id)).await
+    });
+    let sent = tokio::select! {
+        biased;
+        _ = life.stopped() => false,
+        _ = close_rx.changed() => false,
+        result = welcome => matches!(result, Ok(Ok(()))),
+    };
+    if !sent {
+        shared.connections.unregister(conn_id);
+        super::emit_state_changed(&app);
+        return;
+    }
+    decoder.max_frame_len = MAX_FRAME_LEN;
     let writer = tauri::async_runtime::spawn(writer_loop(send, out_rx));
 
     // 4. Ordered dispatch lane (terminal input keeps client-send order), exactly
@@ -919,6 +1016,8 @@ async fn handle_bi_stream<R: Runtime>(
     // 5. Reader loop: dispatch client frames until close / EOF / revocation.
     loop {
         tokio::select! {
+            biased;
+            _ = life.stopped() => break,
             changed = close_rx.changed() => {
                 if changed.is_err() || *close_rx.borrow() {
                     break;
@@ -973,6 +1072,16 @@ mod tests {
         assert_eq!(empty[0], KIND_BINARY);
         assert_eq!(&empty[1..5], &0u32.to_be_bytes());
         assert_eq!(empty.len(), HEADER_LEN);
+    }
+
+    #[test]
+    fn handshake_header_is_checked_against_the_smaller_limit() {
+        let payload = vec![0; MAX_HANDSHAKE_LEN + 1];
+        let frame = encode_frame(KIND_TEXT, &payload);
+        let mut decoder = FrameDecoder::with_limit(MAX_HANDSHAKE_LEN);
+        // The advertised length is rejected as soon as the header arrives.
+        decoder.push(&frame[..HEADER_LEN]);
+        assert_eq!(decoder.next_frame(), Err(CodecError::FrameTooLarge(payload.len())));
     }
 
     #[test]
@@ -1341,28 +1450,28 @@ mod tests {
 
     #[test]
     fn account_reject_codes_are_stable() {
-        assert_eq!(AccountHandshakeReject::Malformed.code(), "malformed_handshake");
-        assert_eq!(AccountHandshakeReject::Unverified.code(), "grant_invalid");
-        assert_eq!(AccountHandshakeReject::WrongNode.code(), "wrong_device");
-        assert_eq!(AccountHandshakeReject::WrongAccount.code(), "account_mismatch");
-        assert_eq!(AccountHandshakeReject::NonceMismatch.code(), "nonce_mismatch");
+        assert_eq!(AccountHandshakeReject::Malformed.code(), Some("malformed_handshake"));
+        assert_eq!(AccountHandshakeReject::Unverified.code(), Some("grant_invalid"));
+        assert_eq!(AccountHandshakeReject::WrongNode.code(), Some("wrong_device"));
+        assert_eq!(AccountHandshakeReject::WrongAccount.code(), Some("account_mismatch"));
+        assert_eq!(AccountHandshakeReject::NonceMismatch.code(), Some("nonce_mismatch"));
         let pending = AccountHandshakeReject::Pending {
             browser_label: "Relay browser 1234ABCD".into(),
         };
-        assert_eq!(pending.code(), "pending_approval");
-        let reply: Value = serde_json::from_slice(&account_reject_frame_bytes(&pending)).unwrap();
+        assert_eq!(pending.code(), Some("pending_approval"));
+        let payload = account_reject_frame_bytes(&pending).unwrap();
+        let reply: Value = serde_json::from_slice(&payload).unwrap();
         assert_eq!(reply["browser_label"], "Relay browser 1234ABCD");
         assert_eq!(
             AccountHandshakeReject::Internal("x".into()).code(),
-            "internal_error"
+            Some("internal_error")
         );
     }
 
     // ── Full account admission: grant verify (mocked) → session mint ──
     //
-    // These mock `POST /api/devices/grant/verify` via mockito + `CODEMUX_API_URL`
-    // and NEVER hit the real API. `CODEMUX_API_URL` mutation is serialized under
-    // the shared `mockserver` group with the auth/account tests.
+    // Inject a local verifier address directly so these tests do not contact
+    // the real API or change process-wide configuration.
 
     fn seed_owner(db: &DatabaseStore) {
         use crate::auth::{save_auth, AuthUser};
@@ -1412,14 +1521,8 @@ mod tests {
         shared: &Arc<Shared>,
         hello: &AccountHello,
     ) -> Result<String, AccountHandshakeReject> {
-        let prev = std::env::var("CODEMUX_API_URL").ok();
-        std::env::set_var("CODEMUX_API_URL", api_url);
-        let out = authorize_account_handshake(db, shared, OWN_NODE, hello).await;
-        match prev {
-            Some(v) => std::env::set_var("CODEMUX_API_URL", v),
-            None => std::env::remove_var("CODEMUX_API_URL"),
-        }
-        out
+        authorize_account_handshake(db, shared, OWN_NODE, hello, api_url, HANDSHAKE_TIMEOUT)
+            .await
     }
 
     #[tokio::test]
@@ -1561,7 +1664,9 @@ mod tests {
         let mut hello = account_hello("g", "n");
         hello.browser_key.clear();
         assert_eq!(
-            authorize_account_handshake(&db, &shared, OWN_NODE, &hello).await,
+            authorize_account_handshake(
+                &db, &shared, OWN_NODE, &hello, "http://127.0.0.1:0", HANDSHAKE_TIMEOUT,
+            ).await,
             Err(AccountHandshakeReject::BrowserKeyRequired)
         );
         assert!(db.web_remote_list_sessions().is_empty());
@@ -1590,7 +1695,50 @@ mod tests {
             .await
             .expect_err("an invalid grant is rejected");
         assert_eq!(err, AccountHandshakeReject::Unverified);
+        let frame = account_reject_frame_bytes(&err).unwrap();
+        assert_eq!(
+            serde_json::from_slice::<Value>(&frame).unwrap(),
+            json!({ "t": "unauthorized", "reason": "grant_invalid" })
+        );
         assert!(db.web_remote_list_sessions().is_empty(), "no row on a bad grant");
+    }
+
+    #[tokio::test]
+    async fn account_handshake_closes_without_denial_when_verification_times_out() {
+        let db = init_test_database();
+        seed_owner(&db);
+        let shared = shared_with_trust(true);
+        // Accept TCP connections at the kernel without answering any request.
+        let verifier = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", verifier.local_addr().unwrap());
+        let hello = account_hello("grant", "nonce");
+        let reject = authorize_account_handshake(
+            &db, &shared, OWN_NODE, &hello, &url, Duration::from_millis(100),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(reject, AccountHandshakeReject::VerifierUnavailable);
+        assert!(account_reject_frame_bytes(&reject).is_none());
+        assert!(db.web_remote_list_sessions().is_empty());
+    }
+
+    #[tokio::test]
+    async fn account_handshake_closes_without_denial_when_verifier_is_unavailable() {
+        let db = init_test_database();
+        seed_owner(&db);
+        let shared = shared_with_trust(true);
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("POST", "/api/devices/grant/verify")
+            .with_status(503)
+            .create_async()
+            .await;
+        let hello = account_hello("grant", "nonce");
+        let reject = run_account_admit(&server.url(), &db, &shared, &hello).await.unwrap_err();
+        mock.assert_async().await;
+        assert_eq!(reject, AccountHandshakeReject::VerifierUnavailable);
+        assert!(account_reject_frame_bytes(&reject).is_none());
+        assert!(db.web_remote_list_sessions().is_empty());
     }
 
     #[tokio::test]
@@ -1763,6 +1911,73 @@ mod tests {
             std::net::SocketAddr::V6(v6) => {
                 std::net::SocketAddr::from((std::net::Ipv6Addr::LOCALHOST, v6.port()))
             }
+        }
+    }
+
+    #[tokio::test]
+    async fn iroh_direct_distinguishes_account_denial_from_verifier_disconnect() {
+        let server_ep = Endpoint::builder(presets::Minimal)
+            .alpns(vec![IROH_ALPN.to_vec()])
+            .bind()
+            .await
+            .unwrap();
+        let client_ep = Endpoint::builder(presets::Minimal).bind().await.unwrap();
+        let dial = iroh::EndpointAddr::new(server_ep.id()).with_ip_addr(loopback_addr(&server_ep));
+
+        for reject in [
+            AccountHandshakeReject::Unverified,
+            AccountHandshakeReject::VerifierUnavailable,
+        ] {
+            let (receipt_tx, receipt_rx) = tokio::sync::oneshot::channel();
+            let closing = std::cell::Cell::new(false);
+            let server = async {
+                let conn = server_ep.accept().await.unwrap().await.unwrap();
+                let (mut send, mut recv) = conn.accept_bi().await.unwrap();
+                let first = read_frame(&mut recv, &mut FrameDecoder::new(), &mut [0; 256])
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert!(is_account_handshake(&first));
+                assert!(receipt_tx.send(send.stopped()).is_ok());
+
+                let (_shutdown, receiver) = watch::channel(false);
+                reject_account_handshake(&conn, &mut send, &mut ListenerLife(receiver), &reject)
+                    .await;
+                drop(send);
+                closing.set(true);
+                conn.close(0u32.into(), b"control stream closed");
+            };
+            let client = async {
+                let conn = client_ep.connect(dial.clone(), IROH_ALPN).await.unwrap();
+                let (mut send, mut recv) = conn.open_bi().await.unwrap();
+                let hello = account_hello_frame("fixture-grant", "fixture-nonce");
+                write_frame(&mut send, hello.kind, &hello.payload).await.unwrap();
+                let receipt = receipt_rx.await.unwrap();
+                let mut decoder = FrameDecoder::new();
+                let mut buf = [0; 256];
+
+                if reject == AccountHandshakeReject::Unverified {
+                    // The transport has acknowledged the denial before the
+                    // client application polls its receive stream.
+                    assert_eq!(receipt.await.unwrap(), None);
+                    assert!(!closing.get(), "keep the connection open after the ACK");
+                    let reply = read_frame(&mut recv, &mut decoder, &mut buf).await.unwrap().unwrap();
+                    assert_eq!(
+                        serde_json::from_slice::<Value>(&reply.payload).unwrap(),
+                        json!({ "t": "unauthorized", "reason": "grant_invalid" })
+                    );
+                    assert!(read_frame(&mut recv, &mut decoder, &mut buf).await.unwrap().is_none());
+                    conn.close(0u32.into(), b"client-closed");
+                } else {
+                    let reply = read_frame(&mut recv, &mut decoder, &mut buf).await;
+                    assert!(matches!(reply, Ok(None) | Err(_)), "outage sent a frame: {reply:?}");
+                }
+            };
+            timeout(Duration::from_secs(8), async {
+                tokio::join!(biased; server, client);
+            })
+            .await
+            .expect("loopback denial or disconnect completed");
         }
     }
 

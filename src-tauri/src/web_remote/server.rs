@@ -32,7 +32,7 @@ use std::time::Duration;
 use axum::{
     extract::{
         ws::{Message, WebSocket, WebSocketUpgrade},
-        ConnectInfo, Query, State,
+        ConnectInfo, Extension, Query, State,
     },
     http::{header, HeaderMap, StatusCode, Uri},
     response::{IntoResponse, Response},
@@ -50,7 +50,7 @@ use tauri::{AppHandle, Manager, Runtime};
 
 use super::auth;
 use super::compress::{self, FrameCompressor, WireStats};
-use super::{Shared, WebRemoteState};
+use super::{ListenerLife, Shared, WebRemoteState};
 
 /// Cookie name for the HttpOnly session token (asset/`<img>` GET auth).
 pub const SESSION_COOKIE: &str = "cmux_web_session";
@@ -688,6 +688,7 @@ async fn withdraw<R: Runtime>(State(app): State<AppHandle<R>>, headers: HeaderMa
 async fn ws_upgrade<R: Runtime>(
     State(app): State<AppHandle<R>>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    life: Option<Extension<ListenerLife>>,
     Query(params): Query<HashMap<String, String>>,
     headers: HeaderMap,
     ws: WebSocketUpgrade,
@@ -695,6 +696,9 @@ async fn ws_upgrade<R: Runtime>(
     if !auth::origin_ok(&headers) {
         return (StatusCode::FORBIDDEN, "origin mismatch").into_response();
     }
+    let Some(Extension(life)) = life.filter(|Extension(life)| life.live()) else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
     let ticket = match params.get("ticket") {
         Some(t) => t.clone(),
         None => return (StatusCode::BAD_REQUEST, "missing ticket").into_response(),
@@ -719,7 +723,7 @@ async fn ws_upgrade<R: Runtime>(
     let app_for_socket = app.clone();
     ws.on_upgrade(move |socket| {
         let plaintext = !super::endpoints::is_local_peer(peer.ip());
-        handle_socket(app_for_socket, session_id, socket, compress_frames, plaintext)
+        handle_socket(app_for_socket, session_id, socket, compress_frames, plaintext, life)
     })
 }
 
@@ -824,17 +828,23 @@ async fn handle_socket<R: Runtime>(
     socket: WebSocket,
     compress_frames: bool,
     plaintext: bool,
+    mut life: ListenerLife,
 ) {
     let shared = app.state::<WebRemoteState>().shared();
-    app.state::<crate::database::DatabaseStore>()
-        .web_remote_touch_session(&session_id);
-
     let (mut sink, mut stream) = socket.split();
     let (close_tx, mut close_rx) = watch::channel(false);
     let (out_tx, mut out_rx) = outbound_channel(close_tx.clone());
     let conn_id = shared
         .connections
         .register(&session_id, Transport::Lan, out_tx.clone(), close_tx.clone());
+    // Register first: a revocation during the upgrade is then either
+    // visible in the database or reaches the live socket's close signal.
+    if !life.live() || !session_active(&app, &session_id) {
+        shared.connections.unregister(conn_id);
+        return;
+    }
+    app.state::<crate::database::DatabaseStore>()
+        .web_remote_touch_session(&session_id);
     if plaintext {
         shared.connections.mark_plaintext(conn_id);
     }
@@ -907,6 +917,8 @@ async fn handle_socket<R: Runtime>(
     // Reader: dispatch client frames until close/error/revocation.
     loop {
         tokio::select! {
+            biased;
+            _ = life.stopped() => break,
             changed = close_rx.changed() => {
                 if changed.is_err() || *close_rx.borrow() {
                     break;
