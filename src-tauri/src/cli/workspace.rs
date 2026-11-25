@@ -60,7 +60,7 @@ pub enum WorkspaceCommand {
         #[command(flatten)]
         out: OutputArgs,
     },
-    /// Re-run setup scripts (.codemuxinclude + setup commands) for a workspace
+    /// Re-run setup commands for a workspace
     RerunSetup {
         /// Workspace ID (defaults to active workspace)
         workspace_id: Option<String>,

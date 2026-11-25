@@ -574,6 +574,18 @@ Outside agents see workspaces on your devices in `workspace_list` with `native_c
 
 To control Codemux from another machine, use SSH or **Over the network**, not `codemux-remote`: `codemux-remote` listens only on its own server and manages that server, not your desktop.
 
+#### Worktree includes and setup on headless hosts
+
+On a headless host, `worktree_create` and `codemux-remote worktree create` copy matching top-level files from the main checkout into a new worktree before returning. Project setup commands start in the background after the include step. Desktop setup also limits include copies to the registered checkout root because a nested directory can move outside the checkout while a copy is in progress.
+
+The tool lists skipped nested paths in `setup.includes_skipped_nested` and copy failures in `setup.includes_errors`. The CLI prints both to stderr. On the machine with the worktree, copy missing files from the main checkout to the same relative paths in the worktree, preserving existing files. The desktop warning's **Copy skipped paths** action copies the list of paths to your clipboard.
+
+For non-UTF-8 Unix paths, `setup.includes_skipped_nested_path_bytes` supplies a zero-based `index` into the skipped path list and `bytes_hex`, the exact bytes of the relative path in hexadecimal. The CLI prints these records after the skipped path list. The desktop clipboard represents these entries as objects with the display `path` and exact `bytes_hex`.
+
+After you copy the missing files, use **Re-run setup** on the desktop to run the setup commands with your restored files and existing worktree settings.
+
+On a headless host, you can rerun setup commands with `codemux-remote worktree setup --path <path> --workspace-id <id> --name <name> --branch <branch>`. Get those values from `worktree_create` or `codemux-remote workspace list`.
+
 ### Phones and browsers
 
 A paired phone or browser can remove a clean worktree, for example with **Devices → Sweep**. Codemux refuses one with uncommitted or unpushed work. Force delete, deleting the branch together with the worktree, and deleting archived workspaces are only in the desktop app. Merging a pull request from the phone can delete its branch, as on the desktop.

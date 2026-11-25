@@ -122,6 +122,9 @@ export interface WorktreeIncludesApplied {
   workspace_id: string;
   source: "file" | "setting" | "defaults";
   copied: string[];
+  skipped_nested?: string[];
+  skipped_nested_path_bytes?: Array<{ index: number; bytes_hex: string }>;
+  errors?: string[];
 }
 
 export const onWorktreeIncludesApplied = (

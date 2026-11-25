@@ -30,7 +30,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
-use tauri::{Emitter, Manager, State};
+use tauri::{Manager, State};
 
 /// Snapshot of the git fields written to a workspace by `populate_git_info`.
 /// Carrying these out of the I/O step as a value lets async callers gather
@@ -3645,21 +3645,11 @@ fn spawn_setup_scripts<R: tauri::Runtime>(
         }
 
         // Step 1: Process worktree includes (file → setting → defaults)
-        match crate::scripts::process_worktree_includes(&root_path, &ws_path, &setting_patterns) {
-            Ok(result) => {
-                let _ = app2.emit(
-                    "worktree-includes-applied",
-                    serde_json::json!({
-                        "workspace_id": ws_id,
-                        "source": result.source,
-                        "copied": result.copied,
-                    }),
-                );
-            }
-            Err(e) => {
-                eprintln!("[codemux::scripts] worktree includes error for workspace {ws_id}: {e}");
-            }
-        }
+        crate::scripts::emit_worktree_include_result(
+            &app2,
+            &ws_id,
+            crate::scripts::process_worktree_includes(&root_path, &ws_path, &setting_patterns),
+        );
 
         // Step 2: Run setup commands
         if let Some(config) = config {
