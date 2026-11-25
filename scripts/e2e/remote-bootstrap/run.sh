@@ -791,6 +791,18 @@ except Exception as e:
         info "journal:"; rexec "$distro" journalctl "_UID=${uid}" -n 60 --no-pager 2>&1 | sed 's/^/      /'
     fi
 
+    # Probe the account API through the target's loopback proxy without
+    # opening an SSH login session. The inbound listener can recover even
+    # when the local proxy service did not restart.
+    local post_proxy_health=""
+    for _ in $(seq 1 45); do
+        post_proxy_health=$(rexec "$distro" curl --max-time 3 -fsS \
+            "${MOCK_API}/_e2e/health" 2>/dev/null || true)
+        [[ "$post_proxy_health" == *'"ok": true'* ]] && break
+        sleep 2
+    done
+    assert_contains "mock API loopback proxy survives reboot" "$post_proxy_health" '"ok": true'
+
     # And still reachable from off-box, which is the actual user-facing promise.
     ip=$(container_ip "$distro")
     local post_health
