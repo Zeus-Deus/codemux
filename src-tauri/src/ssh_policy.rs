@@ -344,6 +344,26 @@ fn legacy_git_ssh(
     policy_dir: &std::path::Path,
     default_ssh: &str,
 ) -> std::io::Result<()> {
+    // Clients predating GIT_SSH_COMMAND must still fail closed. Git also
+    // uses this path if a preflighted core.sshCommand is later removed.
+    command.env("GIT_SSH", policy_dir.join("ssh-requires-git-2.3"));
+    let clone_git_dir = clone_destination.map(|destination| destination.join(".git"));
+    let mut query = config_command(command);
+    if let Some(git_dir) = &clone_git_dir {
+        // A clone ignores the source checkout's local configuration.
+        query.arg("--git-dir").arg(git_dir);
+    }
+    let configured = query
+        .args(["config", "--get", "core.sshCommand"])
+        .stdout(std::process::Stdio::null())
+        .output()?;
+    match configured.status.code() {
+        // core.sshCommand takes precedence over GIT_SSH. Let Git inspect
+        // the actual command to select its argument dialect.
+        Some(0) => return Ok(()),
+        Some(1) => {}
+        _ => return Err(git_config_error(&configured)),
+    }
     let invocation_dir = command
         .get_current_dir()
         .map_or_else(std::env::current_dir, std::path::absolute)?;
@@ -360,9 +380,10 @@ fn legacy_git_ssh(
     command.env("CODEMUX_GIT_CONFIG_PROGRAM", git);
     // Git runs this only for SSH transports. A clone's .git directory
     // exists by then, so its conditional config can still select an
-    // explicit SSH command.
-    let config = if let Some(destination) = clone_destination {
-        command.env("CODEMUX_GIT_CLONE_CONFIG", destination.join(".git"));
+    // explicit SSH command. A custom dialect uses Git's ssh.variant
+    // setting to select the arguments passed to this wrapper.
+    let config = if let Some(git_dir) = clone_git_dir {
+        command.env("CODEMUX_GIT_CLONE_CONFIG", git_dir);
         r#""$CODEMUX_GIT_CONFIG_PROGRAM" --git-dir "$CODEMUX_GIT_CLONE_CONFIG" config --get core.sshCommand"#
     } else {
         r#""$CODEMUX_GIT_CONFIG_PROGRAM" config --get core.sshCommand"#
@@ -382,13 +403,10 @@ case $status in
 esac
 "#
     );
-    command
-        .env(
-            "GIT_SSH_COMMAND",
-            format!("sh -c {} codemux-git-ssh", shell_quote(&script)),
-        )
-        // Clients predating GIT_SSH_COMMAND must also fail closed.
-        .env("GIT_SSH", policy_dir.join("ssh-requires-git-2.3"));
+    command.env(
+        "GIT_SSH_COMMAND",
+        format!("sh -c {} codemux-git-ssh", shell_quote(&script)),
+    );
     Ok(())
 }
 
@@ -670,6 +688,10 @@ printf 'transport started\n'
             "scoped-ssh",
             "#!/bin/sh\n[ \"$1\" != -G ] || exit 0\nprintf 'explicit %s\\n' \"$*\" >&2\nexit 1\n",
         );
+        let plink = fixture(
+            "plink",
+            "#!/bin/sh\n[ \"$1\" != -G ] || exit 1\nprintf 'plink %s\\n' \"$*\" >&2\nexit 1\n",
+        );
         let path = std::env::join_paths(
             std::iter::once(root.path().to_owned())
                 .chain(std::env::split_paths(&std::env::var_os("PATH").unwrap())),
@@ -728,5 +750,42 @@ printf 'transport started\n'
         let stderr = String::from_utf8_lossy(&output.stderr);
         assert!(stderr.contains("explicit "), "{stderr}");
         assert!(!stderr.contains("verified "), "{stderr}");
+
+        let configure = |args: &[&str]| {
+            let output = command().arg("config").args(args).output().unwrap();
+            assert!(output.status.success(), "{output:?}");
+        };
+        let plink_command = shell_quote(plink.to_str().unwrap());
+        configure(&["--global", "core.sshCommand", &plink_command]);
+        let port_url = "ssh://git@fixture.invalid:2205/repo";
+        let assert_plink_port = |output: std::process::Output| {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(!output.status.success(), "{output:?}");
+            assert!(stderr.contains("plink -P 2205 git@fixture.invalid"), "{stderr}");
+            assert!(!stderr.contains("verified "), "{stderr}");
+        };
+        let mut known = command();
+        known.args(["ls-remote", "--", port_url]);
+        assert_plink_port(run(known, None));
+        let mut known_clone = command();
+        known_clone.args(["clone", "--", port_url, "plink-clone"]);
+        assert_plink_port(run(known_clone, Some(Path::new("plink-clone"))));
+
+        let mut removed = command();
+        removed.args(["ls-remote", "--", remote]);
+        let _config = unattended_git(&mut removed, None).unwrap().unwrap();
+        configure(&["--global", "--unset", "core.sshCommand"]);
+        let output = removed.output().unwrap();
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(!output.status.success(), "{output:?}");
+        assert!(stderr.contains("ssh-requires-git-2.3"), "{stderr}");
+        assert!(!stderr.contains("verified "), "{stderr}");
+
+        let config_path = config.to_str().unwrap();
+        configure(&["--file", config_path, "core.sshCommand", &plink_command]);
+        configure(&["--file", config_path, "ssh.variant", "plink"]);
+        let mut scoped_plink = command();
+        scoped_plink.args(["clone", "--", port_url, "ssh-clone"]);
+        assert_plink_port(run(scoped_plink, Some(Path::new("ssh-clone"))));
     }
 }
