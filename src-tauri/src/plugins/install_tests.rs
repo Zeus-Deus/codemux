@@ -261,11 +261,13 @@ fn provenance_searches_older_default_pin_before_large_unrelated_refs() {
     let work = origin.parent().unwrap().join("work");
     let origin = origin.to_str().unwrap();
 
-    // An unrelated branch has a large, hard-to-compress commit object. A
-    // wildcard fetch would download it even when main proves the pin.
+    // An unrelated branch and tag have a large, hard-to-compress commit
+    // object. Neither should consume the budget needed to deepen main.
     git(&work, &["checkout", "-q", "-b", "zlarge"]);
     large_commit(&work);
     git(&work, &["push", "-q", origin, "zlarge"]);
+    git(&work, &["tag", "-a", "v99-large", "-m", "unrelated"]);
+    git(&work, &["push", "-q", origin, "refs/tags/v99-large"]);
 
     // The pinned commit is deeper than the first round on main. Searching
     // unrelated refs first would hit the large branch and exhaust the budget.
@@ -359,6 +361,26 @@ fn lazy_blob_fetch_stops_when_repository_exceeds_disk_guard() {
     .err()
     .unwrap();
     assert!(error.contains("Git download exceeded its disk limit"), "{error}");
+}
+
+#[cfg(unix)]
+#[test]
+fn lazy_tree_fetch_reports_its_disk_limit_instead_of_missing_plugin() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let f = fixture();
+    let wrapper_dir = tempfile::tempdir().unwrap();
+    let wrapper = wrapper_dir.path().join("git");
+    std::fs::write(
+        &wrapper,
+        "#!/bin/sh\ncase \" $* \" in\n  *' ls-tree '*) dd if=/dev/zero of=\"$GIT_DIR/oversize\" bs=1024 count=2048 2>/dev/null ;;\nesac\nexec git \"$@\"\n",
+    ).unwrap();
+    std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+    let git = Git::with(wrapper, true).unwrap().with_disk_limit(1024 * 1024);
+    let error = install::fetch_plugin(&git, &f.url, None, Some(&f.second), None).err().unwrap();
+    assert!(error.contains("Git download exceeded its disk limit"), "{error}");
+    assert!(!error.contains("No plugin.js"), "{error}");
 }
 
 #[test]

@@ -508,27 +508,28 @@ impl Git {
         // fetched named ref that contains it can prove its provenance.
         let check = Self::with_by(self.exe.clone(), self.allow_file, deadline).map_err(&limit_error)?;
         check.set_origin_by(url, deadline).map_err(&limit_error)?;
-        let fetch = |depth: &str, refspec: &str| {
-            check.run_by_limited(
+        let fetch = |verifier: &Git, depth: &str, refspec: &str, until: Instant, budget: u64| {
+            verifier.run_by_limited(
                 &["fetch", "-q", "--no-tags", "--no-write-fetch-head", "--no-auto-gc", "--keep",
                   "--filter=tree:0", "--depth", depth, "origin", refspec],
                 None,
                 1024 * 1024,
-                deadline,
-                Some(disk_budget),
-            ).map(drop).map_err(&limit_error)
+                until,
+                Some(budget),
+            ).map(drop)
         };
-        fetch("1", &format!("+{sha}:refs/codemux/want"))?;
-        let search_ref = |remote_ref: &str, depth: u32| -> Result<bool, String> {
+        fetch(&check, "1", &format!("+{sha}:refs/codemux/want"), deadline, disk_budget)
+            .map_err(&limit_error)?;
+        let search_ref = |verifier: &Git, remote_ref: &str, depth: u32, until: Instant, budget: u64| -> Result<bool, String> {
             let local_ref = remote_ref.replacen("refs/", "refs/codemux/", 1);
-            fetch(&depth.to_string(), &format!("+{remote_ref}:{local_ref}"))?;
-            let out = check.run_by(
+            fetch(verifier, &depth.to_string(), &format!("+{remote_ref}:{local_ref}"), until, budget)?;
+            let out = verifier.run_by(
                 &["for-each-ref", "--count=1", "--contains", sha, "--format=%(refname)",
                   "refs/codemux/heads/", "refs/codemux/tags/"],
                 None,
                 4096,
-                deadline,
-            ).map_err(&limit_error)?;
+                until,
+            )?;
             Ok(!String::from_utf8_lossy(&out).trim().is_empty())
         };
 
@@ -539,18 +540,43 @@ impl Git {
         let default_ref = default_head.as_ref().filter(|head| refs.contains(head));
         if let Some(first_depth) = depths.first() {
             if let Some(default_ref) = default_ref {
-                if search_ref(default_ref, *first_depth)? {
+                if search_ref(&check, default_ref, *first_depth, deadline, disk_budget).map_err(&limit_error)? {
                     return Ok(());
                 }
             }
-            for tag in refs.iter().filter(|name| name.starts_with("refs/tags/")) {
-                if search_ref(tag, *first_depth)? {
-                    return Ok(());
+            // Try shallow release tags before deepening the default branch.
+            // A separate verifier lets a large unrelated tag exhaust only its
+            // share of the disk and time budget, then releases its files before
+            // the default branch's second pass.
+            let tag_budget = disk_budget / 2;
+            if tag_budget > 0
+                && !directory_budget_exceeded(check.dir.path(), disk_budget - tag_budget)?
+                && refs.iter().any(|name| name.starts_with("refs/tags/"))
+            {
+                let tag_start = Instant::now();
+                let tag_deadline = tag_start
+                    + (deadline.saturating_duration_since(tag_start) / 3).min(GIT_TIMEOUT / 4);
+                let tag_check = Self::with_by(self.exe.clone(), self.allow_file, tag_deadline)
+                    .map_err(&limit_error)?;
+                tag_check.set_origin_by(url, tag_deadline).map_err(&limit_error)?;
+                match fetch(&tag_check, "1", &format!("+{sha}:refs/codemux/want"), tag_deadline, tag_budget) {
+                    Ok(()) => {
+                        for tag in refs.iter().filter(|name| name.starts_with("refs/tags/")) {
+                            match search_ref(&tag_check, tag, *first_depth, tag_deadline, tag_budget) {
+                                Ok(true) => return Ok(()),
+                                Ok(false) => {}
+                                Err(error) if error == GIT_DISK_LIMIT || error == GIT_DEADLINE => break,
+                                Err(error) => return Err(limit_error(error)),
+                            }
+                        }
+                    }
+                    Err(error) if error == GIT_DISK_LIMIT || error == GIT_DEADLINE => {}
+                    Err(error) => return Err(limit_error(error)),
                 }
             }
         }
         if let (Some(default_ref), Some(second_depth)) = (default_ref, depths.get(1)) {
-            if search_ref(default_ref, *second_depth)? {
+            if search_ref(&check, default_ref, *second_depth, deadline, disk_budget).map_err(&limit_error)? {
                 return Ok(());
             }
         }
@@ -562,7 +588,7 @@ impl Git {
                 {
                     continue;
                 }
-                if search_ref(remote_ref, *depth)? {
+                if search_ref(&check, remote_ref, *depth, deadline, disk_budget).map_err(&limit_error)? {
                     return Ok(());
                 }
             }
@@ -589,13 +615,9 @@ impl Git {
         }
     }
 
-    /// `(mode, oid, name)` for the entries of one folder (non-recursive).
-    fn list_folder(&self, sha: &str, folder: Option<&str>) -> Result<Vec<(String, String, String)>, String> {
-        let spec = match folder {
-            Some(f) => format!("{sha}:{f}"),
-            None => sha.to_string(),
-        };
-        let out = self.run(&["ls-tree", "-z", &spec], None, 4 * 1024 * 1024)?;
+    /// `(mode, oid, name)` for the entries of one tree (non-recursive).
+    fn list_tree(&self, tree: &str) -> Result<Vec<(String, String, String)>, String> {
+        let out = self.run(&["ls-tree", "-z", tree], None, 4 * 1024 * 1024)?;
         Ok(out
             .split(|b| *b == 0)
             .filter(|e| !e.is_empty())
@@ -609,6 +631,24 @@ impl Git {
                 Some((mode, oid, name.to_string()))
             })
             .collect())
+    }
+
+    /// An absent path is a candidate miss. Git errors, including limits hit
+    /// while fetching a promised tree, must reach the caller unchanged.
+    fn list_folder(&self, sha: &str, folder: Option<&str>) -> Result<Vec<(String, String, String)>, String> {
+        let mut tree = sha.to_string();
+        if let Some(folder) = folder {
+            for component in folder.split('/') {
+                let entries = self.list_tree(&tree)?;
+                let Some((_, oid, _)) = entries.into_iter().find(|(mode, _, name)| {
+                    mode == "040000" && name == component
+                }) else {
+                    return Ok(Vec::new());
+                };
+                tree = oid;
+            }
+        }
+        self.list_tree(&tree)
     }
 
     fn read_blobs(&self, oids: &[String]) -> Result<Vec<Vec<u8>>, String> {
@@ -741,10 +781,7 @@ pub fn fetch_plugin(
     };
     let mut chosen = None;
     for folder in candidates {
-        let entries = match git.list_folder(&sha, folder.as_deref()) {
-            Ok(entries) => entries,
-            Err(_) => continue,
-        };
+        let entries = git.list_folder(&sha, folder.as_deref())?;
         if entries.iter().any(|(mode, _, name)| name == ENTRY_FILE && mode.starts_with("100")) {
             chosen = Some((folder, entries));
             break;
