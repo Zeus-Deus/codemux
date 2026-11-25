@@ -602,27 +602,173 @@ fn key_file_path() -> PathBuf {
     data_dir.join(crate::APP_DIR_NAME).join(KEY_FILE)
 }
 
-/// Follow an existing user-owned relocation, then keep the opened directory
-/// handle for every key operation. A changed path cannot redirect later I/O.
+/// Resolve each path entry from a pinned parent directory. An app-data
+/// relocation is allowed when its link and target are under directories that
+/// another user cannot replace or modify.
 #[cfg(unix)]
 fn open_private_key_dir(parent: &Path) -> Result<std::fs::File, String> {
-    use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
+    use std::collections::VecDeque;
+    use std::ffi::{CString, OsString};
+    use std::os::fd::{AsRawFd, FromRawFd};
+    use std::os::unix::ffi::{OsStrExt, OsStringExt};
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+    use std::path::Component;
 
-    std::fs::DirBuilder::new()
-        .recursive(true)
-        .mode(0o700)
-        .create(parent)
-        .map_err(|e| format!("create iroh key directory: {e}"))?;
-    let directory = std::fs::OpenOptions::new()
+    #[derive(Debug)]
+    enum Part {
+        Root,
+        Parent,
+        Name(OsString),
+    }
+
+    fn parts(path: &Path) -> Result<VecDeque<Part>, String> {
+        path.components()
+            .map(|part| match part {
+                Component::RootDir => Ok(Part::Root),
+                Component::CurDir => Ok(Part::Name(OsString::from("."))),
+                Component::ParentDir => Ok(Part::Parent),
+                Component::Normal(name) => Ok(Part::Name(name.to_os_string())),
+                _ => Err("unsupported iroh key directory path".to_string()),
+            })
+            .collect()
+    }
+
+    if !parent.is_absolute() {
+        return Err("iroh key directory must be absolute".to_string());
+    }
+    let root = std::fs::OpenOptions::new()
         .read(true)
-        .custom_flags(libc::O_DIRECTORY | libc::O_CLOEXEC)
-        .open(parent)
-        .map_err(|e| format!("open iroh key directory: {e}"))?;
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open("/")
+        .map_err(|e| format!("open filesystem root for iroh key: {e}"))?;
+    let mut directories = vec![root];
+    let mut remaining = parts(parent)?;
+    let mut links = 0;
+    let uid = unsafe { libc::geteuid() };
+
+    while let Some(part) = remaining.pop_front() {
+        let name = match part {
+            Part::Root => {
+                directories.truncate(1);
+                continue;
+            }
+            Part::Parent => {
+                if directories.len() > 1 {
+                    directories.pop();
+                }
+                continue;
+            }
+            Part::Name(name) if name == "." => continue,
+            Part::Name(name) => name,
+        };
+        let directory = directories.last().expect("root directory remains open");
+        let parent_meta = directory
+            .metadata()
+            .map_err(|e| format!("inspect iroh key ancestor: {e}"))?;
+        if parent_meta.uid() != uid && parent_meta.uid() != 0 {
+            return Err("iroh key ancestor is not owner controlled".to_string());
+        }
+        let mode = parent_meta.permissions().mode();
+        let writable_by_others = mode & 0o022 != 0;
+        if writable_by_others && mode & libc::S_ISVTX == 0 {
+            return Err("iroh key ancestor allows other users to replace entries".to_string());
+        }
+
+        let name = CString::new(name.as_bytes())
+            .map_err(|_| "iroh key directory contains a NUL byte".to_string())?;
+        let mut entry = unsafe { std::mem::zeroed::<libc::stat>() };
+        let mut result = unsafe {
+            libc::fstatat(
+                directory.as_raw_fd(),
+                name.as_ptr(),
+                &mut entry,
+                libc::AT_SYMLINK_NOFOLLOW,
+            )
+        };
+        if result < 0 && std::io::Error::last_os_error().kind() == std::io::ErrorKind::NotFound {
+            result = unsafe { libc::mkdirat(directory.as_raw_fd(), name.as_ptr(), 0o700) };
+            if result < 0 && std::io::Error::last_os_error().kind() != std::io::ErrorKind::AlreadyExists {
+                return Err(format!("create iroh key directory: {}", std::io::Error::last_os_error()));
+            }
+            result = unsafe {
+                libc::fstatat(
+                    directory.as_raw_fd(),
+                    name.as_ptr(),
+                    &mut entry,
+                    libc::AT_SYMLINK_NOFOLLOW,
+                )
+            };
+        }
+        if result < 0 {
+            return Err(format!("inspect iroh key directory entry: {}", std::io::Error::last_os_error()));
+        }
+        if entry.st_uid != uid && entry.st_uid != 0 {
+            return Err("iroh key directory entry is not owner controlled".to_string());
+        }
+        if writable_by_others && entry.st_uid != uid && entry.st_uid != parent_meta.uid() {
+            return Err("iroh key directory entry can be replaced by another user".to_string());
+        }
+
+        if entry.st_mode & libc::S_IFMT == libc::S_IFLNK {
+            links += 1;
+            if links > 40 {
+                return Err("too many iroh key directory relocations".to_string());
+            }
+            let mut target = vec![0u8; 256];
+            let target = loop {
+                let length = unsafe {
+                    libc::readlinkat(
+                        directory.as_raw_fd(),
+                        name.as_ptr(),
+                        target.as_mut_ptr().cast(),
+                        target.len(),
+                    )
+                };
+                if length < 0 {
+                    return Err(format!("read iroh key relocation: {}", std::io::Error::last_os_error()));
+                }
+                if (length as usize) < target.len() {
+                    target.truncate(length as usize);
+                    break PathBuf::from(OsString::from_vec(target));
+                }
+                if target.len() >= 1 << 20 {
+                    return Err("iroh key relocation is too long".to_string());
+                }
+                target.resize(target.len() * 2, 0);
+            };
+            let mut target_parts = parts(&target)?;
+            target_parts.append(&mut remaining);
+            remaining = target_parts;
+            continue;
+        }
+        if entry.st_mode & libc::S_IFMT != libc::S_IFDIR {
+            return Err("iroh key directory entry is not a directory".to_string());
+        }
+        let fd = unsafe {
+            libc::openat(
+                directory.as_raw_fd(),
+                name.as_ptr(),
+                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            )
+        };
+        if fd < 0 {
+            return Err(format!("open iroh key directory entry: {}", std::io::Error::last_os_error()));
+        }
+        let opened = unsafe { std::fs::File::from_raw_fd(fd) };
+        let opened_meta = opened
+            .metadata()
+            .map_err(|e| format!("inspect opened iroh key directory: {e}"))?;
+        if opened_meta.dev() != entry.st_dev as u64 || opened_meta.ino() != entry.st_ino as u64 {
+            return Err("iroh key directory entry changed during validation".to_string());
+        }
+        directories.push(opened);
+    }
+    let directory = directories.pop().expect("root directory remains open");
     let meta = directory
         .metadata()
         .map_err(|e| format!("inspect iroh key directory: {e}"))?;
     // The descriptor, not the pathname, identifies the directory we tighten.
-    if !meta.is_dir() || meta.uid() != unsafe { libc::geteuid() } {
+    if !meta.is_dir() || meta.uid() != uid {
         return Err("iroh key directory is not an owned directory".to_string());
     }
     if meta.permissions().mode() & 0o777 != 0o700 {
@@ -636,10 +782,7 @@ fn open_private_key_dir(parent: &Path) -> Result<std::fs::File, String> {
 /// Open only the key entry under the validated directory. The descriptor is
 /// checked and tightened before any read or truncation, including old files.
 #[cfg(unix)]
-fn open_private_key_file(
-    directory: &std::fs::File,
-    flags: libc::c_int,
-) -> Result<Option<std::fs::File>, String> {
+fn open_private_key_file(directory: &std::fs::File) -> Result<Option<std::fs::File>, String> {
     use std::os::fd::{AsRawFd, FromRawFd};
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
 
@@ -648,13 +791,13 @@ fn open_private_key_file(
         libc::openat(
             directory.as_raw_fd(),
             name.as_ptr(),
-            flags | libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK,
-            0o600,
+            libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK,
+            0,
         )
     };
     if fd < 0 {
         let error = std::io::Error::last_os_error();
-        if error.kind() == std::io::ErrorKind::NotFound && flags & libc::O_CREAT == 0 {
+        if error.kind() == std::io::ErrorKind::NotFound {
             return Ok(None);
         }
         if error.raw_os_error() == Some(libc::ELOOP) {
@@ -666,8 +809,8 @@ fn open_private_key_file(
     let meta = file
         .metadata()
         .map_err(|e| format!("inspect iroh key file: {e}"))?;
-    if !meta.is_file() || meta.uid() != unsafe { libc::geteuid() } {
-        return Err("iroh key path is not an owned regular file".to_string());
+    if !meta.is_file() || meta.uid() != unsafe { libc::geteuid() } || meta.nlink() != 1 {
+        return Err("iroh key path is not a singly linked owned regular file".to_string());
     }
     if meta.permissions().mode() & 0o777 != 0o600 {
         file.set_permissions(std::fs::Permissions::from_mode(0o600))
@@ -678,7 +821,7 @@ fn open_private_key_file(
 
 #[cfg(unix)]
 fn read_private_key_in(directory: &std::fs::File) -> Result<Option<Vec<u8>>, String> {
-    let Some(mut file) = open_private_key_file(directory, libc::O_RDONLY)? else {
+    let Some(mut file) = open_private_key_file(directory)? else {
         return Ok(None);
     };
     let mut sealed = Vec::new();
@@ -689,17 +832,51 @@ fn read_private_key_in(directory: &std::fs::File) -> Result<Option<Vec<u8>>, Str
 
 #[cfg(unix)]
 fn persist_secret_key_in(directory: &std::fs::File, key: &SecretKey) -> Result<(), String> {
-    // Repair an old read-only key before opening it for writing. Both opens
-    // resolve within the now-private directory; neither follows a key link.
-    drop(open_private_key_file(directory, libc::O_RDONLY)?);
+    use std::os::fd::{AsRawFd, FromRawFd};
+    use std::os::unix::fs::PermissionsExt;
+
+    // Refuse hardlinked or symlinked legacy entries before replacing them.
+    drop(open_private_key_file(directory)?);
     let sealed = crate::auth::encrypt_data(&key.to_bytes())?;
-    let mut file = open_private_key_file(directory, libc::O_WRONLY | libc::O_CREAT)?
-        .ok_or("created iroh key file is missing")?;
-    file.set_len(0)
-        .map_err(|e| format!("truncate iroh key file: {e}"))?;
-    file.write_all(&sealed)
-        .map_err(|e| format!("write iroh key: {e}"))?;
-    Ok(())
+    let key_name = std::ffi::CString::new(KEY_FILE).expect("static key filename has no NUL");
+    let temp_name = std::ffi::CString::new(format!(".{KEY_FILE}.{}.tmp", uuid::Uuid::new_v4()))
+        .expect("generated temp filename has no NUL");
+    let fd = unsafe {
+        libc::openat(
+            directory.as_raw_fd(),
+            temp_name.as_ptr(),
+            libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            0o600,
+        )
+    };
+    if fd < 0 {
+        return Err(format!("create iroh key temp file: {}", std::io::Error::last_os_error()));
+    }
+    let mut file = unsafe { std::fs::File::from_raw_fd(fd) };
+    let result = (|| {
+        file.set_permissions(std::fs::Permissions::from_mode(0o600))
+            .map_err(|e| format!("secure iroh key temp file: {e}"))?;
+        file.write_all(&sealed)
+            .map_err(|e| format!("write iroh key temp file: {e}"))?;
+        file.sync_all()
+            .map_err(|e| format!("sync iroh key temp file: {e}"))?;
+        let renamed = unsafe {
+            libc::renameat(
+                directory.as_raw_fd(),
+                temp_name.as_ptr(),
+                directory.as_raw_fd(),
+                key_name.as_ptr(),
+            )
+        };
+        if renamed < 0 {
+            return Err(format!("publish iroh key file: {}", std::io::Error::last_os_error()));
+        }
+        Ok(())
+    })();
+    if result.is_err() {
+        unsafe { libc::unlinkat(directory.as_raw_fd(), temp_name.as_ptr(), 0) };
+    }
+    result
 }
 
 #[cfg(test)]
@@ -1345,6 +1522,93 @@ mod tests {
             replacement.public()
         );
         assert!(!second.join(KEY_FILE).exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn iroh_identity_key_rejects_relocation_through_writable_ancestor() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        let shared = temp.path().join("shared");
+        let target = temp.path().join("target");
+        std::fs::create_dir(&shared).unwrap();
+        std::fs::create_dir(&target).unwrap();
+        std::fs::set_permissions(temp.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::set_permissions(&shared, std::fs::Permissions::from_mode(0o777)).unwrap();
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::os::unix::fs::symlink(&target, shared.join("codemux")).unwrap();
+
+        let error = load_or_create_secret_key_at(&shared.join("codemux").join(KEY_FILE))
+            .unwrap_err();
+        assert!(error.contains("replace entries"), "{error}");
+        assert_eq!(
+            std::fs::metadata(&target).unwrap().permissions().mode() & 0o777,
+            0o755
+        );
+        assert!(!target.join(KEY_FILE).exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn iroh_identity_key_allows_owned_entry_under_sticky_directory() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        let shared = temp.path().join("shared");
+        let target = temp.path().join("target");
+        std::fs::create_dir(&shared).unwrap();
+        std::fs::create_dir(&target).unwrap();
+        std::fs::set_permissions(&shared, std::fs::Permissions::from_mode(0o1777)).unwrap();
+        std::os::unix::fs::symlink(&target, shared.join("codemux")).unwrap();
+
+        let path = shared.join("codemux").join(KEY_FILE);
+        let key = load_or_create_secret_key_at(&path).unwrap();
+        assert_eq!(load_or_create_secret_key_at(&path).unwrap().public(), key.public());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn iroh_identity_key_rejects_hardlinked_legacy_file_without_changing_it() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        let dir = temp.path().join("codemux");
+        std::fs::create_dir(&dir).unwrap();
+        let target = temp.path().join("other-file");
+        std::fs::write(&target, b"legacy content").unwrap();
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let path = dir.join(KEY_FILE);
+        std::fs::hard_link(&target, &path).unwrap();
+
+        let error = load_or_create_secret_key_at(&path).unwrap_err();
+        assert!(error.contains("singly linked"), "{error}");
+        let error = persist_secret_key(&path, &SecretKey::generate()).unwrap_err();
+        assert!(error.contains("singly linked"), "{error}");
+        assert_eq!(std::fs::read(&target).unwrap(), b"legacy content");
+        assert_eq!(std::fs::metadata(&target).unwrap().permissions().mode() & 0o777, 0o644);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn iroh_identity_key_replaces_invalid_file_without_truncating_old_inode() {
+        use std::io::Read;
+        use std::os::unix::fs::MetadataExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        let dir = temp.path().join("codemux");
+        std::fs::create_dir(&dir).unwrap();
+        let path = dir.join(KEY_FILE);
+        std::fs::write(&path, b"corrupt key").unwrap();
+        let mut old = std::fs::File::open(&path).unwrap();
+        let old_ino = old.metadata().unwrap().ino();
+
+        let key = load_or_create_secret_key_at(&path).unwrap();
+        assert_ne!(std::fs::metadata(&path).unwrap().ino(), old_ino);
+        let mut unchanged = Vec::new();
+        old.read_to_end(&mut unchanged).unwrap();
+        assert_eq!(unchanged, b"corrupt key");
+        assert_eq!(load_or_create_secret_key_at(&path).unwrap().public(), key.public());
     }
 
     // ── Handshake / session gate ──────────────────────────────────────
