@@ -189,9 +189,11 @@ pub fn build_pull_rsync_argv(opts: &PullOptions<'_>) -> Vec<String> {
 /// Whether `path` can be handed to the remote host as an rsync path. Older
 /// rsync (before 3.2.4, still common on servers and macOS) passes the remote
 /// path through the remote shell unquoted, so anything that shell would
-/// interpret is refused instead of transferred. A leading `~/` (or a bare
-/// `~`) stays allowed for the remote home; spaces are allowed because they
-/// cannot run anything.
+/// interpret is refused instead of transferred, and so is whitespace, which
+/// that rsync would split into separate paths so the transfer could address a
+/// different directory than the quoted preflight checked. A leading `~/` (or a
+/// bare `~`) stays allowed for the remote home. Codemux's own remote paths
+/// (`~/.codemux/worktrees/<project>/<branch>`) never need anything else.
 pub(crate) fn is_transfer_safe_remote_path(path: &str) -> bool {
     let body = path
         .strip_prefix("~/")
@@ -199,7 +201,7 @@ pub(crate) fn is_transfer_safe_remote_path(path: &str) -> bool {
         .unwrap_or(path);
     !path.is_empty()
         && body.chars().all(|c| {
-            c.is_ascii_alphanumeric() || matches!(c, ' ' | '.' | '_' | '/' | '@' | '+' | ',' | ':' | '=' | '%' | '-')
+            c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '/' | '@' | '+' | ',' | ':' | '=' | '%' | '-')
         })
 }
 
@@ -830,10 +832,10 @@ mod tests {
 
     #[test]
     fn transfer_paths_refuse_shell_syntax_before_rsync() {
-        for ok in ["~/.codemux/worktrees/proj/branch", "/srv/code/my proj", "~", "/home/u/a@b+c,d=e%f:g"] {
+        for ok in ["~/.codemux/worktrees/proj/branch", "/srv/code/my-proj", "~", "/home/u/a@b+c,d=e%f:g"] {
             assert!(is_transfer_safe_remote_path(ok), "{ok}");
         }
-        for bad in ["", "~$(id)/x", "/srv/`id`", "/srv/a;id", "/srv/a|b", "/srv/a&b", "~alice/x", "/srv/a\nb", "/srv/'x'", "/srv/*", "/srv/a$b"] {
+        for bad in ["", "~$(id)/x", "/srv/`id`", "/srv/a;id", "/srv/a|b", "/srv/a&b", "~alice/x", "/srv/a\nb", "/srv/'x'", "/srv/*", "/srv/a$b", "/srv/my proj", "/srv/a\tb"] {
             assert!(!is_transfer_safe_remote_path(bad), "{bad}");
         }
     }
