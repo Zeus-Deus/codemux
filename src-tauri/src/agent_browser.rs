@@ -3769,7 +3769,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn browser_open_passes_session_as_one_argument_for_native_and_npx() {
-        let session = "browser-'$(id);x";
+        let session = "browser-safe_session";
         let native = browser_open_command("/tmp/my browser/agent-browser", session, 9223).unwrap();
         assert_eq!(native.get_program(), std::ffi::OsStr::new("/tmp/my browser/agent-browser"));
         let args: Vec<_> = native.get_args().map(|arg| arg.to_string_lossy().into_owned()).collect();
@@ -3779,6 +3779,8 @@ mod tests {
         assert_eq!(npx.get_program(), std::ffi::OsStr::new("npx"));
         let args: Vec<_> = npx.get_args().map(|arg| arg.to_string_lossy().into_owned()).collect();
         assert_eq!(args, ["agent-browser", "open", "about:blank", "--session", session]);
+
+        assert!(browser_open_command("/tmp/my browser/agent-browser", "browser-'$(id);x", 9223).is_err());
     }
 
     struct TestBrowserPidFile(PathBuf);
@@ -4460,11 +4462,7 @@ mod tests {
             stream_generation: 1,
             last_seen_at: None,
         };
-        let replacement = BrowserPidRecord {
-            pid: 42,
-            start_time: 200,
-            token: "a".repeat(32),
-        };
+        let replacement = test_browser_record(42, 200, "a".repeat(32));
         let identity = refresh_stream_session_identity(&mut stream, &replacement);
         assert_eq!(identity.pid, 42);
         assert_eq!(identity.start_time, 200);
