@@ -624,6 +624,7 @@ enum KeyAclScope {
 enum KeyDirAccess {
     PrivateCreate,
     PrivateReadOnly,
+    AncestorCreate,
     AncestorReadOnly,
 }
 
@@ -921,7 +922,7 @@ fn open_key_dir(parent: &Path, access: KeyDirAccess) -> Result<std::fs::File, St
             )
         };
         if result < 0
-            && access == KeyDirAccess::PrivateCreate
+            && matches!(access, KeyDirAccess::PrivateCreate | KeyDirAccess::AncestorCreate)
             && std::io::Error::last_os_error().kind() == std::io::ErrorKind::NotFound
         {
             result = unsafe { libc::mkdirat(directory.as_raw_fd(), name.as_ptr(), 0o700) };
@@ -1011,7 +1012,7 @@ fn open_key_dir(parent: &Path, access: KeyDirAccess) -> Result<std::fs::File, St
     // Legacy lookup needs only search permission on the app-data root. Keep
     // the validated descriptor: reopening it for read would reject an owned
     // 0300 directory even though its private key is accessible by name.
-    if access == KeyDirAccess::AncestorReadOnly {
+    if matches!(access, KeyDirAccess::AncestorCreate | KeyDirAccess::AncestorReadOnly) {
         if !search_meta.is_dir()
             || search_meta.uid() != uid
             || search_meta.permissions().mode() & 0o022 != 0
@@ -1071,6 +1072,76 @@ fn open_key_dir(parent: &Path, access: KeyDirAccess) -> Result<std::fs::File, St
     }
     check_key_acl(&directory, "iroh key directory", scope)?;
     Ok(directory)
+}
+
+/// Open the fixed private child relative to the validated app-data root.
+/// App-data root relocations remain supported, but this child cannot redirect
+/// identity reads or writes to a different root.
+#[cfg(unix)]
+fn open_private_child_dir(
+    root: &std::fs::File,
+    access: KeyDirAccess,
+) -> Result<Option<std::fs::File>, String> {
+    use std::os::fd::{AsRawFd, FromRawFd};
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    let name = std::ffi::CString::new(KEY_DIR).expect("static directory name has no NUL");
+    let mut entry: libc::stat = unsafe { std::mem::zeroed() };
+    let mut result = unsafe {
+        libc::fstatat(root.as_raw_fd(), name.as_ptr(), &mut entry, libc::AT_SYMLINK_NOFOLLOW)
+    };
+    if result < 0 && std::io::Error::last_os_error().kind() == std::io::ErrorKind::NotFound {
+        if access == KeyDirAccess::PrivateReadOnly {
+            return Ok(None);
+        }
+        result = unsafe { libc::mkdirat(root.as_raw_fd(), name.as_ptr(), 0o700) };
+        if result < 0 && std::io::Error::last_os_error().kind() != std::io::ErrorKind::AlreadyExists {
+            return Err(format!("create iroh key directory: {}", std::io::Error::last_os_error()));
+        }
+        result = unsafe {
+            libc::fstatat(root.as_raw_fd(), name.as_ptr(), &mut entry, libc::AT_SYMLINK_NOFOLLOW)
+        };
+    }
+    if result < 0 {
+        return Err(format!("inspect iroh key directory entry: {}", std::io::Error::last_os_error()));
+    }
+    if entry.st_mode & libc::S_IFMT != libc::S_IFDIR {
+        return Err("iroh key directory entry is not a directory".to_string());
+    }
+    let fd = unsafe {
+        libc::openat(
+            root.as_raw_fd(),
+            name.as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )
+    };
+    if fd < 0 {
+        return Err(format!("open iroh key directory for I/O: {}", std::io::Error::last_os_error()));
+    }
+    let directory = unsafe { std::fs::File::from_raw_fd(fd) };
+    let meta = directory.metadata().map_err(|e| format!("inspect iroh key directory: {e}"))?;
+    if !meta.is_dir()
+        || meta.dev() != entry.st_dev as u64
+        || meta.ino() != entry.st_ino as u64
+        || meta.uid() != unsafe { libc::geteuid() }
+    {
+        return Err("iroh key directory changed during validation".to_string());
+    }
+    check_key_acl(&directory, "iroh key directory", KeyAclScope::PrivateDirectory)?;
+    if access == KeyDirAccess::PrivateCreate && meta.permissions().mode() & 0o777 != 0o700 {
+        directory
+            .set_permissions(std::fs::Permissions::from_mode(0o700))
+            .map_err(|e| format!("secure iroh key directory: {e}"))?;
+    }
+    let secured = directory.metadata().map_err(|e| format!("recheck iroh key directory permissions: {e}"))?;
+    if !secured.is_dir()
+        || secured.uid() != unsafe { libc::geteuid() }
+        || secured.permissions().mode() & 0o777 != 0o700
+    {
+        return Err("iroh key directory permissions remain unsafe".to_string());
+    }
+    check_key_acl(&directory, "iroh key directory", KeyAclScope::PrivateDirectory)?;
+    Ok(Some(directory))
 }
 
 /// Open only the key entry under the validated directory. Startup may tighten
@@ -1215,7 +1286,13 @@ fn persist_secret_key(path: &Path, key: &SecretKey) -> Result<(), String> {
 
     let parent = path.parent().ok_or("iroh key path has no parent")?;
     std::fs::create_dir_all(parent).map_err(|e| format!("create iroh key directory: {e}"))?;
-    secure_existing_key_file(path)?;
+    // canonicalize returns a verbatim Win32 path (\\?\ for drives or
+    // \\?\UNC\ for shares). Both MoveFileExW arguments must use that form:
+    // the UUID temp name can cross MAX_PATH even when the key path does not.
+    let parent = std::fs::canonicalize(parent)
+        .map_err(|e| format!("resolve iroh key directory: {e}"))?;
+    let path = parent.join(path.file_name().ok_or("iroh key path has no filename")?);
+    secure_existing_key_file(&path)?;
     let sealed = crate::auth::encrypt_data(&key.to_bytes())?;
     let temporary = parent.join(format!(".{KEY_FILE}.{}.tmp", uuid::Uuid::new_v4()));
     let result = (|| {
@@ -1268,68 +1345,17 @@ fn secure_existing_key_file(path: &Path) -> Result<(), String> {
     }
 }
 
-/// Open the app-data root through the pinned private key directory. Resolving
-/// the configured path again could select a different root after a relocation.
-#[cfg(unix)]
-fn legacy_key_dir_from_private(directory: &std::fs::File) -> Result<std::fs::File, String> {
-    use std::os::fd::{AsRawFd, FromRawFd};
-    use std::os::unix::fs::{MetadataExt, PermissionsExt};
-
-    #[cfg(target_os = "linux")]
-    const SEARCH_ONLY: libc::c_int = libc::O_PATH;
-    #[cfg(target_os = "macos")]
-    const SEARCH_ONLY: libc::c_int = libc::O_SEARCH;
-    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-    const SEARCH_ONLY: libc::c_int = libc::O_RDONLY;
-
-    let parent = std::ffi::CString::new("..").expect("static parent name has no NUL");
-    let fd = unsafe {
-        libc::openat(
-            directory.as_raw_fd(),
-            parent.as_ptr(),
-            SEARCH_ONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
-        )
-    };
-    if fd < 0 {
-        return Err(format!("open pinned app-data directory: {}", std::io::Error::last_os_error()));
-    }
-    let root = unsafe { std::fs::File::from_raw_fd(fd) };
-    let meta = root.metadata().map_err(|e| format!("inspect pinned app-data directory: {e}"))?;
-    if !meta.is_dir()
-        || meta.uid() != unsafe { libc::geteuid() }
-        || meta.permissions().mode() & 0o022 != 0
-    {
-        return Err("pinned app-data directory permissions are unsafe".to_string());
-    }
-    check_key_acl(&root, "pinned app-data directory", KeyAclScope::Ancestor)?;
-
-    // The private directory must be a direct child of this root. A symlinked
-    // child or a moved directory has no provable sibling legacy key.
-    let child = std::ffi::CString::new(KEY_DIR).expect("static directory name has no NUL");
-    let mut entry: libc::stat = unsafe { std::mem::zeroed() };
-    if unsafe {
-        libc::fstatat(root.as_raw_fd(), child.as_ptr(), &mut entry, libc::AT_SYMLINK_NOFOLLOW)
-    } < 0 {
-        return Err(format!("inspect pinned iroh key directory: {}", std::io::Error::last_os_error()));
-    }
-    let private_meta = directory.metadata().map_err(|e| format!("inspect pinned iroh key directory: {e}"))?;
-    if entry.st_mode & libc::S_IFMT != libc::S_IFDIR
-        || entry.st_dev as u64 != private_meta.dev()
-        || entry.st_ino as u64 != private_meta.ino()
-    {
-        return Err("iroh key directory is not a direct child of its pinned app-data directory".to_string());
-    }
-    Ok(root)
-}
-
 /// Copy an existing root-level key only after validating its inode. The app
 /// data directory is an ancestor here: its unrelated permissions stay intact.
 #[cfg(unix)]
-fn migrate_legacy_secret_key(path: &Path, directory: &std::fs::File) -> Result<Option<SecretKey>, String> {
+fn migrate_legacy_secret_key(
+    path: &Path,
+    legacy_dir: &std::fs::File,
+    directory: &std::fs::File,
+) -> Result<Option<SecretKey>, String> {
     if legacy_key_file_path(path).is_none() {
         return Ok(None);
     }
-    let legacy_dir = legacy_key_dir_from_private(directory)?;
     let Some(mut file) = open_private_key_file(&legacy_dir, true)? else {
         return Ok(None);
     };
@@ -1378,7 +1404,21 @@ fn load_or_create_secret_key() -> Result<SecretKey, String> {
 fn load_or_create_secret_key_at(path: &Path) -> Result<SecretKey, String> {
     let parent = path.parent().ok_or("iroh key path has no parent")?;
     #[cfg(unix)]
-    let directory = open_private_key_dir(parent)?;
+    let legacy_root = if let Some(legacy) = legacy_key_file_path(path) {
+        Some(open_key_dir(
+            legacy.parent().ok_or("legacy iroh key has no parent")?,
+            KeyDirAccess::AncestorCreate,
+        )?)
+    } else {
+        None
+    };
+    #[cfg(unix)]
+    let directory = if let Some(root) = legacy_root.as_ref() {
+        open_private_child_dir(root, KeyDirAccess::PrivateCreate)?
+            .ok_or("iroh key directory was not created")?
+    } else {
+        open_private_key_dir(parent)?
+    };
     #[cfg(unix)]
     let sealed = read_private_key_in(&directory, true)?;
     #[cfg(not(unix))]
@@ -1401,8 +1441,10 @@ fn load_or_create_secret_key_at(path: &Path) -> Result<SecretKey, String> {
         );
     }
     #[cfg(unix)]
-    if let Some(key) = migrate_legacy_secret_key(path, &directory)? {
-        return Ok(key);
+    if let Some(root) = legacy_root.as_ref() {
+        if let Some(key) = migrate_legacy_secret_key(path, root, &directory)? {
+            return Ok(key);
+        }
     }
     #[cfg(not(unix))]
     if let Some(key) = migrate_legacy_secret_key(path)? {
@@ -1439,16 +1481,15 @@ pub fn persisted_node_id() -> Option<String> {
 
 fn persisted_node_id_at(path: &Path) -> Option<String> {
     #[cfg(unix)]
-    let current = {
-        let private_dir = path.parent()?;
-        match open_key_dir(private_dir, KeyDirAccess::PrivateReadOnly) {
-            Ok(directory) => read_private_key_in(&directory, false).ok()?,
-            Err(_) if matches!(
-                std::fs::symlink_metadata(private_dir),
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound
-            ) => None,
+    let (current, legacy_root) = {
+        let legacy = legacy_key_file_path(path)?;
+        let root = open_key_dir(legacy.parent()?, KeyDirAccess::AncestorReadOnly).ok()?;
+        let current = match open_private_child_dir(&root, KeyDirAccess::PrivateReadOnly) {
+            Ok(Some(directory)) => read_private_key_in(&directory, false).ok()?,
+            Ok(None) => None,
             Err(_) => return None,
-        }
+        };
+        (current, root)
     };
     #[cfg(not(unix))]
     let current = {
@@ -1467,14 +1508,11 @@ fn persisted_node_id_at(path: &Path) -> Option<String> {
 
     // A damaged new copy can be restored from a retained legacy key at
     // startup. Status uses the same fallback without changing either file.
-    let legacy = legacy_key_file_path(path)?;
     #[cfg(unix)]
-    let sealed = {
-        let directory = open_key_dir(legacy.parent()?, KeyDirAccess::AncestorReadOnly).ok()?;
-        read_private_key_in(&directory, false).ok()??
-    };
+    let sealed = read_private_key_in(&legacy_root, false).ok()??;
     #[cfg(not(unix))]
     let sealed = {
+        let legacy = legacy_key_file_path(path)?;
         secure_existing_key_file(&legacy).ok()?;
         std::fs::read(legacy).ok()?
     };
@@ -2180,11 +2218,14 @@ mod tests {
             std::fs::set_permissions(&legacy, std::fs::Permissions::from_mode(0o600)).unwrap();
         }
 
-        let private = open_private_key_dir(path.parent().unwrap()).unwrap();
+        let root = open_key_dir(&configured, KeyDirAccess::AncestorReadOnly).unwrap();
+        let private = open_private_child_dir(&root, KeyDirAccess::PrivateCreate)
+            .unwrap()
+            .unwrap();
         std::fs::remove_file(&configured).unwrap();
         std::os::unix::fs::symlink(&second, &configured).unwrap();
 
-        let migrated = migrate_legacy_secret_key(&path, &private).unwrap().unwrap();
+        let migrated = migrate_legacy_secret_key(&path, &root, &private).unwrap().unwrap();
         assert_eq!(migrated.public(), first_key.public());
         assert_eq!(load_or_create_secret_key_at(&first.join(KEY_DIR).join(KEY_FILE)).unwrap().public(), first_key.public());
         assert!(!second.join(KEY_DIR).exists());
@@ -2196,6 +2237,48 @@ mod tests {
             decode_secret_key(&std::fs::read(second.join(KEY_FILE)).unwrap()).unwrap().public(),
             second_key.public()
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn iroh_identity_key_rejects_private_child_relocation_without_selecting_foreign_legacy_key() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        let configured = temp.path().join("codemux");
+        let foreign = temp.path().join("foreign");
+        std::fs::create_dir(&configured).unwrap();
+        std::fs::create_dir(&foreign).unwrap();
+        std::fs::create_dir(foreign.join(KEY_DIR)).unwrap();
+        let own_key = SecretKey::generate();
+        let foreign_key = SecretKey::generate();
+        for (root, key) in [(&configured, &own_key), (&foreign, &foreign_key)] {
+            let legacy = root.join(KEY_FILE);
+            std::fs::write(&legacy, crate::auth::encrypt_data(&key.to_bytes()).unwrap()).unwrap();
+            std::fs::set_permissions(&legacy, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        let child = configured.join(KEY_DIR);
+        std::os::unix::fs::symlink(foreign.join(KEY_DIR), &child).unwrap();
+        let path = child.join(KEY_FILE);
+
+        assert!(persisted_node_id_at(&path).is_none());
+        let error = load_or_create_secret_key_at(&path).unwrap_err();
+        assert!(error.contains("not a directory"), "{error}");
+        assert!(!foreign.join(KEY_DIR).join(KEY_FILE).exists());
+        assert_eq!(
+            decode_secret_key(&std::fs::read(configured.join(KEY_FILE)).unwrap()).unwrap().public(),
+            own_key.public()
+        );
+        assert_eq!(
+            decode_secret_key(&std::fs::read(foreign.join(KEY_FILE)).unwrap()).unwrap().public(),
+            foreign_key.public()
+        );
+
+        std::fs::remove_file(child).unwrap();
+        let own_id = own_key.public().to_string();
+        assert_eq!(persisted_node_id_at(&path).as_deref(), Some(own_id.as_str()));
+        assert_eq!(load_or_create_secret_key_at(&path).unwrap().public(), own_key.public());
+        assert!(!foreign.join(KEY_DIR).join(KEY_FILE).exists());
     }
 
     #[cfg(windows)]
@@ -2219,6 +2302,27 @@ mod tests {
         std::fs::write(&path, b"incomplete replacement").unwrap();
         assert_eq!(persisted_node_id_at(&path).as_deref(), Some(node_id.as_str()));
         assert_eq!(load_or_create_secret_key_at(&path).unwrap().public(), original.public());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn iroh_identity_key_publishes_temp_name_beyond_max_path() {
+        use std::os::windows::ffi::OsStrExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        let mut app_dir = temp.path().join("codemux");
+        let path_length = |path: &Path| path.as_os_str().encode_wide().count();
+        while path_length(&app_dir.join(KEY_DIR).join(KEY_FILE)) < 230 {
+            app_dir.push("nested-directory");
+        }
+        let path = app_dir.join(KEY_DIR).join(KEY_FILE);
+        let temporary = path.parent().unwrap().join(format!(".{KEY_FILE}.{}.tmp", uuid::Uuid::nil()));
+        assert!(path_length(&path) < 260, "the destination should fit MAX_PATH");
+        assert!(path_length(&temporary) > 260, "the temporary name should exceed MAX_PATH");
+
+        let key = SecretKey::generate();
+        persist_secret_key(&path, &key).unwrap();
+        assert_eq!(load_or_create_secret_key_at(&path).unwrap().public(), key.public());
     }
 
     #[cfg(unix)]
