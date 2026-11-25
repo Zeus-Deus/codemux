@@ -1106,12 +1106,25 @@ fn browser_process_has_open_attempt(pid: u32, attempt: &str) -> bool {
 
 #[cfg(unix)]
 fn browser_daemon_for_open_attempt(session: &str, attempt: &str) -> Option<BrowserPidRecord> {
+    browser_daemons_for_open_attempts(session, &HashSet::from([attempt.to_owned()]))
+        .into_iter()
+        .next()
+        .map(|(_, record)| record)
+}
+
+#[cfg(unix)]
+fn browser_daemons_for_open_attempts(
+    session: &str,
+    attempts: &HashSet<String>,
+) -> Vec<(String, BrowserPidRecord)> {
     use sysinfo::{ProcessRefreshKind, ProcessesToUpdate, System, UpdateKind};
 
-    let (owner_pid, owner_start_time) = current_app_process_identity()?;
+    if attempts.is_empty() {
+        return Vec::new();
+    }
+    let Some((owner_pid, owner_start_time)) = current_app_process_identity() else { return Vec::new() };
     let owner = format!("CODEMUX_BROWSER_OWNER={}", browser_owner_token());
     let session_env = format!("CODEMUX_BROWSER_SESSION={session}");
-    let attempt_env = format!("CODEMUX_BROWSER_OPEN_ATTEMPT={attempt}");
     let mut system = System::new();
     system.refresh_processes_specifics(
         ProcessesToUpdate::All,
@@ -1120,14 +1133,20 @@ fn browser_daemon_for_open_attempt(session: &str, attempt: &str) -> Option<Brows
             .with_exe(UpdateKind::Always)
             .with_environ(UpdateKind::Always),
     );
-    system.processes().values().find_map(|process| {
+    system.processes().values().filter_map(|process| {
         let env = process.environ();
-        if ![&owner, &session_env, &attempt_env]
+        if ![&owner, &session_env]
             .iter()
             .all(|expected| env.iter().any(|entry| entry.to_string_lossy() == expected.as_str()))
         {
             return None;
         }
+        let attempt = env.iter().find_map(|entry| {
+            let value = entry.to_string_lossy();
+            value.strip_prefix("CODEMUX_BROWSER_OPEN_ATTEMPT=")
+                .filter(|attempt| attempts.contains(*attempt))
+                .map(str::to_owned)
+        })?;
         let record = BrowserPidRecord {
             pid: process.pid().as_u32(),
             start_time: process.start_time(),
@@ -1135,8 +1154,8 @@ fn browser_daemon_for_open_attempt(session: &str, attempt: &str) -> Option<Brows
             owner_pid,
             owner_start_time,
         };
-        browser_process_matches(&record, session).then_some(record)
-    })
+        browser_process_matches(&record, session).then_some((attempt, record))
+    }).collect()
 }
 
 #[cfg(unix)]
@@ -1181,17 +1200,16 @@ fn rollback_failed_unix_stream_open(session: &str, before_open: Option<&BrowserP
 
 #[cfg(unix)]
 fn stop_failed_stream_daemons_on_close(session: &str) -> bool {
-    let attempts: Vec<String> = failed_stream_attempts()
+    let attempts: HashSet<String> = failed_stream_attempts()
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .get(session)
-        .map_or_else(Vec::new, |attempts| attempts.iter().cloned().collect());
-    for attempt in &attempts {
-        if let Some(record) = browser_daemon_for_open_attempt(session, attempt) {
-            kill_verified_browser_pid(&record, session);
-            if !browser_process_matches(&record, session) {
-                clear_failed_stream_attempt(session, attempt);
-            }
+        .cloned()
+        .unwrap_or_default();
+    for (attempt, record) in browser_daemons_for_open_attempts(session, &attempts) {
+        kill_verified_browser_pid(&record, session);
+        if !browser_process_matches(&record, session) {
+            clear_failed_stream_attempt(session, &attempt);
         }
     }
     !attempts.is_empty()
@@ -1454,6 +1472,50 @@ fn listener_owned_by_pid(port: u16, pid: u32) -> bool {
     }
 }
 
+async fn browser_stream_reports_attached_client(port: u16) -> bool {
+    use futures_util::StreamExt;
+
+    let response = async {
+        let stream = tokio::net::TcpStream::connect(("127.0.0.1", port)).await.ok()?;
+        let url = format!("ws://127.0.0.1:{port}");
+        let (mut socket, _) = tokio_tungstenite::client_async(&url, stream).await.ok()?;
+        let message = socket.next().await?.ok()?;
+        let text = message.to_text().ok()?;
+        let status: serde_json::Value = serde_json::from_str(text).ok()?;
+        Some(
+            status.get("type")?.as_str()? == "status"
+                && status.get("connected")?.as_bool()?,
+        )
+    };
+    tokio::time::timeout(Duration::from_millis(800), response)
+        .await
+        .ok()
+        .flatten()
+        .unwrap_or(false)
+}
+
+async fn browser_stream_attached_to_daemon(port: u16, pid: u32, attempts: usize) -> bool {
+    let owned = tokio::task::spawn_blocking(move || listener_owned_by_pid(port, pid))
+        .await
+        .unwrap_or(false);
+    if !owned {
+        return false;
+    }
+    for _ in 0..attempts {
+        if browser_stream_reports_attached_client(port).await {
+            let still_owned = tokio::task::spawn_blocking(move || listener_owned_by_pid(port, pid))
+                .await
+                .unwrap_or(false);
+            if still_owned {
+                return true;
+            }
+            return false;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    false
+}
+
 /// Check whether a PID is still alive without sending a real signal.
 /// Used by safe-adoption to decide whether a stale PID file points at a
 /// dead daemon (reap) or a still-running one (adopt).
@@ -1502,8 +1564,8 @@ struct StreamSession {
     /// Whether a daemon process is believed to be live. Commands may set
     /// this provisionally before the browser has attached.
     running: bool,
-    /// A successful command or stream open confirmed a browser was attached
-    /// to this daemon. A PID alone cannot make a pane stream ready.
+    /// A completed command or stream open indicates a browser may be ready.
+    /// Stream URLs also require a connected status from this daemon.
     browser_ready: bool,
     /// PID of the spawned agent-browser daemon, when known. None when
     /// the session was adopted from a stale PID file or when the
@@ -2845,6 +2907,20 @@ fn browser_action_has_usable_output(status_success: bool, stdout: &str) -> bool 
     status_success || stdout.contains("✓") || stdout.contains("{") || stdout.contains("- ")
 }
 
+fn browser_action_completed(status_success: bool, stdout: &str) -> bool {
+    if !status_success || stdout.contains("Confirmation required:") {
+        return false;
+    }
+    let pending = serde_json::from_str::<serde_json::Value>(stdout)
+        .ok()
+        .is_some_and(|value| {
+            value.pointer("/data/confirmation_required").and_then(|value| value.as_bool()) == Some(true)
+                || value.get("confirmation_required").and_then(|value| value.as_bool()) == Some(true)
+                || value.get("success").and_then(|value| value.as_bool()) == Some(false)
+        });
+    !pending
+}
+
 fn execute_agent_browser_action_with_status(
     browser_id: &str,
     action: &str,
@@ -2945,7 +3021,7 @@ fn execute_agent_browser_action_with_status(
                     browser_id: browser_id.to_string(),
                     data: serde_json::json!({ "tree": combined }),
                     message: None,
-                }, status_success));
+                }, browser_action_completed(status_success, &stdout)));
             }
         }
     }
@@ -2975,7 +3051,7 @@ fn execute_agent_browser_action_with_status(
         browser_id: browser_id.to_string(),
         data,
         message: None,
-    }, status_success))
+    }, browser_action_completed(status_success, &stdout)))
 }
 
 fn execute_agent_browser_action(browser_id: &str, action: &str, params: serde_json::Value, stream_port: u16) -> Result<BrowserAutomationResult, String> {
@@ -3207,9 +3283,9 @@ impl AgentBrowserManager {
                     .map_err(|e| format!("Failed to start agent-browser: {}", e))?
             };
 
-            if !output.status.success() {
+            if !browser_action_completed(output.status.success(), &String::from_utf8_lossy(&output.stdout)) {
                 let stderr = String::from_utf8_lossy(&output.stderr);
-                return Err(format!("Failed to start browser: {}", stderr));
+                return Err(format!("Failed to start browser: {} {}", String::from_utf8_lossy(&output.stdout), stderr));
             }
             track_current_browser_daemon(&session)
                 .map(|record| record.pid)
@@ -3275,20 +3351,15 @@ impl AgentBrowserManager {
         browser_id: &str,
         session: &str,
         action: &str,
-        was_running: bool,
         result: &Result<(BrowserAutomationResult, bool), String>,
     ) {
-        // A JSON error can be returned as a payload even when the CLI exited
-        // unsuccessfully. Only its process status confirms browser readiness.
-        let browser_action_succeeded = result.as_ref().is_ok_and(|(_, status_success)| *status_success);
+        // A JSON error may be returned as a payload after a failed exit, and
+        // a confirmation response may exit successfully before the action.
+        let browser_action_succeeded = result.as_ref().is_ok_and(|(_, completed)| *completed);
         if action == "close" {
             self.note_close_finished(browser_id).await;
-        } else if !was_running || !browser_action_succeeded {
-            self.refresh_running_session(browser_id, session, browser_action_succeeded).await;
         } else {
-            self.sessions.lock().await.entry(browser_id.to_string()).and_modify(|s| {
-                s.browser_ready = true;
-            });
+            self.refresh_running_session(browser_id, session, browser_action_succeeded).await;
         }
     }
 
@@ -3344,7 +3415,7 @@ impl AgentBrowserManager {
         // The agent-facing "close" goes through this path (not close()), so
         // reset the state here — otherwise the entry keeps running = true and
         // a later open on the fresh daemon would skip the default viewport.
-        self.reconcile_action_result(browser_id, &session, action, was_running, &result).await;
+        self.reconcile_action_result(browser_id, &session, action, &result).await;
 
         result.map(|(result, _)| result)
     }
@@ -3523,8 +3594,8 @@ impl AgentBrowserManager {
     ///   3. Run `agent-browser open` to trigger daemon + browser launch,
     ///      with stderr redirected to `~/.codemux/run/agent-browser-{name}.log`
     ///      so the next investigation has a paper trail.
-    ///   4. Probe the port with `probe_stream_port()` — only mark
-    ///      `running = true` when we've actually seen a live socket. The
+    ///   4. Probe the port and read its WebSocket status — only mark
+    ///      `running = true` when its owned daemon reports an attached browser. The
     ///      old "sleep(1s) and trust" approach lied to the frontend when
     ///      the daemon crashed mid-startup, leaving the BrowserPane to
     ///      retry-loop a dead URL forever.
@@ -3573,11 +3644,12 @@ impl AgentBrowserManager {
                     self.clear_stale_running_stream_allocation(browser_id, port).await;
                     return Err(format!("Browser stream port {port} is not owned by session {session}"));
                 }
-                return Ok(format!("ws://127.0.0.1:{port}"));
+                if browser_stream_attached_to_daemon(port, record.pid, 3).await {
+                    return Ok(format!("ws://127.0.0.1:{port}"));
+                }
             }
-            // running was true but the socket is dead — clear the flag so
-            // we don't hand the caller a stale URL. The respawn path below
-            // will set it again once the new daemon is verified.
+            // A dead socket or a live daemon without an attached browser
+            // cannot satisfy the stream. Reopen it below.
             self.sessions
                 .lock()
                 .await
@@ -3608,7 +3680,6 @@ impl AgentBrowserManager {
         // its PID. Every step here shells out, sleeps, or blocks on a TCP
         // probe, so the whole sequence runs on a blocking thread under hard
         // timeouts so it can never stall the async runtime (issue #96).
-        #[cfg(windows)]
         let session_after_launch = session.clone();
         let launch_result = tokio::task::spawn_blocking(move || -> Result<(bool, Option<u32>), String> {
             if std::net::TcpListener::bind(("127.0.0.1", port)).is_err() {
@@ -3735,6 +3806,22 @@ impl AgentBrowserManager {
                 return Err(error);
             }
         };
+
+        let attached = if let Some(pid) = pid {
+            browser_stream_attached_to_daemon(port, pid, 20).await
+        } else {
+            false
+        };
+        if !attached {
+            // Keep the verified PID with its allocation so pane close can
+            // retry teardown, even if the CLI exited before Chromium attached.
+            self.sessions.lock().await.entry(browser_id.to_string()).and_modify(|entry| {
+                entry.running = false;
+                entry.browser_ready = false;
+                entry.pid = pid;
+            });
+            return Err(format!("Browser session {session_after_launch} has no attached browser"));
+        }
 
         let now = Some(Instant::now());
         self.sessions
@@ -5468,7 +5555,7 @@ mod tests {
             data: serde_json::json!({"error": "browser launch failed"}),
             message: None,
         }, false));
-        manager.reconcile_action_result(&session, &session, "get_styles", false, &result).await;
+        manager.reconcile_action_result(&session, &session, "get_styles", &result).await;
         assert!(result.is_ok());
         let sessions = manager.sessions.lock().await;
         let tracked = sessions.get(&session).unwrap();
@@ -5479,6 +5566,77 @@ mod tests {
 
         let _ = daemon.kill();
         let _ = daemon.wait();
+        let _ = std::fs::remove_file(daemon_pid_path);
+        clear_session_pid(&session);
+    }
+
+    #[test]
+    fn confirmation_response_does_not_complete_a_browser_action() {
+        assert!(!browser_action_completed(true, "Confirmation required:\n  Run: agent-browser confirm c1"));
+        assert!(!browser_action_completed(
+            true,
+            r#"{"id":"c1","success":true,"data":{"confirmation_required":true}}"#,
+        ));
+        assert!(browser_action_completed(true, r#"{"success":true,"data":{"url":"about:blank"}}"#));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn stream_attachment_requires_a_connected_status_from_its_listener() {
+        use futures_util::SinkExt;
+
+        for connected in [false, true] {
+            let listener = Arc::new(tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap());
+            let port = listener.local_addr().unwrap().port();
+            let server_listener = listener.clone();
+            let server = tokio::spawn(async move {
+                let (stream, _) = server_listener.accept().await.unwrap();
+                let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
+                socket.send(tokio_tungstenite::tungstenite::Message::Text(
+                    format!(r#"{{"type":"status","connected":{connected}}}"#).into(),
+                )).await.unwrap();
+            });
+            assert_eq!(browser_stream_attached_to_daemon(port, std::process::id(), 1).await, connected);
+            server.await.unwrap();
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn successful_command_refreshes_a_replacement_daemon_pid() {
+        let session = format!("browser-replacement-{}", uuid::Uuid::new_v4().simple());
+        let (_old_temp, mut old, _old_record) = browser_identity_fixture(&session, browser_owner_token());
+        let daemon_pid_path = run_dir_for_session(&session).unwrap().join(format!("{session}.pid"));
+        std::fs::write(&daemon_pid_path, old.id().to_string()).unwrap();
+        let manager = AgentBrowserManager::new();
+        manager.allocate_port(&session).await.unwrap();
+        {
+            let mut sessions = manager.sessions.lock().await;
+            let stream = sessions.get_mut(&session).unwrap();
+            stream.running = true;
+            stream.browser_ready = true;
+            stream.pid = Some(old.id());
+        }
+        old.kill().unwrap();
+        old.wait().unwrap();
+        let (_new_temp, mut replacement, _new_record) = browser_identity_fixture(&session, browser_owner_token());
+        std::fs::write(&daemon_pid_path, replacement.id().to_string()).unwrap();
+
+        let result = Ok((BrowserAutomationResult {
+            request_id: "replacement-open".into(),
+            browser_id: session.clone(),
+            data: serde_json::json!({"result": "opened"}),
+            message: None,
+        }, true));
+        manager.reconcile_action_result(&session, &session, "open", &result).await;
+        let sessions = manager.sessions.lock().await;
+        let tracked = sessions.get(&session).unwrap();
+        assert!(stream_can_reuse_browser(tracked));
+        assert_eq!(tracked.pid, Some(replacement.id()));
+        drop(sessions);
+
+        let _ = replacement.kill();
+        let _ = replacement.wait();
         let _ = std::fs::remove_file(daemon_pid_path);
         clear_session_pid(&session);
     }
