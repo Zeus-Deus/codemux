@@ -351,12 +351,14 @@ fn context(path: &Path, args: &[&str]) -> Result<(String, Vec<String>), String> 
         }
     });
     let env_host = std::env::var("GH_HOST").ok();
-    let host = explicit_host
+    let configured_host = explicit_host
         .map(str::to_string)
         .or(repo_host)
         .or_else(|| env_host.filter(|h| !h.trim().is_empty()))
         // OWNER/REPO selects the default host, not a host named OWNER.
-        .or_else(|| selected_repo.map(|_| "github.com".to_string()))
+        .or_else(|| selected_repo.map(|_| "github.com".to_string()));
+    let inferred_from_remote = configured_host.is_none();
+    let host = configured_host
         .or_else(|| {
             repository
                 .as_ref()
@@ -365,6 +367,12 @@ fn context(path: &Path, args: &[&str]) -> Result<(String, Vec<String>), String> 
         .or_else(|| detected.and_then(|d| d.host))
         .unwrap_or_else(|| "github.com".into());
     let host = clean_host(&host).ok_or("Invalid GitHub hostname")?;
+    // A remote URL comes from the repository, not the user. Pinning gh to
+    // an unconfigured host would hand it an enterprise env token, so such a
+    // host is refused before any gh call or credential lookup.
+    if inferred_from_remote && !crate::github::gh_host_is_trusted(&host) {
+        return Err(untrusted_host_message(&host));
+    }
     let mut pinned: Vec<String> = args.iter().map(|s| s.to_string()).collect();
     if let (Some(explicit), Some(repo)) = (explicit_repo, repository.as_ref()) {
         let repo_path = if repo.split('/').count() == 3 {
@@ -409,6 +417,13 @@ fn context(path: &Path, args: &[&str]) -> Result<(String, Vec<String>), String> 
         }
     }
     Ok((host, pinned))
+}
+
+fn untrusted_host_message(host: &str) -> String {
+    format!(
+        "GitHub host {host} is not configured. Run `gh auth login --hostname {host}` \
+         or map it to GitHub in Settings → Source Control."
+    )
 }
 
 /// Auth and budget probes must use the same offline host resolution as reads.

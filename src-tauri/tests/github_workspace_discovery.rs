@@ -73,6 +73,13 @@ fn siblings_batch_and_share_coordinator_cache_without_live_credentials() {
     fs::create_dir(&bin).unwrap();
     let config = root.join("gh-config");
     fs::create_dir(&config).unwrap();
+    // The fixture host stands in for an enterprise host signed in with gh;
+    // an unconfigured remote host is never queried.
+    fs::write(
+        config.join("hosts.yml"),
+        "discovery.example.test:\n    user: fixture\n",
+    )
+    .unwrap();
     let log = root.join("calls.jsonl");
     fs::write(&log, "").unwrap();
     let script = r#"#!/usr/bin/env python3

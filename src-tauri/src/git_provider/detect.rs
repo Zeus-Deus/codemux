@@ -429,6 +429,8 @@ pub(crate) fn classify_host(
     if host.ends_with(".dev.azure.com") || host.ends_with(".visualstudio.com") {
         return ProviderKind::AzureDevOps;
     }
+    // A label only: credentials are gated separately on exact, configured
+    // hosts (`github::gh_host_is_trusted`), never on this substring rule.
     if host.contains("github") {
         return ProviderKind::GitHub;
     }

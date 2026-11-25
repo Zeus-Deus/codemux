@@ -63,25 +63,39 @@ async fn harvest_gemini_models() -> Result<Vec<LaunchGeminiModel>, String> {
         .ok()
         .filter(|s| !s.trim().is_empty())
         .ok_or_else(|| "gemini_no_api_key".to_string())?;
+    harvest_gemini_models_from(GEMINI_API_BASE, &api_key).await
+}
+
+/// The key rides in the `x-goog-api-key` header, never the URL: reqwest
+/// errors print their URL, and the caller logs those errors to stderr.
+async fn harvest_gemini_models_from(
+    api_base: &str,
+    api_key: &str,
+) -> Result<Vec<LaunchGeminiModel>, String> {
+    let mut key = reqwest::header::HeaderValue::from_str(api_key.trim())
+        .map_err(|_| "GEMINI_API_KEY is not a valid header value".to_string())?;
+    key.set_sensitive(true);
     let client = reqwest::Client::builder()
         .timeout(HARVEST_TIMEOUT)
         .build()
-        .map_err(|e| format!("client build: {e}"))?;
-    let url = format!("{GEMINI_API_BASE}/models?key={api_key}&pageSize=200");
+        .map_err(|e| format!("client build: {}", e.without_url()))?;
     let resp = client
-        .get(url)
+        .get(format!("{api_base}/models"))
+        .query(&[("pageSize", "200")])
+        .header("x-goog-api-key", key)
         .send()
         .await
-        .map_err(|e| format!("request: {e}"))?;
+        .map_err(|e| format!("request: {}", e.without_url()))?;
     if !resp.status().is_success() {
-        return Err(format!(
-            "HTTP {}: {}",
-            resp.status(),
-            resp.text().await.unwrap_or_default()
-        ));
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        let body: String = body.chars().take(500).collect();
+        return Err(format!("HTTP {status}: {body}"));
     }
-    let parsed: ApiModelsResponse =
-        resp.json().await.map_err(|e| format!("decode: {e}"))?;
+    let parsed: ApiModelsResponse = resp
+        .json()
+        .await
+        .map_err(|e| format!("decode: {}", e.without_url()))?;
     Ok(filter_and_map(parsed.models))
 }
 
@@ -187,5 +201,61 @@ mod tests {
     #[test]
     fn filter_returns_empty_on_empty_input() {
         assert!(filter_and_map(vec![]).is_empty());
+    }
+
+    const TEST_KEY: &str = "AIzaTEST-not-a-real-key";
+
+    #[tokio::test]
+    async fn api_key_is_sent_as_a_header_not_in_the_url() {
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("GET", "/models")
+            .match_query(mockito::Matcher::UrlEncoded("pageSize".into(), "200".into()))
+            .match_header("x-goog-api-key", TEST_KEY)
+            .with_status(200)
+            .with_body(
+                r#"{"models":[{"name":"models/gemini-9-pro","displayName":"Gemini 9 Pro","supportedGenerationMethods":["generateContent"]}]}"#,
+            )
+            .create_async()
+            .await;
+        let models = harvest_gemini_models_from(&server.url(), TEST_KEY)
+            .await
+            .expect("harvest succeeds");
+        mock.assert_async().await;
+        assert_eq!(models.len(), 1);
+        assert_eq!(models[0].id, "gemini-9-pro");
+    }
+
+    #[tokio::test]
+    async fn transport_errors_never_contain_the_api_key() {
+        // Bind then drop a listener so the port is closed: the request fails
+        // fast with a connection error, which reqwest would print with its URL.
+        let port = std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        let err = harvest_gemini_models_from(&format!("http://127.0.0.1:{port}"), TEST_KEY)
+            .await
+            .expect_err("closed port fails");
+        assert!(err.starts_with("request:"), "{err}");
+        assert!(!err.contains(TEST_KEY), "{err}");
+    }
+
+    #[tokio::test]
+    async fn decode_errors_never_contain_the_api_key() {
+        let mut server = mockito::Server::new_async().await;
+        let _mock = server
+            .mock("GET", "/models")
+            .match_query(mockito::Matcher::Any)
+            .with_status(200)
+            .with_body("not json")
+            .create_async()
+            .await;
+        let err = harvest_gemini_models_from(&server.url(), TEST_KEY)
+            .await
+            .expect_err("bad body fails");
+        assert!(err.starts_with("decode:"), "{err}");
+        assert!(!err.contains(TEST_KEY), "{err}");
     }
 }

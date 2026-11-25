@@ -593,8 +593,103 @@ fn auth_fingerprint(host: &str) -> u64 {
     hash.finish()
 }
 
+/// gh's own config directory rule (`GH_CONFIG_DIR`, then
+/// `$XDG_CONFIG_HOME/gh`, then `%AppData%\GitHub CLI` on Windows, then
+/// `~/.config/gh`).
+fn gh_config_dir() -> Option<PathBuf> {
+    let non_empty = |name: &str| std::env::var_os(name).filter(|value| !value.is_empty());
+    if let Some(dir) = non_empty("GH_CONFIG_DIR") {
+        return Some(PathBuf::from(dir));
+    }
+    if let Some(dir) = non_empty("XDG_CONFIG_HOME") {
+        return Some(PathBuf::from(dir).join("gh"));
+    }
+    if cfg!(windows) {
+        if let Some(dir) = non_empty("AppData") {
+            return Some(PathBuf::from(dir).join("GitHub CLI"));
+        }
+    }
+    dirs::home_dir().map(|home| home.join(".config").join("gh"))
+}
+
+/// Hosts the user signed in to with `gh auth login` (keys of `hosts.yml`).
+fn gh_signed_in_hosts() -> Vec<String> {
+    gh_config_dir()
+        .and_then(|dir| std::fs::read_to_string(dir.join("hosts.yml")).ok())
+        .map(|text| parse_gh_hosts_yml(&text))
+        .unwrap_or_default()
+}
+
+fn parse_gh_hosts_yml(text: &str) -> Vec<String> {
+    serde_yaml::from_str::<serde_yaml::Mapping>(text)
+        .map(|hosts| {
+            hosts
+                .keys()
+                .filter_map(|key| key.as_str())
+                .map(|host| host.trim().to_ascii_lowercase())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Whether a GitHub credential may be used for `host`. A remote URL is
+/// repository content, so a host only qualifies by exact match against
+/// github.com, a `*.ghe.com` tenancy, or a host the user configured
+/// (`GH_HOST`, `gh auth login`, or a GitHub mapping in Settings → Source
+/// Control). gh hands `GH_ENTERPRISE_TOKEN` to *any* other host, so a
+/// hostname that merely contains "github" must never qualify.
+pub(crate) fn gh_host_is_trusted(host: &str) -> bool {
+    gh_host_trusted_in(
+        host,
+        std::env::var("GH_HOST").ok().as_deref(),
+        gh_signed_in_hosts,
+        crate::git_provider::detect::custom_hosts_from_settings,
+    )
+}
+
+fn gh_host_trusted_in(
+    host: &str,
+    gh_host: Option<&str>,
+    signed_in_hosts: impl FnOnce() -> Vec<String>,
+    custom_hosts: impl FnOnce() -> HashMap<String, crate::git_provider::ProviderKind>,
+) -> bool {
+    let host = host.trim().to_ascii_lowercase();
+    if host.is_empty() {
+        return false;
+    }
+    if host == "github.com"
+        || host
+            .strip_suffix(".ghe.com")
+            .is_some_and(|tenant| !tenant.is_empty() && !tenant.contains(':'))
+    {
+        return true;
+    }
+    if gh_host.is_some_and(|configured| configured.trim().eq_ignore_ascii_case(&host)) {
+        return true;
+    }
+    if signed_in_hosts().iter().any(|known| *known == host) {
+        return true;
+    }
+    // Settings keys are bare hostnames: the user's port is dropped there.
+    let bare = match host.rsplit_once(':') {
+        Some((name, port)) if !port.is_empty() && port.chars().all(|c| c.is_ascii_digit()) => name,
+        _ => host.as_str(),
+    };
+    custom_hosts().get(bare) == Some(&crate::git_provider::ProviderKind::GitHub)
+}
+
 fn local_gh_auth(host: &str) -> LocalGhAuth {
     use std::hash::{Hash, Hasher};
+    let signed_out = || LocalGhAuth {
+        status: GhStatus::NotAuthenticated,
+        identity: None,
+        token: None,
+    };
+    // Checked before the cache and before spawning gh, so an untrusted host
+    // never reaches `gh auth token` (which would answer with an env token).
+    if !gh_host_is_trusted(host) {
+        return signed_out();
+    }
     let cache = GH_LOCAL_AUTH.get_or_init(Mutex::default);
     let fingerprint = auth_fingerprint(host);
     // Serialize local keyring reads too: a page fan-out should not open one
@@ -627,11 +722,7 @@ fn local_gh_auth(host: &str) -> LocalGhAuth {
                 token: Some(Arc::from(output.stdout.trim())),
             }
         }
-        _ => LocalGhAuth {
-            status: GhStatus::NotAuthenticated,
-            identity: None,
-            token: None,
-        },
+        _ => signed_out(),
     };
     if cache.len() >= 64 {
         cache.clear();
@@ -3962,6 +4053,212 @@ fn parse_incoming_pr_json(v: &serde_json::Value) -> IncomingPrItem {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_exact_configured_hosts_may_use_a_github_credential() {
+        use crate::git_provider::ProviderKind;
+        let none = Vec::new;
+        let no_custom = HashMap::new;
+        for host in ["github.com", "GitHub.com", "acme.ghe.com"] {
+            assert!(gh_host_trusted_in(host, None, none, no_custom), "{host}");
+        }
+        for host in [
+            "github-mirror.attacker.example",
+            "github.com.attacker.example",
+            "attacker-github.com",
+            "ghe.com",
+            "acme.ghe.com.attacker.example",
+            "",
+        ] {
+            assert!(!gh_host_trusted_in(host, None, none, no_custom), "{host:?}");
+        }
+
+        assert!(gh_host_trusted_in(
+            "ghe.corp.example",
+            Some("GHE.corp.example"),
+            none,
+            no_custom
+        ));
+        assert!(!gh_host_trusted_in(
+            "ghe.corp.example",
+            Some("other.example"),
+            none,
+            no_custom
+        ));
+
+        let signed_in = || {
+            vec![
+                "ghe.corp.example".to_string(),
+                "ghe.port.example:8443".to_string(),
+            ]
+        };
+        assert!(gh_host_trusted_in(
+            "ghe.corp.example",
+            None,
+            signed_in,
+            no_custom
+        ));
+        assert!(gh_host_trusted_in(
+            "ghe.port.example:8443",
+            None,
+            signed_in,
+            no_custom
+        ));
+        assert!(!gh_host_trusted_in(
+            "sub.ghe.corp.example",
+            None,
+            signed_in,
+            no_custom
+        ));
+
+        let custom = || {
+            HashMap::from([
+                ("git.acme.internal".to_string(), ProviderKind::GitHub),
+                ("gitlab.acme.internal".to_string(), ProviderKind::GitLab),
+            ])
+        };
+        assert!(gh_host_trusted_in("git.acme.internal", None, none, custom));
+        assert!(gh_host_trusted_in(
+            "git.acme.internal:8443",
+            None,
+            none,
+            custom
+        ));
+        assert!(!gh_host_trusted_in(
+            "gitlab.acme.internal",
+            None,
+            none,
+            custom
+        ));
+    }
+
+    #[test]
+    fn hosts_yml_keys_are_the_signed_in_hosts() {
+        let text = "github.com:\n    user: octo\n    git_protocol: ssh\nGHE.Corp.Example:\n    users:\n        octo:\n";
+        assert_eq!(
+            parse_gh_hosts_yml(text),
+            vec!["github.com".to_string(), "ghe.corp.example".to_string()]
+        );
+        assert!(parse_gh_hosts_yml("not: [valid").is_empty());
+        assert!(parse_gh_hosts_yml("").is_empty());
+    }
+
+    /// End to end with a stub `gh` that records every call and would answer
+    /// any host with a token, the way gh does when `GH_ENTERPRISE_TOKEN` is
+    /// set: a remote on an unconfigured host must never reach it.
+    #[cfg(unix)]
+    #[test]
+    fn enterprise_env_token_never_reaches_an_unconfigured_remote_host() {
+        use std::os::unix::fs::PermissionsExt;
+        const FIXTURE: &str = "CODEMUX_GH_TRUST_FIXTURE";
+        if std::env::var_os(FIXTURE).is_none() {
+            let fixture = tempfile::tempdir().unwrap();
+            let bin = fixture.path().join("bin");
+            let gh_config = fixture.path().join("gh-config");
+            std::fs::create_dir_all(&bin).unwrap();
+            std::fs::create_dir_all(&gh_config).unwrap();
+            std::fs::write(
+                gh_config.join("hosts.yml"),
+                "ghe.corp.example:\n    user: fixture\n",
+            )
+            .unwrap();
+            let gh = bin.join("gh");
+            std::fs::write(
+                &gh,
+                "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$CODEMUX_GH_TRUST_FIXTURE/calls\"\n\
+                 case \"$1\" in auth) printf 'ent_fixture_token\\n';; config) printf 'fixture\\n';; *) exit 1;; esac\n",
+            )
+            .unwrap();
+            std::fs::set_permissions(&gh, std::fs::Permissions::from_mode(0o755)).unwrap();
+            let mut child = std::process::Command::new(std::env::current_exe().unwrap());
+            child
+                .args([
+                    "--exact",
+                    "github::tests::enterprise_env_token_never_reaches_an_unconfigured_remote_host",
+                    "--test-threads=1",
+                    "--nocapture",
+                ])
+                .env(FIXTURE, fixture.path())
+                .env(
+                    "PATH",
+                    format!(
+                        "{}:{}",
+                        bin.display(),
+                        std::env::var("PATH").unwrap_or_default()
+                    ),
+                )
+                .env("HOME", fixture.path())
+                .env("XDG_CONFIG_HOME", fixture.path().join("config"))
+                .env("XDG_DATA_HOME", fixture.path().join("data"))
+                .env("GH_CONFIG_DIR", &gh_config)
+                .env("GH_ENTERPRISE_TOKEN", "ent_fixture_token");
+            for key in [
+                "GH_TOKEN",
+                "GITHUB_TOKEN",
+                "GITHUB_ENTERPRISE_TOKEN",
+                "GH_HOST",
+                "GH_REPO",
+            ] {
+                child.env_remove(key);
+            }
+            let output = child.output().unwrap();
+            assert!(
+                output.status.success(),
+                "gh trust fixture failed:\n{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+        let root = PathBuf::from(std::env::var_os(FIXTURE).unwrap());
+        let repo_with_origin = |name: &str, url: &str| {
+            let repo = root.join(name);
+            std::fs::create_dir_all(&repo).unwrap();
+            for args in [vec!["init", "-q"], vec!["remote", "add", "origin", url]] {
+                let status = std::process::Command::new("git")
+                    .args(&args)
+                    .current_dir(&repo)
+                    .status()
+                    .unwrap();
+                assert!(status.success(), "git {args:?}");
+            }
+            repo
+        };
+        let calls = || std::fs::read_to_string(root.join("calls")).unwrap_or_default();
+
+        let mirror = repo_with_origin("mirror", "https://github-mirror.attacker.example/o/r.git");
+        let err = crate::github_budget::host_for_path(&mirror).unwrap_err();
+        assert!(err.contains("not configured"), "{err}");
+        assert!(matches!(
+            check_gh_status_for_path(&mirror),
+            GhStatus::NotAuthenticated
+        ));
+        assert!(gh_api_token("github-mirror.attacker.example").is_none());
+        assert!(
+            crate::github_budget::run(&mirror, &["pr", "list"], Duration::from_secs(5)).is_err()
+        );
+        assert!(
+            !calls().contains("attacker"),
+            "gh was called for the mirror:\n{}",
+            calls()
+        );
+
+        // A host the user signed in to with gh keeps working.
+        let corp = repo_with_origin("corp", "https://ghe.corp.example/o/r.git");
+        assert_eq!(
+            crate::github_budget::host_for_path(&corp).unwrap(),
+            "ghe.corp.example"
+        );
+        assert_eq!(
+            gh_api_token("ghe.corp.example").as_deref(),
+            Some("ent_fixture_token")
+        );
+        assert!(
+            calls().contains("auth token --hostname ghe.corp.example"),
+            "{}",
+            calls()
+        );
+    }
 
     #[test]
     fn created_pr_url_is_the_last_url_gh_prints() {
