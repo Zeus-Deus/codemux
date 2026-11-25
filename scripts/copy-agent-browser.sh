@@ -5,7 +5,8 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 SOURCE_COMMIT="0a923358ea989d7602f0d06507ad3447c62ffe9b" # upstream v0.44.0
-PATCH="$ROOT/scripts/patches/agent-browser-v0.44-codemux.patch"
+AUTH_PATCH="$ROOT/scripts/patches/agent-browser-v0.44-codemux.patch"
+PIPE_PATCH="$ROOT/scripts/patches/agent-browser-v0.44-cdp-pipe.patch"
 TARGET="${CARGO_BUILD_TARGET:-$(rustc -vV | sed -n 's/^host: //p')}"
 
 case "$TARGET" in
@@ -28,13 +29,14 @@ hash_file() {
     return 1
   fi
 }
-PATCH_HASH="$(hash_file "$PATCH")"
+AUTH_PATCH_HASH="$(hash_file "$AUTH_PATCH")"
+PIPE_PATCH_HASH="$(hash_file "$PIPE_PATCH")"
 mkdir -p "$ROOT/src-tauri/binaries" "$BUILD_ROOT"
 
 # Reusing a staged binary requires both the reviewed patch identity and the
 # exact bytes recorded by this build. An npm binary never satisfies the stamp.
 if [ -s "$DEST" ] && [ -f "$STAMP" ] &&
-   [ "$(cat "$STAMP")" = "$SOURCE_COMMIT $PATCH_HASH $(hash_file "$DEST")" ] &&
+   [ "$(cat "$STAMP")" = "$SOURCE_COMMIT $AUTH_PATCH_HASH $PIPE_PATCH_HASH $(hash_file "$DEST")" ] &&
    [ "$("$DEST" --version)" = "agent-browser 0.44.0+codemux.1" ]; then
   exit 0
 fi
@@ -48,8 +50,10 @@ if [ "$(git -C "$SOURCE_DIR" rev-parse HEAD)" != "$SOURCE_COMMIT" ]; then
   echo "Browser sidecar source commit mismatch" >&2
   exit 1
 fi
-git -C "$SOURCE_DIR" apply --check "$PATCH"
-git -C "$SOURCE_DIR" apply "$PATCH"
+git -C "$SOURCE_DIR" apply --check "$AUTH_PATCH"
+git -C "$SOURCE_DIR" apply "$AUTH_PATCH"
+git -C "$SOURCE_DIR" apply --check "$PIPE_PATCH"
+git -C "$SOURCE_DIR" apply "$PIPE_PATCH"
 
 TMPDIR="${CODEMUX_BROWSER_BUILD_TMPDIR:-${TMPDIR:-$BUILD_ROOT}}" \
   CARGO_TARGET_DIR="$BUILD_ROOT/target" \
@@ -63,4 +67,4 @@ if [ ! -s "$BUILT" ] || [ "$("$BUILT" --version)" != "agent-browser 0.44.0+codem
 fi
 cp "$BUILT" "$DEST"
 chmod +x "$DEST"
-printf '%s %s %s\n' "$SOURCE_COMMIT" "$PATCH_HASH" "$(hash_file "$DEST")" > "$STAMP"
+printf '%s %s %s %s\n' "$SOURCE_COMMIT" "$AUTH_PATCH_HASH" "$PIPE_PATCH_HASH" "$(hash_file "$DEST")" > "$STAMP"

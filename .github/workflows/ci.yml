@@ -19,6 +19,7 @@ on:
   pull_request:
     branches:
       - main
+      - fix/browser-listener-auth
 
 # Cancel in-flight runs for the same branch when a new commit is pushed.
 concurrency:
@@ -415,6 +416,7 @@ jobs:
             *)         DEST="src-tauri/binaries/agent-browser-$TARGET" ;;
           esac
           node scripts/test-agent-browser-listeners.mjs "$DEST"
+          node scripts/test-agent-browser-pipe.mjs "$DEST"
 
       - name: Stage codemux-remote binary (placeholder for cargo test)
         shell: bash
@@ -618,6 +620,7 @@ jobs:
           bash scripts/copy-agent-browser.sh
           TARGET="$(rustc -vV | awk '/^host:/ {print $2}')"
           node scripts/test-agent-browser-listeners.mjs "src-tauri/binaries/agent-browser-$TARGET"
+          node scripts/test-agent-browser-pipe.mjs "src-tauri/binaries/agent-browser-$TARGET"
 
   ci-gate:
     name: ci-gate

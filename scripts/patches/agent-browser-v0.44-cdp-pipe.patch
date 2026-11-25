@@ -1,0 +1,1802 @@
+diff --git a/cli/Cargo.toml b/cli/Cargo.toml
+index f31f005..e6488c6 100644
+--- a/cli/Cargo.toml
++++ b/cli/Cargo.toml
+@@ -15,7 +15,7 @@ serde = { version = "1.0", features = ["derive"] }
+ serde_json = "1.0"
+ base64 = "0.22"
+ getrandom = "0.2"
+-tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "time", "sync", "signal", "process"] }
++tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "fs", "time", "sync", "signal", "process"] }
+ tokio-tungstenite = { version = "0.24", features = ["rustls-tls-webpki-roots"] }
+ rustls = { version = "0.23", default-features = false }
+ rustls-native-certs = "0.8"
+diff --git a/cli/src/mcp.rs b/cli/src/mcp.rs
+index afb567c..30e5501 100644
+--- a/cli/src/mcp.rs
++++ b/cli/src/mcp.rs
+@@ -1095,7 +1095,7 @@ fn tools() -> Vec<Value> {
+         tool(
+             TOOL_GET_CDP_URL,
+             "Get CDP URL",
+-            "Get the CDP WebSocket URL of a running browser. Never launches a browser.",
++            "Get an attached browser's CDP WebSocket URL. Unavailable for managed browsers. Never launches a browser.",
+             json!({}),
+             &[],
+         ),
+@@ -1625,7 +1625,7 @@ fn parity_tools() -> Vec<Value> {
+         tool(
+             TOOL_INSPECT,
+             "Inspect",
+-            "Open Chrome DevTools.",
++            "Open Chrome DevTools for an attached browser. Unavailable for managed browsers.",
+             json!({}),
+             &[],
+         ),
+diff --git a/cli/src/native/actions.rs b/cli/src/native/actions.rs
+index aad976c..14643dc 100644
+--- a/cli/src/native/actions.rs
++++ b/cli/src/native/actions.rs
+@@ -6903,6 +6903,9 @@ async fn handle_read(cmd: &Value, state: &DaemonState) -> Result<Value, String>
+ 
+ async fn handle_cdp_url(state: &DaemonState) -> Result<Value, String> {
+     let mgr = state.browser.as_ref().ok_or("Browser not launched")?;
++    if !mgr.is_cdp_connection() {
++        return Err("Managed browser CDP endpoints are unavailable".to_string());
++    }
+     if !mgr.is_connection_alive().await {
+         return Err("Browser not launched".to_string());
+     }
+@@ -6911,6 +6914,9 @@ async fn handle_cdp_url(state: &DaemonState) -> Result<Value, String> {
+ 
+ async fn handle_inspect(state: &mut DaemonState) -> Result<Value, String> {
+     let mgr = state.browser.as_ref().ok_or("Browser not launched")?;
++    if !mgr.is_cdp_connection() {
++        return Err("Inspect is unavailable for managed browsers".to_string());
++    }
+ 
+     // Shut down any existing inspect server so we always target the current page
+     if let Some(server) = state.inspect_server.take() {
+@@ -16918,15 +16924,9 @@ mod tests {
+     #[tokio::test]
+     #[ignore = "requires Chrome"]
+     async fn e2e_attached_download_fails_before_browser_or_filesystem_changes() {
+-        let mut producer = super::BrowserManager::launch(super::LaunchOptions::default(), None)
+-            .await
+-            .unwrap();
++        let (ws_url, _external) = super::super::e2e_tests::launch_external_chrome().await;
+         let mut state = super::DaemonState::new();
+-        state.browser = Some(
+-            super::BrowserManager::connect_cdp(producer.get_cdp_url())
+-                .await
+-                .unwrap(),
+-        );
++        state.browser = Some(super::BrowserManager::connect_cdp(&ws_url).await.unwrap());
+         let dir = tempfile::tempdir().unwrap();
+         let destination = dir.path().join("new-directory").join("output.bin");
+ 
+@@ -16938,7 +16938,6 @@ mod tests {
+         .unwrap_err();
+         assert!(error.contains("--cdp"), "{error}");
+         assert!(!destination.parent().unwrap().exists());
+-        let _ = producer.close().await;
+     }
+ 
+     async fn start_finished_download(
+@@ -17081,17 +17080,37 @@ mod tests {
+         let dir = tempfile::tempdir().unwrap();
+         let download_dir = dir.path().join("downloads");
+         std::fs::create_dir_all(&download_dir).unwrap();
++        let (cdp_url, _external) = super::super::e2e_tests::launch_external_chrome().await;
+         let mut owner = super::DaemonState::new();
+-        for cmd in [
+-            serde_json::json!({ "id": "1", "action": "launch", "headless": true,
+-                "downloadPath": download_dir.to_string_lossy() }),
+-            serde_json::json!({ "id": "2", "action": "navigate", "url":
++        let resp = super::execute_command(
++            &serde_json::json!({ "id": "1", "action": "launch", "cdpUrl": cdp_url }),
++            &mut owner,
++        )
++        .await;
++        assert_eq!(resp["success"], true, "{resp}");
++        owner
++            .browser
++            .as_ref()
++            .unwrap()
++            .client
++            .send_command(
++                "Browser.setDownloadBehavior",
++                Some(serde_json::json!({
++                    "behavior": "allow",
++                    "downloadPath": download_dir.to_string_lossy(),
++                    "eventsEnabled": true
++                })),
++                None,
++            )
++            .await
++            .unwrap();
++        let resp = super::execute_command(
++            &serde_json::json!({ "id": "2", "action": "navigate", "url":
+                 "data:text/html,<a id=dl download=report.bin href='data:application/octet-stream,report'>dl</a>" }),
+-        ] {
+-            let resp = super::execute_command(&cmd, &mut owner).await;
+-            assert_eq!(resp["success"], true, "{resp}");
+-        }
+-        let cdp_url = owner.browser.as_ref().unwrap().get_cdp_url().to_string();
++            &mut owner,
++        )
++        .await;
++        assert_eq!(resp["success"], true, "{resp}");
+ 
+         let mut attached = super::DaemonState::new();
+         for cmd in [
+@@ -21351,15 +21370,10 @@ printf '%s' '{"protocol":"agent-browser.plugin.v1","success":true,"data":{}}'
+     #[tokio::test]
+     #[ignore = "requires Chrome"]
+     async fn e2e_browser_use_owned_connection_preserves_plain_command_state() {
+-        let mut producer = BrowserManager::launch(LaunchOptions::default(), None)
+-            .await
+-            .unwrap();
++        let (ws_url, _external) = super::super::e2e_tests::launch_external_chrome().await;
++        let mut producer = BrowserManager::connect_cdp(&ws_url).await.unwrap();
+         let mut state = DaemonState::new();
+-        state.browser = Some(
+-            BrowserManager::connect_cdp(producer.get_cdp_url())
+-                .await
+-                .unwrap(),
+-        );
++        state.browser = Some(BrowserManager::connect_cdp(&ws_url).await.unwrap());
+         state.active_provider_session = Some(pending_browser_use_session());
+         state.active_provider_connection = true;
+         let target = state
+diff --git a/cli/src/native/browser.rs b/cli/src/native/browser.rs
+index 27ef4d1..c1d5969 100644
+--- a/cli/src/native/browser.rs
++++ b/cli/src/native/browser.rs
+@@ -923,7 +923,7 @@ impl BrowserManager {
+         let download_path = options.download_path.clone();
+         let headless = options.effectively_headless();
+ 
+-        let (ws_url, process) = match engine {
++        let (ws_url, process, chrome_pipe) = match engine {
+             "lightpanda" => {
+                 let lp_options = LightpandaLaunchOptions {
+                     executable_path: options.executable_path.clone(),
+@@ -932,7 +932,7 @@ impl BrowserManager {
+                 };
+                 let lp = launch_lightpanda(&lp_options).await?;
+                 let url = lp.ws_url.clone();
+-                (url, BrowserProcess::Lightpanda(lp))
++                (url, BrowserProcess::Lightpanda(lp), None)
+             }
+             "obscura" => {
+                 let obscura_options = ObscuraLaunchOptions {
+@@ -943,14 +943,14 @@ impl BrowserManager {
+                 };
+                 let ob = launch_obscura(&obscura_options).await?;
+                 let url = ob.ws_url.clone();
+-                (url, BrowserProcess::Obscura(ob))
++                (url, BrowserProcess::Obscura(ob), None)
+             }
+             _ => {
+-                let chrome = tokio::task::spawn_blocking(move || launch_chrome(&options))
++                let mut chrome = tokio::task::spawn_blocking(move || launch_chrome(&options))
+                     .await
+                     .map_err(|e| format!("Chrome launch task failed: {}", e))??;
+-                let url = chrome.ws_url.clone();
+-                (url, BrowserProcess::Chrome(chrome))
++                let pipe = chrome.take_pipe()?;
++                (String::new(), BrowserProcess::Chrome(chrome), Some(pipe))
+             }
+         };
+ 
+@@ -959,7 +959,23 @@ impl BrowserManager {
+         } else if engine == "obscura" {
+             initialize_obscura_manager(ws_url, process).await?
+         } else {
+-            let client = Arc::new(CdpClient::connect(&ws_url).await?);
++            let client = if let Some((reader, writer)) = chrome_pipe {
++                let client = Arc::new(CdpClient::connect_pipe(reader, writer));
++                // A successful spawn does not prove Chromium accepted its
++                // private transport. Never retry over a TCP debug port.
++                let ready = tokio::time::timeout(
++                    Duration::from_secs(10),
++                    client.send_command_no_params("Browser.getVersion", None),
++                )
++                .await;
++                if !matches!(ready, Ok(Ok(_))) {
++                    client.close().await;
++                    return Err(format!("Chrome pipe did not become ready: {ready:?}"));
++                }
++                client
++            } else {
++                Arc::new(CdpClient::connect(&ws_url).await?)
++            };
+             let mut manager = Self {
+                 client,
+                 browser_process: Some(process),
+@@ -4531,7 +4547,7 @@ mod tests {
+         let executable = dir.path().join("chrome");
+         let port = url::Url::parse(url).unwrap().port().unwrap();
+         std::fs::write(&executable, format!(
+-            "#!/bin/sh\nfor arg in \"$@\"; do\ncase \"$arg\" in\n--user-data-dir=*) profile=${{arg#*=}} ;;\nesac\ndone\nprintf '%s\\n' {port} /devtools/browser/test > \"$profile/DevToolsActivePort\"\nprintf '%s\\n' \"$$\" > '{}/pid'\nexec sleep 60\n",
++            "#!/bin/sh\nfor arg in \"$@\"; do\ncase \"$arg\" in\n--user-data-dir=*) profile=${{arg#*=}} ;;\nesac\ndone\nprintf '%s\\n' {port} /devtools/browser/test > \"$profile/DevToolsActivePort\"\nprintf '%s\\n' \"$$\" > '{}/pid'\nexec 3<&- 4>&-\nexec sleep 60\n",
+             dir.path().display()
+         )).unwrap();
+         std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
+@@ -4570,23 +4586,19 @@ mod tests {
+ 
+     #[cfg(unix)]
+     #[tokio::test]
+-    async fn test_failed_local_initialization_disconnects_and_reaps() {
+-        for (method, ignore_close) in [
+-            ("Target.getTargets", false),
+-            ("Network.enable", false),
+-            ("Network.enable", true),
+-        ] {
+-            let (url, server) = initialization_server(method, false, 1, ignore_close).await;
+-            let (dir, options) = initialization_process(&url);
+-            let error = BrowserManager::launch(options, None)
+-                .await
+-                .err()
+-                .expect("launch should fail");
+-            assert!(error.contains("injected initialization failure"), "{error}");
+-            let observed = server.await.unwrap();
+-            assert!(observed[0].iter().any(|method| method == "Browser.close"));
+-            assert_initialization_process_reaped(dir.path());
+-        }
++    async fn test_failed_local_pipe_disconnects_and_reaps() {
++        let (url, server) = initialization_server("Target.getTargets", false, 1, false).await;
++        let (dir, options) = initialization_process(&url);
++        let error = BrowserManager::launch(options, None)
++            .await
++            .err()
++            .expect("launch should fail");
++        assert!(
++            error.contains("Chrome pipe did not become ready"),
++            "{error}"
++        );
++        server.abort();
++        assert_initialization_process_reaped(dir.path());
+     }
+ 
+     #[cfg(unix)]
+diff --git a/cli/src/native/cdp/chrome.rs b/cli/src/native/cdp/chrome.rs
+index bf572f9..3d61a50 100644
+--- a/cli/src/native/cdp/chrome.rs
++++ b/cli/src/native/cdp/chrome.rs
+@@ -1,8 +1,13 @@
+ #[cfg(windows)]
+ use super::windows_process::Child;
+-use std::io::{BufRead, BufReader, Write};
++use std::fs::File;
++use std::io::Write;
++#[cfg(unix)]
++use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd};
+ #[cfg(target_os = "linux")]
+ use std::os::unix::ffi::OsStrExt;
++#[cfg(unix)]
++use std::os::unix::net::UnixStream;
+ use std::path::{Path, PathBuf};
+ #[cfg(not(windows))]
+ use std::process::{Child, Command, Stdio};
+@@ -14,7 +19,8 @@ use crate::ca_bundle::CaBundle;
+ 
+ pub struct ChromeProcess {
+     child: Child,
+-    pub ws_url: String,
++    pipe_reader: Option<File>,
++    pipe_writer: Option<File>,
+     temp_user_data_dir: Option<PathBuf>,
+     temp_nss_home: Option<PreparedNssHome>,
+     /// On Unix, the process group ID used to kill the entire Chrome process tree.
+@@ -61,6 +67,18 @@ impl PreparedNssHome {
+ }
+ 
+ impl ChromeProcess {
++    pub fn take_pipe(&mut self) -> Result<(File, File), String> {
++        let reader = self
++            .pipe_reader
++            .take()
++            .ok_or("Chrome pipe reader is unavailable")?;
++        let writer = self
++            .pipe_writer
++            .take()
++            .ok_or("Chrome pipe writer is unavailable")?;
++        Ok((reader, writer))
++    }
++
+     pub fn kill(&mut self) {
+         let _ = self.child.kill();
+         // On Unix, kill the entire process group to ensure Chrome helper
+@@ -426,7 +444,6 @@ impl Default for LaunchOptions {
+ 
+ struct ChromeArgs {
+     args: Vec<String>,
+-    user_data_dir: PathBuf,
+     temp_user_data_dir: Option<PathBuf>,
+ }
+ 
+@@ -453,6 +470,11 @@ fn build_chrome_args(options: &LaunchOptions) -> Result<ChromeArgs, String> {
+     // resolves as disabled.
+     let mut user_args: Vec<String> = Vec::new();
+     for arg in &options.args {
++        if arg.to_ascii_lowercase().starts_with("--remote-debugging-") {
++            return Err(
++                "Custom remote debugging arguments are unavailable for managed Chrome".into(),
++            );
++        }
+         if let Some(values) = arg.strip_prefix("--enable-features=") {
+             for feature in values.split(',').map(str::trim).filter(|f| !f.is_empty()) {
+                 if !enable_features.iter().any(|f| f == feature) {
+@@ -465,7 +487,7 @@ fn build_chrome_args(options: &LaunchOptions) -> Result<ChromeArgs, String> {
+     }
+ 
+     let mut args = vec![
+-        "--remote-debugging-port=0".to_string(),
++        "--remote-debugging-pipe".to_string(),
+         "--no-first-run".to_string(),
+         "--no-default-browser-check".to_string(),
+         "--disable-background-networking".to_string(),
+@@ -538,18 +560,17 @@ fn build_chrome_args(options: &LaunchOptions) -> Result<ChromeArgs, String> {
+         args.push(format!("--proxy-bypass-list={}", bypass));
+     }
+ 
+-    let (user_data_dir, temp_user_data_dir) = if let Some(ref profile) = options.profile {
++    let temp_user_data_dir = if let Some(ref profile) = options.profile {
+         let expanded = expand_tilde(profile);
+-        let dir = PathBuf::from(&expanded);
+         args.push(format!("--user-data-dir={}", expanded));
+-        (dir, None)
++        None
+     } else {
+         let dir =
+             std::env::temp_dir().join(format!("agent-browser-chrome-{}", uuid::Uuid::new_v4()));
+         std::fs::create_dir_all(&dir)
+             .map_err(|e| format!("Failed to create temp profile dir: {}", e))?;
+         args.push(format!("--user-data-dir={}", dir.display()));
+-        (dir.clone(), Some(dir))
++        Some(dir)
+     };
+ 
+     if options.ignore_https_errors {
+@@ -600,7 +621,6 @@ fn build_chrome_args(options: &LaunchOptions) -> Result<ChromeArgs, String> {
+ 
+     Ok(ChromeArgs {
+         args,
+-        user_data_dir,
+         temp_user_data_dir,
+     })
+ }
+@@ -909,14 +929,9 @@ pub fn launch_chrome(options: &LaunchOptions) -> Result<ChromeProcess, String> {
+ fn try_launch_chrome(chrome_path: &Path, options: &LaunchOptions) -> Result<ChromeProcess, String> {
+     let ChromeArgs {
+         args,
+-        user_data_dir,
+         temp_user_data_dir,
+     } = build_chrome_args(options)?;
+ 
+-    // Mitigate stale DevToolsActivePort risk (e.g., previous crash left it behind).
+-    // Puppeteer does similar cleanup before spawning.
+-    let _ = std::fs::remove_file(user_data_dir.join("DevToolsActivePort"));
+-
+     let cleanup_temp_dir = |dir: &Option<PathBuf>| {
+         if let Some(ref d) = dir {
+             let _ = std::fs::remove_dir_all(d);
+@@ -937,6 +952,32 @@ fn try_launch_chrome(chrome_path: &Path, options: &LaunchOptions) -> Result<Chro
+     #[cfg(target_os = "linux")]
+     let xvfb = maybe_start_xvfb(options);
+ 
++    // Chromium reads commands from fd 3 and writes responses to fd 4. Keep
++    // both ends private to this parent and child, with no TCP debug listener.
++    #[cfg(unix)]
++    let (child_reader, parent_writer) =
++        UnixStream::pair().map_err(|e| format!("Failed to create Chrome command pipe: {e}"))?;
++    #[cfg(unix)]
++    let (parent_reader, child_writer) =
++        UnixStream::pair().map_err(|e| format!("Failed to create Chrome response pipe: {e}"))?;
++    #[cfg(unix)]
++    let duplicate_above_debug_fds = |fd| -> Result<OwnedFd, String> {
++        // Source fds must not be 3 or 4, since the first dup2 could overwrite
++        // the source needed by the second one.
++        let duplicated = unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 5) };
++        if duplicated < 0 {
++            return Err(format!(
++                "Failed to reserve Chrome pipe descriptor: {}",
++                std::io::Error::last_os_error()
++            ));
++        }
++        Ok(unsafe { OwnedFd::from_raw_fd(duplicated) })
++    };
++    #[cfg(unix)]
++    let child_reader_fd = duplicate_above_debug_fds(child_reader.as_raw_fd())?;
++    #[cfg(unix)]
++    let child_writer_fd = duplicate_above_debug_fds(child_writer.as_raw_fd())?;
++
+     #[cfg(not(windows))]
+     let mut cmd = Command::new(chrome_path);
+     #[cfg(not(windows))]
+@@ -969,11 +1010,21 @@ fn try_launch_chrome(chrome_path: &Path, options: &LaunchOptions) -> Result<Chro
+     #[cfg(unix)]
+     {
+         use std::os::unix::process::CommandExt;
++        let read_fd = child_reader_fd.as_raw_fd();
++        let write_fd = child_writer_fd.as_raw_fd();
+         // SAFETY: pre_exec runs between fork() and exec() in the child.
+-        // setpgid is async-signal-safe.
++        // dup2, fcntl, and setpgid are async-signal-safe.
+         unsafe {
+-            cmd.pre_exec(|| {
+-                libc::setpgid(0, 0);
++            cmd.pre_exec(move || {
++                if libc::dup2(read_fd, 3) < 0 || libc::dup2(write_fd, 4) < 0 {
++                    return Err(std::io::Error::last_os_error());
++                }
++                if libc::fcntl(3, libc::F_SETFD, 0) < 0
++                    || libc::fcntl(4, libc::F_SETFD, 0) < 0
++                    || libc::setpgid(0, 0) < 0
++                {
++                    return Err(std::io::Error::last_os_error());
++                }
+                 Ok(())
+             });
+         }
+@@ -988,38 +1039,15 @@ fn try_launch_chrome(chrome_path: &Path, options: &LaunchOptions) -> Result<Chro
+         format!("Failed to launch Chrome at {:?}: {}", chrome_path, e)
+     })?;
+ 
+-    // Shared overall deadline so we don't double-wait (poll + stderr fallback).
+-    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+-
+-    // Primary path: use DevToolsActivePort written into user-data-dir.
+-    // This is more reliable on Windows than scraping stderr for "DevTools listening on ...",
+-    // which can be missing/empty depending on how Chrome is launched.
+-    let ws_url = match wait_for_devtools_active_port(&mut child, &user_data_dir, deadline) {
+-        Ok(url) => url,
+-        Err(primary_err) => {
+-            // Fallback: scrape stderr (legacy behavior) for better diagnostics.
+-            let stderr = child.stderr.take().ok_or_else(|| {
+-                terminate_launched_chrome(&mut child);
+-                cleanup_temp_dir(&temp_user_data_dir);
+-                "Failed to capture Chrome stderr".to_string()
+-            })?;
+-            let reader = BufReader::new(stderr);
+-            match wait_for_ws_url_until(reader, deadline) {
+-                Ok(url) => url,
+-                Err(fallback_err) => {
+-                    terminate_launched_chrome(&mut child);
+-                    cleanup_temp_dir(&temp_user_data_dir);
+-                    return Err(format!(
+-                        "{}\n(also tried parsing stderr) {}",
+-                        primary_err, fallback_err
+-                    ));
+-                }
+-            }
+-        }
+-    };
++    #[cfg(unix)]
++    let (pipe_reader, pipe_writer) = (
++        unsafe { File::from_raw_fd(parent_reader.into_raw_fd()) },
++        unsafe { File::from_raw_fd(parent_writer.into_raw_fd()) },
++    );
++    #[cfg(windows)]
++    let (pipe_reader, pipe_writer) = child.take_pipe();
+ 
+-    // Chrome blocks on stderr writes once the pipe buffer fills, so keep draining it
+-    // after readiness. The fallback path has already taken stderr.
++    // Chrome blocks on stderr writes once the pipe buffer fills, so keep draining it.
+     if let Some(stderr) = child.stderr.take() {
+         let _ = std::thread::Builder::new()
+             .name("chrome-stderr-drain".into())
+@@ -1039,7 +1067,8 @@ fn try_launch_chrome(chrome_path: &Path, options: &LaunchOptions) -> Result<Chro
+ 
+     Ok(ChromeProcess {
+         child,
+-        ws_url,
++        pipe_reader: Some(pipe_reader),
++        pipe_writer: Some(pipe_writer),
+         temp_user_data_dir,
+         temp_nss_home,
+         #[cfg(unix)]
+@@ -1049,123 +1078,6 @@ fn try_launch_chrome(chrome_path: &Path, options: &LaunchOptions) -> Result<Chro
+     })
+ }
+ 
+-fn wait_for_devtools_active_port(
+-    child: &mut Child,
+-    user_data_dir: &Path,
+-    deadline: std::time::Instant,
+-) -> Result<String, String> {
+-    let poll_interval = Duration::from_millis(50);
+-
+-    while std::time::Instant::now() <= deadline {
+-        if let Ok(Some(status)) = child.try_wait() {
+-            // Chrome exited before writing DevToolsActivePort -- report the
+-            // exit code so the caller can surface it alongside stderr output.
+-            let code = status
+-                .code()
+-                .map(|c| format!("{}", c))
+-                .unwrap_or_else(|| "unknown".to_string());
+-            return Err(format!(
+-                "Chrome exited early (exit code: {}) without writing DevToolsActivePort",
+-                code
+-            ));
+-        }
+-
+-        if let Some((port, ws_path)) = read_devtools_active_port(user_data_dir) {
+-            let ws_url = format!("ws://127.0.0.1:{}{}", port, ws_path);
+-            return Ok(ws_url);
+-        }
+-
+-        std::thread::sleep(poll_interval);
+-    }
+-
+-    Err("Timeout waiting for DevToolsActivePort".to_string())
+-}
+-
+-fn wait_for_ws_url_until(
+-    reader: impl BufRead,
+-    deadline: std::time::Instant,
+-) -> Result<String, String> {
+-    let prefix = "DevTools listening on ";
+-    let mut stderr_lines: Vec<String> = Vec::new();
+-
+-    for line in reader.lines() {
+-        if std::time::Instant::now() > deadline {
+-            return Err(chrome_launch_error(
+-                "Timeout waiting for Chrome DevTools URL",
+-                &stderr_lines,
+-            ));
+-        }
+-        let line = line.map_err(|e| format!("Failed to read Chrome stderr: {}", e))?;
+-        if let Some(url) = line.strip_prefix(prefix) {
+-            return Ok(url.trim().to_string());
+-        }
+-        stderr_lines.push(line);
+-    }
+-
+-    Err(chrome_launch_error(
+-        "Chrome exited before providing DevTools URL",
+-        &stderr_lines,
+-    ))
+-}
+-
+-fn chrome_launch_error(message: &str, stderr_lines: &[String]) -> String {
+-    let relevant: Vec<&String> = stderr_lines
+-        .iter()
+-        .filter(|l| {
+-            let lower = l.to_lowercase();
+-            lower.contains("error")
+-                || lower.contains("fatal")
+-                || lower.contains("sandbox")
+-                || lower.contains("namespace")
+-                || lower.contains("permission")
+-                || lower.contains("cannot")
+-                || lower.contains("failed")
+-                || lower.contains("abort")
+-        })
+-        .collect();
+-
+-    if relevant.is_empty() {
+-        if stderr_lines.is_empty() {
+-            return format!(
+-                "{} (no stderr output from Chrome)\nHint: try passing --args \"--no-sandbox\" if Chrome crashes silently in your environment",
+-                message
+-            );
+-        }
+-        let last_lines: Vec<&String> = stderr_lines.iter().rev().take(5).collect();
+-        return format!(
+-            "{}\nChrome stderr (last {} lines):\n  {}",
+-            message,
+-            last_lines.len(),
+-            last_lines
+-                .into_iter()
+-                .rev()
+-                .map(|s| s.as_str())
+-                .collect::<Vec<_>>()
+-                .join("\n  ")
+-        );
+-    }
+-
+-    let hint = if relevant.iter().any(|l| {
+-        let lower = l.to_lowercase();
+-        lower.contains("sandbox") || lower.contains("namespace")
+-    }) {
+-        "\nHint: try --args \"--no-sandbox\" (required in containers, VMs, and some Linux setups)"
+-    } else {
+-        ""
+-    };
+-
+-    format!(
+-        "{}\nChrome stderr:\n  {}{}",
+-        message,
+-        relevant
+-            .iter()
+-            .map(|s| s.as_str())
+-            .collect::<Vec<_>>()
+-            .join("\n  "),
+-        hint
+-    )
+-}
+-
+ /// Finds Chrome from the install cache, macOS Applications directories, or system paths.
+ pub fn find_chrome() -> Option<PathBuf> {
+     // 1. Check Chrome downloaded by `agent-browser install`
+@@ -1995,9 +1907,45 @@ mod tests {
+         ]));
+     }
+ 
++    #[test]
++    fn managed_chrome_uses_only_pipe_debugging() {
++        let built = build_chrome_args(&LaunchOptions::default()).unwrap();
++        assert_eq!(
++            built
++                .args
++                .iter()
++                .filter(|arg| arg.as_str() == "--remote-debugging-pipe")
++                .count(),
++            1
++        );
++        assert!(!built
++            .args
++            .iter()
++            .any(|arg| arg.starts_with("--remote-debugging-port")));
++        if let Some(dir) = built.temp_user_data_dir {
++            std::fs::remove_dir_all(dir).unwrap();
++        }
++    }
++
++    #[test]
++    fn managed_chrome_rejects_debugging_overrides() {
++        for flag in [
++            "--remote-debugging-port=0",
++            "--remote-debugging-pipe",
++            "--remote-debugging-io-pipes=1,2",
++            "--REMOTE-DEBUGGING-ADDRESS=0.0.0.0",
++        ] {
++            let options = LaunchOptions {
++                args: vec![flag.to_string()],
++                ..Default::default()
++            };
++            assert!(build_chrome_args(&options).is_err(), "accepted {flag}");
++        }
++    }
++
+     #[cfg(unix)]
+     #[test]
+-    fn test_stderr_drained_after_port_readiness() {
++    fn test_stderr_drained_after_pipe_launch() {
+         use std::os::unix::fs::PermissionsExt;
+ 
+         let fixture = tempfile::tempdir().unwrap();
+@@ -2009,7 +1957,6 @@ set -eu
+ for arg do
+     case "$arg" in --user-data-dir=*) profile="${arg#*=}" ;; esac
+ done
+-printf '9222\n/devtools/browser/stderr-test\n' > "$profile/DevToolsActivePort"
+ for round in 1 2; do
+     while [ ! -f "$profile/request-$round" ]; do sleep 0.01; done
+     printf '\377' >&2
+@@ -2027,10 +1974,7 @@ exec sleep 60
+         };
+         let mut chrome = try_launch_chrome(&executable, &options).unwrap();
+         let profile = chrome.temp_user_data_dir.clone().unwrap();
+-        assert_eq!(
+-            chrome.ws_url,
+-            "ws://127.0.0.1:9222/devtools/browser/stderr-test"
+-        );
++        assert!(!profile.join("DevToolsActivePort").exists());
+         for round in 1..=2 {
+             std::fs::write(profile.join(format!("request-{round}")), b"").unwrap();
+             let drained = profile.join(format!("drained-{round}"));
+@@ -2182,33 +2126,6 @@ exec sleep 60
+         assert!(!should_disable_sandbox(&args));
+     }
+ 
+-    #[test]
+-    fn test_chrome_launch_error_no_stderr() {
+-        let msg = chrome_launch_error("Chrome exited", &[]);
+-        assert!(msg.contains("no stderr output"));
+-        assert!(msg.contains("Hint:"));
+-        assert!(msg.contains("--no-sandbox"));
+-    }
+-
+-    #[test]
+-    fn test_chrome_launch_error_with_sandbox_hint() {
+-        let lines = vec![
+-            "some log line".to_string(),
+-            "Failed to move to new namespace: sandbox error".to_string(),
+-        ];
+-        let msg = chrome_launch_error("Chrome exited", &lines);
+-        assert!(msg.contains("sandbox error"));
+-        assert!(msg.contains("Hint:"));
+-        assert!(msg.contains("--no-sandbox"));
+-    }
+-
+-    #[test]
+-    fn test_chrome_launch_error_generic() {
+-        let lines = vec!["info line".to_string(), "another info line".to_string()];
+-        let msg = chrome_launch_error("Chrome exited", &lines);
+-        assert!(msg.contains("last 2 lines"));
+-    }
+-
+     #[test]
+     fn test_find_playwright_chromium_nonexistent() {
+         let guard = EnvGuard::new(&["PLAYWRIGHT_BROWSERS_PATH", "HOME", "USERPROFILE"]);
+@@ -2703,7 +2620,8 @@ exec sleep 60
+             let child = spawn_noop_child();
+             let _process = ChromeProcess {
+                 child,
+-                ws_url: String::new(),
++                pipe_reader: None,
++                pipe_writer: None,
+                 temp_user_data_dir: Some(dir.clone()),
+                 temp_nss_home: None,
+                 #[cfg(unix)]
+diff --git a/cli/src/native/cdp/client.rs b/cli/src/native/cdp/client.rs
+index f06379b..b5f3b42 100644
+--- a/cli/src/native/cdp/client.rs
++++ b/cli/src/native/cdp/client.rs
+@@ -1,4 +1,5 @@
+ use std::collections::{HashMap, HashSet, VecDeque};
++use std::fs::File;
+ use std::io::Write;
+ use std::net::Shutdown;
+ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+@@ -9,6 +10,7 @@ use futures_util::{SinkExt, StreamExt};
+ use serde::de::IgnoredAny;
+ use serde::Deserialize;
+ use serde_json::Value;
++use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+ use tokio::sync::{broadcast, mpsc, oneshot, watch, Mutex};
+ use tokio::task::JoinHandle;
+ use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+@@ -117,16 +119,115 @@ pub fn is_session_detached_error(error: &str) -> bool {
+         .is_some_and(|rest| rest.is_empty() || rest == ".")
+ }
+ 
+-type WsTx = Arc<
+-    Mutex<
+-        futures_util::stream::SplitSink<
+-            tokio_tungstenite::WebSocketStream<
+-                tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+-            >,
+-            Message,
+-        >,
+-    >,
+->;
++type CdpWebSocket =
++    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
++
++enum TransportWriter {
++    WebSocket(futures_util::stream::SplitSink<CdpWebSocket, Message>),
++    Pipe(tokio::fs::File),
++}
++
++impl TransportWriter {
++    async fn send_text(&mut self, text: String) -> Result<(), String> {
++        match self {
++            Self::WebSocket(socket) => socket
++                .send(Message::Text(text))
++                .await
++                .map_err(|e| e.to_string()),
++            Self::Pipe(pipe) => {
++                pipe.write_all(text.as_bytes())
++                    .await
++                    .map_err(|e| e.to_string())?;
++                pipe.write_all(&[0]).await.map_err(|e| e.to_string())?;
++                pipe.flush().await.map_err(|e| e.to_string())
++            }
++        }
++    }
++
++    async fn close(&mut self) {
++        match self {
++            Self::WebSocket(socket) => {
++                let _ = socket.close().await;
++            }
++            Self::Pipe(pipe) => {
++                let _ = pipe.shutdown().await;
++            }
++        }
++    }
++
++    async fn ping(&mut self) -> Result<(), String> {
++        match self {
++            Self::WebSocket(socket) => socket
++                .send(Message::Ping(Vec::new()))
++                .await
++                .map_err(|e| e.to_string()),
++            Self::Pipe(_) => Ok(()),
++        }
++    }
++}
++
++type TransportTx = Arc<Mutex<TransportWriter>>;
++
++enum TransportReader {
++    WebSocket(futures_util::stream::SplitStream<CdpWebSocket>),
++    Pipe(BufReader<tokio::fs::File>),
++}
++
++const MAX_PIPE_MESSAGE_BYTES: usize = 100 * 1024 * 1024;
++
++impl TransportReader {
++    async fn next_text(&mut self) -> Option<String> {
++        match self {
++            Self::WebSocket(socket) => loop {
++                match socket.next().await? {
++                    Ok(Message::Text(text)) => return Some(text),
++                    Ok(Message::Binary(data)) => {
++                        if let Ok(text) = String::from_utf8(data) {
++                            return Some(text);
++                        }
++                    }
++                    Ok(Message::Close(frame)) => {
++                        if std::env::var("AGENT_BROWSER_DEBUG").is_ok() {
++                            let reason = frame
++                                .as_ref()
++                                .map(|f| format!("code={}, reason={}", f.code, f.reason))
++                                .unwrap_or_else(|| "no frame".to_string());
++                            let _ = writeln!(std::io::stderr(), "[cdp] WebSocket Close: {reason}");
++                        }
++                        return None;
++                    }
++                    Ok(Message::Pong(_)) | Ok(_) => continue,
++                    Err(error) => {
++                        if std::env::var("AGENT_BROWSER_DEBUG").is_ok() {
++                            let _ = writeln!(std::io::stderr(), "[cdp] WebSocket Error: {error}");
++                        }
++                        return None;
++                    }
++                }
++            },
++            Self::Pipe(pipe) => {
++                let mut message = Vec::new();
++                loop {
++                    let available = pipe.fill_buf().await.ok()?;
++                    if available.is_empty() {
++                        return None;
++                    }
++                    let end = available.iter().position(|byte| *byte == 0);
++                    let count = end.map_or(available.len(), |position| position + 1);
++                    if message.len().saturating_add(count) > MAX_PIPE_MESSAGE_BYTES {
++                        return None;
++                    }
++                    message.extend_from_slice(&available[..count]);
++                    pipe.consume(count);
++                    if end.is_some() {
++                        message.pop();
++                        return String::from_utf8(message).ok();
++                    }
++                }
++            }
++        }
++    }
++}
+ 
+ /// Sessions whose events go to one private receiver instead of the broadcast.
+ type PrivateSessions = Arc<std::sync::Mutex<HashMap<String, mpsc::Sender<CdpEvent>>>>;
+@@ -336,8 +437,8 @@ async fn release_detached_session(
+ }
+ 
+ pub struct CdpClient {
+-    ws_tx: WsTx,
+-    socket: socket2::Socket,
++    transport_tx: TransportTx,
++    socket: Option<socket2::Socket>,
+     closed: Arc<AtomicBool>,
+     close_complete: AtomicBool,
+     close_lock: Mutex<()>,
+@@ -439,8 +540,29 @@ impl CdpClient {
+             .try_clone()
+             .map_err(|error| format!("Failed to duplicate CDP socket: {}", error))?;
+ 
+-        let (ws_tx, mut ws_rx) = ws_stream.split();
+-        let ws_tx = Arc::new(Mutex::new(ws_tx));
++        let (ws_tx, ws_rx) = ws_stream.split();
++        Ok(Self::from_transport(
++            TransportWriter::WebSocket(ws_tx),
++            TransportReader::WebSocket(ws_rx),
++            Some(socket),
++        ))
++    }
++
++    pub fn connect_pipe(reader: File, writer: File) -> Self {
++        Self::from_transport(
++            TransportWriter::Pipe(tokio::fs::File::from_std(writer)),
++            TransportReader::Pipe(BufReader::new(tokio::fs::File::from_std(reader))),
++            None,
++        )
++    }
++
++    fn from_transport(
++        writer: TransportWriter,
++        mut reader: TransportReader,
++        socket: Option<socket2::Socket>,
++    ) -> Self {
++        let is_websocket = matches!(writer, TransportWriter::WebSocket(_));
++        let transport_tx = Arc::new(Mutex::new(writer));
+ 
+         let pending: PendingMap = Arc::new(Mutex::new(HashMap::new()));
+         let raw_pending: RawPendingMap = Arc::new(Mutex::new(HashMap::new()));
+@@ -466,36 +588,7 @@ impl CdpClient {
+         let reader_cancel_tx = cancel_tx.clone();
+ 
+         let reader_handle = tokio::spawn(async move {
+-            while let Some(msg) = ws_rx.next().await {
+-                // Accept both Text and Binary frames — remote CDP proxies
+-                // (e.g. Browserless) may send responses as Binary frames.
+-                let msg = match msg {
+-                    Ok(Message::Text(text)) => text,
+-                    Ok(Message::Binary(data)) => match String::from_utf8(data) {
+-                        Ok(text) => text,
+-                        Err(_) => continue,
+-                    },
+-                    Ok(Message::Close(frame)) => {
+-                        if std::env::var("AGENT_BROWSER_DEBUG").is_ok() {
+-                            let reason = frame
+-                                .as_ref()
+-                                .map(|f| format!("code={}, reason={}", f.code, f.reason))
+-                                .unwrap_or_else(|| "no frame".to_string());
+-                            let _ =
+-                                writeln!(std::io::stderr(), "[cdp] WebSocket Close: {}", reason);
+-                        }
+-                        break;
+-                    }
+-                    Ok(Message::Pong(_)) => continue,
+-                    Ok(_) => continue,
+-                    Err(e) => {
+-                        if std::env::var("AGENT_BROWSER_DEBUG").is_ok() {
+-                            let _ = writeln!(std::io::stderr(), "[cdp] WebSocket Error: {}", e);
+-                        }
+-                        break;
+-                    }
+-                };
+-
++            while let Some(msg) = reader.next_text().await {
+                 // Broadcast raw message for inspect proxy subscribers before typed parse,
+                 // so messages with negative IDs (used by the inspect proxy) are still delivered.
+                 if raw_tx_clone.receiver_count() > 0 {
+@@ -642,27 +735,29 @@ impl CdpClient {
+         // interval. This prevents intermediate proxies (Envoy, nginx, OpenResty,
+         // cloud load balancers) from closing idle WebSocket connections. If the
+         // send fails, the connection is dead and we stop pinging.
+-        let keepalive_tx = ws_tx.clone();
++        let keepalive_tx = transport_tx.clone();
+         let closed_keepalive = closed.clone();
+-        let keepalive_handle = tokio::spawn(async move {
+-            let interval = std::time::Duration::from_secs(WS_KEEPALIVE_INTERVAL_SECS);
+-            loop {
+-                tokio::select! {
+-                    _ = tokio::time::sleep(interval) => {}
+-                    _ = cancel_rx.changed() => break,
+-                }
+-                let mut tx = keepalive_tx.lock().await;
+-                if closed_keepalive.load(Ordering::SeqCst) {
+-                    break;
+-                }
+-                if tx.send(Message::Ping(Vec::new())).await.is_err() {
+-                    break;
++        let keepalive_handle = is_websocket.then(|| {
++            tokio::spawn(async move {
++                let interval = std::time::Duration::from_secs(WS_KEEPALIVE_INTERVAL_SECS);
++                loop {
++                    tokio::select! {
++                        _ = tokio::time::sleep(interval) => {}
++                        _ = cancel_rx.changed() => break,
++                    }
++                    let mut tx = keepalive_tx.lock().await;
++                    if closed_keepalive.load(Ordering::SeqCst) {
++                        break;
++                    }
++                    if tx.ping().await.is_err() {
++                        break;
++                    }
+                 }
+-            }
++            })
+         });
+ 
+-        Ok(Self {
+-            ws_tx,
++        Self {
++            transport_tx,
+             socket,
+             closed,
+             close_complete: AtomicBool::new(false),
+@@ -674,11 +769,11 @@ impl CdpClient {
+             event_tx,
+             raw_tx,
+             reader_handle: Mutex::new(Some(reader_handle)),
+-            keepalive_handle: Mutex::new(Some(keepalive_handle)),
++            keepalive_handle: Mutex::new(keepalive_handle),
+             private_sessions,
+             method_taps,
+             detached_sessions,
+-        })
++        }
+     }
+ 
+     /// Refuse a command to a session Chrome already reported detached.
+@@ -716,6 +811,13 @@ impl CdpClient {
+         }
+     }
+ 
++    async fn mark_transport_failed(&self) {
++        self.closed.store(true, Ordering::SeqCst);
++        self.pending.lock().await.clear();
++        self.raw_pending.lock().await.clear();
++        let _ = self.cancel_tx.send(true);
++    }
++
+     async fn abort_task(handle: &Mutex<Option<JoinHandle<()>>>) {
+         let Some(task) = handle.lock().await.take() else {
+             return;
+@@ -735,12 +837,14 @@ impl CdpClient {
+         Self::abort_task(&self.keepalive_handle).await;
+ 
+         let _ = tokio::time::timeout(TRANSPORT_CLOSE_TIMEOUT, async {
+-            let mut ws_tx = self.ws_tx.lock().await;
+-            let _ = ws_tx.close().await;
++            let mut transport = self.transport_tx.lock().await;
++            transport.close().await;
+         })
+         .await;
+ 
+-        let _ = self.socket.shutdown(Shutdown::Both);
++        if let Some(socket) = &self.socket {
++            let _ = socket.shutdown(Shutdown::Both);
++        }
+         Self::abort_task(&self.reader_handle).await;
+         self.pending.lock().await.clear();
+         self.raw_pending.lock().await.clear();
+@@ -776,7 +880,7 @@ impl CdpClient {
+         };
+ 
+         {
+-            let mut ws_tx = self.ws_tx.lock().await;
++            let mut transport = self.transport_tx.lock().await;
+             self.ensure_open()?;
+             let mut pending = self.pending.lock().await;
+             if let Err(error) = self.ensure_session_attached(method, cmd.session_id.as_deref()) {
+@@ -791,8 +895,8 @@ impl CdpClient {
+                 },
+             );
+             drop(pending);
+-            if let Err(error) = ws_tx.send(Message::Text(json)).await {
+-                self.pending.lock().await.remove(&id);
++            if let Err(error) = transport.send_text(json).await {
++                self.mark_transport_failed().await;
+                 guard.done = true;
+                 return Err(format!("Failed to send CDP command: {}", error));
+             }
+@@ -872,7 +976,7 @@ impl CdpClient {
+     /// Contains only what's needed to forward messages bidirectionally.
+     pub fn inspect_handle(&self) -> InspectProxyHandle {
+         InspectProxyHandle {
+-            ws_tx: self.ws_tx.clone(),
++            transport_tx: self.transport_tx.clone(),
+             raw_tx: self.raw_tx.clone(),
+             closed: self.closed.clone(),
+         }
+@@ -936,7 +1040,7 @@ impl CdpClient {
+         };
+ 
+         {
+-            let mut ws_tx = self.ws_tx.lock().await;
++            let mut transport = self.transport_tx.lock().await;
+             self.ensure_open()?;
+             let mut raw_pending = self.raw_pending.lock().await;
+             if let Err(error) = self.ensure_session_attached(method, cmd.session_id.as_deref()) {
+@@ -951,8 +1055,8 @@ impl CdpClient {
+                 },
+             );
+             drop(raw_pending);
+-            if let Err(error) = ws_tx.send(Message::Text(json)).await {
+-                self.raw_pending.lock().await.remove(&id);
++            if let Err(error) = transport.send_text(json).await {
++                self.mark_transport_failed().await;
+                 guard.done = true;
+                 return Err(format!("Failed to send CDP command: {}", error));
+             }
+@@ -1018,23 +1122,25 @@ impl CdpClient {
+         let json = serde_json::to_string(&cmd)
+             .map_err(|e| format!("Failed to serialize CDP command: {}", e))?;
+ 
+-        let mut ws_tx = self.ws_tx.lock().await;
++        let mut transport = self.transport_tx.lock().await;
+         self.ensure_open()?;
+-        ws_tx
+-            .send(Message::Text(json))
+-            .await
+-            .map_err(|e| format!("Failed to send CDP command: {}", e))
++        if let Err(error) = transport.send_text(json).await {
++            self.mark_transport_failed().await;
++            return Err(format!("Failed to send CDP command: {}", error));
++        }
++        Ok(())
+     }
+ 
+     /// Send raw JSON through the WebSocket without tracking a response.
+     /// Used by the inspect proxy to forward DevTools frontend messages.
+     pub async fn send_raw(&self, json: String) -> Result<(), String> {
+-        let mut ws_tx = self.ws_tx.lock().await;
++        let mut transport = self.transport_tx.lock().await;
+         self.ensure_open()?;
+-        ws_tx
+-            .send(Message::Text(json))
+-            .await
+-            .map_err(|e| format!("Failed to send raw CDP message: {}", e))
++        if let Err(error) = transport.send_text(json).await {
++            self.mark_transport_failed().await;
++            return Err(format!("Failed to send raw CDP message: {}", error));
++        }
++        Ok(())
+     }
+ 
+     /// Test-only: count of in-flight commands still awaiting a response, so a
+@@ -1055,19 +1161,19 @@ impl CdpClient {
+ /// Lightweight handle for the inspect WebSocket proxy, holding only
+ /// the cloneable parts of CdpClient needed for bidirectional message forwarding.
+ pub struct InspectProxyHandle {
+-    ws_tx: WsTx,
++    transport_tx: TransportTx,
+     raw_tx: broadcast::Sender<RawCdpMessage>,
+     closed: Arc<AtomicBool>,
+ }
+ 
+ impl InspectProxyHandle {
+     pub async fn send_raw(&self, json: String) -> Result<(), String> {
+-        let mut ws_tx = self.ws_tx.lock().await;
++        let mut transport = self.transport_tx.lock().await;
+         if self.closed.load(Ordering::SeqCst) {
+             return Err(CONNECTION_CLOSED_ERROR.to_string());
+         }
+-        ws_tx
+-            .send(Message::Text(json))
++        transport
++            .send_text(json)
+             .await
+             .map_err(|e| format!("Failed to send raw CDP message: {}", e))
+     }
+@@ -1123,6 +1229,74 @@ mod tests {
+     const TEST_CERT_DER: &str = "MIIBPDCB46ADAgECAgkA9xwXmIhbzQIwCgYIKoZIzj0EAwIwFDESMBAGA1UEAwwJbG9jYWxob3N0MB4XDTI2MDgzMDA1NTU0NFoXDTM2MDgyNzA1NTU0NFowFDESMBAGA1UEAwwJbG9jYWxob3N0MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEQdmPO0sXXFRmVn7+8MViXGom2rYy8aV3Oc0pNZhUmFGaPl4MRFzc1G0yaV/WRBPF/BUh2LGsXCvUsn7NqaYkFaMeMBwwGgYDVR0RBBMwEYIJbG9jYWxob3N0hwR/AAABMAoGCCqGSM49BAMCA0gAMEUCIQC32oureGNAupABEmonQPAQBD7OdJjXmUxoVQNr0UB+6AIgb23GMwxTjwHyLG4tZcJST7r3cCW8K/Y+1h618j2f+Uw=";
+     const TEST_KEY_DER: &str = "MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgIVZST8Vhc5f3OW+4kF78f8o1nQCRwjW/Yo8CXQ35Y9uhRANCAARB2Y87SxdcVGZWfv7wxWJcaibatjLxpXc5zSk1mFSYUZo+XgxEXNzUbTJpX9ZEE8X8FSHYsaxcK9Syfs2ppiQV";
+ 
++    #[cfg(unix)]
++    #[tokio::test]
++    async fn pipe_transport_frames_commands_and_fails_closed_on_eof() {
++        use std::io::BufRead;
++        use std::os::fd::{FromRawFd, IntoRawFd};
++        use std::os::unix::net::UnixStream;
++
++        let (child_reader, parent_writer) = UnixStream::pair().unwrap();
++        let (parent_reader, mut child_writer) = UnixStream::pair().unwrap();
++        let reader = unsafe { File::from_raw_fd(parent_reader.into_raw_fd()) };
++        let writer = unsafe { File::from_raw_fd(parent_writer.into_raw_fd()) };
++        let client = CdpClient::connect_pipe(reader, writer);
++        let server = tokio::task::spawn_blocking(move || {
++            let mut command = Vec::new();
++            std::io::BufReader::new(child_reader)
++                .read_until(0, &mut command)
++                .unwrap();
++            assert_eq!(command.last(), Some(&0));
++            let parsed: Value = serde_json::from_slice(&command[..command.len() - 1]).unwrap();
++            assert_eq!(parsed["method"], "Browser.getVersion");
++            child_writer
++                .write_all(b"{\"id\":1,\"result\":{\"product\":\"test\"}}\0")
++                .unwrap();
++        });
++        let version = client
++            .send_command_no_params("Browser.getVersion", None)
++            .await
++            .unwrap();
++        assert_eq!(version["product"], "test");
++        server.await.unwrap();
++        let failure = tokio::time::timeout(
++            Duration::from_secs(2),
++            client.send_command_no_params("Browser.getVersion", None),
++        )
++        .await
++        .expect("closed pipe must fail promptly");
++        assert!(failure.is_err());
++        client.close().await;
++    }
++
++    #[cfg(unix)]
++    #[tokio::test]
++    async fn pipe_write_error_closes_transport_without_reader_eof() {
++        use std::os::fd::{FromRawFd, IntoRawFd};
++        use std::os::unix::net::UnixStream;
++
++        let (child_reader, parent_writer) = UnixStream::pair().unwrap();
++        let (parent_reader, _child_writer) = UnixStream::pair().unwrap();
++        drop(child_reader);
++        let reader = unsafe { File::from_raw_fd(parent_reader.into_raw_fd()) };
++        let writer = unsafe { File::from_raw_fd(parent_writer.into_raw_fd()) };
++        let client = CdpClient::connect_pipe(reader, writer);
++
++        let error = client
++            .send_command_no_params("Browser.getVersion", None)
++            .await
++            .unwrap_err();
++        assert!(error.contains("Failed to send CDP command"), "{error}");
++        assert_eq!(
++            client
++                .send_command_no_params("Browser.getVersion", None)
++                .await
++                .unwrap_err(),
++            CONNECTION_CLOSED_ERROR
++        );
++        client.close().await;
++    }
++
+     #[test]
+     fn repairs_only_unpaired_surrogate_escapes() {
+         let msg = r#"{"id":1,"result":{"high":"\ud800","low":"\udfff","pair":"\ud83d\ude00","escaped":"\\ud800","text":"café 中文"}}"#;
+@@ -1888,7 +2062,7 @@ mod tests {
+ 
+         let client = Arc::new(CdpClient::connect(&url).await.unwrap());
+         accepted_rx.await.unwrap();
+-        let sink_guard = client.ws_tx.lock().await;
++        let sink_guard = client.transport_tx.lock().await;
+         let close_client = client.clone();
+         tokio::time::timeout(Duration::from_secs(1), async move {
+             close_client.close().await;
+diff --git a/cli/src/native/cdp/windows_process.rs b/cli/src/native/cdp/windows_process.rs
+index 6838149..180b3ea 100644
+--- a/cli/src/native/cdp/windows_process.rs
++++ b/cli/src/native/cdp/windows_process.rs
+@@ -48,6 +48,8 @@ pub(super) struct Child {
+     _desktop: Option<Desktop>,
+     pid: u32,
+     pub stderr: Option<File>,
++    pipe_reader: Option<File>,
++    pipe_writer: Option<File>,
+ }
+ 
+ struct Desktop(HDESK);
+@@ -70,8 +72,6 @@ impl Child {
+             command_line.push(b' ' as u16);
+             command_line.extend(quoted(OsStr::new(arg))?);
+         }
+-        command_line.push(0);
+-
+         // SAFETY: Null security attributes create an unnamed, non-inheritable
+         // job. OwnedHandle closes it on every subsequent error path.
+         let job = owned(unsafe { CreateJobObjectW(null(), null()) })?;
+@@ -118,11 +118,33 @@ impl Child {
+ 
+         let null_file = OpenOptions::new().read(true).write(true).open("NUL")?;
+         let (stderr_reader, stderr_writer) = io::pipe()?;
++        let (chrome_reader, parent_writer) = io::pipe()?;
++        let (parent_reader, chrome_writer) = io::pipe()?;
+         let null_handle = inheritable(null_file.as_raw_handle() as HANDLE)?;
+         let stderr_handle = inheritable(stderr_writer.as_raw_handle() as HANDLE)?;
++        let chrome_reader_handle = inheritable(chrome_reader.as_raw_handle() as HANDLE)?;
++        let chrome_writer_handle = inheritable(chrome_writer.as_raw_handle() as HANDLE)?;
++        // Chromium parses these values as u32 before adopting the handles.
++        let pipe_handle_value = |handle: &OwnedHandle| {
++            u32::try_from(raw(handle) as usize)
++                .map_err(|_| io::Error::other("Chrome pipe handle exceeds Chromium's u32 range"))
++        };
++        let pipe_switch = format!(
++            "--remote-debugging-io-pipes={},{}",
++            pipe_handle_value(&chrome_reader_handle)?,
++            pipe_handle_value(&chrome_writer_handle)?
++        );
++        command_line.push(b' ' as u16);
++        command_line.extend(quoted(OsStr::new(&pipe_switch))?);
++        command_line.push(0);
+         // The handle allowlist excludes the job, the desktop, and all other
+         // daemon handles, even when another thread is spawning concurrently.
+-        let handles = [raw(&null_handle), raw(&stderr_handle)];
++        let handles = [
++            raw(&null_handle),
++            raw(&stderr_handle),
++            raw(&chrome_reader_handle),
++            raw(&chrome_writer_handle),
++        ];
+         let jobs = [raw(&job)];
+         let mut attributes = AttributeList::new(2)?;
+         attributes.add(PROC_THREAD_ATTRIBUTE_HANDLE_LIST, &handles)?;
+@@ -169,9 +191,18 @@ impl Child {
+             _desktop: desktop,
+             pid: info.dwProcessId,
+             stderr: Some(File::from(OwnedHandle::from(stderr_reader))),
++            pipe_reader: Some(File::from(OwnedHandle::from(parent_reader))),
++            pipe_writer: Some(File::from(OwnedHandle::from(parent_writer))),
+         })
+     }
+ 
++    pub fn take_pipe(&mut self) -> (File, File) {
++        (
++            self.pipe_reader.take().expect("Chrome pipe reader missing"),
++            self.pipe_writer.take().expect("Chrome pipe writer missing"),
++        )
++    }
++
+     pub fn id(&self) -> u32 {
+         self.pid
+     }
+diff --git a/cli/src/native/e2e_tests.rs b/cli/src/native/e2e_tests.rs
+index 749a5b7..f0db2e2 100644
+--- a/cli/src/native/e2e_tests.rs
++++ b/cli/src/native/e2e_tests.rs
+@@ -4643,7 +4643,7 @@ async fn e2e_tab_keep_frozen() {
+ #[ignore]
+ async fn e2e_tab_keep_frozen_ends_with_an_attached_session() {
+     let (guard, _dir) = binding_test_env();
+-    let (mut host, ws_url) = launch_binding_host(&guard).await;
++    let (mut host, ws_url, _external) = launch_binding_host(&guard).await;
+     let mut session = attach_pinned_session(&guard, "e2e-keep-frozen", &ws_url, GAP_PAGE).await;
+     let mut run = async |action: &str, mut cmd: Value| {
+         cmd["id"] = json!(action);
+@@ -5633,23 +5633,8 @@ async fn e2e_relaunch_keeps_session_setup() {
+ #[tokio::test]
+ #[ignore]
+ async fn e2e_attach_starts_without_the_local_session_setup() {
+-    let mut external = DaemonState::new();
+-    let resp = execute_command(
+-        &json!({ "id": "1", "action": "launch", "headless": true }),
+-        &mut external,
+-    )
+-    .await;
+-    assert_success(&resp);
+-    let port: u64 = external
+-        .browser
+-        .as_ref()
+-        .unwrap()
+-        .chrome_host_port()
+-        .rsplit(':')
+-        .next()
+-        .unwrap()
+-        .parse()
+-        .unwrap();
++    let (ws_url, _external) = launch_external_chrome().await;
++    let port = url::Url::parse(&ws_url).unwrap().port().unwrap() as u64;
+ 
+     let mut state = DaemonState::new();
+     let resp = execute_command(
+@@ -5677,8 +5662,6 @@ async fn e2e_attach_starts_without_the_local_session_setup() {
+ 
+     let resp = execute_command(&json!({ "id": "98", "action": "close" }), &mut state).await;
+     assert_success(&resp);
+-    let resp = execute_command(&json!({ "id": "99", "action": "close" }), &mut external).await;
+-    assert_success(&resp);
+ }
+ 
+ /// A relaunch that fails after the browser started keeps the previous session
+@@ -9223,24 +9206,36 @@ async fn e2e_profile_cookie_persistence() {
+ #[ignore]
+ async fn e2e_get_cdp_url() {
+     let mut state = DaemonState::new();
++    let profile = tempfile::tempdir().unwrap();
+ 
+     let resp = execute_command(
+-        &json!({ "id": "1", "action": "launch", "headless": true }),
++        &json!({
++            "id": "1",
++            "action": "launch",
++            "headless": true,
++            "profile": profile.path().to_string_lossy().to_string(),
++            "args": ["--no-sandbox"]
++        }),
+         &mut state,
+     )
+     .await;
+     assert_success(&resp);
+ 
+-    let resp = execute_command(&json!({ "id": "2", "action": "cdp_url" }), &mut state).await;
++    let resp = execute_command(
++        &json!({ "id": "eval", "action": "evaluate", "script": "1 + 1" }),
++        &mut state,
++    )
++    .await;
+     assert_success(&resp);
+-    let cdp_url = get_data(&resp)["cdpUrl"]
++    assert_eq!(get_data(&resp)["result"], 2);
++    assert!(!profile.path().join("DevToolsActivePort").exists());
++
++    let resp = execute_command(&json!({ "id": "2", "action": "cdp_url" }), &mut state).await;
++    assert_eq!(resp["success"], false, "{resp}");
++    assert!(resp["error"]
+         .as_str()
+-        .expect("cdpUrl should be a string");
+-    assert!(
+-        cdp_url.starts_with("ws://"),
+-        "CDP URL should start with ws://, got: {}",
+-        cdp_url
+-    );
++        .unwrap_or_default()
++        .contains("unavailable"));
+ 
+     let resp = execute_command(&json!({ "id": "99", "action": "close" }), &mut state).await;
+     assert_success(&resp);
+@@ -9258,41 +9253,12 @@ async fn e2e_inspect() {
+     .await;
+     assert_success(&resp);
+ 
+-    let resp = execute_command(
+-        &json!({ "id": "2", "action": "navigate", "url": "https://example.com" }),
+-        &mut state,
+-    )
+-    .await;
+-    assert_success(&resp);
+-
+     let resp = execute_command(&json!({ "id": "3", "action": "inspect" }), &mut state).await;
+-    assert_success(&resp);
+-    let data = get_data(&resp);
+-    assert_eq!(data["opened"], true);
+-    let url = data["url"]
++    assert_eq!(resp["success"], false, "{resp}");
++    assert!(resp["error"]
+         .as_str()
+-        .expect("inspect url should be a string");
+-    assert!(
+-        url.starts_with("http://127.0.0.1:"),
+-        "Inspect URL should be http://127.0.0.1:<port>, got: {}",
+-        url
+-    );
+-
+-    // Verify the HTTP redirect serves a 302 to the DevTools frontend
+-    let http_resp = reqwest::get(url).await;
+-    match http_resp {
+-        Ok(r) => {
+-            let final_url = r.url().to_string();
+-            assert!(
+-                final_url.contains("devtools/devtools_app.html"),
+-                "Redirect should point to DevTools frontend, got: {}",
+-                final_url
+-            );
+-        }
+-        Err(e) => {
+-            panic!("HTTP GET to inspect URL failed: {}", e);
+-        }
+-    }
++        .unwrap_or_default()
++        .contains("unavailable"));
+ 
+     let resp = execute_command(&json!({ "id": "99", "action": "close" }), &mut state).await;
+     assert_success(&resp);
+@@ -13953,7 +13919,7 @@ async fn e2e_upload_attaches_content_and_directories() {
+ #[ignore]
+ async fn e2e_upload_over_cdp_setting_treats_non_local_browser_as_remote() {
+     let (guard, _dir) = binding_test_env();
+-    let (mut host, ws_url) = launch_binding_host(&guard).await;
++    let (mut host, ws_url, _external) = launch_binding_host(&guard).await;
+     let ws_url = ws_url.replacen("127.0.0.1", "0.0.0.0", 1);
+     assert!(ws_url.contains("0.0.0.0"), "{ws_url}");
+ 
+@@ -18163,29 +18129,100 @@ fn binding_test_env() -> (EnvGuard<'static>, tempfile::TempDir) {
+     (guard, dir)
+ }
+ 
+-/// Launch a host Chrome and return (host_state, ws_url) for other sessions
+-/// to attach to over CDP.
+-async fn launch_binding_host(guard: &EnvGuard<'static>) -> (DaemonState, String) {
++/// External Chrome is used only by explicit CDP attachment tests. Its profile
++/// is temporary, and the guard terminates only the process tree it started.
++pub(crate) struct ExternalChromeGuard {
++    child: std::process::Child,
++    _profile: tempfile::TempDir,
++}
++
++impl ExternalChromeGuard {
++    fn kill(&mut self) {
++        #[cfg(unix)]
++        unsafe {
++            libc::kill(-(self.child.id() as i32), libc::SIGKILL);
++        }
++        #[cfg(windows)]
++        let _ = std::process::Command::new("taskkill")
++            .args(["/PID", &self.child.id().to_string(), "/T", "/F"])
++            .status();
++        let _ = self.child.kill();
++        let _ = self.child.wait();
++    }
++}
++
++impl Drop for ExternalChromeGuard {
++    fn drop(&mut self) {
++        self.kill();
++    }
++}
++
++/// Start a temporary external Chrome for tests of explicit CDP attachment.
++pub(crate) async fn launch_external_chrome() -> (String, ExternalChromeGuard) {
++    let profile = tempfile::tempdir().unwrap();
++    let executable = super::cdp::chrome::find_chrome().expect("Chrome is required for CDP tests");
++    let mut command = std::process::Command::new(executable);
++    command.args([
++        "--headless=new",
++        "--no-sandbox",
++        "--disable-dev-shm-usage",
++        "--no-first-run",
++        "--remote-debugging-port=0",
++        &format!("--user-data-dir={}", profile.path().display()),
++        "about:blank",
++    ]);
++    command
++        .stdout(std::process::Stdio::null())
++        .stderr(std::process::Stdio::null());
++    #[cfg(unix)]
++    {
++        use std::os::unix::process::CommandExt;
++        command.process_group(0);
++    }
++    let child = command.spawn().expect("start external Chrome");
++    let mut external = ExternalChromeGuard {
++        child,
++        _profile: profile,
++    };
++    let active = external._profile.path().join("DevToolsActivePort");
++    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
++    let (port, path) = loop {
++        if let Ok(content) = std::fs::read_to_string(&active) {
++            let mut lines = content.lines();
++            if let (Some(Ok(port)), Some(path)) =
++                (lines.next().map(str::parse::<u16>), lines.next())
++            {
++                break (port, path.to_string());
++            }
++        }
++        assert!(
++            std::time::Instant::now() < deadline,
++            "external Chrome did not expose CDP"
++        );
++        assert!(
++            external.child.try_wait().unwrap().is_none(),
++            "external Chrome exited early"
++        );
++        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
++    };
++    let ws_url = format!("ws://127.0.0.1:{port}{path}");
++
++    (ws_url, external)
++}
++
++async fn launch_binding_host(
++    guard: &EnvGuard<'static>,
++) -> (DaemonState, String, ExternalChromeGuard) {
++    let (ws_url, external) = launch_external_chrome().await;
+     guard.set("AGENT_BROWSER_SESSION", "e2e-bind-host");
+     let mut host = DaemonState::new();
+     let resp = execute_command(
+-        &json!({
+-            "id": "host-1",
+-            "action": "launch",
+-            "headless": true,
+-            "args": ["--no-sandbox", "--disable-dev-shm-usage"]
+-        }),
++        &json!({ "id": "host-1", "action": "launch", "cdpUrl": ws_url }),
+         &mut host,
+     )
+     .await;
+     assert_success(&resp);
+-    let resp = execute_command(&json!({ "id": "host-2", "action": "cdp_url" }), &mut host).await;
+-    assert_success(&resp);
+-    let ws_url = get_data(&resp)["cdpUrl"]
+-        .as_str()
+-        .expect("cdpUrl should be a string")
+-        .to_string();
+-    (host, ws_url)
++    (host, ws_url, external)
+ }
+ 
+ /// Create a pinned session attached to the shared Chrome and navigate its
+@@ -18232,11 +18269,14 @@ fn load_binding(session: &str, expect: &str) -> super::tab_binding::TabBinding {
+ #[ignore]
+ async fn e2e_cdp_attach_survives_follow_up_launch_without_a_target() {
+     let (guard, _dir) = binding_test_env();
+-    let (mut host, ws_url) = launch_binding_host(&guard).await;
++    let (mut host, ws_url, _external) = launch_binding_host(&guard).await;
+     guard.set("AGENT_BROWSER_SESSION", "e2e-attach-sticky");
+     let mut state = DaemonState::new();
+     let attach = json!({ "id": "1", "action": "launch", "cdpUrl": ws_url });
+     assert_success(&execute_command(&attach, &mut state).await);
++    let endpoint = execute_command(&json!({ "id": "cdp", "action": "cdp_url" }), &mut state).await;
++    assert_success(&endpoint);
++    assert_eq!(get_data(&endpoint)["cdpUrl"], ws_url);
+     let page = "data:text/html,attached-page";
+     let navigate = json!({ "id": "2", "action": "navigate", "url": page });
+     assert_success(&execute_command(&navigate, &mut state).await);
+@@ -18260,12 +18300,13 @@ async fn e2e_cdp_attach_survives_follow_up_launch_without_a_target() {
+ #[ignore]
+ async fn e2e_cdp_attach_dead_browser_errors_instead_of_launching_locally() {
+     let (guard, _dir) = binding_test_env();
+-    let (mut host, ws_url) = launch_binding_host(&guard).await;
++    let (mut host, ws_url, mut external) = launch_binding_host(&guard).await;
+     guard.set("AGENT_BROWSER_SESSION", "e2e-attach-dead");
+     let mut state = DaemonState::new();
+     let attach = json!({ "id": "1", "action": "launch", "cdpUrl": ws_url });
+     assert_success(&execute_command(&attach, &mut state).await);
+     assert_success(&execute_command(&json!({ "id": "h", "action": "close" }), &mut host).await);
++    external.kill();
+     tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+ 
+     let local =
+@@ -18284,7 +18325,7 @@ async fn e2e_cdp_attach_dead_browser_errors_instead_of_launching_locally() {
+ #[ignore]
+ async fn e2e_pin_tab_rebinds_after_daemon_restart() {
+     let (guard, _dir) = binding_test_env();
+-    let (mut host, ws_url) = launch_binding_host(&guard).await;
++    let (mut host, ws_url, _external) = launch_binding_host(&guard).await;
+ 
+     let url_a = "data:text/html,session-a-page";
+     let url_b = "data:text/html,session-b-page";
+@@ -18388,7 +18429,7 @@ async fn e2e_pin_tab_rebinds_after_daemon_restart() {
+ #[ignore]
+ async fn e2e_auto_attached_foreign_tab_does_not_steal_pinned_tab() {
+     let (guard, _dir) = binding_test_env();
+-    let (mut host, ws_url) = launch_binding_host(&guard).await;
++    let (mut host, ws_url, _external) = launch_binding_host(&guard).await;
+ 
+     let url_a = "data:text/html,pinned-session-a";
+     let mut state_a = attach_pinned_session(&guard, "e2e-foreign-a", &ws_url, url_a).await;
+@@ -18441,7 +18482,7 @@ async fn e2e_auto_attached_foreign_tab_does_not_steal_pinned_tab() {
+ #[ignore]
+ async fn e2e_tab_new_still_activates_under_auto_attach() {
+     let (guard, _dir) = binding_test_env();
+-    let (mut host, ws_url) = launch_binding_host(&guard).await;
++    let (mut host, ws_url, _external) = launch_binding_host(&guard).await;
+ 
+     let url_a = "data:text/html,pinned-session-a";
+     let mut state_a = attach_pinned_session(&guard, "e2e-tabnew-a", &ws_url, url_a).await;
+@@ -18473,7 +18514,7 @@ async fn e2e_tab_new_still_activates_under_auto_attach() {
+ #[ignore]
+ async fn e2e_pin_tab_setting_off_releases_the_manager_pin() {
+     let (guard, _dir) = binding_test_env();
+-    let (mut host, ws_url) = launch_binding_host(&guard).await;
++    let (mut host, ws_url, _external) = launch_binding_host(&guard).await;
+     let url_a = "data:text/html,release-session-a";
+     let url_b = "data:text/html,release-session-b";
+     let mut state_a = attach_pinned_session(&guard, "e2e-release-a", &ws_url, url_a).await;
+@@ -18511,7 +18552,7 @@ async fn e2e_pin_tab_setting_off_releases_the_manager_pin() {
+ #[ignore]
+ async fn e2e_pin_tab_gone_error_and_recovery() {
+     let (guard, _dir) = binding_test_env();
+-    let (mut host, ws_url) = launch_binding_host(&guard).await;
++    let (mut host, ws_url, _external) = launch_binding_host(&guard).await;
+ 
+     let url_a = "data:text/html,gone-session-a";
+     let url_b = "data:text/html,gone-session-b";
+diff --git a/cli/src/output.rs b/cli/src/output.rs
+index 5323fc7..0681f51 100644
+--- a/cli/src/output.rs
++++ b/cli/src/output.rs
+@@ -3169,10 +3169,9 @@ Examples:
+             r##"
+ agent-browser inspect - Open Chrome DevTools for the active page
+ 
+-Starts a local WebSocket proxy and opens Chrome's DevTools frontend in your
+-default browser. The proxy routes DevTools traffic through the daemon's
+-existing CDP connection, so both DevTools and agent-browser commands work
+-simultaneously.
++For an attached browser, starts a local WebSocket proxy and
++opens Chrome's DevTools frontend in your default browser. Managed browsers
++use a private debugging pipe, so inspect is unavailable for them.
+ 
+ Usage: agent-browser inspect
+ 
+@@ -3202,7 +3201,7 @@ Subcommands:
+   count <selector>           Count matching elements
+   box <selector>             Get bounding box (x, y, width, height)
+   styles <selector>          Get computed styles of elements
+-  cdp-url                    Get CDP WebSocket URL of a running browser
++  cdp-url                    Get an attached browser's CDP WebSocket URL
+                              Never launches a browser, including metadata-only batches
+ 
+ Global Options:
+diff --git a/docs/content/docs/commands.mdx b/docs/content/docs/commands.mdx
+index b3728db..1ca5c45 100644
+--- a/docs/content/docs/commands.mdx
++++ b/docs/content/docs/commands.mdx
+@@ -91,13 +91,13 @@ agent-browser get value <sel>         # Get input value
+ agent-browser get attr <sel> <attr>   # Get attribute
+ agent-browser get title               # Get page title
+ agent-browser get url                 # Get current URL
+-agent-browser get cdp-url             # Get CDP WebSocket URL
++agent-browser get cdp-url             # Get an attached browser's CDP WebSocket URL
+ agent-browser get count <sel>         # Count matching elements
+ agent-browser get box <sel>           # Get bounding box
+ agent-browser get styles <sel>        # Get computed styles
+ ```
+ 
+-`get cdp-url` reports the CDP WebSocket URL of a browser that is already running. It requires a running browser and never launches one. A batch containing only `get cdp-url` commands also skips browser launch. A mixed batch can launch a browser for its other commands.
++`get cdp-url` reports the CDP WebSocket URL of an attached browser, including one connected through `--cdp`. Managed browsers use a private debugging pipe, so this command returns an error for them. It requires a running browser and never launches one. A batch containing only `get cdp-url` commands also skips browser launch. A mixed batch can launch a browser for its other commands.
+ 
+ ## Read agent-friendly text
+ 
+@@ -445,9 +445,11 @@ agent-browser console --clear         # Clear console log
+ agent-browser errors                  # View page errors
+ agent-browser errors --clear          # Clear error log
+ agent-browser highlight <sel>         # Highlight element
+-agent-browser inspect                 # Open Chrome DevTools for the active page
++agent-browser inspect                 # Open Chrome DevTools for an attached browser
+ ```
+ 
++`inspect` is available for attached browsers, including ones connected through `--cdp`. Managed browsers use a private debugging pipe and do not serve the DevTools frontend.
++
+ Recording requires `ffmpeg` on `PATH`. See [Debugging](/debugging) for console, error, dialog, trace, highlight, and DevTools workflows. See [Video Recording](/recording) for recording requirements and `record` workflows, and [Profiler](/profiler) for performance profiles.
+ 
+ ## Auth vault
+diff --git a/docs/content/docs/debugging.mdx b/docs/content/docs/debugging.mdx
+index ed7dfa0..1273806 100644
+--- a/docs/content/docs/debugging.mdx
++++ b/docs/content/docs/debugging.mdx
+@@ -52,7 +52,7 @@ agent-browser highlight "#submit"
+ agent-browser inspect
+ ```
+ 
+-`highlight` draws attention to an element in the live page, which is useful when running headed or when viewing the session through streaming or the dashboard. `inspect` opens Chrome DevTools for the active page through a local proxy while the daemon continues to accept agent-browser commands.
++`highlight` draws attention to an element in the live page, which is useful when running headed or when viewing the session through streaming or the dashboard. For an attached browser, `inspect` opens Chrome DevTools for the active page through a local proxy while the daemon continues to accept commands. Managed browsers use a private debugging pipe, so `inspect` is unavailable for them.
+ 
+ ## Chrome trace capture
+ 
+diff --git a/docs/tests/fixtures/docs-edits.json b/docs/tests/fixtures/docs-edits.json
+index 66fed64..348f566 100644
+--- a/docs/tests/fixtures/docs-edits.json
++++ b/docs/tests/fixtures/docs-edits.json
+@@ -92,6 +92,14 @@
+       {
+         "from": "not available with Safari or iOS WebDriver sessions",
+         "to": "not available with Safari, iOS, or Ladybird WebDriver sessions"
++      },
++      {
++        "from": "agent-browser get cdp-url             # Get CDP WebSocket URL",
++        "to": "agent-browser get cdp-url             # Get an attached browser's CDP WebSocket URL"
++      },
++      {
++        "from": "agent-browser inspect                 # Open Chrome DevTools for the active page",
++        "to": "agent-browser inspect                 # Open Chrome DevTools for an attached browser"
+       }
+     ],
+     "/configuration": [
+@@ -499,6 +507,16 @@
+         "from": "Without --baseline, the command automatically compares against the most recent snapshot taken in the current session.",
+         "to": "Without --baseline, the command automatically compares against the most recent snapshot taken on this tab."
+       }
++    ],
++    "/debugging": [
++      {
++        "from": "`highlight` draws attention to an element in the live page, which is useful when running headed or when viewing the session through streaming or the dashboard. `inspect` opens Chrome DevTools for the active page through a local proxy while the daemon continues to accept agent-browser commands.",
++        "to": "`highlight` draws attention to an element in the live page, which is useful when running headed or when viewing the session through streaming or the dashboard. For an attached browser, `inspect` opens Chrome DevTools for the active page through a local proxy while the daemon continues to accept commands. Managed browsers use a private debugging pipe, so `inspect` is unavailable for them."
++      },
++      {
++        "from": "highlight draws attention to an element in the live page, which is useful when running headed or when viewing the session through streaming or the dashboard. inspect opens Chrome DevTools for the active page through a local proxy while the daemon continues to accept agent-browser commands.",
++        "to": "highlight draws attention to an element in the live page, which is useful when running headed or when viewing the session through streaming or the dashboard. For an attached browser, inspect opens Chrome DevTools for the active page through a local proxy while the daemon continues to accept commands. Managed browsers use a private debugging pipe, so inspect is unavailable for them."
++      }
+     ]
+   },
+   "resources": {
+diff --git a/skill-data/core/references/commands.md b/skill-data/core/references/commands.md
+index 471ca19..e2db4fe 100644
+--- a/skill-data/core/references/commands.md
++++ b/skill-data/core/references/commands.md
+@@ -130,13 +130,13 @@ agent-browser get value @e1       # Get input value
+ agent-browser get attr @e1 href   # Get attribute
+ agent-browser get title           # Get page title
+ agent-browser get url             # Get current URL
+-agent-browser get cdp-url         # CDP WebSocket URL of a running browser (never launches)
++agent-browser get cdp-url         # CDP WebSocket URL of an attached browser (never launches)
+ agent-browser get count ".item"   # Count matching elements
+ agent-browser get box @e1         # Get bounding box
+ agent-browser get styles @e1      # Get computed styles (font, color, bg, etc.)
+ ```
+ 
+-A batch containing only `get cdp-url` commands also skips browser launch. A mixed batch can launch a browser for its other commands.
++`get cdp-url` is unavailable for managed browsers because they use a private debugging pipe. A batch containing only `get cdp-url` commands also skips browser launch. A mixed batch can launch a browser for its other commands.
+ 
+ ## Check State
+ 
+@@ -624,7 +624,7 @@ agent-browser console --clear             # Clear console
+ agent-browser errors                      # View page errors
+ agent-browser errors --clear              # Clear errors
+ agent-browser highlight @e1               # Highlight element
+-agent-browser inspect                     # Open Chrome DevTools for this session
++agent-browser inspect                     # Open Chrome DevTools for an attached browser
+ agent-browser trace start                 # Start recording trace
+ agent-browser trace stop trace.json       # Stop and save trace
+ agent-browser profiler start              # Start Chrome DevTools profiling
