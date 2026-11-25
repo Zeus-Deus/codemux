@@ -3,6 +3,7 @@ import type { Terminal } from "@xterm/xterm";
 
 import {
   findTerminalLinks,
+  hyperlinkDestination,
   hyperlinkTitle,
   isLoopbackUrl,
   rangeForMatch,
@@ -115,6 +116,15 @@ describe("terminalHyperlinkTarget", () => {
     expect(terminalHyperlinkTarget("javascript:alert(1)")).toBeNull();
     expect(terminalHyperlinkTarget("vscode://file/x")).toBeNull();
     expect(terminalHyperlinkTarget("not a url")).toBeNull();
+  });
+});
+
+describe("hyperlinkDestination", () => {
+  it("names the host, not the user-info in front of it", () => {
+    expect(hyperlinkDestination(`https://github.com:${"x".repeat(300)}@evil.example/a`)).toBe("evil.example");
+    expect(hyperlinkDestination("https://example.com:8443/a")).toBe("example.com:8443");
+    expect(hyperlinkDestination("https://bücher.example/")).toBe("xn--bcher-kva.example");
+    expect(hyperlinkDestination("mailto:dev@example.com")).toBe("dev@example.com");
   });
 });
 

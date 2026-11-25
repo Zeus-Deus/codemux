@@ -58,6 +58,7 @@ import { openRightPanelDoc } from "@/lib/open-right-panel-doc";
 import { toast } from "@/lib/toast";
 import {
   findTerminalLinks,
+  hyperlinkDestination,
   hyperlinkTitle,
   isLoopbackUrl,
   rangeForMatch,
@@ -419,7 +420,14 @@ export const TerminalPane = memo(function TerminalPane({ sessionId, paneId, focu
             description: (
               <>
                 Terminal link text can differ from where it goes. Check the address before opening it.
-                <span className="mt-3 block max-h-32 select-text overflow-y-auto break-all rounded-lg bg-muted px-3 py-2 text-left font-mono text-label text-muted-foreground">
+                <span className="mt-3 block text-left text-foreground">
+                  Opens{" "}
+                  <span className="break-all font-mono font-medium">{hyperlinkDestination(target)}</span>
+                </span>
+                <span
+                  tabIndex={0}
+                  className="mt-2 block max-h-32 select-text overflow-y-auto break-all rounded-lg bg-muted px-3 py-2 text-left font-mono text-label text-muted-foreground"
+                >
                   {target}
                 </span>
               </>
@@ -427,8 +435,12 @@ export const TerminalPane = memo(function TerminalPane({ sessionId, paneId, focu
             confirmLabel: "Open link",
             // The dialog has no trigger to return focus to; hand it back to
             // the terminal the click came from while it is still on screen.
+            // Skipped when the pane has since switched session or gone off
+            // screen, so focus never lands in a replaced terminal.
             returnFocus: () => {
-              if (containerEl.isConnected) term.focus();
+              if (containerEl.isConnected && termRef.current === term && visibleRef.current) {
+                term.focus();
+              }
             },
           }).then((confirmed) => {
             if (confirmed) openUrl(target);

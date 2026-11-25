@@ -116,6 +116,20 @@ export function terminalHyperlinkTarget(uri: string): string | null {
   }
 }
 
+/** Where a confirmed hyperlink goes, short enough to read at a glance: the
+ *  host (port included) for web links, the address for mail links. A long
+ *  user-info part (`https://github.com:...@evil.example/`) can push the
+ *  host far along the full address, so the dialog shows this on its own.
+ *  Internationalized hosts come back in their ASCII (`xn--`) form. */
+export function hyperlinkDestination(target: string): string {
+  try {
+    const url = new URL(target);
+    return url.protocol === "mailto:" ? url.pathname : url.host;
+  } catch {
+    return target;
+  }
+}
+
 const MAX_TITLE_URL = 500;
 
 /** Hover text for an OSC 8 hyperlink: its real address, then how to open it. */

@@ -1122,12 +1122,21 @@ describe("TerminalPane OSC 8 hyperlinks", () => {
     expect(document.activeElement).toBe(term.input);
   });
 
+  it("names the real host outside the scrolling address", async () => {
+    const { view, click } = await hyperlink("https://github.com/acme/app/pull/7");
+    await click(`https://github.com:${"x".repeat(2000)}@evil.example/oauth`);
+    const host = view.getByText("evil.example");
+    expect(host.closest(".overflow-y-auto")).toBeNull();
+    expect(host.parentElement?.textContent).toBe("Opens evil.example");
+  });
+
   it("keeps a long address inside a scrollable box", async () => {
     const { view, click } = await hyperlink("docs");
     await click(`https://example.com/${"a".repeat(5000)}`);
     const address = view.getByText(/^https:\/\/example\.com\/a+$/);
     expect(address.className).toContain("max-h-32");
     expect(address.className).toContain("overflow-y-auto");
+    expect(address.getAttribute("tabindex")).toBe("0");
     expect(view.getByRole("button", { name: "Open link" })).toBeTruthy();
   });
 
