@@ -18,6 +18,8 @@ const MAX_SOCKET_PATH_BYTES: usize = 103;
 pub(super) const DISCOVERY_TIMEOUT: Duration = Duration::from_secs(6);
 const MAX_DISCOVERY_OUTPUT: u64 = 16 * 1024;
 const PATH_MARKER: &str = "codemux:pty-path:v1 ";
+const SOCKET_ROOT_UNAVAILABLE: &str =
+    "The device has no usable private workspace socket directory. Check its SSH home, runtime, and temporary directories.";
 const LOCAL_SOCKET_FILE: &str = "pty.sock";
 
 #[derive(Clone, Copy)]
@@ -166,10 +168,13 @@ daemon_alive() {
     case "$pid" in ''|0|*[!0-9]*) return 1 ;; esac
     kill -0 "$pid" 2>/dev/null
 }
+usable_socket_lock_path() {
+    [ ! -L "$1" ] && { [ ! -e "$1" ] || { [ -f "$1" ] && [ -O "$1" ] && [ -w "$1" ]; }; }
+}
 lock_socket_path() {
     # This file lives in an already verified private directory and is never
     # unlinked. The kernel releases its lock when the last descriptor closes.
-    [ ! -L "$1" ] && { [ ! -e "$1" ] || { [ -f "$1" ] && [ -O "$1" ]; }; } || return 1
+    usable_socket_lock_path "$1" || return 1
     exec 9>>"$1" || return 1
     if command -v flock >/dev/null 2>&1; then
         flock -x -w 3 9
@@ -202,42 +207,45 @@ HOME_ROOT=$(absolute_dir "$HOME" 2>/dev/null) || HOME_ROOT=
 RUNTIME=$(absolute_dir "${XDG_RUNTIME_DIR:-}" 2>/dev/null) || RUNTIME=
 TMP_ROOT=$(absolute_dir "$TMP_ROOT" 2>/dev/null) || TMP_ROOT=
 if ! trusted_directory "$TMP_ROOT"; then TMP_ROOT=; fi
-STATE=
-if [ -n "$HOME_ROOT" ] && [ -O "$HOME_ROOT" ] && trusted_directory "$HOME_ROOT"; then
-    STATE="$HOME_ROOT/.cmux-tunnels"
-    if [ "$PROBE_ONLY" = 0 ]; then
+report_socket() {
+    printf 'codemux:pty-path:v1 %s\n' "$1"
+}
+unusable_root() {
+    report_socket unavailable
+    exit 0
+}
+state_candidate() {
+    STATE="$1/.cmux-tunnels"
+    if [ ! -e "$STATE" ] && [ ! -L "$STATE" ] && [ -w "$1" ]; then
+        # In probe mode verify the parent without creating its cold state.
+        [ "$PROBE_ONLY" = 0 ] || return 0
         mkdir -m 700 "$STATE" 2>/dev/null || :
     fi
-    # A missing state directory in a writable home is the place normal
-    # discovery will initialize, rather than an old runtime fallback.
-    if ! private_directory "$STATE"; then
-        if [ "$PROBE_ONLY" = 0 ] || [ -e "$STATE" ] || [ -L "$STATE" ] || [ ! -w "$HOME_ROOT" ]; then
-            STATE=
-        fi
+    private_directory "$STATE" && [ -w "$STATE" ]
+}
+select_state() {
+    if [ -n "$HOME_ROOT" ] && [ -O "$HOME_ROOT" ] && trusted_directory "$HOME_ROOT" &&
+        state_candidate "$HOME_ROOT"; then
+        return 0
     fi
-fi
-if [ -z "$STATE" ] && [ -n "$RUNTIME" ] && private_directory "$RUNTIME"; then
-    STATE="$RUNTIME/.cmux-tunnels"
-    if [ "$PROBE_ONLY" = 0 ]; then
-        mkdir -m 700 "$STATE" 2>/dev/null || :
-    fi
-fi
-
+    [ -n "$RUNTIME" ] && private_directory "$RUNTIME" && state_candidate "$RUNTIME"
+}
 socket_fits() {
     case "$1/$KEY.sock" in /*[!A-Za-z0-9_./-]*) return 1;; /*) ;; *) return 1;; esac
     [ "${#1}" -le "$((103 - ${#KEY} - 6))" ]
 }
+select_state || unusable_root
+MARKER="$STATE/$KEY.root"
+LOCK="$STATE/$KEY.lock.fd"
 ROOT=
-if [ -n "$STATE" ] && private_directory "$STATE"; then
-    MARKER="$STATE/$KEY.root"
-    if [ "$PROBE_ONLY" = 0 ]; then
-        lock_socket_path "$STATE/$KEY.lock.fd" || exit 1
-    fi
-    if [ -f "$MARKER" ] && [ ! -L "$MARKER" ]; then
-        ROOT=$(cat "$MARKER") || ROOT=
-    fi
-elif [ "$PROBE_ONLY" = 0 ]; then
-    exit 1
+if [ "$PROBE_ONLY" = 1 ]; then
+    usable_socket_lock_path "$LOCK" || unusable_root
+    command -v flock >/dev/null 2>&1 || command -v perl >/dev/null 2>&1 || unusable_root
+else
+    lock_socket_path "$LOCK" || exit 1
+fi
+if [ -f "$MARKER" ] && [ ! -L "$MARKER" ]; then
+    ROOT=$(cat "$MARKER") || ROOT=
 fi
 # An active legacy listener must be renamed on the same filesystem.
 OLD=
@@ -248,49 +256,52 @@ if [ -n "$TMP_ROOT" ]; then
         if ! daemon_alive "$OLD"; then OLD=; fi
     fi
 fi
-# Match normal reuse and migration decisions, without moving a legacy
-# listener, allocating a path, or creating a lock during a rejected push.
-if [ "$PROBE_ONLY" = 1 ]; then
-    SOCKET=absent
-    if [ -n "$ROOT" ] && private_directory "$ROOT" && socket_fits "$ROOT"; then
-        if daemon_alive "$ROOT/$KEY.sock"; then
-            SOCKET="$ROOT/$KEY.sock"
-        else
-            case "$ROOT" in "$TMP_ROOT"/cmux.*) SOCKET=${OLD:-absent};; esac
-        fi
-    elif [ -n "$OLD" ]; then
-        SOCKET="$OLD"
-    fi
-    printf 'codemux:pty-path:v1 %s\n' "$SOCKET"
-    exit 0
-fi
-if [ -z "$ROOT" ] || ! private_directory "$ROOT" || ! socket_fits "$ROOT"; then
+if [ -z "$ROOT" ] || ! private_directory "$ROOT" || [ ! -w "$ROOT" ] || ! socket_fits "$ROOT"; then
     if [ -n "$OLD" ] || ! socket_fits "$STATE"; then
-        [ -n "$TMP_ROOT" ] || exit 1
+        [ -n "$TMP_ROOT" ] && [ -w "$TMP_ROOT" ] &&
+            socket_fits "$TMP_ROOT/cmux.XXXXXXXX" || unusable_root
+        if [ "$PROBE_ONLY" = 1 ]; then
+            report_socket "${OLD:-absent}"
+            exit 0
+        fi
         ROOT=$(mktemp -d "$TMP_ROOT/cmux.XXXXXXXX") || exit 1
     else
         # A detached daemon may outlast an SSH login session.
         ROOT=$STATE
     fi
-    private_directory "$ROOT" && socket_fits "$ROOT" || exit 1
-    # Recording the root before renaming lets the next attempt recover if
-    # interrupted. With a live legacy socket, every attempt retries migration
-    # before reporting readiness.
-    NEXT=$(mktemp "$STATE/.root.XXXXXXXX") || exit 1
-    printf '%s\n' "$ROOT" > "$NEXT" && mv -f "$NEXT" "$MARKER" || exit 1
+    if [ "$PROBE_ONLY" = 0 ]; then
+        private_directory "$ROOT" && socket_fits "$ROOT" || exit 1
+        # Recording the root before renaming lets the next attempt recover if
+        # interrupted. With a live legacy socket, discovery retries migration.
+        NEXT=$(mktemp "$STATE/.root.XXXXXXXX") || exit 1
+        printf '%s\n' "$ROOT" > "$NEXT" && mv -f "$NEXT" "$MARKER" || exit 1
+    fi
 fi
 SOCKET="$ROOT/$KEY.sock"
+usable_socket_lock_path "$SOCKET.start.fd" || unusable_root
 case "$ROOT" in
     "$TMP_ROOT"/cmux.*)
         if [ -n "$OLD" ] && ! daemon_alive "$SOCKET"; then
             [ ! -e "$SOCKET" ] && [ ! -L "$SOCKET" ] || exit 1
             [ ! -d "$SOCKET.pid" ] && [ ! -L "$SOCKET.pid" ] || exit 1
+            if [ "$PROBE_ONLY" = 1 ]; then
+                report_socket "$OLD"
+                exit 0
+            fi
             cp "$OLD.pid" "$SOCKET.pid" && mv "$OLD" "$SOCKET" || exit 1
         fi
         ;;
 esac
+if [ "$PROBE_ONLY" = 1 ]; then
+    if daemon_alive "$SOCKET"; then
+        report_socket "$SOCKET"
+    else
+        report_socket absent
+    fi
+    exit 0
+fi
 unlock_socket_path || exit 1
-printf 'codemux:pty-path:v1 %s\n' "$SOCKET"
+report_socket "$SOCKET"
 "#,
     );
     format!("exec sh -c {}", sh_quote(&script))
@@ -310,6 +321,9 @@ fn parse_discovered_socket(
         .ok_or("SSH did not report a private socket path")?;
     if paths.next().is_some() {
         return Err("SSH reported ambiguous socket paths".into());
+    }
+    if path == "unavailable" {
+        return Err(SOCKET_ROOT_UNAVAILABLE.into());
     }
     let probing = matches!(discovery, SocketDiscovery::Probe);
     if probing && path == "absent" {
@@ -490,6 +504,58 @@ mod tests {
         assert!(first.starts_with(tmp.path().canonicalize().unwrap()));
         assert!(is_private_directory(first.parent().unwrap()));
         assert!(forward_socket_path(&first));
+    }
+
+    #[test]
+    fn cold_probe_rejects_unusable_state_or_uses_the_same_runtime_fallback_as_prepare() {
+        let home = private_temp();
+        let runtime = private_temp();
+        let tmp = private_temp();
+        let home_state = home.path().join(".cmux-tunnels");
+        let runtime_state = runtime.path().join(".cmux-tunnels");
+        fs::DirBuilder::new().create(&home_state).unwrap();
+        fs::set_permissions(&home_state, fs::Permissions::from_mode(0o755)).unwrap();
+
+        for discovery in [SocketDiscovery::Probe, SocketDiscovery::Prepare] {
+            let error = run_socket_search(home.path(), None, tmp.path(), discovery).unwrap_err();
+            assert_eq!(error, SOCKET_ROOT_UNAVAILABLE);
+        }
+        assert_eq!(
+            run_socket_search(home.path(), Some(runtime.path()), tmp.path(), SocketDiscovery::Probe)
+                .unwrap(),
+            None,
+        );
+        assert!(!runtime_state.exists(), "a cold probe must not create state");
+        let socket = run_discovery(home.path(), Some(runtime.path()), tmp.path()).unwrap();
+        assert_eq!(socket.parent(), Some(runtime_state.canonicalize().unwrap().as_path()));
+        assert_eq!(fs::metadata(home_state).unwrap().mode() & 0o777, 0o755);
+
+        fs::set_permissions(&runtime_state, fs::Permissions::from_mode(0o755)).unwrap();
+        for discovery in [SocketDiscovery::Probe, SocketDiscovery::Prepare] {
+            let error = run_socket_search(
+                home.path(), Some(runtime.path()), tmp.path(), discovery,
+            ).unwrap_err();
+            assert_eq!(error, SOCKET_ROOT_UNAVAILABLE);
+        }
+    }
+
+    #[test]
+    fn cold_probe_requires_a_short_usable_root_for_long_state_paths() {
+        let fixture = private_temp();
+        let long_home = fixture.path().join("h".repeat(100));
+        let long_tmp = fixture.path().join("t".repeat(100));
+        fs::create_dir(&long_home).unwrap();
+        fs::create_dir(&long_tmp).unwrap();
+        assert_eq!(
+            run_socket_search(&long_home, None, &long_tmp, SocketDiscovery::Probe).unwrap_err(),
+            SOCKET_ROOT_UNAVAILABLE,
+        );
+        assert!(!long_home.join(".cmux-tunnels").exists());
+        assert_eq!(
+            run_discovery(&long_home, None, &long_tmp).unwrap_err(),
+            SOCKET_ROOT_UNAVAILABLE,
+        );
+        assert_eq!(fs::read_dir(long_tmp).unwrap().count(), 0);
     }
 
     #[test]

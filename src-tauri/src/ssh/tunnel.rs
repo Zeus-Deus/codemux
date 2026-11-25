@@ -187,6 +187,12 @@ fn build_forward_argv(
 ) -> Vec<String> {
     let mut args: Vec<_> = verified_ssh_args().into_iter().map(String::from).collect();
     args.extend([
+        // Keep SSH under our supervisor. For daemon probes, the remote
+        // command also uses EOF on the caller's pipe as its cleanup signal.
+        "-o".into(),
+        "ForkAfterAuthentication=no".into(),
+        "-o".into(),
+        "StdinNull=no".into(),
         "-o".into(),
         "ServerAliveInterval=30".into(),
         "-o".into(),
@@ -531,6 +537,21 @@ mod tests {
                 argv.iter().any(|a| a == must_have),
                 "missing required flag: {must_have} (argv={argv:?})"
             );
+        }
+    }
+
+    #[test]
+    fn daemon_probe_argv_preserves_the_supervised_stdin_pipe() {
+        let (_, opts) = options();
+        let argv = build_forward_argv(
+            opts.ssh_target,
+            opts.remote_socket,
+            opts.local_socket,
+            build_existing_daemon_command(opts.remote_socket),
+        );
+        let flags = &argv[..argv.iter().position(|arg| arg == "--").unwrap()];
+        for setting in ["ForkAfterAuthentication=no", "StdinNull=no"] {
+            assert!(flags.windows(2).any(|pair| pair == ["-o", setting]));
         }
     }
 

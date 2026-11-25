@@ -14310,6 +14310,92 @@ exit 255
         assert!(!local_target.exists());
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn push_without_a_private_device_socket_root_leaves_the_local_chat_running() {
+        use std::os::unix::fs::PermissionsExt;
+
+        const TEST: &str =
+            "commands::agent_chat::tests::push_without_a_private_device_socket_root_leaves_the_local_chat_running";
+        if crate::test_isolation::isolated(TEST) {
+            return;
+        }
+        let root = crate::test_isolation::isolated_root().unwrap();
+        let remote_home = root.join("device-home");
+        let state_dir = remote_home.join(".cmux-tunnels");
+        std::fs::create_dir_all(&state_dir).unwrap();
+        std::fs::set_permissions(&state_dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let remote_bin = remote_home.join(".local/bin");
+        std::fs::create_dir_all(&remote_bin).unwrap();
+        let helper = remote_bin.join("codemux-remote");
+        let version = json!({
+            "version": env!("CARGO_PKG_VERSION"),
+            "protocol_version": crate::pty_daemon::PROTOCOL_VERSION,
+            "guarded_shells": true,
+            "prepared_spawn": true,
+        });
+        std::fs::write(&helper, format!("#!/bin/sh\nprintf '%s\\n' '{version}'\n")).unwrap();
+        std::fs::set_permissions(&helper, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+        let ssh = root.join("ssh");
+        std::fs::write(
+            &ssh,
+            r#"#!/bin/sh
+strict=no
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+        StrictHostKeyChecking=yes) strict=yes;;
+        --) shift; break;;
+    esac
+    shift
+done
+[ "$strict" = yes ] && [ "$#" -eq 2 ] && [ "$1" = deus@ai-node ] || exit 255
+case "$2" in
+    *CMX_PUSH_HELPER*) step=helper;;
+    *PROBE_ONLY=1*) step=discovery;;
+    *) printf 'unexpected\n' >> "$CODEMUX_TEST_PUSH_LOG"; exit 1;;
+esac
+printf '%s\n' "$step" >> "$CODEMUX_TEST_PUSH_LOG"
+HOME="$CODEMUX_TEST_PUSH_REMOTE_HOME" XDG_RUNTIME_DIR= exec /bin/sh -c "$2"
+"#,
+        )
+        .unwrap();
+        std::fs::set_permissions(ssh, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let path = std::env::var_os("PATH").unwrap_or_default();
+        let path = std::env::join_paths(
+            std::iter::once(root.clone()).chain(std::env::split_paths(&path)),
+        )
+        .unwrap();
+        let log = root.join("push-log");
+        std::env::set_var("PATH", path);
+        std::env::set_var("CODEMUX_TEST_PUSH_LOG", &log);
+        std::env::set_var("CODEMUX_TEST_PUSH_REMOTE_HOME", remote_home);
+
+        let thread = ThreadId("unusable-device-socket-root".into());
+        let provider = Arc::new(PlacementProvider::default());
+        let (app, workspace_id) = placement_app(&thread.0, None, provider.clone()).await;
+        let db = app.state::<DatabaseStore>();
+        let host_id = db.list_hosts()[0].id;
+        let state = app.state::<AppStateStore>();
+        let checkout = root.join("checkout");
+        std::fs::create_dir(&checkout).unwrap();
+        state.set_workspace_worktree(&workspace_id, checkout.display().to_string(), "Test".into());
+        provider.live.lock().unwrap().insert(thread.0.clone());
+        record_session_host(&thread.0, None);
+
+        let error = super::super::hosts::workspace_push_to_host(
+            app.handle().clone(), db, workspace_id.clone(), host_id,
+        )
+        .await
+        .unwrap_err();
+        assert!(error.contains("no usable private workspace socket directory"), "{error}");
+        assert_eq!(state.find_workspace(&workspace_id).unwrap().host_id, None);
+        assert!(provider.stopped.lock().unwrap().is_empty());
+        assert!(provider.has_session(&thread).await);
+        assert_eq!(std::fs::read_to_string(log).unwrap(), "helper\ndiscovery\n");
+        assert_eq!(std::fs::read_dir(state_dir).unwrap().count(), 0);
+    }
+
     /// A failed move leaves the workspace where it was, and a send waiting
     /// on it starts the chat there.
     #[tokio::test]
