@@ -225,6 +225,12 @@ async fn verify_bearer(token: &str) -> Result<(AuthUser, String), LoginError> {
         .await
         .map_err(|e| LoginError::Network(e.to_string()))?;
 
+    if resp.status().is_redirection() {
+        return Err(LoginError::Config(
+            "The token verification endpoint redirected. Check CODEMUX_API_URL or your proxy configuration."
+                .into(),
+        ));
+    }
     if !resp.status().is_success() {
         return Err(LoginError::Token);
     }
@@ -936,6 +942,41 @@ mod tests {
         // No half-written session.
         assert!(load_token(&db).is_none());
         assert!(load_stored_auth_method(&db).is_none());
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(mockserver)]
+    async fn a_redirected_token_endpoint_reports_configuration_not_token_rejection() {
+        let mut destination = mockito::Server::new_async().await;
+        let forwarded = destination
+            .mock("GET", "/api/auth/desktop/verify")
+            .expect(0)
+            .create_async()
+            .await;
+        let mut server = mockito::Server::new_async().await;
+        let redirect = server
+            .mock("GET", "/api/auth/desktop/verify")
+            .with_status(302)
+            .with_header(
+                "location",
+                &format!("{}/api/auth/desktop/verify", destination.url()),
+            )
+            .create_async()
+            .await;
+        let _guard = ApiUrlGuard::set(&server.url());
+
+        let db = test_db();
+        let err = sign_in_with_token(&db, "sess_private")
+            .await
+            .expect_err("the token endpoint must not redirect");
+        assert!(matches!(err, LoginError::Config(_)), "got {err:?}");
+        let message = err.user_message();
+        assert!(message.contains("CODEMUX_API_URL"), "{message}");
+        assert!(!message.contains("sess_private"), "{message}");
+        assert!(!message.contains("not accepted"), "{message}");
+        assert!(load_token(&db).is_none());
+        redirect.assert_async().await;
+        forwarded.assert_async().await;
     }
 
     #[tokio::test]
