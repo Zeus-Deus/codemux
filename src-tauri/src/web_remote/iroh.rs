@@ -242,11 +242,11 @@ fn message_to_frame(msg: &Message) -> MessageFrame<'_> {
 /// re-encoding each through the codec. The single owner of `send` — every
 /// producer (invoke responses, channel router, event hub, the registry's Close)
 /// feeds `out_rx`, exactly as the WS writer task works.
-async fn writer_loop(mut send: SendStream, mut out_rx: OutboundRx) {
+async fn writer_loop(mut send: SendStream, mut out_rx: OutboundRx, db: &DatabaseStore) {
     while let Some(msg) = out_rx.recv().await {
         match message_to_frame(&msg) {
             MessageFrame::Wire(kind, payload) => {
-                if write_frame(&mut send, kind, payload).await.is_err() {
+                if !out_rx.can_forward(db) || write_frame(&mut send, kind, payload).await.is_err() {
                     break;
                 }
             }
@@ -876,20 +876,34 @@ async fn handle_bi_stream<R: Runtime>(
     // 2. Register in the SHARED registry the WS transport + revocation use, so
     //    close_session / close_all sever this iroh session too.
     let (close_tx, mut close_rx) = watch::channel(false);
-    let (out_tx, out_rx) = super::server::outbound_channel(close_tx.clone());
+    let db = app.state::<DatabaseStore>();
+    let Some(account) = auth::AccountSessionGuard::new(&db, &session_id) else {
+        return;
+    };
+    let (out_tx, out_rx) =
+        super::server::outbound_channel(close_tx.clone(), account.account_session_id());
     let conn_id = shared
         .connections
         .register(&session_id, crate::web_remote::server::Transport::Relay, out_tx.clone(), close_tx.clone());
-    let db = app.state::<DatabaseStore>();
-    let Some(account) = auth::AccountSessionGuard::new(&db, &session_id) else {
+
+    // 3. Acknowledge only while the newly registered connection is authorized.
+    if !auth::session_status(&db, &session_id).is_approved()
+        || out_tx.is_closed()
+        || write_frame(&mut send, KIND_TEXT, &welcome_frame_bytes(&session_id))
+            .await
+            .is_err()
+    {
         shared.connections.unregister(conn_id);
         return;
-    };
+    }
     super::emit_state_changed(&app);
-
-    // 3. Acknowledge, then hand the send half to the writer task.
-    let _ = write_frame(&mut send, KIND_TEXT, &welcome_frame_bytes(&session_id)).await;
-    let writer = tauri::async_runtime::spawn(writer_loop(send, out_rx));
+    let writer = {
+        let app = app.clone();
+        tauri::async_runtime::spawn(async move {
+            let db = app.state::<DatabaseStore>();
+            writer_loop(send, out_rx, &db).await;
+        })
+    };
 
     // 4. Ordered dispatch lane (terminal input keeps client-send order), exactly
     //    as the WS reader does — `handle_text_frame` decides what routes here.
@@ -901,6 +915,9 @@ async fn handle_bi_stream<R: Runtime>(
         tauri::async_runtime::spawn(async move {
             while let Some((id, cmd, args)) = ordered_rx.recv().await {
                 super::dispatch::dispatch_invoke(&app, &router, conn_id, &out, id, cmd, args).await;
+                if out.is_closed() {
+                    break;
+                }
             }
         })
     };
@@ -939,11 +956,11 @@ async fn handle_bi_stream<R: Runtime>(
 
     // 6. Teardown — channels + event subscriptions die with the stream, same as
     //    the WS lifecycle.
+    close_tx.send_replace(true);
     shared.connections.unregister(conn_id);
     shared.channels.remove_conn(conn_id);
     shared.events.remove_conn(&app, conn_id);
     ordered_task.abort();
-    let _ = close_tx.send(true);
     drop(out_tx);
     writer.abort();
     super::emit_state_changed(&app);
@@ -1629,13 +1646,15 @@ mod tests {
         };
 
         let (close_tx, mut close_rx) = watch::channel(false);
-        let (out_tx, out_rx) = crate::web_remote::server::outbound_channel(close_tx.clone());
+        let account = auth::AccountSessionGuard::new(&db, &session_id).unwrap();
+        let (out_tx, out_rx) =
+            crate::web_remote::server::outbound_channel(close_tx.clone(), account.account_session_id());
         let conn_id = shared
             .connections
             .register(&session_id, crate::web_remote::server::Transport::Relay, out_tx.clone(), close_tx.clone());
 
         let _ = write_frame(&mut send, KIND_TEXT, &welcome_frame_bytes(&session_id)).await;
-        let writer = tokio::spawn(writer_loop(send, out_rx));
+        let writer = tokio::spawn(async move { writer_loop(send, out_rx, &db).await });
 
         loop {
             tokio::select! {

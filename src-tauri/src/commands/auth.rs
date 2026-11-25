@@ -340,9 +340,10 @@ pub async fn refresh_session<R: tauri::Runtime>(
 #[tauri::command]
 pub async fn start_oauth_flow<R: tauri::Runtime>(
     app: tauri::AppHandle<R>,
+    db: State<'_, DatabaseStore>,
     auth_state: State<'_, AuthState>,
 ) -> Result<(), String> {
-    let csrf_state = auth_state.generate_csrf_state();
+    let csrf_state = auth_state.generate_csrf_state(&db)?;
 
     // The callback server reads the managed AuthState through the AppHandle.
     // Keeping CSRF and session-generation state in that one instance makes an

@@ -313,9 +313,13 @@ impl<'a> AccountSessionGuard<'a> {
         Some(Self { db, session_id, account_session: session.source == "account" })
     }
 
+    pub(super) fn account_session_id(&self) -> Option<&str> {
+        self.account_session.then_some(self.session_id)
+    }
+
     pub(super) fn active(&self) -> bool {
         !self.account_session
-            || active_session(self.db, self.session_id).is_some_and(|session| session.approved)
+            || session_status(self.db, self.session_id).is_approved()
     }
 
     pub(super) async fn expired(&self) {
@@ -332,6 +336,26 @@ impl<'a> AccountSessionGuard<'a> {
             }
         }
     }
+}
+
+#[cfg(test)]
+pub(super) fn seed_account_browser(db: &DatabaseStore, session_id: &str, token: &str) {
+    let owner = crate::auth::AuthUser {
+        id: "fixture-owner".into(),
+        email: "owner@example.test".into(),
+        name: None,
+        image: None,
+    };
+    crate::auth::save_auth(db, "fixture-token", "2099-01-01T00:00:00Z", Some(&owner)).unwrap();
+    db.web_remote_insert_account_session(
+        session_id,
+        None,
+        None,
+        &sha256_hex(token),
+        true,
+        &owner.id,
+    )
+    .unwrap();
 }
 
 // ── Origin checks ───────────────────────────────────────────────────

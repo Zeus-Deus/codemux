@@ -267,7 +267,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Mutex;
 
-const SCHEMA_VERSION: u32 = 24;
+const SCHEMA_VERSION: u32 = 25;
 
 pub struct DatabaseStore {
     conn: Mutex<Connection>,
@@ -697,6 +697,13 @@ fn create_schema(conn: &Connection) -> Result<(), String> {
             encrypted_data BLOB NOT NULL,
             updated_at TEXT NOT NULL DEFAULT (datetime('now'))
         );
+
+        CREATE TABLE IF NOT EXISTS auth_session_revision (
+            id INTEGER PRIMARY KEY CHECK (id = 1),
+            revision INTEGER NOT NULL CHECK (typeof(revision) = 'integer' AND revision >= 0)
+        );
+
+        INSERT OR IGNORE INTO auth_session_revision (id, revision) VALUES (1, 0);
 
         CREATE TABLE IF NOT EXISTS agent_chat_sessions (
             thread_id TEXT PRIMARY KEY,
@@ -5987,17 +5994,8 @@ impl DatabaseStore {
 
 impl DatabaseStore {
     pub fn save_auth_token(&self, encrypted_data: &[u8]) -> Result<(), String> {
-        let conn = self.conn.lock().unwrap();
-        Self::write_auth_token(&conn, encrypted_data)
-    }
-
-    fn write_auth_token(conn: &Connection, encrypted_data: &[u8]) -> Result<(), String> {
-        conn.execute(
-            "INSERT OR REPLACE INTO auth_tokens (id, encrypted_data, updated_at) VALUES (1, ?1, datetime('now'))",
-            params![encrypted_data],
-        )
-        .map_err(|e| format!("Failed to save auth token: {e}"))?;
-        Ok(())
+        self.replace_auth_token(encrypted_data, None, None)
+            .map(|_| ())
     }
 
     /// Save the verified owner and revoke another account's browser access
@@ -6007,11 +6005,76 @@ impl DatabaseStore {
         encrypted_data: &[u8],
         account_id: &str,
     ) -> Result<(), String> {
+        self.replace_auth_token(encrypted_data, Some(account_id), None)
+            .map(|_| ())
+    }
+
+    pub(crate) fn auth_session_revision(&self) -> Result<i64, String> {
+        self.conn
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT revision FROM auth_session_revision WHERE id = 1",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(|error| format!("Failed to load auth session revision: {error}"))
+    }
+
+    pub(crate) fn save_oauth_token_if_revision(
+        &self,
+        encrypted_data: &[u8],
+        expected_revision: i64,
+    ) -> Result<bool, String> {
+        self.replace_auth_token(encrypted_data, None, Some(expected_revision))
+    }
+
+    fn replace_auth_token(
+        &self,
+        encrypted_data: &[u8],
+        account_id: Option<&str>,
+        expected_revision: Option<i64>,
+    ) -> Result<bool, String> {
         let mut conn = self.conn.lock().unwrap();
         let transaction = conn.transaction().map_err(|error| error.to_string())?;
-        Self::revoke_account_sessions(&transaction, Some(account_id))?;
+        if !Self::advance_auth_revision(&transaction, expected_revision)? {
+            return Ok(false);
+        }
+        if let Some(account_id) = account_id {
+            Self::revoke_account_sessions(&transaction, Some(account_id))?;
+        }
         Self::write_auth_token(&transaction, encrypted_data)?;
-        transaction.commit().map_err(|error| error.to_string())
+        transaction.commit().map_err(|error| error.to_string())?;
+        Ok(true)
+    }
+
+    // The single row survives sign-out, including a sign-out performed while
+    // there is no token to delete. The first write obtains SQLite's writer
+    // lock before comparing the revision against a pending OAuth launch.
+    fn advance_auth_revision(
+        conn: &Connection,
+        expected_revision: Option<i64>,
+    ) -> Result<bool, String> {
+        let updated = conn
+            .execute(
+                "UPDATE auth_session_revision SET revision = revision + 1
+             WHERE id = 1 AND (?1 IS NULL OR revision = ?1)",
+                params![expected_revision],
+            )
+            .map_err(|error| format!("Failed to advance auth session revision: {error}"))?;
+        if updated == 0 && expected_revision.is_none() {
+            return Err("Auth session revision is missing".into());
+        }
+        Ok(updated == 1)
+    }
+
+    fn write_auth_token(conn: &Connection, encrypted_data: &[u8]) -> Result<(), String> {
+        conn.execute(
+            "INSERT OR REPLACE INTO auth_tokens (id, encrypted_data, updated_at) VALUES (1, ?1, datetime('now'))",
+            params![encrypted_data],
+        )
+        .map_err(|e| format!("Failed to save auth token: {e}"))?;
+        Ok(())
     }
 
     /// Persist a verification or metadata update only for the auth record
@@ -6102,6 +6165,7 @@ impl DatabaseStore {
     }
 
     fn erase_auth_record(conn: &Connection) -> Result<(), String> {
+        Self::advance_auth_revision(conn, None)?;
         Self::revoke_account_sessions(conn, None)?;
         conn.execute("DELETE FROM auth_tokens WHERE id = 1", [])
             .map_err(|error| format!("Failed to clear auth token: {error}"))?;
@@ -6386,6 +6450,7 @@ mod tests {
     fn failed_account_revocation_leaves_auth_and_sessions_intact() {
         let db = init_test_database();
         db.save_auth_token(b"sign-in fixture").unwrap();
+        let revision = db.auth_session_revision().unwrap();
         db.web_remote_insert_account_session("account", None, None, "account-hash", true, "owner")
             .unwrap();
         db.web_remote_insert_session("pair", None, None, "pair-hash", true).unwrap();
@@ -6396,6 +6461,7 @@ mod tests {
         ).unwrap();
 
         assert!(db.clear_auth_token().unwrap_err().contains("fixture rejected revocation"));
+        assert_eq!(db.auth_session_revision().unwrap(), revision);
         assert_eq!(db.load_auth_token().as_deref(), Some(b"sign-in fixture".as_slice()));
         assert!(!db.web_remote_get_session("account").unwrap().revoked);
 
@@ -6404,6 +6470,43 @@ mod tests {
         assert!(db.load_auth_token().is_none());
         assert!(db.web_remote_get_session("account").unwrap().revoked);
         assert!(!db.web_remote_get_session("pair").unwrap().revoked);
+    }
+
+    #[test]
+    fn auth_revision_migration_preserves_existing_auth_and_survives_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("auth.sqlite");
+        {
+            let legacy = Connection::open(&path).unwrap();
+            legacy
+                .execute_batch(
+                    "CREATE TABLE auth_tokens (
+                    id INTEGER PRIMARY KEY CHECK (id = 1),
+                    encrypted_data BLOB NOT NULL,
+                    updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+                );",
+                )
+                .unwrap();
+            DatabaseStore::write_auth_token(&legacy, b"legacy-token").unwrap();
+        }
+
+        let desktop = DatabaseStore::test_file(&path);
+        let initial = desktop.auth_session_revision().unwrap();
+        assert_eq!(
+            desktop.load_auth_token().as_deref(),
+            Some(b"legacy-token".as_slice())
+        );
+        desktop.clear_auth_token().unwrap();
+        assert_eq!(desktop.auth_session_revision().unwrap(), initial + 1);
+        drop(desktop);
+
+        let reopened = DatabaseStore::test_file(&path);
+        assert_eq!(reopened.auth_session_revision().unwrap(), initial + 1);
+        assert!(reopened.load_auth_token().is_none());
+        assert!(!reopened
+            .save_oauth_token_if_revision(b"stale-token", initial)
+            .unwrap());
+        assert!(reopened.load_auth_token().is_none());
     }
 
     #[test]

@@ -108,6 +108,22 @@ pub(crate) struct AuthRecord {
 }
 
 impl AuthRecord {
+    fn new(
+        token: &str,
+        expires_at: &str,
+        user: Option<&AuthUser>,
+        method: Option<&str>,
+    ) -> Result<Self, String> {
+        let stored = StoredAuth {
+            token: token.to_string(),
+            expires_at: expires_at.to_string(),
+            user: user.cloned(),
+            auth_method: method.map(str::to_owned),
+        };
+        let encrypted = encode_record(&stored)?;
+        Ok(Self { encrypted, stored })
+    }
+
     pub(crate) fn is_current(&self, db: &DatabaseStore) -> bool {
         db.load_auth_token().as_deref() == Some(self.encrypted.as_slice())
     }
@@ -131,9 +147,14 @@ impl AuthRecord {
 
 // ── Auth State (managed by Tauri) ────────────────────────────────
 
+struct OAuthLaunch {
+    generation: u64,
+    revision: i64,
+}
+
 pub struct AuthState {
     /// CSRF state tokens keyed to their creation time and launching session
-    /// generation. Uses `SystemTime`
+    /// version. Uses `SystemTime`
     /// rather than `Instant` because on Windows `Instant` is backed by
     /// `QueryPerformanceCounter`, and `Instant::now() - Duration::from_secs(600)`
     /// panics with "overflow when subtracting duration from instant" during
@@ -144,7 +165,7 @@ pub struct AuthState {
     /// `SystemTime` is not monotonic, so NTP adjustments or manual clock
     /// changes could briefly skew CSRF token validity — acceptable for a
     /// 10-minute OAuth state token.
-    pub(crate) csrf_states: Mutex<HashMap<String, (SystemTime, u64)>>,
+    csrf_states: Mutex<HashMap<String, (SystemTime, OAuthLaunch)>>,
     callback_port: Mutex<Option<u16>>,
     /// Tracks which signin path produced the current session —
     /// `"email"` after email/password, `"github"` after OAuth, or
@@ -172,7 +193,7 @@ impl Default for AuthState {
 
 impl AuthState {
     /// Generate a CSRF state token and store it with a timestamp.
-    pub fn generate_csrf_state(&self) -> String {
+    pub fn generate_csrf_state(&self, db: &DatabaseStore) -> Result<String, String> {
         let mut bytes = [0u8; 32];
         rand::thread_rng().fill_bytes(&mut bytes);
         let state = base64_url_encode(&bytes);
@@ -181,14 +202,18 @@ impl AuthState {
         // generation guard until the CSRF record is installed closes the gap
         // where sign-out could otherwise happen between those two actions.
         let generation = self.session_generation.lock().unwrap();
+        let launch = OAuthLaunch {
+            generation: *generation,
+            revision: db.auth_session_revision()?,
+        };
         let mut states = self.csrf_states.lock().unwrap();
         // Clean up expired entries (older than 10 minutes). See the
         // csrf_states field comment for why this uses SystemTime.
         let cutoff = SystemTime::now() - std::time::Duration::from_secs(600);
         states.retain(|_, (created_at, _)| *created_at > cutoff);
-        states.insert(state.clone(), (SystemTime::now(), *generation));
+        states.insert(state.clone(), (SystemTime::now(), launch));
 
-        state
+        Ok(state)
     }
 
     /// Validate and consume a CSRF state token (one-time use).
@@ -196,14 +221,30 @@ impl AuthState {
         self.consume_csrf_state(state).is_some()
     }
 
-    /// Validate and consume an OAuth state token, returning the exact session
-    /// generation that launched the flow. The callback may replace a session
-    /// only if that generation is still current.
-    pub fn consume_csrf_state(&self, state: &str) -> Option<u64> {
+    /// Consume an OAuth state token and recover the version observed at launch.
+    fn consume_csrf_state(&self, state: &str) -> Option<OAuthLaunch> {
         let mut states = self.csrf_states.lock().unwrap();
         let cutoff = SystemTime::now() - std::time::Duration::from_secs(600);
-        let (created_at, generation) = states.remove(state)?;
-        (created_at > cutoff).then_some(generation)
+        let (created_at, launch) = states.remove(state)?;
+        (created_at > cutoff).then_some(launch)
+    }
+
+    fn install_oauth_callback(
+        &self,
+        db: &DatabaseStore,
+        launch: OAuthLaunch,
+        token: &str,
+        expires_at: &str,
+    ) -> Result<Option<(u64, AuthRecord)>, String> {
+        self.replace_session_if_current(launch.generation, || {
+            let record = AuthRecord::new(token, expires_at, None, Some("github"))?;
+            if !db.save_oauth_token_if_revision(&record.encrypted, launch.revision)? {
+                return Ok(None);
+            }
+            // Hide the previous account's settings pending identity verification.
+            self.set_local_session(Some(&record.stored));
+            Ok(Some(record))
+        })
     }
 
     pub fn set_callback_port(&self, port: u16) {
@@ -437,18 +478,12 @@ pub(crate) fn save_auth_with_method(
     user: Option<&AuthUser>,
     method: Option<&str>,
 ) -> Result<AuthRecord, String> {
-    let stored = StoredAuth {
-        token: token.to_string(),
-        expires_at: expires_at.to_string(),
-        user: user.cloned(),
-        auth_method: method.map(str::to_owned),
-    };
-    let encrypted = encode_record(&stored)?;
+    let record = AuthRecord::new(token, expires_at, user, method)?;
     match user {
-        Some(user) => db.save_auth_token_for_account(&encrypted, &user.id)?,
-        None => db.save_auth_token(&encrypted)?,
+        Some(user) => db.save_auth_token_for_account(&record.encrypted, &user.id)?,
+        None => db.save_auth_token(&record.encrypted)?,
     }
-    Ok(AuthRecord { encrypted, stored })
+    Ok(record)
 }
 
 fn encode_record(stored: &StoredAuth) -> Result<Vec<u8>, String> {
@@ -622,9 +657,7 @@ pub fn start_callback_server<R: tauri::Runtime>(
                     if let (Some(token), Some(expires_at), Some(state)) = (token, expires_at, state)
                     {
                         let auth_state_local: tauri::State<'_, AuthState> = handle_clone.state();
-                        let Some(oauth_launch_generation) =
-                            auth_state_local.consume_csrf_state(state)
-                        else {
+                        let Some(launch) = auth_state_local.consume_csrf_state(state) else {
                             let body = r#"{"error":"Invalid or expired auth session"}"#;
                             let resp = format!(
                                 "HTTP/1.1 400 Bad Request\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
@@ -636,22 +669,8 @@ pub fn start_callback_server<R: tauri::Runtime>(
                         };
 
                         let db: tauri::State<'_, DatabaseStore> = handle_clone.state();
-                        let replacement = auth_state_local.replace_session_if_current(
-                            oauth_launch_generation,
-                            || {
-                                let record = save_auth_with_method(
-                                    &db,
-                                    token,
-                                    expires_at,
-                                    None,
-                                    Some("github"),
-                                )?;
-                                // Keep the previous account's settings hidden while
-                                // the callback token awaits identity verification.
-                                auth_state_local.set_local_session(Some(&record.stored));
-                                Ok(Some(record))
-                            },
-                        );
+                        let replacement =
+                            auth_state_local.install_oauth_callback(&db, launch, token, expires_at);
                         let (oauth_generation, record) = match replacement {
                             Ok(Some(replacement)) => replacement,
                             Ok(None) => {
@@ -991,7 +1010,7 @@ mod tests {
     #[test]
     fn csrf_state_generate_and_validate() {
         let state = AuthState::default();
-        let token = state.generate_csrf_state();
+        let token = state.generate_csrf_state(&test_db()).unwrap();
         assert!(!token.is_empty());
         assert!(state.validate_csrf_state(&token));
         assert!(!state.validate_csrf_state(&token));
@@ -1006,16 +1025,74 @@ mod tests {
     #[test]
     fn oauth_state_cannot_replace_a_session_that_changed_after_launch() {
         let state = AuthState::default();
-        let token = state.generate_csrf_state();
+        let token = state.generate_csrf_state(&test_db()).unwrap();
         state.replace_session(|| "explicit-sign-out");
 
-        let launch_generation = state
+        let launch = state
             .consume_csrf_state(&token)
             .expect("the CSRF state itself remains valid");
         assert!(state
-            .replace_session_if_current(launch_generation, || Ok(Some("stale-oauth-callback")))
+            .replace_session_if_current(launch.generation, || Ok(Some("stale-oauth-callback")))
             .unwrap()
             .is_none());
+    }
+
+    #[test]
+    fn pending_oauth_rejects_cross_process_logout_and_replacement() {
+        if crate::test_isolation::isolated(
+            "auth::tests::pending_oauth_rejects_cross_process_logout_and_replacement",
+        ) {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("auth.sqlite");
+        let desktop = DatabaseStore::test_file(&path);
+        let cli = DatabaseStore::test_file(&path);
+        let state = AuthState::default();
+        let expiry = "2099-01-01T00:00:00Z";
+
+        assert!(desktop.load_auth_token().is_none());
+        let csrf = state.generate_csrf_state(&desktop).unwrap();
+        clear_token(&cli).unwrap();
+        let launch = state.consume_csrf_state(&csrf).unwrap();
+        assert!(state
+            .install_oauth_callback(&desktop, launch, "stale", expiry)
+            .unwrap()
+            .is_none());
+        assert!(desktop.load_auth_token().is_none());
+
+        let csrf = state.generate_csrf_state(&desktop).unwrap();
+        let user = AuthUser {
+            id: "different-account".into(),
+            email: "fixture@example.test".into(),
+            name: None,
+            image: None,
+        };
+        let replacement =
+            save_auth_with_method(&cli, "new", expiry, Some(&user), Some("email")).unwrap();
+        let launch = state.consume_csrf_state(&csrf).unwrap();
+        assert!(state
+            .install_oauth_callback(&desktop, launch, "stale", expiry)
+            .unwrap()
+            .is_none());
+        assert!(replacement.is_current(&desktop));
+
+        let csrf = state.generate_csrf_state(&desktop).unwrap();
+        let launch = state.consume_csrf_state(&csrf).unwrap();
+        // In-place verification may update ciphertext while OAuth is pending.
+        let verified = replacement
+            .save_verified_user(&cli, &user)
+            .unwrap()
+            .unwrap();
+        assert!(verified.is_current(&desktop));
+        let (_, saved) = state
+            .install_oauth_callback(&desktop, launch, "fresh", expiry)
+            .unwrap()
+            .unwrap();
+        assert!(saved.is_current(&cli));
+        assert_eq!(saved.stored.token, "fresh");
+        assert_eq!(saved.stored.auth_method.as_deref(), Some("github"));
+        assert!(state.consume_csrf_state(&csrf).is_none());
     }
 
     #[test]
@@ -1090,7 +1167,16 @@ mod tests {
             // safe here because current wall-clock time is ~56 years past
             // the Unix epoch — 660s subtraction never underflows.
             let expired = SystemTime::now() - std::time::Duration::from_secs(660);
-            states.insert("expired-state".into(), (expired, 0));
+            states.insert(
+                "expired-state".into(),
+                (
+                    expired,
+                    OAuthLaunch {
+                        generation: 0,
+                        revision: 0,
+                    },
+                ),
+            );
         }
         assert!(!state.validate_csrf_state("expired-state"));
     }

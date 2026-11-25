@@ -160,7 +160,7 @@ async fn bridge_ws(client: WebSocket, port: u16, account: &super::auth::AccountS
         while let Some(Ok(msg)) = daemon_rx.next().await {
             let closing = matches!(msg, TungMessage::Close(_));
             if let Some(out) = tungstenite_to_axum(msg) {
-                if client_tx.send(out).await.is_err() {
+                if !account.active() || client_tx.send(out).await.is_err() {
                     break;
                 }
             }
@@ -557,6 +557,7 @@ mod tests {
                 db.web_remote_insert_session(id, None, None, &auth::sha256_hex(id), true)
                     .unwrap();
             }
+            auth::seed_account_browser(&db, "account", "account-browser");
             app.manage(db);
             app.manage(WebRemoteState::default());
             let shared = app.state::<WebRemoteState>().shared();
@@ -576,8 +577,17 @@ mod tests {
 
             let (mut phone, mut phone_daemon) = open_bridge(proxy, &daemon, "phone").await;
             let (mut tablet, mut tablet_daemon) = open_bridge(proxy, &daemon, "tablet").await;
+            let (mut account, mut account_daemon) = open_bridge(proxy, &daemon, "account-browser").await;
             forward_frame(&mut phone, &mut phone_daemon, "phone input").await;
             forward_frame(&mut tablet, &mut tablet_daemon, "tablet input").await;
+            forward_frame(&mut account_daemon, &mut account, "before sign-out").await;
+
+            // A separate process can sign out by updating SQLite alone.
+            app.state::<crate::database::DatabaseStore>().clear_auth_token().unwrap();
+            account_daemon.send(TungMessage::text("after sign-out")).await.unwrap();
+            assert_peer_closed(&mut account).await;
+            assert_peer_closed(&mut account_daemon).await;
+            forward_frame(&mut tablet_daemon, &mut tablet, "code-paired after sign-out").await;
 
             crate::web_remote::web_remote_revoke_session(app.handle().clone(), "phone".into())
                 .unwrap();
