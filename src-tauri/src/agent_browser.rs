@@ -1041,44 +1041,49 @@ fn connect_unix_browser_control_until(
     let socket = socket2::Socket::new(socket2::Domain::UNIX, socket2::Type::STREAM, None)?;
     socket.set_nonblocking(true)?;
     let address = socket2::SockAddr::unix(socket_path)?;
-    match socket.connect(&address) {
-        Ok(()) => {}
-        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock
-            || error.raw_os_error().is_some_and(|code| code == libc::EINPROGRESS || code == libc::EINTR) =>
-        {
-            loop {
-                let remaining = deadline.saturating_duration_since(Instant::now());
-                if remaining.is_zero() {
-                    return Err(std::io::ErrorKind::TimedOut.into());
-                }
-                let timeout_ms = remaining.as_millis().clamp(1, i32::MAX as u128) as i32;
-                let mut ready = libc::pollfd {
-                    fd: socket.as_raw_fd(),
-                    events: libc::POLLOUT,
-                    revents: 0,
-                };
-                let result = unsafe { libc::poll(&mut ready, 1, timeout_ms) };
-                if result == 0 {
-                    return Err(std::io::ErrorKind::TimedOut.into());
-                }
-                if result < 0 {
-                    let error = std::io::Error::last_os_error();
-                    if error.kind() == std::io::ErrorKind::Interrupted {
-                        continue;
-                    }
-                    return Err(error);
-                }
-                if let Some(error) = socket.take_error()? {
-                    return Err(error);
-                }
-                if ready.revents & libc::POLLOUT == 0 {
-                    return Err(std::io::Error::other("Browser control connection did not become writable"));
-                }
-                break;
-            }
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(std::io::ErrorKind::TimedOut.into());
         }
-        Err(error) => return Err(error),
+        match socket.connect(&address) {
+            Ok(()) => break,
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock
+                || error.kind() == std::io::ErrorKind::Interrupted
+                || error.raw_os_error().is_some_and(|code| code == libc::EINPROGRESS || code == libc::EALREADY) => {}
+            Err(error) => return Err(error),
+        }
+        let timeout_ms = remaining.as_millis().clamp(1, i32::MAX as u128) as i32;
+        let mut ready = libc::pollfd {
+            fd: socket.as_raw_fd(),
+            events: libc::POLLOUT,
+            revents: 0,
+        };
+        let result = unsafe { libc::poll(&mut ready, 1, timeout_ms) };
+        if result == 0 {
+            return Err(std::io::ErrorKind::TimedOut.into());
+        }
+        if result < 0 {
+            let error = std::io::Error::last_os_error();
+            if error.kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(error);
+        }
+        if let Some(error) = socket.take_error()? {
+            return Err(error);
+        }
+        match socket.peer_addr() {
+            Ok(_) => break,
+            Err(error) if error.kind() == std::io::ErrorKind::NotConnected => {
+                // Linux can report POLLOUT|POLLHUP for a full Unix backlog
+                // without completing connect. Retry until the deadline.
+                std::thread::sleep(remaining.min(Duration::from_millis(1)));
+            }
+            Err(error) => return Err(error),
+        }
     }
+    socket.peer_addr()?;
     socket.set_nonblocking(false)?;
     Ok(socket.into())
 }
