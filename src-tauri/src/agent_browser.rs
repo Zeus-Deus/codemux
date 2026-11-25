@@ -5252,9 +5252,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let socket_path = dir.path().join("browser-control-drain.sock");
         let (listener, _clients) = saturated_control_socket(&socket_path);
+        let accept_listener = listener.try_clone().unwrap();
         let releaser = std::thread::spawn(move || {
             std::thread::sleep(Duration::from_millis(10));
-            listener.accept().unwrap().0
+            accept_listener.accept().unwrap().0
         });
         let connected = connect_unix_browser_control_until(&socket_path, Instant::now() + Duration::from_secs(1));
         assert!(connected.is_ok(), "{connected:?}");
