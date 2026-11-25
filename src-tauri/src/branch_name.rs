@@ -395,6 +395,8 @@ pub fn shell_quote_for_powershell(s: &str) -> String {
             c => body.push(c),
         }
     }
+    // Control bytes above may have been removed before a leading option.
+    guard_leading_option(&mut body);
     if body.ends_with('\\') || !body.contains(' ') {
         body.push(' ');
     }
@@ -410,6 +412,12 @@ pub fn shell_quote_for_powershell(s: &str) -> String {
     out
 }
 
+fn guard_leading_option(prompt: &mut String) {
+    if prompt.starts_with('-') {
+        prompt.insert(0, ' ');
+    }
+}
+
 /// The prompt as one argument for `shell` (the shell the agent command is
 /// typed into), or None when that shell can't take it safely: `$'...'` is
 /// only decoded by bash and zsh, fish rejects it, and cmd.exe expands
@@ -417,31 +425,22 @@ pub fn shell_quote_for_powershell(s: &str) -> String {
 fn quote_prompt_argument(prompt: &str, shell: &str) -> Option<String> {
     let name = shell.rsplit(['/', '\\']).next().unwrap_or(shell).to_ascii_lowercase();
     match name.strip_suffix(".exe").unwrap_or(&name) {
-        "bash" | "zsh" => Some(format!("$'{}'", shell_escape_for_ansi_c_quotes(prompt))),
+        "bash" | "zsh" => {
+            // ANSI-C quoting drops NUL, which cannot reach argv. Guard the
+            // resulting value, since NUL may have preceded an option.
+            let mut normalized = prompt.replace('\0', "");
+            guard_leading_option(&mut normalized);
+            Some(format!("$'{}'", shell_escape_for_ansi_c_quotes(&normalized)))
+        }
         "pwsh" | "powershell" => Some(shell_quote_for_powershell(prompt)),
         _ => None,
     }
 }
 
-/// Make a prompt safe to type into an agent's TUI as keystrokes.
-///
-/// Used for presets whose prompt is written to the PTY after the agent
-/// starts. Control characters would act as editing keys (^U, ^C, ESC
-/// sequences), so all of them are dropped except tab and newline; CR and CRLF
-/// become newlines.
-pub fn sanitize_prompt_for_pty(prompt: &str) -> String {
-    prompt
-        .replace("\r\n", "\n")
-        .replace('\r', "\n")
-        .chars()
-        .filter(|c| matches!(c, '\n' | '\t') || !c.is_control())
-        .collect()
-}
-
 /// The flag that passes an initial prompt to an interactive session of a
 /// builtin agent CLI (`""` for a positional prompt), checked against each
-/// CLI's `--help`. None means the CLI has no such flag and the prompt has to
-/// be typed into its TUI after it starts.
+/// CLI's `--help`. None means the CLI has no such flag and the user must
+/// enter the prompt in its TUI after it starts.
 fn interactive_prompt_flag(preset_id: &str) -> Option<&'static str> {
     match preset_id {
         "builtin-claude" | "builtin-codex" | "builtin-cursor-agent" | "builtin-grok" => Some(""),
@@ -452,25 +451,28 @@ fn interactive_prompt_flag(preset_id: &str) -> Option<&'static str> {
 }
 
 /// Build the agent launch command, optionally embedding the prompt.
-/// Returns (command, needs_pty_injection).
-/// If needs_pty_injection is true, the prompt should be written to PTY after agent startup.
+/// Returns (command, prompt_requires_manual_entry).
 ///
 /// Embedding is preferred: the prompt stays one quoted argument and never
-/// reaches a line editor as keystrokes. Typing is the fallback for CLIs
-/// without a prompt flag (Amp, Droid, Mastracode, Pi, whose bare arguments
-/// can name `@files`, and custom presets) and for shells the prompt can't be
-/// quoted for.
+/// reaches a line editor as keystrokes. For CLIs without a prompt flag and
+/// shells that cannot be quoted safely, the user enters it in the agent.
+/// `shell` must describe the receiving session, not the desktop's default.
+/// Pass None when the receiving shell is unknown.
 pub fn prepare_agent_command(
     preset_id: &str,
     base_command: &str,
     initial_prompt: Option<&str>,
+    shell: Option<&str>,
 ) -> (String, bool) {
-    prepare_agent_command_for_shell(
-        preset_id,
-        base_command,
-        initial_prompt,
-        &crate::terminal::default_shell(),
-    )
+    match shell {
+        Some(shell) => {
+            prepare_agent_command_for_shell(preset_id, base_command, initial_prompt, shell)
+        }
+        None => (
+            base_command.to_string(),
+            initial_prompt.is_some_and(|prompt| !prompt.trim().is_empty()),
+        ),
+    }
 }
 
 fn prepare_agent_command_for_shell(
@@ -483,37 +485,10 @@ fn prepare_agent_command_for_shell(
         Some(p) if !p.trim().is_empty() => p,
         _ => return (base_command.to_string(), false),
     };
-    // A prompt that starts with `-` would be read as an option by the agent
-    // CLI (`--mcp-config ...`); a leading space keeps it a plain argument.
-    let spaced;
-    let prompt = if prompt.starts_with('-') {
-        spaced = format!(" {prompt}");
-        spaced.as_str()
-    } else {
-        prompt
-    };
-
     match interactive_prompt_flag(preset_id).zip(quote_prompt_argument(prompt, shell)) {
         Some((flag, quoted)) => (format!("{base_command} {flag}{quoted}"), false),
         None => (base_command.to_string(), true),
     }
-}
-
-/// The program a preset command launches: the first word of its last
-/// `&&` step (agent-context setup runs first, see `inject_agent_context`)
-/// after any `NAME=value` assignments and an `env` prefix, without its
-/// directory. Used to recognise the agent once it owns the terminal.
-pub fn agent_binary_name(command: &str) -> String {
-    let last_step = command.rsplit("&&").next().unwrap_or(command);
-    let program = last_step
-        .split_whitespace()
-        .find(|word| *word != "env" && !word.contains('='))
-        .unwrap_or("");
-    program
-        .rsplit(['/', '\\'])
-        .next()
-        .unwrap_or(program)
-        .to_string()
 }
 
 #[cfg(test)]
@@ -537,6 +512,37 @@ mod tests {
             "pwsh",
         );
         assert_eq!(cmd, "claude ' -p'");
+
+        // Both encoders remove controls before the CLI sees the value. A
+        // dash that becomes first only after that removal is still guarded.
+        let (cmd, withheld) = prepare_agent_command_for_shell(
+            "builtin-claude",
+            "claude",
+            Some("\0--mcp-config x"),
+            "/bin/bash",
+        );
+        assert!(!withheld);
+        assert_eq!(cmd, "claude $' --mcp-config x'");
+        let (cmd, withheld) = prepare_agent_command_for_shell(
+            "builtin-claude",
+            "claude",
+            Some("\x01--mcp-config x"),
+            "pwsh",
+        );
+        assert!(!withheld);
+        assert_eq!(cmd, "claude ' --mcp-config x'");
+    }
+
+    #[test]
+    fn unknown_receiving_shell_requires_manual_prompt_entry() {
+        assert_eq!(
+            prepare_agent_command("builtin-claude", "claude", Some("fix it"), None),
+            ("claude".to_string(), true)
+        );
+        assert_eq!(
+            prepare_agent_command("builtin-claude", "claude", None, None),
+            ("claude".to_string(), false)
+        );
     }
 
     #[test]
@@ -676,7 +682,7 @@ mod tests {
     }
 
     /// CLIs with an interactive prompt flag get the prompt as one quoted
-    /// argument; the rest have it typed into their TUI.
+    /// argument; the rest ask the user to enter it in their TUI.
     #[test]
     fn prepare_embeds_prompt_for_clis_with_a_prompt_flag() {
         let cases = [
@@ -704,7 +710,7 @@ mod tests {
     }
 
     /// Only bash and zsh decode `$'...'`; PowerShell gets its own quoting;
-    /// any other shell falls back to typing the prompt into the agent.
+    /// any other shell requires manual prompt entry in the agent.
     #[test]
     fn prepare_quotes_the_prompt_for_the_users_shell() {
         let prompt = "it's $HOME\n\x1b[201~\x15x";
@@ -813,17 +819,6 @@ mod tests {
     }
 
     #[test]
-    fn agent_binary_name_skips_setup_and_env() {
-        assert_eq!(agent_binary_name("amp --dangerously-allow-all"), "amp");
-        assert_eq!(agent_binary_name("/opt/bin/aider --yes"), "aider");
-        assert_eq!(agent_binary_name("FOO=1 env BAR=2 droid"), "droid");
-        assert_eq!(
-            agent_binary_name("printf '%s' '{}' > /tmp/s.json && droid --settings /tmp/s.json"),
-            "droid"
-        );
-    }
-
-    #[test]
     fn prepare_no_prompt_no_change() {
         let (cmd, via_pty) = prepare_agent_command_for_shell(
             "builtin-claude",
@@ -917,14 +912,6 @@ mod tests {
             assert!(out.status.success(), "{shell}: {}", String::from_utf8_lossy(&out.stderr));
             assert_eq!(String::from_utf8(out.stdout).unwrap(), prompt, "{shell}");
         }
-    }
-
-    #[test]
-    fn pty_prompt_drops_control_characters() {
-        assert_eq!(
-            sanitize_prompt_for_pty("a\x15b\x0f\x1b[201~c\x03\x7f\u{9b}d\r\ne\rf\tg\nh 🚀"),
-            "ab[201~cd\ne\nf\tg\nh 🚀"
-        );
     }
 
     #[test]

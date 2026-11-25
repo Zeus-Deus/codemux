@@ -424,23 +424,20 @@ pub fn apply_preset<R: tauri::Runtime>(
                     if command.is_empty() {
                         continue;
                     }
-                    let (cmd, needs_pty_injection) = crate::branch_name::prepare_agent_command(
-                        &preset_id,
-                        command,
-                        initial_prompt.as_deref(),
+                    let shell = receiving_shell_for_agent_prompt(
+                        &state, &workspace_id, &session_id, false,
                     );
+                    let (cmd, prompt_requires_manual_entry) =
+                        crate::branch_name::prepare_agent_command(
+                            &preset_id,
+                            command,
+                            initial_prompt.as_deref(),
+                            shell.as_deref(),
+                        );
                     state.update_terminal_session_command(&session_id, command.clone());
                     write_command_when_ready(sessions_arc.clone(), session_id.clone(), cmd, 120);
-                    if needs_pty_injection {
-                        if let Some(ref prompt) = initial_prompt {
-                            write_prompt_when_agent_ready(
-                                app.clone(),
-                                sessions_arc.clone(),
-                                session_id.clone(),
-                                command,
-                                prompt,
-                            );
-                        }
+                    if prompt_requires_manual_entry {
+                        report_prompt_requires_manual_entry(&app, &session_id, &preset.name);
                     }
                 }
             } else {
@@ -731,50 +728,55 @@ fn wait_and_write_command(
     wait_and_write(sessions, session_id, command, settle_ms, PTY_COMMAND_TERMINATOR);
 }
 
-/// Type an agent's initial prompt into its TUI once the agent has started.
-///
-/// Only for presets whose CLI has no prompt flag (see
-/// `branch_name::prepare_agent_command`). The prompt can hold untrusted text
-/// (PR comments, CI logs, issue bodies), so control characters are stripped
-/// first, and nothing is written unless `agent_command`'s program provably
-/// owns the terminal. Otherwise the agent exited or never started, a nested
-/// shell is in front, or ownership can't be checked (non-Linux hosts, remote
-/// panes), and every prompt line could run as a shell command. A prompt that
-/// isn't typed is reported to the user as a notification on the session.
-pub(crate) fn write_prompt_when_agent_ready<R: tauri::Runtime>(
-    app: tauri::AppHandle<R>,
-    sessions: Arc<std::sync::Mutex<std::collections::HashMap<String, terminal::SessionRuntime>>>,
-    session_id: String,
-    agent_command: &str,
-    prompt: &str,
-) {
-    let prompt = crate::branch_name::sanitize_prompt_for_pty(prompt);
-    let agent = crate::branch_name::agent_binary_name(agent_command);
-    std::thread::spawn(move || {
-        let outcome = wait_and_write_guarded(
-            &sessions,
-            &session_id,
-            &prompt,
-            AGENT_PROMPT_SETTLE_MS,
-            PTY_COMMAND_TERMINATOR,
-            Some(&agent),
-        );
-        if outcome == WriteOutcome::AgentNotConfirmed {
-            report_prompt_not_sent(&app, &session_id, &agent);
-        }
-    });
+/// Pick the shell that receives a preset command. Device sessions run Bash
+/// regardless of the desktop's SHELL. A newly created local session uses the
+/// same default-shell selection as PTY spawn. An existing session with no
+/// recorded shell remains unknown, so its prompt cannot be embedded.
+pub(crate) fn receiving_shell_for_agent_prompt(
+    state: &AppStateStore,
+    workspace_id: &str,
+    session_id: &str,
+    newly_spawned: bool,
+) -> Option<String> {
+    let snapshot = state.snapshot();
+    let remote = snapshot
+        .workspaces
+        .iter()
+        .find(|workspace| workspace.workspace_id.0 == workspace_id)?
+        .host_id.is_some();
+    let shell = snapshot
+        .terminal_sessions
+        .iter()
+        .find(|session| session.session_id.0 == session_id)?
+        .shell.as_deref();
+    let local_default = (!remote && newly_spawned).then(terminal::default_shell);
+    choose_agent_launch_shell(remote, shell, local_default.as_deref())
 }
 
-/// Tell the user an agent launch went ahead without its starting prompt.
-fn report_prompt_not_sent<R: tauri::Runtime>(
+fn choose_agent_launch_shell(
+    remote: bool,
+    recorded_shell: Option<&str>,
+    newly_spawned_local_shell: Option<&str>,
+) -> Option<String> {
+    if remote {
+        Some("bash".to_string())
+    } else {
+        recorded_shell
+            .or(newly_spawned_local_shell)
+            .map(str::to_string)
+    }
+}
+
+/// Tell the user a prompt cannot be delivered safely through this terminal.
+pub(crate) fn report_prompt_requires_manual_entry<R: tauri::Runtime>(
     app: &tauri::AppHandle<R>,
     session_id: &str,
     agent: &str,
 ) {
     use tauri::Manager as _;
     let message = format!(
-        "Codemux did not send the starting prompt to {agent}: it could not confirm \
-         {agent} was running in this terminal."
+        "Codemux cannot include the starting prompt when launching {agent}. \
+         Enter it directly in the agent once it opens."
     );
     let state = app.state::<AppStateStore>();
     if state
@@ -797,91 +799,6 @@ fn report_prompt_not_sent<R: tauri::Runtime>(
     crate::state::emit_app_state(app);
 }
 
-/// What `wait_and_write_guarded` did.
-#[derive(Debug, PartialEq, Eq)]
-enum WriteOutcome {
-    /// The payload was handed to the PTY (or the write itself failed).
-    Written,
-    /// Nothing to write, or the PTY never became ready.
-    Skipped,
-    /// An agent prompt was withheld: the agent did not provably own the terminal.
-    AgentNotConfirmed,
-}
-
-/// Quiet period before typing a prompt into an agent TUI, long enough for the
-/// agent to finish initializing.
-const AGENT_PROMPT_SETTLE_MS: u64 = 1500;
-
-/// Whether the program now in the terminal asked for bracketed paste: the most
-/// recent DEC private mode set/reset (`CSI ? Pm h` / `CSI ? Pm l`) whose
-/// parameter list names 2004 is a set. Shells turn it off before running a
-/// command, so a stale shell `h` does not count for the agent that follows.
-fn bracketed_paste_enabled(runtime: &terminal::SessionRuntime) -> bool {
-    latest_bracketed_paste_switch(runtime.pending_output.iter().map(Vec::as_slice))
-        .unwrap_or(false)
-}
-
-/// How far back `latest_bracketed_paste_switch` looks. The agent switches the
-/// mode while it starts, just before the prompt is typed; the cap keeps a huge
-/// scrollback from holding the sessions lock. Not finding it is the safe
-/// answer (the prompt is sent as one line).
-const BRACKETED_PASTE_SCAN_BYTES: usize = 4 * 1024 * 1024;
-
-/// The last bracketed-paste switch in `chunks` (oldest first): `Some(true)`
-/// for a set, `Some(false)` for a reset, None if there is none. Scans the
-/// bytes backwards as one stream, so a sequence split across chunks counts,
-/// and accepts combined parameter lists such as `ESC[?1049;2004h`.
-fn latest_bracketed_paste_switch<'a>(
-    chunks: impl DoubleEndedIterator<Item = &'a [u8]>,
-) -> Option<bool> {
-    let mut bytes = chunks
-        .rev()
-        .flat_map(|chunk| chunk.iter().rev().copied())
-        .take(BRACKETED_PASTE_SCAN_BYTES)
-        .peekable();
-    while let Some(byte) = bytes.next() {
-        let enable = match byte {
-            b'h' => true,
-            b'l' => false,
-            _ => continue,
-        };
-        // Parameters, read backwards. Anything else ends them and is left
-        // for the next iteration (it may itself be a final byte).
-        let mut params = Vec::new();
-        while params.len() < 64 {
-            match bytes.next_if(|b| b.is_ascii_digit() || *b == b';') {
-                Some(b) => params.push(b),
-                None => break,
-            }
-        }
-        if bytes.next_if_eq(&b'?').is_none()
-            || bytes.next_if_eq(&b'[').is_none()
-            || bytes.next_if_eq(&0x1b).is_none()
-        {
-            continue;
-        }
-        params.reverse();
-        if params.split(|b| *b == b';').any(|param| param == b"2004") {
-            return Some(enable);
-        }
-    }
-    None
-}
-
-/// An agent prompt as typed input. Wrapped in bracketed paste when the agent
-/// enabled it, so its TUI inserts the whole text as one paste; the body has no
-/// ESC left to end the paste early. Without bracketed paste each newline
-/// would submit a line on its own (and a TUI with `!` shell escapes could run
-/// one as a command), so line breaks and tabs become spaces and the prompt
-/// goes in as one line with one submit.
-fn agent_prompt_payload(prompt: &str, bracketed: bool) -> String {
-    if bracketed {
-        format!("\x1b[200~{prompt}\x1b[201~")
-    } else {
-        prompt.replace(['\r', '\n', '\t'], " ")
-    }
-}
-
 /// `wait_and_write_command` with the byte(s) written after the command as a
 /// parameter: an empty `terminator` leaves the command typed but not run.
 fn wait_and_write(
@@ -891,19 +808,8 @@ fn wait_and_write(
     settle_ms: u64,
     terminator: &[u8],
 ) {
-    wait_and_write_guarded(sessions, session_id, command, settle_ms, terminator, None);
-}
-
-/// `wait_and_write`; with `agent`, writes only while that program owns the
-/// terminal (see `write_prompt_when_agent_ready`).
-fn wait_and_write_guarded(
-    sessions: &Arc<std::sync::Mutex<std::collections::HashMap<String, terminal::SessionRuntime>>>,
-    session_id: &str,
-    command: &str,
-    settle_ms: u64,
-    terminator: &[u8],
-    agent: Option<&str>,
-) -> WriteOutcome {
+    // Only commands reach the PTY through this helper. Untrusted
+    // starting prompts never enter a PTY input queue.
     // Phase 1: poll until the PTY writer is available (shell process spawned).
     //
     // This used to share a single 5-second budget with Phase 2's quiet-
@@ -956,7 +862,7 @@ fn wait_and_write_guarded(
              after {:?}",
             writer_poll_start.elapsed()
         );
-        return WriteOutcome::Skipped;
+        return;
     }
 
     let command_to_write = {
@@ -983,7 +889,7 @@ fn wait_and_write_guarded(
     };
 
     if command_to_write.is_empty() {
-        return WriteOutcome::Skipped;
+        return;
     }
 
     // Phase 2: wait for shell output to arrive and then go quiet.
@@ -1048,24 +954,6 @@ fn wait_and_write_guarded(
         writer_poll_start.elapsed()
     );
 
-    let command_to_write = if let Some(agent) = agent {
-        if !terminal::session_agent_owns_terminal(sessions, session_id, agent) {
-            eprintln!(
-                "[codemux::presets] not typing the prompt into {session_id}: \
-                 cannot confirm {agent:?} owns the terminal (shell or nested shell \
-                 in front, remote pane, or no /proc)"
-            );
-            return WriteOutcome::AgentNotConfirmed;
-        }
-        let bracketed = {
-            let guard = sessions.lock().unwrap_or_else(|e| e.into_inner());
-            guard.get(session_id).is_some_and(bracketed_paste_enabled)
-        };
-        agent_prompt_payload(&command_to_write, bracketed)
-    } else {
-        command_to_write
-    };
-
     // Write the plain command text followed by the PTY command
     // terminator in a SINGLE `write_all` call. See
     // `build_pty_command_payload` for why this MUST be one call (and
@@ -1076,14 +964,13 @@ fn wait_and_write_guarded(
     match terminal::write_pty_input_sync(sessions, session_id, &payload) {
         Ok(()) => eprintln!(
             "[codemux::presets] wrote preset/resume command to {session_id} \
-             (payload_len={}, cmd={command_to_write:?})",
+             (payload_len={})",
             payload.len(),
         ),
         Err(error) => {
             eprintln!("[codemux::presets] cannot write command to {session_id}: {error}")
         }
     }
-    WriteOutcome::Written
 }
 
 /// Check whether a command's binary exists on `PATH` for the current user.
@@ -1181,6 +1068,25 @@ mod tests {
     use crate::terminal::SessionRuntime;
     use std::collections::HashMap;
     use std::io::Write;
+
+    #[test]
+    fn agent_prompt_uses_the_receiving_shell() {
+        // Device PTYs launch Bash even when the desktop launches Fish.
+        let remote_shell = choose_agent_launch_shell(true, None, Some("/usr/bin/fish"));
+        assert_eq!(remote_shell.as_deref(), Some("bash"));
+        assert_eq!(
+            crate::branch_name::prepare_agent_command(
+                "builtin-claude", "claude", Some("fix it"), remote_shell.as_deref(),
+            ),
+            ("claude $'fix it'".to_string(), false)
+        );
+        assert_eq!(
+            choose_agent_launch_shell(false, Some("/bin/zsh"), Some("/usr/bin/fish")),
+            Some("/bin/zsh".to_string())
+        );
+        // Existing local sessions without a recorded shell are unknown.
+        assert_eq!(choose_agent_launch_shell(false, None, None), None);
+    }
 
     fn make_sessions() -> Arc<std::sync::Mutex<HashMap<String, SessionRuntime>>> {
         Arc::new(std::sync::Mutex::new(HashMap::new()))
@@ -1310,173 +1216,6 @@ mod tests {
         wait_and_write(&sessions, "sess", "npm install -g @openai/codex", 30, b"");
 
         assert_eq!(*calls.lock().unwrap(), vec![b"npm install -g @openai/codex".to_vec()]);
-    }
-
-    #[test]
-    fn bracketed_paste_follows_the_latest_mode_switch() {
-        let mut runtime = crate::terminal::SessionRuntime::new("sess");
-        assert!(!bracketed_paste_enabled(&runtime));
-        // The shell enables it at its prompt and disables it to run a command.
-        runtime.pending_output.push_back(b"$ \x1b[?2004h".to_vec());
-        runtime.pending_output.push_back(b"gemini\r\n\x1b[?2004l\r".to_vec());
-        assert!(!bracketed_paste_enabled(&runtime));
-        runtime.pending_output.push_back(b"\x1b[?1049h\x1b[?2004h> ".to_vec());
-        runtime.pending_output.push_back(b"banner".to_vec());
-        assert!(bracketed_paste_enabled(&runtime));
-        // An agent that turns it back off.
-        runtime.pending_output.push_back(b"\x1b[?2004l".to_vec());
-        assert!(!bracketed_paste_enabled(&runtime));
-    }
-
-    /// `CSI ? Pm h/l` takes a parameter list, and PTY reads can split a
-    /// sequence anywhere.
-    #[test]
-    fn bracketed_paste_parses_parameter_lists_and_split_chunks() {
-        let switch = |chunks: &[&[u8]]| latest_bracketed_paste_switch(chunks.iter().copied());
-        assert_eq!(switch(&[b"\x1b[?1049;2004h"]), Some(true));
-        assert_eq!(switch(&[b"\x1b[?2004;1h> "]), Some(true));
-        assert_eq!(switch(&[b"\x1b[?1;2004;25h"]), Some(true));
-        assert_eq!(switch(&[b"\x1b[?2004h", b"\x1b[?1049;2004l"]), Some(false));
-        assert_eq!(switch(&[b"\x1b[?1049h\x1b[?25l"]), None);
-        // Neither another mode nor a different number containing 2004.
-        assert_eq!(switch(&[b"\x1b[?20040h\x1b[?12004h"]), None);
-        // Plain text or an incomplete sequence is not a switch.
-        assert_eq!(switch(&[b"?2004h [?2004h \x1b[2004h"]), None);
-        assert_eq!(switch(&[b"x\x1b", b"[?20", b"04", b"h"]), Some(true));
-        assert_eq!(switch(&[b"\x1b[?2004h", b"\x1b[", b"?2004;1", b"l"]), Some(false));
-        assert_eq!(switch(&[]), None);
-    }
-
-    /// Without bracketed paste every newline would submit a line of its own,
-    /// so the prompt goes in as a single line.
-    #[test]
-    fn agent_prompt_payload_wraps_only_when_bracketed() {
-        let plain = agent_prompt_payload("fix\n!curl x|sh\r\n\tnow", false);
-        assert_eq!(plain, "fix !curl x|sh   now");
-        assert!(!plain.contains(['\n', '\r', '\t']));
-        assert_eq!(agent_prompt_payload("a\nb", true), "\x1b[200~a\nb\x1b[201~");
-    }
-
-    /// An agent prompt reaches the PTY only while the agent owns the
-    /// terminal: an idle shell, a nested shell, another program, an unknown
-    /// pid or a pid that can't be read gets nothing.
-    #[test]
-    #[serial_test::serial]
-    #[cfg(target_os = "linux")]
-    fn agent_prompt_is_written_only_while_the_agent_owns_the_terminal() {
-        use portable_pty::{native_pty_system, CommandBuilder, PtySize};
-
-        fn spawn(cmd: CommandBuilder) -> (Box<dyn portable_pty::Child + Send + Sync>, u32) {
-            let pty = native_pty_system()
-                .openpty(PtySize {
-                    rows: 24,
-                    cols: 80,
-                    pixel_width: 0,
-                    pixel_height: 0,
-                })
-                .expect("openpty");
-            let child = pty.slave.spawn_command(cmd).expect("spawn");
-            drop(pty.slave);
-            let pid = child.process_id().expect("child pid");
-            std::mem::forget(pty.master);
-            (child, pid)
-        }
-        fn stop(mut child: Box<dyn portable_pty::Child + Send + Sync>, pid: u32) {
-            if let Some((_, tpgid)) = crate::terminal::read_pgrp_tpgid(pid) {
-                if tpgid > 1 && tpgid as u32 != pid {
-                    // SAFETY: plain signal to the test job's own process group.
-                    unsafe { libc::killpg(tpgid, libc::SIGKILL) };
-                }
-            }
-            let _ = child.kill();
-            let _ = child.wait();
-        }
-
-        let sessions = make_sessions();
-        let insert = |id: &str, pid: Option<u32>| {
-            let calls: std::sync::Arc<std::sync::Mutex<Vec<Vec<u8>>>> = Default::default();
-            let mut runtime = crate::terminal::SessionRuntime::new(id);
-            runtime.writer = Some(Box::new(RecordingWriter {
-                calls: calls.clone(),
-            }));
-            runtime.child_pid = pid;
-            runtime.pending_output.push_back(b"\x1b[?2004h> ".to_vec());
-            sessions.lock().unwrap().insert(id.into(), runtime);
-            calls
-        };
-        let write = |id: &str, agent: &str| {
-            wait_and_write_guarded(&sessions, id, "fix\nit", 30, PTY_COMMAND_TERMINATOR, Some(agent))
-        };
-        // A job-control shell running `script`, once it has handed the
-        // terminal to that job.
-        let spawn_job = |script: &str| {
-            let mut cmd = CommandBuilder::new("sh");
-            cmd.arg("-c");
-            cmd.arg(format!("set -m; {script}"));
-            let (child, pid) = spawn(cmd);
-            let start = std::time::Instant::now();
-            while !matches!(
-                crate::terminal::read_pgrp_tpgid(pid),
-                Some((pgrp, tpgid)) if tpgid > 0 && tpgid != pgrp
-            ) && start.elapsed() < std::time::Duration::from_secs(5)
-            {
-                std::thread::sleep(std::time::Duration::from_millis(20));
-            }
-            std::thread::sleep(std::time::Duration::from_millis(100));
-            (child, pid)
-        };
-
-        let (idle, idle_pid) = spawn(CommandBuilder::new("cat"));
-        std::thread::sleep(std::time::Duration::from_millis(100));
-        let idle_calls = insert("idle", Some(idle_pid));
-        let no_pid_calls = insert("no-pid", None);
-        let gone_calls = insert("gone", Some(u32::MAX));
-        let refused = WriteOutcome::AgentNotConfirmed;
-        assert_eq!(write("idle", "cat"), refused);
-        assert_eq!(write("no-pid", "cat"), refused);
-        assert_eq!(write("gone", "cat"), refused);
-        stop(idle, idle_pid);
-        assert!(idle_calls.lock().unwrap().is_empty(), "typed into an idle shell");
-        assert!(no_pid_calls.lock().unwrap().is_empty());
-        assert!(gone_calls.lock().unwrap().is_empty());
-
-        // The agent binary is missing inside a nested interactive shell
-        // (`nix develop`, `ssh`, an rc file starting `bash`): the nested
-        // shell owns the terminal and would run every prompt line.
-        let (nested, nested_pid) = spawn_job("bash --norc --noprofile -i");
-        let nested_calls = insert("nested", Some(nested_pid));
-        assert_eq!(write("nested", "gemini"), refused);
-        stop(nested, nested_pid);
-        assert!(nested_calls.lock().unwrap().is_empty(), "typed into a nested shell");
-
-        // Some other program in front is not the agent either.
-        let (other, other_pid) = spawn_job("sleep 3600");
-        let other_calls = insert("other", Some(other_pid));
-        assert_eq!(write("other", "droid"), refused);
-        stop(other, other_pid);
-        assert!(other_calls.lock().unwrap().is_empty());
-
-        let (busy, busy_pid) = spawn_job("sleep 3600");
-        let busy_calls = insert("busy", Some(busy_pid));
-        assert_eq!(write("busy", "sleep"), WriteOutcome::Written);
-        stop(busy, busy_pid);
-        assert_eq!(
-            *busy_calls.lock().unwrap(),
-            vec![b"\x1b[200~fix\nit\x1b[201~\r".to_vec()]
-        );
-
-        // The agent never enabled bracketed paste: one line, one submit.
-        let (plain, plain_pid) = spawn_job("sleep 3600");
-        let plain_calls = insert("plain", Some(plain_pid));
-        {
-            let mut guard = sessions.lock().unwrap();
-            let runtime = guard.get_mut("plain").unwrap();
-            runtime.pending_output.clear();
-            runtime.pending_output.push_back(b"\x1b[?2004l> ".to_vec());
-        }
-        assert_eq!(write("plain", "sleep"), WriteOutcome::Written);
-        stop(plain, plain_pid);
-        assert_eq!(*plain_calls.lock().unwrap(), vec![b"fix it\r".to_vec()]);
     }
 
     #[test]
