@@ -602,6 +602,133 @@ fn key_file_path() -> PathBuf {
     data_dir.join(crate::APP_DIR_NAME).join(KEY_FILE)
 }
 
+#[cfg(unix)]
+#[derive(Clone, Copy)]
+enum KeyAclScope {
+    Ancestor,
+    PrivateDirectory,
+    KeyFile,
+}
+
+/// macOS ACL allow entries can grant access despite private POSIX mode bits.
+/// Inspect the opened inode, never a pathname that can be replaced afterward.
+#[cfg(target_os = "macos")]
+fn check_key_acl(file: &std::fs::File, context: &str, scope: KeyAclScope) -> Result<(), String> {
+    use std::ffi::c_void;
+    use std::os::fd::AsRawFd;
+
+    unsafe extern "C" {
+        fn acl_get_fd_np(fd: libc::c_int, acl_type: libc::c_int) -> *mut c_void;
+        fn acl_get_entry(
+            acl: *mut c_void,
+            entry_id: libc::c_int,
+            entry: *mut *mut c_void,
+        ) -> libc::c_int;
+        fn acl_get_tag_type(entry: *mut c_void, tag: *mut libc::c_int) -> libc::c_int;
+        fn acl_get_permset_mask_np(entry: *mut c_void, mask: *mut u64) -> libc::c_int;
+        fn acl_free(object: *mut c_void) -> libc::c_int;
+    }
+
+    // From macOS <sys/acl.h>. Directory mutation includes deletion of the
+    // directory itself, not just creation or deletion of its children.
+    const MUTATE: u64 = (1 << 2) | (1 << 4) | (1 << 5) | (1 << 6)
+        | (1 << 8) | (1 << 10) | (1 << 12) | (1 << 13);
+    const READ_DATA: u64 = 1 << 1;
+    const SEARCH: u64 = 1 << 3;
+    const ACL_TYPE_EXTENDED: libc::c_int = 0x100;
+    const ACL_FIRST_ENTRY: libc::c_int = 0;
+    const ACL_NEXT_ENTRY: libc::c_int = -1;
+    const ACL_EXTENDED_ALLOW: libc::c_int = 1;
+    const ACL_EXTENDED_DENY: libc::c_int = 2;
+    let forbidden = match scope {
+        KeyAclScope::Ancestor => MUTATE,
+        KeyAclScope::PrivateDirectory => MUTATE | READ_DATA | SEARCH,
+        KeyAclScope::KeyFile => MUTATE | READ_DATA,
+    };
+
+    let acl = unsafe { acl_get_fd_np(file.as_raw_fd(), ACL_TYPE_EXTENDED) };
+    if acl.is_null() {
+        let error = std::io::Error::last_os_error();
+        return if error.raw_os_error() == Some(libc::ENOENT) {
+            Ok(()) // No extended ACL on this inode.
+        } else {
+            Err(format!("inspect {context} ACL: {error}"))
+        };
+    }
+    let result = (|| {
+        let mut entry = std::ptr::null_mut();
+        let mut entry_id = ACL_FIRST_ENTRY;
+        loop {
+            let found = unsafe { acl_get_entry(acl, entry_id, &mut entry) };
+            if found == 0 {
+                return Ok(());
+            }
+            if found < 0 {
+                return Err(format!("inspect {context} ACL entry: {}", std::io::Error::last_os_error()));
+            }
+            entry_id = ACL_NEXT_ENTRY;
+            let mut tag = 0;
+            if unsafe { acl_get_tag_type(entry, &mut tag) } < 0 {
+                return Err(format!("inspect {context} ACL tag: {}", std::io::Error::last_os_error()));
+            }
+            if tag == ACL_EXTENDED_DENY {
+                continue;
+            }
+            if tag != ACL_EXTENDED_ALLOW {
+                return Err(format!("{context} has an unsupported ACL entry"));
+            }
+            let mut mask = 0u64;
+            if unsafe { acl_get_permset_mask_np(entry, &mut mask) } < 0 {
+                return Err(format!("inspect {context} ACL rights: {}", std::io::Error::last_os_error()));
+            }
+            if mask & forbidden != 0 {
+                return Err(format!("{context} ACL grants unsafe access"));
+            }
+        }
+    })();
+    if unsafe { acl_free(acl) } != 0 {
+        return Err(format!("release {context} ACL: {}", std::io::Error::last_os_error()));
+    }
+    result
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
+fn check_key_acl(_file: &std::fs::File, _context: &str, _scope: KeyAclScope) -> Result<(), String> {
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn check_symlink_key_acl(
+    directory: &std::fs::File,
+    name: &std::ffi::CStr,
+    expected: &libc::stat,
+) -> Result<(), String> {
+    use std::os::fd::{AsRawFd, FromRawFd};
+    use std::os::unix::fs::MetadataExt;
+
+    // O_SYMLINK pins the link itself. A pathname-based ACL lookup could
+    // inspect a replacement link after fstatat had validated the original.
+    let fd = unsafe {
+        libc::openat(
+            directory.as_raw_fd(),
+            name.as_ptr(),
+            libc::O_SYMLINK | libc::O_CLOEXEC,
+        )
+    };
+    if fd < 0 {
+        return Err(format!("open iroh key relocation for ACL: {}", std::io::Error::last_os_error()));
+    }
+    let link = unsafe { std::fs::File::from_raw_fd(fd) };
+    let meta = link.metadata().map_err(|e| format!("inspect iroh key relocation: {e}"))?;
+    if !meta.file_type().is_symlink()
+        || meta.dev() != expected.st_dev as u64
+        || meta.ino() != expected.st_ino as u64
+    {
+        return Err("iroh key relocation changed during ACL validation".to_string());
+    }
+    check_key_acl(&link, "iroh key relocation", KeyAclScope::Ancestor)
+}
+
 /// Resolve each path entry from a pinned parent directory. An app-data
 /// relocation is allowed when its link and target are under directories that
 /// another user cannot replace or modify.
@@ -674,6 +801,7 @@ fn open_private_key_dir(parent: &Path) -> Result<std::fs::File, String> {
         let parent_meta = directory
             .metadata()
             .map_err(|e| format!("inspect iroh key ancestor: {e}"))?;
+        check_key_acl(directory, "iroh key ancestor", KeyAclScope::Ancestor)?;
         if parent_meta.uid() != uid && parent_meta.uid() != 0 {
             return Err("iroh key ancestor is not owner controlled".to_string());
         }
@@ -719,6 +847,8 @@ fn open_private_key_dir(parent: &Path) -> Result<std::fs::File, String> {
         }
 
         if entry.st_mode & libc::S_IFMT == libc::S_IFLNK {
+            #[cfg(target_os = "macos")]
+            check_symlink_key_acl(directory, &name, &entry)?;
             links += 1;
             if links > 40 {
                 return Err("too many iroh key directory relocations".to_string());
@@ -770,6 +900,7 @@ fn open_private_key_dir(parent: &Path) -> Result<std::fs::File, String> {
         if opened_meta.dev() != entry.st_dev as u64 || opened_meta.ino() != entry.st_ino as u64 {
             return Err("iroh key directory entry changed during validation".to_string());
         }
+        check_key_acl(&opened, "iroh key directory entry", KeyAclScope::Ancestor)?;
         directories.push(opened);
     }
     let search_handle = directories.pop().expect("root directory remains open");
@@ -798,11 +929,22 @@ fn open_private_key_dir(parent: &Path) -> Result<std::fs::File, String> {
     if !meta.is_dir() || meta.uid() != uid {
         return Err("iroh key directory is not an owned directory".to_string());
     }
+    check_key_acl(&directory, "iroh key directory", KeyAclScope::PrivateDirectory)?;
     if meta.permissions().mode() & 0o777 != 0o700 {
         directory
             .set_permissions(std::fs::Permissions::from_mode(0o700))
             .map_err(|e| format!("secure iroh key directory: {e}"))?;
     }
+    // Some filesystems acknowledge chmod without changing the effective
+    // mode. Never read or publish key material until the pinned directory
+    // reports the private mode we require.
+    let secured = directory
+        .metadata()
+        .map_err(|e| format!("recheck iroh key directory permissions: {e}"))?;
+    if !secured.is_dir() || secured.uid() != uid || secured.permissions().mode() & 0o777 != 0o700 {
+        return Err("iroh key directory permissions remain unsafe".to_string());
+    }
+    check_key_acl(&directory, "iroh key directory", KeyAclScope::PrivateDirectory)?;
     Ok(directory)
 }
 
@@ -839,10 +981,22 @@ fn open_private_key_file(directory: &std::fs::File) -> Result<Option<std::fs::Fi
     if !meta.is_file() || meta.uid() != unsafe { libc::geteuid() } || meta.nlink() != 1 {
         return Err("iroh key path is not a singly linked owned regular file".to_string());
     }
+    check_key_acl(&file, "iroh key file", KeyAclScope::KeyFile)?;
     if meta.permissions().mode() & 0o777 != 0o600 {
         file.set_permissions(std::fs::Permissions::from_mode(0o600))
             .map_err(|e| format!("secure iroh key file: {e}"))?;
     }
+    let secured = file
+        .metadata()
+        .map_err(|e| format!("recheck iroh key file permissions: {e}"))?;
+    if !secured.is_file()
+        || secured.uid() != unsafe { libc::geteuid() }
+        || secured.nlink() != 1
+        || secured.permissions().mode() & 0o777 != 0o600
+    {
+        return Err("iroh key file permissions remain unsafe".to_string());
+    }
+    check_key_acl(&file, "iroh key file", KeyAclScope::KeyFile)?;
     Ok(Some(file))
 }
 
@@ -860,7 +1014,7 @@ fn read_private_key_in(directory: &std::fs::File) -> Result<Option<Vec<u8>>, Str
 #[cfg(unix)]
 fn persist_secret_key_in(directory: &std::fs::File, key: &SecretKey) -> Result<(), String> {
     use std::os::fd::{AsRawFd, FromRawFd};
-    use std::os::unix::fs::PermissionsExt;
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
 
     // Refuse hardlinked or symlinked legacy entries before replacing them.
     drop(open_private_key_file(directory)?);
@@ -883,6 +1037,17 @@ fn persist_secret_key_in(directory: &std::fs::File, key: &SecretKey) -> Result<(
     let result = (|| {
         file.set_permissions(std::fs::Permissions::from_mode(0o600))
             .map_err(|e| format!("secure iroh key temp file: {e}"))?;
+        let secured = file
+            .metadata()
+            .map_err(|e| format!("recheck iroh key temp file permissions: {e}"))?;
+        if !secured.is_file()
+            || secured.uid() != unsafe { libc::geteuid() }
+            || secured.nlink() != 1
+            || secured.permissions().mode() & 0o777 != 0o600
+        {
+            return Err("iroh key temp file permissions remain unsafe".to_string());
+        }
+        check_key_acl(&file, "iroh key temp file", KeyAclScope::KeyFile)?;
         file.write_all(&sealed)
             .map_err(|e| format!("write iroh key temp file: {e}"))?;
         file.sync_all()
