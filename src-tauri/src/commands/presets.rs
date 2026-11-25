@@ -385,6 +385,7 @@ pub fn apply_preset<R: tauri::Runtime>(
     // The launch-time model selection (if any) is spliced into each command
     // *before* agent-context injection so the Gemini env wrapper and the
     // Claude/Codex `--system-prompt` suffix compose around it correctly.
+    let pane_shell = crate::agent_context::launch_shell_for_workspace(&state, &workspace_id);
     let commands = if preset.commands.is_empty() {
         vec![String::new()]
     } else {
@@ -394,7 +395,7 @@ pub fn apply_preset<R: tauri::Runtime>(
             .map(|cmd| {
                 let cmd =
                     crate::agent_capability::apply_model_selection(cmd, model_selection.as_ref());
-                crate::agent_context::inject_agent_context(&cmd, &workspace_id)
+                crate::agent_context::inject_agent_context(&cmd, &workspace_id, &pane_shell)
             })
             .collect()
     };

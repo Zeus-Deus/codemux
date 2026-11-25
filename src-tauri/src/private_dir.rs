@@ -213,7 +213,6 @@ pub(crate) fn create_private_file(path: &Path) -> io::Result<std::fs::File> {
 /// root/user-owned ancestors (such as `/tmp`) are safe to descend through.
 /// Callers append their file operation to this script while `cmx_dir` names
 /// the verified leaf. `parts` are internal, literal directory names.
-#[cfg(unix)]
 pub(crate) fn shell_private_dir_guard(parts: &[&str], create: bool) -> String {
     let mut script = String::from(
         r#"umask 077

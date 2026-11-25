@@ -999,6 +999,7 @@ pub(crate) async fn create_worktree_checked<R: tauri::Runtime>(
         };
 
         if let Some(preset) = preset {
+            let pane_shell = crate::agent_context::launch_shell_for_workspace(&state, &workspace_id.0);
             let commands: Vec<String> = if preset.commands.is_empty() {
                 vec![String::new()]
             } else {
@@ -1010,7 +1011,7 @@ pub(crate) async fn create_worktree_checked<R: tauri::Runtime>(
                             cmd,
                             model_selection.as_ref(),
                         );
-                        crate::agent_context::inject_agent_context(&cmd, &workspace_id.0)
+                        crate::agent_context::inject_agent_context(&cmd, &workspace_id.0, &pane_shell)
                     })
                     .collect()
             };

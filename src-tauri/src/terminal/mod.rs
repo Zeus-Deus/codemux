@@ -1512,7 +1512,7 @@ fn windows_user_local_bin() -> Option<String> {
 }
 
 #[cfg(unix)]
-fn default_shell() -> String {
+pub(crate) fn default_shell() -> String {
     env::var("SHELL")
         .ok()
         .filter(|shell| !shell.trim().is_empty())
@@ -1520,7 +1520,7 @@ fn default_shell() -> String {
 }
 
 #[cfg(windows)]
-fn default_shell() -> String {
+pub(crate) fn default_shell() -> String {
     resolve_windows_shell(
         |cmd| which::which(cmd).ok().map(|p| p.display().to_string()),
         env::var("COMSPEC").ok(),
