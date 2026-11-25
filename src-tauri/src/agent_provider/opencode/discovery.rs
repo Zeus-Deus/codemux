@@ -23,8 +23,8 @@ use crate::execution::sanitize_gui_env_tokio;
 /// "please upgrade" hint instead of a hard error.
 pub const MINIMUM_OPENCODE_VERSION: &str = "1.14.19";
 
-/// Hard cap on each subprocess / network probe so a flaky CLI or
-/// unreachable server never stalls startup. Tuned to match the codex
+/// Hard cap on availability subprocess / network probes so a flaky CLI or
+/// unreachable server never stalls discovery. Tuned to match the codex
 /// auth-probe budget at `agent_provider/codex/auth.rs`.
 const PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -411,19 +411,42 @@ fn read_small_text(path: &Path, limit: u64) -> Option<String> {
 /// first line. Returns `None` on any failure; spawn admission rejects an
 /// unknown version because it cannot establish project-config isolation.
 pub(crate) async fn probe_version(binary_path: &Path) -> Option<String> {
+    probe_version_with_timeout(binary_path, PROBE_TIMEOUT).await
+}
+
+/// Starting a server needs a fresh, verified version. Real OpenCode releases
+/// can take longer on a busy runner than the quick availability probe allows.
+pub(crate) async fn probe_version_with_timeout(
+    binary_path: &Path,
+    timeout: Duration,
+) -> Option<String> {
     let mut cmd = Command::new(binary_path);
     cmd.arg("--version").kill_on_drop(true);
     sanitize_gui_env_tokio(&mut cmd);
-    let result = tokio::time::timeout(PROBE_TIMEOUT, cmd.output()).await;
+    let result = tokio::time::timeout(timeout, cmd.output()).await;
     let output = match result {
         Ok(Ok(out)) => out,
-        Ok(Err(_)) => return None,
-        Err(_) => return None,
+        Ok(Err(error)) => {
+            eprintln!("[codemux::opencode] version probe could not run: {error}");
+            return None;
+        }
+        Err(_) => {
+            eprintln!("[codemux::opencode] version probe timed out after {timeout:?}");
+            return None;
+        }
     };
     if !output.status.success() {
+        eprintln!(
+            "[codemux::opencode] version probe exited with {}",
+            output.status
+        );
         return None;
     }
-    parse_version_output(&String::from_utf8_lossy(&output.stdout))
+    let version = parse_version_output(&String::from_utf8_lossy(&output.stdout));
+    if version.is_none() {
+        eprintln!("[codemux::opencode] version probe returned no version");
+    }
+    version
 }
 
 /// Pure helper so version-banner parsing is unit-testable.

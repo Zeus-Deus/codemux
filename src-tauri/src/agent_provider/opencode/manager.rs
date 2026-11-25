@@ -53,7 +53,7 @@ use std::time::Duration;
 
 use tokio::sync::Mutex;
 
-use super::discovery::{prepared_binary, probe_version, MINIMUM_OPENCODE_VERSION};
+use super::discovery::{prepared_binary, probe_version_with_timeout, MINIMUM_OPENCODE_VERSION};
 use super::server::OpenCodeServer;
 
 /// Per-attempt budget for the cached-server liveness probe in
@@ -70,6 +70,10 @@ const LIVENESS_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 /// Allow the existing bounded probe, resolver, ready handshake and reaps
 /// to settle, but never wait indefinitely for in-flight lifecycle work.
 const SHUTDOWN_LOCK_TIMEOUT: Duration = Duration::from_secs(40);
+
+/// The native acceptance runner allows real CLI version checks 20 seconds.
+/// Admission uses that budget while availability checks stay responsive.
+const VERSION_ADMISSION_TIMEOUT: Duration = Duration::from_secs(20);
 
 /// Cheap, owned snapshot of "where the running server lives" handed
 /// to every caller of [`OpenCodeServerManager::ensure_running`].
@@ -325,8 +329,11 @@ async fn require_project_config_isolation(binary_path: &Path) -> Result<(), Stri
     // MCP command before Codemux's approval gate sees it.
     let minimum = semver::Version::parse(MINIMUM_OPENCODE_VERSION)
         .expect("valid minimum OpenCode version");
-    let version = probe_version(binary_path).await
-        .and_then(|version| semver::Version::parse(version.strip_prefix('v').unwrap_or(&version)).ok());
+    let version = probe_version_with_timeout(binary_path, VERSION_ADMISSION_TIMEOUT)
+        .await
+        .and_then(|version| {
+            semver::Version::parse(version.strip_prefix('v').unwrap_or(&version)).ok()
+        });
     match version {
         Some(version) if version >= minimum => Ok(()),
         Some(version) => Err(format!(
@@ -540,7 +547,7 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     #[serial(opencode_path)]
-    async fn unsupported_or_unknown_version_cannot_start_project_loading() {
+    async fn only_verified_supported_version_can_start_project_loading() {
         use std::os::unix::fs::PermissionsExt;
         let tmp = tempfile::tempdir().unwrap();
         let binary = tmp.path().join("opencode");
@@ -562,6 +569,11 @@ mod tests {
             assert!(!manager.is_running_for_tests().await);
         }
         std::fs::write(&binary, "#!/bin/sh\necho opencode v2.4.1\n").unwrap();
+        assert!(require_project_config_isolation(&binary).await.is_ok());
+
+        // On a loaded CI runner the real CLI can answer after the short
+        // availability budget. Startup must still verify its version.
+        std::fs::write(&binary, "#!/bin/sh\n/bin/sleep 6\necho opencode v1.18.35\n").unwrap();
         assert!(require_project_config_isolation(&binary).await.is_ok());
     }
 
