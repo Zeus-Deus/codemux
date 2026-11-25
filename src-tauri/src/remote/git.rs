@@ -89,7 +89,7 @@ fn fetch_origin_branch(repo_root: &Path, branch: &str) -> bool {
     cmd.arg("-C")
         .arg(repo_root)
         .args(["fetch", "--quiet", "--no-tags", "origin", branch]);
-    let Ok(_ssh) = crate::ssh_policy::unattended_git(&mut cmd) else {
+    let Ok(_ssh) = crate::ssh_policy::unattended_git(&mut cmd, None) else {
         return false;
     };
     let Ok(mut child) = cmd
@@ -387,7 +387,7 @@ pub fn clone_repo(url: &str, target: &Path, timeout: Duration) -> Result<(), Str
     if let Some(parent) = target.parent() {
         cmd.current_dir(parent);
     }
-    let _ssh = crate::ssh_policy::unattended_git(&mut cmd)
+    let _ssh = crate::ssh_policy::unattended_git(&mut cmd, Some(target))
         .map_err(|e| format!("couldn't prepare unattended Git SSH: {e}"))?;
     run_capped(cmd, timeout).map(|_| ())
 }
@@ -409,7 +409,7 @@ pub fn ensure_origin_head(repo_root: &Path) {
     cmd.arg("-C")
         .arg(repo_root)
         .args(["remote", "set-head", "origin", "--auto"]);
-    let Ok(_ssh) = crate::ssh_policy::unattended_git(&mut cmd) else {
+    let Ok(_ssh) = crate::ssh_policy::unattended_git(&mut cmd, None) else {
         return;
     };
     let _ = run_capped(cmd, ORIGIN_HEAD_TIMEOUT);

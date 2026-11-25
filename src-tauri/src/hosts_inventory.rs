@@ -518,19 +518,13 @@ async fn fetch_inventory(ssh_target: &str, walk_disk: bool) -> Result<String, St
         INVENTORY_BUDGET
     };
     let argv = build_inventory_argv(ssh_target, INVENTORY_BUDGET.as_secs(), walk_disk);
-    let mut cmd = crate::ssh_policy::checked_ssh_tokio();
-    for arg in &argv {
-        cmd.arg(arg);
-    }
+    let mut cmd = crate::ssh_policy::checked_ssh_with_args(&argv)
+        .await
+        .map_err(|error| format!("ssh: {error}"))?;
     cmd.stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
-
-    #[cfg(windows)]
-    crate::ssh_policy::check_native_jumps(&cmd)
-        .await
-        .map_err(|error| format!("ssh: {error}"))?;
 
     let output = match timeout(budget, cmd.output()).await {
         Ok(Ok(o)) => o,

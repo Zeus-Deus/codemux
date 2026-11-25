@@ -111,8 +111,10 @@ impl TaskTransport for SshTransport {
 }
 
 async fn ssh_command(target: &str, remote: &str) -> Result<tokio::process::Command, TransportError> {
-    let mut command = crate::ssh_policy::pinned_native_ssh();
-    command.args(crate::ssh_policy::verified_command_args()).args([
+    let mut args: Vec<_> = crate::ssh_policy::verified_command_args()
+        .map(str::to_owned)
+        .collect();
+    args.extend([
         "-o",
         "ConnectTimeout=10",
         "-o",
@@ -122,11 +124,10 @@ async fn ssh_command(target: &str, remote: &str) -> Result<tokio::process::Comma
         "--",
         target,
         remote,
-    ]);
-    crate::ssh_policy::check_native_jumps(&command)
+    ].map(str::to_owned));
+    crate::ssh_policy::checked_native_ssh(&args)
         .await
-        .map_err(|error| TransportError::BeforeSend(error.to_string()))?;
-    Ok(command)
+        .map_err(|error| TransportError::BeforeSend(error.to_string()))
 }
 
 /// Actual production dispatch owner, shared with explicit offline CLI fixtures.

@@ -423,12 +423,13 @@ fn ensure_clone(source: &CloneSource<'_>, clone_dir: &Path) -> Result<(), String
             return Err("Automation checkout does not match the requested Git remote".into());
         }
         let mut command = crate::git::git_command();
-        let _ssh = crate::ssh_policy::unattended_git(&mut command)
-            .map_err(|error| format!("Failed to prepare unattended Git SSH: {error}"))?;
-        let output = command
+        command
             .arg("-C")
             .arg(clone_dir)
-            .args(["fetch", "--prune", "origin"])
+            .args(["fetch", "--prune", "origin"]);
+        let _ssh = crate::ssh_policy::unattended_git(&mut command, None)
+            .map_err(|error| format!("Failed to prepare unattended Git SSH: {error}"))?;
+        let output = command
             .output()
             .map_err(|error| format!("Failed to run git fetch: {error}"))?;
         if !output.status.success() {
@@ -452,17 +453,18 @@ fn ensure_clone(source: &CloneSource<'_>, clone_dir: &Path) -> Result<(), String
         Err(error) => return Err(format!("Failed to inspect automation checkout: {error}")),
     }
     let mut command = crate::git::git_command();
-    let _ssh = crate::ssh_policy::unattended_git(&mut command)
-        .map_err(|error| format!("Failed to prepare unattended Git SSH: {error}"))?;
-    record_clone_state(&lock, CLONE_IN_PROGRESS)
-        .map_err(|error| format!("Failed to mark automation checkout incomplete: {error}"))?;
     // Initialize .git at its final location so clone and fetch see the same
     // destination-scoped Git config.
-    let child = command
+    command
         .current_dir(source.cwd)
         .args(["clone", "--"])
         .arg(source.clone_argument())
-        .arg(clone_dir)
+        .arg(clone_dir);
+    let _ssh = crate::ssh_policy::unattended_git(&mut command, Some(clone_dir))
+        .map_err(|error| format!("Failed to prepare unattended Git SSH: {error}"))?;
+    record_clone_state(&lock, CLONE_IN_PROGRESS)
+        .map_err(|error| format!("Failed to mark automation checkout incomplete: {error}"))?;
+    let child = command
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())

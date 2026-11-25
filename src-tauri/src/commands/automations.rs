@@ -576,19 +576,19 @@ pub async fn automations_check_repo_access(
         use std::process::Stdio;
         use tokio::io::AsyncWriteExt;
 
-        let mut command = crate::ssh_policy::checked_ssh_tokio();
-        command.args(crate::ssh_policy::verified_command_args())
-            .arg("-o")
-            .arg("ConnectTimeout=10")
-            .arg("--")
-            .arg(&host.ssh_target)
-            .arg("sh -s")
+        let mut args: Vec<_> = crate::ssh_policy::verified_command_args()
+            .map(str::to_owned)
+            .collect();
+        args.extend(
+            ["-o", "ConnectTimeout=10", "--", host.ssh_target.as_str(), "sh -s"]
+                .map(str::to_owned),
+        );
+        let mut command = crate::ssh_policy::checked_ssh_with_args(&args).await?;
+        command
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .kill_on_drop(true);
-        #[cfg(windows)]
-        crate::ssh_policy::check_native_jumps(&command).await?;
         let mut child = command.spawn()?;
         let mut stdin = child.stdin.take().expect("piped SSH stdin");
         let send = async move {
