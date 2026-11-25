@@ -567,6 +567,17 @@ fn local_image_path(destination: &str) -> Option<String> {
         .get(..5)
         .is_some_and(|scheme| scheme.eq_ignore_ascii_case("file:"));
     let path = if is_file_url {
+        // `url::Url` collapses `file:////server/share` to `/server/share`.
+        // Inspect the original path before parsing can erase a UNC prefix.
+        if let Some(authority_and_path) = destination[5..].strip_prefix("//") {
+            let path_start = authority_and_path
+                .find(|c| c == '/' || c == '\\')
+                .unwrap_or(authority_and_path.len());
+            let raw_path = decode_uri(&authority_and_path[path_start..], "")?;
+            if is_network_or_device_image_path(&raw_path) {
+                return None;
+            }
+        }
         let url = url::Url::parse(&normalize_uri(destination)).ok()?;
         if url.scheme() != "file" || url.host_str().is_some_and(|host| host != "localhost") {
             return None;
@@ -697,9 +708,20 @@ mod tests {
     #[test]
     fn network_image_paths_are_never_planned_for_retention() {
         let text = "[unc](//server/share/a.png) [file](file:////server/share/b.png) \
-                    [device](//?/UNC/server/share/c.png) [local](/tmp/screenshot.png)";
+                    [encoded](file:///%2Fserver/share/c.png) \
+                    [mixed](file:///%5Cserver/share/d.png) \
+                    [hosted](file://localhost//server/share/e.png) \
+                    [device](//?/UNC/server/share/f.png) [local](/tmp/screenshot.png)";
         assert_eq!(local_image_sources(text), ["/tmp/screenshot.png"]);
-        for path in ["//server/share/a.png", r"\\server\share\a.png", r"\\?\C:\a.png"] {
+        for path in [
+            "//server/share/a.png",
+            r"\\server\share\a.png",
+            r"\\?\C:\a.png",
+            "file:////server/share/b.png",
+            "file:///%2Fserver/share/c.png",
+            "file:///%5Cserver/share/d.png",
+            "file://localhost//server/share/e.png",
+        ] {
             assert!(local_image_path(path).is_none(), "{path}");
         }
     }
