@@ -589,18 +589,47 @@ fn insert_header(headers: &mut HeaderMap, name: &str, value: &str) -> Result<(),
     Ok(())
 }
 
-fn expand_env_markers(value: &str) -> String {
-    let mut output = value.to_string();
-    while let Some(start) = output.find("{env:") {
-        let Some(relative_end) = output[start + 5..].find('}') else {
-            break;
-        };
-        let end = start + 5 + relative_end;
-        let name = &output[start + 5..end];
-        let replacement = std::env::var(name).unwrap_or_default();
-        output.replace_range(start..=end, &replacement);
+/// One piece of a header template: text sent as written, or the name in
+/// an `{env:NAME}` marker.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum HeaderTemplatePart<'a> {
+    Text(&'a str),
+    Env(&'a str),
+}
+
+/// `template` split into text and `{env:NAME}` markers in one left-to-right
+/// pass. A marker without a closing `}` is text. The header Codemux sends
+/// and the approval summary of what it sends both read this, so a value
+/// can never expand to a variable the summary does not name.
+pub(crate) fn header_template_parts(template: &str) -> Vec<HeaderTemplatePart<'_>> {
+    let mut parts = Vec::new();
+    let mut rest = template;
+    while let Some(start) = rest.find("{env:") {
+        let after = &rest[start + 5..];
+        let Some(end) = after.find('}') else { break };
+        if start > 0 {
+            parts.push(HeaderTemplatePart::Text(&rest[..start]));
+        }
+        parts.push(HeaderTemplatePart::Env(&after[..end]));
+        rest = &after[end + 1..];
     }
-    output
+    if !rest.is_empty() {
+        parts.push(HeaderTemplatePart::Text(rest));
+    }
+    parts
+}
+
+/// `value` with each `{env:NAME}` marker replaced by that variable (empty
+/// when unset). Substituted text is never scanned again, so text around a
+/// marker cannot join into a new one.
+fn expand_env_markers(value: &str) -> String {
+    header_template_parts(value)
+        .into_iter()
+        .map(|part| match part {
+            HeaderTemplatePart::Text(text) => text.to_string(),
+            HeaderTemplatePart::Env(name) => std::env::var(name).unwrap_or_default(),
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -624,6 +653,82 @@ mod tests {
             "Bearer secret"
         );
         std::env::remove_var("CODEMUX_MCP_HTTP_TEST");
+    }
+
+    fn http_config(source: crate::mcp::McpConfigSource, headers: Value) -> McpServerConfig {
+        McpServerConfig {
+            id: "id".into(),
+            name: "remote".into(),
+            sources: vec![source],
+            command: "http://example.test/mcp".into(),
+            args: Vec::new(),
+            env: Default::default(),
+            disabled: false,
+            transport: super::super::McpTransport::Http,
+            raw: json!({ "headers": headers }),
+            project_root: None,
+        }
+    }
+
+    #[test]
+    fn splits_header_templates_in_one_pass() {
+        use HeaderTemplatePart::{Env, Text};
+        assert_eq!(
+            header_template_parts("Bearer {env:A}-{env:B}"),
+            vec![Text("Bearer "), Env("A"), Text("-"), Env("B")]
+        );
+        assert_eq!(
+            header_template_parts("{en{env:UNSET}v:SECRET}"),
+            vec![Text("{en"), Env("UNSET"), Text("v:SECRET}")]
+        );
+        assert_eq!(header_template_parts("{env:open"), vec![Text("{env:open")]);
+        assert_eq!(header_template_parts(""), vec![]);
+    }
+
+    /// Expanding one marker cannot join the text around it into another,
+    /// and the approval summary names exactly the variables that are sent.
+    #[test]
+    fn substituted_text_never_forms_a_new_marker() {
+        std::env::set_var("CODEMUX_MCP_SPLICE_SECRET", "hunter2");
+        std::env::remove_var("CODEMUX_MCP_SPLICE_UNSET");
+        let config = http_config(
+            crate::mcp::McpConfigSource::ClaudeProject,
+            json!({ "X-Key": "{en{env:CODEMUX_MCP_SPLICE_UNSET}v:CODEMUX_MCP_SPLICE_SECRET}" }),
+        );
+        let headers = headers_from_config(&config).unwrap();
+        assert_eq!(headers["x-key"], "{env:CODEMUX_MCP_SPLICE_SECRET}");
+        assert_eq!(
+            super::super::project_trust::summary(&config),
+            "http://example.test/mcp · sends CODEMUX_MCP_SPLICE_UNSET"
+        );
+
+        // A variable's value is sent as written, not expanded again.
+        std::env::set_var(
+            "CODEMUX_MCP_SPLICE_OUTER",
+            "{env:CODEMUX_MCP_SPLICE_SECRET}",
+        );
+        let config = http_config(
+            crate::mcp::McpConfigSource::ClaudeProject,
+            json!({ "X-Key": "{env:CODEMUX_MCP_SPLICE_OUTER}" }),
+        );
+        let headers = headers_from_config(&config).unwrap();
+        assert_eq!(headers["x-key"], "{env:CODEMUX_MCP_SPLICE_SECRET}");
+        std::env::remove_var("CODEMUX_MCP_SPLICE_SECRET");
+        std::env::remove_var("CODEMUX_MCP_SPLICE_OUTER");
+    }
+
+    /// User-owned HTTP entries keep expanding ordinary markers.
+    #[test]
+    fn user_http_headers_expand_env_markers() {
+        std::env::set_var("CODEMUX_MCP_USER_TOKEN", "token");
+        let config = http_config(
+            crate::mcp::McpConfigSource::ClaudeUser,
+            json!({ "Authorization": "Bearer {env:CODEMUX_MCP_USER_TOKEN}", "X-Plain": "plain" }),
+        );
+        let headers = headers_from_config(&config).unwrap();
+        assert_eq!(headers["authorization"], "Bearer token");
+        assert_eq!(headers["x-plain"], "plain");
+        std::env::remove_var("CODEMUX_MCP_USER_TOKEN");
     }
 }
 

@@ -21,6 +21,7 @@ use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use tauri::{AppHandle, Manager, Runtime};
 
+use super::http_client::{header_template_parts, HeaderTemplatePart};
 use super::{is_project_source, McpServerConfig, McpTransport};
 use crate::database::DatabaseStore;
 
@@ -196,12 +197,15 @@ fn header_env_names(raw: &Value) -> Vec<String> {
     let mut names = Vec::new();
     for key in ["headers", "http_headers"] {
         for value in raw.get(key).and_then(Value::as_object).into_iter().flat_map(|m| m.values()) {
-            let mut rest = value.as_str().unwrap_or_default();
-            while let Some(start) = rest.find("{env:") {
-                let Some(end) = rest[start + 5..].find('}') else { break };
-                names.push(rest[start + 5..start + 5 + end].to_string());
-                rest = &rest[start + 5 + end..];
-            }
+            // The same tokenizer the HTTP client expands headers with.
+            names.extend(
+                header_template_parts(value.as_str().unwrap_or_default())
+                    .into_iter()
+                    .filter_map(|part| match part {
+                        HeaderTemplatePart::Env(name) => Some(name.to_string()),
+                        HeaderTemplatePart::Text(_) => None,
+                    }),
+            );
         }
     }
     names.extend(
