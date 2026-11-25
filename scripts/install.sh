@@ -607,9 +607,9 @@ display_source() {
 
 fetch_text() {
     if have curl; then
-        curl -fsSL "$1"
+        curl --globoff -fsSL "$1" 2>/dev/null
     elif have wget; then
-        wget -qO- "$1"
+        wget -qO- "$1" 2>/dev/null
     else
         die "need curl or wget to talk to GitHub"
     fi
@@ -622,17 +622,26 @@ download_to() {
         printf '%b\n' "  ${C_DIM}would download:${C_RESET} $(display_source "$_url")"
         return 0
     fi
+    # Downloader diagnostics can echo authenticated URLs. Report a safe error
+    # after suppressing both streams; the response goes directly to _dest.
     if have curl; then
-        if [ -t 1 ]; then
-            curl -fL --progress-bar -o "$_dest" "$_url"
+        if curl --globoff -fsSL -o "$_dest" "$_url" >/dev/null 2>&1; then
+            return 0
         else
-            curl -fsSL -o "$_dest" "$_url"
+            _download_status=$?
         fi
+        _download_tool=curl
     elif have wget; then
-        wget -q --show-progress -O "$_dest" "$_url"
+        if wget -q -O "$_dest" "$_url" >/dev/null 2>&1; then
+            return 0
+        else
+            _download_status=$?
+        fi
+        _download_tool=wget
     else
         die "need curl or wget to download the release artifact"
     fi
+    die "could not download the artifact (${_download_tool} exit ${_download_status}). Check the URL, network connection, and access credentials. Nothing was installed."
 }
 
 require_signature_tools() {

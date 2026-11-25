@@ -604,10 +604,22 @@ else
 #!/bin/sh
 # Serve <url> from $FIXTURE_DIR by its last path segment.
 out=""
+globoff=0
 while [ $# -gt 1 ]; do
-    case "$1" in -o) out="$2"; shift ;; esac
+    case "$1" in
+        -o) out="$2"; shift ;;
+        --globoff) globoff=1 ;;
+    esac
     shift
 done
+if [ "${REQUIRE_GLOBOFF:-0}" = 1 ] && [ "$globoff" != 1 ]; then
+    printf 'curl: URL globbing left enabled: %s\n' "$1" >&2
+    exit 3
+fi
+if [ "${SIMULATE_DOWNLOAD_FAILURE:-0}" = 1 ]; then
+    printf 'curl: bad URL: %s\n' "$1" >&2
+    exit 3
+fi
 name="${1##*/}"; name="${name%%[?#]*}"
 if [ -n "${REQUIRED_SIGNATURE_URL:-}" ]; then
     case "$name" in *.sig) [ "$1" = "$REQUIRED_SIGNATURE_URL" ] || exit 22 ;; esac
@@ -643,7 +655,11 @@ CURL
         install_dependencies() { :; }
         verify_install() { :; }
         print_next_steps() { :; }
-        main > "${SIGROOT}/release.log" 2>&1
+        if [ "${SPLIT_RELEASE_OUTPUT:-0}" = 1 ]; then
+            main > "${SIGROOT}/release.stdout" 2> "${SIGROOT}/release.stderr"
+        else
+            main > "${SIGROOT}/release.log" 2>&1
+        fi
     )
 
     cp "$PKG" "$PKG.sig" "$RELEASE_DIR/"
@@ -669,9 +685,20 @@ CURL
     # local file is installed unchecked.
     rm -f "$RELEASE_DIR"/*
     cp "$PKG" "$PKG.sig" "$RELEASE_DIR/"
-    URL_ARTIFACT="https://downloads.example/codemux_9.9.9_amd64.deb" run_release_install
+    REQUIRE_GLOBOFF=1 URL_ARTIFACT="https://downloads.example/codemux_9.9.9_amd64.deb" run_release_install
     is "signed URL artifact installs" "$?" "0"
     is "the verified URL artifact is what gets installed" "$(cat "${SIGROOT}/installed" 2>/dev/null)" "genuine package"
+
+    # A real download failure must not echo authenticated URL components from
+    # curl's own diagnostics on either output stream.
+    SECRET_URL='https://downloads.example/fake-credential[.deb?key=fake-credential'
+    SIMULATE_DOWNLOAD_FAILURE=1 SPLIT_RELEASE_OUTPUT=1 URL_ARTIFACT="$SECRET_URL" run_release_install
+    is "failed authenticated curl download stops installation" "$?" "1"
+    is "failed authenticated curl download installs nothing" "$(test ! -e "${SIGROOT}/installed" && echo yes)" "yes"
+    not_contains "curl failure stdout hides the credential" "$(cat "${SIGROOT}/release.stdout")" "fake-credential"
+    not_contains "curl failure stderr hides the credential" "$(cat "${SIGROOT}/release.stderr")" "fake-credential"
+    contains "curl failure keeps a safe status" "$(cat "${SIGROOT}/release.stderr")" "curl exit 3"
+    contains "curl failure explains what to check" "$(cat "${SIGROOT}/release.stderr")" "Check the URL, network connection, and access credentials"
     printf 'trojaned package\n' > "${RELEASE_DIR}/codemux_9.9.9_amd64.deb"
     URL_ARTIFACT="https://downloads.example/codemux_9.9.9_amd64.deb" run_release_install
     is "replaced URL artifact fails" "$?" "1"
@@ -757,6 +784,10 @@ name="${url##*/}"; name="${name%%\?*}"
 if [ -n "${REQUIRED_SIGNATURE_URL:-}" ]; then
     case "$name" in *.sig) [ "$1" = "$REQUIRED_SIGNATURE_URL" ] || exit 8 ;; esac
 fi
+if [ "${SIMULATE_DOWNLOAD_FAILURE:-0}" = 1 ]; then
+    printf 'wget: bad URL: %s\n' "$1" >&2
+    exit 8
+fi
 src="${FIXTURE_DIR}/${name}"
 [ -f "$src" ] || exit 8
 if [ "$out" = "-" ]; then cat "$src"; else cp "$src" "$out"; fi
@@ -774,6 +805,13 @@ WGET
     REQUIRED_SIGNATURE_URL="$SIGNATURE_URL" URL_ARTIFACT="$PACKAGE_URL" URL_SIGNATURE="$SIGNATURE_URL" run_release_install
     is "authenticated signature verifies via wget" "$?" "0"
     is "wget installs the authenticated verified file" "$(cat "${SIGROOT}/installed" 2>/dev/null)" "genuine package"
+    SIMULATE_DOWNLOAD_FAILURE=1 SPLIT_RELEASE_OUTPUT=1 URL_ARTIFACT="$SECRET_URL" run_release_install
+    is "failed authenticated wget download stops installation" "$?" "1"
+    is "failed authenticated wget download installs nothing" "$(test ! -e "${SIGROOT}/installed" && echo yes)" "yes"
+    not_contains "wget failure stdout hides the credential" "$(cat "${SIGROOT}/release.stdout")" "fake-credential"
+    not_contains "wget failure stderr hides the credential" "$(cat "${SIGROOT}/release.stderr")" "fake-credential"
+    contains "wget failure keeps a safe status" "$(cat "${SIGROOT}/release.stderr")" "wget exit 8"
+    contains "wget failure explains what to check" "$(cat "${SIGROOT}/release.stderr")" "Check the URL, network connection, and access credentials"
     printf 'trojaned package\n' > "${RELEASE_DIR}/codemux_9.9.9_amd64.deb"
     run_release_install
     is "replaced asset via wget fails" "$?" "1"
