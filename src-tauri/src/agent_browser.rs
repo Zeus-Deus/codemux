@@ -2448,7 +2448,35 @@ fn build_agent_browser_argv_groups(
 static BROWSER_DAEMON_START_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 #[cfg(target_os = "windows")]
+struct NativeBrowserLaunchFailure {
+    error: std::io::Error,
+    may_have_launched: bool,
+}
+
+#[cfg(target_os = "windows")]
+impl NativeBrowserLaunchFailure {
+    fn before_launch(error: std::io::Error) -> Self {
+        Self { error, may_have_launched: false }
+    }
+
+    fn after_launch(error: std::io::Error) -> Self {
+        Self { error, may_have_launched: true }
+    }
+}
+
+#[cfg(target_os = "windows")]
 fn ensure_owned_browser_daemon(bin: &str, session: &str, stream_port: u16, timeout: Duration) -> std::io::Result<(BrowserPidRecord, bool)> {
+    ensure_owned_browser_daemon_with_status(bin, session, stream_port, timeout)
+        .map_err(|failure| failure.error)
+}
+
+#[cfg(target_os = "windows")]
+fn ensure_owned_browser_daemon_with_status(
+    bin: &str,
+    session: &str,
+    stream_port: u16,
+    timeout: Duration,
+) -> Result<(BrowserPidRecord, bool), NativeBrowserLaunchFailure> {
     use std::os::windows::process::CommandExt;
     const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
@@ -2458,31 +2486,41 @@ fn ensure_owned_browser_daemon(bin: &str, session: &str, stream_port: u16, timeo
     let started = Instant::now();
     let _start_guard = loop {
         if started.elapsed() >= timeout {
-            return Err(std::io::Error::new(std::io::ErrorKind::TimedOut, "Browser daemon startup timed out"));
+            return Err(NativeBrowserLaunchFailure::before_launch(std::io::Error::new(
+                std::io::ErrorKind::TimedOut, "Browser daemon startup timed out",
+            )));
         }
         match BROWSER_DAEMON_START_LOCK.try_lock() {
             Ok(guard) => break guard,
             Err(std::sync::TryLockError::Poisoned(_)) => {
-                return Err(std::io::Error::other("Browser daemon start lock was poisoned"));
+                return Err(NativeBrowserLaunchFailure::before_launch(std::io::Error::other(
+                    "Browser daemon start lock was poisoned",
+                )));
             }
             Err(std::sync::TryLockError::WouldBlock) => {
                 std::thread::sleep(Duration::from_millis(10).min(timeout.saturating_sub(started.elapsed())));
             }
         }
     };
-    require_owned_browser_session(session).map_err(std::io::Error::other)?;
+    require_owned_browser_session(session)
+        .map_err(std::io::Error::other)
+        .map_err(NativeBrowserLaunchFailure::before_launch)?;
     if let Some(pid) = read_agent_browser_daemon_pid(session) {
         return owned_browser_pid(session, pid)
             .map(|record| (record, false))
-            .ok_or_else(|| std::io::Error::other("Browser daemon identity changed"));
+            .ok_or_else(|| NativeBrowserLaunchFailure::after_launch(
+                std::io::Error::other("Browser daemon identity changed"),
+            ));
     }
 
     // Starting daemon mode directly avoids sending the first `open` command
     // through the CLI's unauthenticated port lookup. The relay below handles
     // that command only after the daemon is ready and identified.
-    let program = native_browser_program(bin)?;
+    let program = native_browser_program(bin).map_err(NativeBrowserLaunchFailure::before_launch)?;
     let mut cmd = std::process::Command::new(program);
-    set_browser_owner_env(&mut cmd, session).map_err(std::io::Error::other)?;
+    set_browser_owner_env(&mut cmd, session)
+        .map_err(std::io::Error::other)
+        .map_err(NativeBrowserLaunchFailure::before_launch)?;
     cmd.env("AGENT_BROWSER_DAEMON", "1")
         .env("AGENT_BROWSER_SESSION", session)
         .env("AGENT_BROWSER_STREAM_PORT", stream_port.to_string())
@@ -2499,7 +2537,7 @@ fn ensure_owned_browser_daemon(bin: &str, session: &str, stream_port: u16, timeo
     } else {
         cmd.stderr(std::process::Stdio::null());
     }
-    let mut child = cmd.spawn()?;
+    let mut child = cmd.spawn().map_err(NativeBrowserLaunchFailure::before_launch)?;
     loop {
         if let Some(pid) = read_agent_browser_daemon_pid(session) {
             if pid == child.id() {
@@ -2515,7 +2553,9 @@ fn ensure_owned_browser_daemon(bin: &str, session: &str, stream_port: u16, timeo
                 if let Some(dir) = run_dir_for_session(session) {
                     cleanup_stale_browser_lock_files_in(&dir, session, child.id());
                 }
-                return Err(std::io::Error::other(format!("Browser daemon exited before control startup: {status}")));
+                return Err(NativeBrowserLaunchFailure::after_launch(std::io::Error::other(
+                    format!("Browser daemon exited before control startup: {status}"),
+                )));
             }
             Ok(None) => {}
             Err(error) => {
@@ -2525,7 +2565,7 @@ fn ensure_owned_browser_daemon(bin: &str, session: &str, stream_port: u16, timeo
                 if let Some(dir) = run_dir_for_session(session) {
                     cleanup_stale_browser_lock_files_in(&dir, session, pid);
                 }
-                return Err(error);
+                return Err(NativeBrowserLaunchFailure::after_launch(error));
             }
         }
         if started.elapsed() >= timeout {
@@ -2535,7 +2575,9 @@ fn ensure_owned_browser_daemon(bin: &str, session: &str, stream_port: u16, timeo
             if let Some(dir) = run_dir_for_session(session) {
                 cleanup_stale_browser_lock_files_in(&dir, session, pid);
             }
-            return Err(std::io::Error::new(std::io::ErrorKind::TimedOut, "Browser daemon control startup timed out"));
+            return Err(NativeBrowserLaunchFailure::after_launch(std::io::Error::new(
+                std::io::ErrorKind::TimedOut, "Browser daemon control startup timed out",
+            )));
         }
         std::thread::sleep(Duration::from_millis(100));
     }
@@ -2553,9 +2595,23 @@ fn run_agent_browser_native(
     discard_stderr: bool,
     timeout: Duration,
 ) -> std::io::Result<std::process::Output> {
+    run_agent_browser_native_with_status(bin, argv, session, stream_port, discard_stderr, timeout)
+        .map_err(|failure| failure.error)
+}
+
+#[cfg(target_os = "windows")]
+fn run_agent_browser_native_with_status(
+    bin: &str,
+    argv: &[String],
+    session: &str,
+    stream_port: u16,
+    discard_stderr: bool,
+    timeout: Duration,
+) -> Result<std::process::Output, NativeBrowserLaunchFailure> {
     let started = Instant::now();
-    let (record, started_here) = ensure_owned_browser_daemon(bin, session, stream_port, timeout)?;
-    track_browser_daemon_before_command(session, bin, &record, started_here)?;
+    let (record, started_here) = ensure_owned_browser_daemon_with_status(bin, session, stream_port, timeout)?;
+    track_browser_daemon_before_command(session, bin, &record, started_here)
+        .map_err(NativeBrowserLaunchFailure::after_launch)?;
     let remaining = timeout.saturating_sub(started.elapsed());
     let result = run_agent_browser_native_with_record(
         bin,
@@ -2567,6 +2623,7 @@ fn run_agent_browser_native(
         record.clone(),
     );
     finish_browser_command(result, session, bin, &record, started_here)
+        .map_err(NativeBrowserLaunchFailure::after_launch)
 }
 
 #[cfg(windows)]
@@ -3235,8 +3292,11 @@ fn execute_agent_browser_action_with_status(
         let mut combined_stderr = String::new();
         let mut all_ok = true;
         for argv in &groups {
-            let out = run_agent_browser_native(&bin, argv, session, stream_port, false, action_timeout(action))
-                .map_err(|e| BrowserActionFailure::after_launch(format!("Failed to run agent-browser: {}", e)))?;
+            let out = run_agent_browser_native_with_status(&bin, argv, session, stream_port, false, action_timeout(action))
+                .map_err(|failure| BrowserActionFailure {
+                    message: format!("Failed to run agent-browser: {}", failure.error),
+                    may_have_launched: failure.may_have_launched,
+                })?;
             combined_stdout.push_str(&String::from_utf8_lossy(&out.stdout));
             combined_stderr.push_str(&String::from_utf8_lossy(&out.stderr));
             if !out.status.success() {
@@ -3776,9 +3836,24 @@ impl AgentBrowserManager {
         .map_err(|e| BrowserActionFailure::after_launch(format!("agent-browser action task failed: {e}")))
         .and_then(|result| result);
 
-        // The agent-facing "close" goes through this path (not close()), so
-        // reset the state here — otherwise the entry keeps running = true and
-        // a later open on the fresh daemon would skip the default viewport.
+        self.reconcile_action_attempt(
+            browser_id, &session, action, was_running, viewport_may_have_launched, &result,
+        ).await;
+
+        result.map(|(result, _)| result).map_err(|error| error.message)
+    }
+
+    async fn reconcile_action_attempt(
+        &self,
+        browser_id: &str,
+        session: &str,
+        action: &str,
+        was_running: bool,
+        viewport_may_have_launched: bool,
+        result: &Result<(BrowserAutomationResult, BrowserActionOutcome), BrowserActionFailure>,
+    ) {
+        // The agent-facing "close" goes through run_command (not close()),
+        // so completed attempts must reset its state before the next open.
         let before_launch = result.as_ref().err().is_some_and(|error| !error.may_have_launched);
         if before_launch {
             if !was_running && !viewport_may_have_launched {
@@ -3790,10 +3865,8 @@ impl AgentBrowserManager {
                 }
             }
         } else {
-            self.reconcile_action_result(browser_id, &session, action, &result).await;
+            self.reconcile_action_result(browser_id, session, action, result).await;
         }
-
-        result.map(|(result, _)| result).map_err(|error| error.message)
     }
 
     pub async fn get_screenshot(&self, browser_id: &str) -> Result<String, String> {
@@ -4592,6 +4665,33 @@ mod tests {
         drop(guard);
         worker.join().unwrap();
         assert_eq!(result.unwrap(), Err(std::io::ErrorKind::TimedOut));
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn failed_windows_daemon_spawn_allows_next_start_attempt() {
+        let manager = AgentBrowserManager::new();
+        let session = format!("browser-spawn-retry-{}", uuid::Uuid::new_v4().simple());
+        let port = manager.allocate_port(&session).await.unwrap();
+        let was_running = manager.note_action_start(&session, "open").await;
+        assert!(!was_running);
+
+        let missing = std::env::temp_dir().join(format!("missing-agent-browser-{}.exe", uuid::Uuid::new_v4().simple()));
+        assert!(!missing.exists());
+        let failure = run_agent_browser_native_with_status(
+            missing.to_str().unwrap(),
+            &["open".into(), "about:blank".into(), "--session".into(), session.clone()],
+            &session,
+            port,
+            false,
+            Duration::from_secs(5),
+        ).unwrap_err();
+        assert_eq!(failure.error.kind(), std::io::ErrorKind::NotFound);
+        assert!(!failure.may_have_launched);
+        let result = Err(BrowserActionFailure::before_launch(failure.error.to_string()));
+        manager.reconcile_action_attempt(&session, &session, "open", was_running, false, &result).await;
+        assert!(!manager.sessions.lock().await.get(&session).unwrap().running);
+        assert!(!manager.note_action_start(&session, "open").await);
     }
 
     #[cfg(windows)]
