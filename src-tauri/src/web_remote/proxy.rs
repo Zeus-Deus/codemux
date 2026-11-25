@@ -51,6 +51,8 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio::sync::watch;
 use tokio_tungstenite::tungstenite::Message as TungMessage;
 
+use crate::agent_browser::{AgentBrowserManager, BrowserStreamIdentity};
+
 use super::{ListenerLife, WebRemoteState};
 
 /// Lowest agent-browser stream port. Sourced from the public constant so the
@@ -103,9 +105,10 @@ pub(super) async fn ws_proxy<R: Runtime>(
     if !port_in_range(port) {
         return (StatusCode::BAD_REQUEST, "port out of range").into_response();
     }
-    if !app.state::<crate::agent_browser::AgentBrowserManager>().owns_stream_port(port).await {
+    let Some(identity) = app.state::<AgentBrowserManager>()
+        .verified_stream_identity_for_port(port).await else {
         return StatusCode::FORBIDDEN.into_response();
-    }
+    };
     ws.on_upgrade(move |socket| async move {
         let shared = app.state::<WebRemoteState>().shared();
         let (close, mut closed) = watch::channel(false);
@@ -113,13 +116,14 @@ pub(super) async fn ws_proxy<R: Runtime>(
         // Register before checking again so a revocation during the upgrade
         // is either visible here or can signal this bridge to close.
         if super::server::session_active(&app, &session.id)
-            && app.state::<crate::agent_browser::AgentBrowserManager>().owns_stream_port(port).await
+            && app.state::<AgentBrowserManager>()
+                .verified_stream_identity_for_port(port).await == Some(identity)
         {
             tokio::select! {
                 biased;
                 _ = closed.changed() => {}
                 _ = life.stopped() => {}
-                _ = bridge_ws(socket, port) => {}
+                _ = bridge_ws(socket, identity) => {}
             }
         }
         shared.connections.unregister(connection);
@@ -129,9 +133,18 @@ pub(super) async fn ws_proxy<R: Runtime>(
 /// Bidirectionally pipe an upgraded client socket to the loopback daemon at
 /// `port`. Both directions await each send, so a slow peer stalls the reader
 /// on the other side (TCP backpressure) instead of buffering unboundedly.
-pub(crate) async fn bridge_ws(client: WebSocket, port: u16) {
+pub(crate) async fn bridge_ws(client: WebSocket, identity: BrowserStreamIdentity) {
+    let port = identity.port;
     let url = format!("ws://127.0.0.1:{port}");
-    let daemon = match tokio_tungstenite::connect_async(&url).await {
+    let daemon = match crate::agent_browser::connect_verified_stream_peer(identity).await {
+        Ok(stream) => tokio_tungstenite::client_async(&url, stream).await,
+        Err(_) => {
+            let mut client = client;
+            let _ = client.send(AxumMessage::Close(None)).await;
+            return;
+        }
+    };
+    let daemon = match daemon {
         Ok((ws, _)) => ws,
         Err(_) => {
             // Daemon not up (pane still launching / already closed). Close the
@@ -228,9 +241,10 @@ pub async fn http_forward<R: Runtime>(
     if !port_in_range(port) {
         return (StatusCode::BAD_REQUEST, "port out of range").into_response();
     }
-    if !app.state::<crate::agent_browser::AgentBrowserManager>().owns_stream_port(port).await {
+    let Some(identity) = app.state::<AgentBrowserManager>()
+        .verified_stream_identity_for_port(port).await else {
         return StatusCode::FORBIDDEN.into_response();
-    }
+    };
     // Reject a percent-decoded CR/LF (or other control char) in the path before
     // it reaches the raw request line — no header/request smuggling to the
     // daemon. (`uri.query()` stays percent-encoded, so it needs no such guard.)
@@ -240,7 +254,7 @@ pub async fn http_forward<R: Runtime>(
     if !allowed_browser_api(&method, &rest) {
         return StatusCode::NOT_FOUND.into_response();
     }
-    match forward(port, &method, &rest, uri.query(), &headers, &body).await {
+    match forward(identity, &method, &rest, uri.query(), &headers, &body).await {
         Ok(resp) => resp,
         Err(()) => (StatusCode::BAD_GATEWAY, "daemon unreachable").into_response(),
     }
@@ -249,13 +263,14 @@ pub async fn http_forward<R: Runtime>(
 /// Open a raw TCP connection to the daemon, write a minimal single-segment
 /// request, and translate the response back into an axum `Response`.
 pub(crate) async fn forward(
-    port: u16,
+    identity: BrowserStreamIdentity,
     method: &Method,
     rest: &str,
     query: Option<&str>,
     headers: &HeaderMap,
     body: &[u8],
 ) -> Result<Response, ()> {
+    let port = identity.port;
     let target = match query {
         Some(q) if !q.is_empty() => format!("/api/{rest}?{q}"),
         _ => format!("/api/{rest}"),
@@ -284,13 +299,9 @@ pub(crate) async fn forward(
     let mut wire = head.into_bytes();
     wire.extend_from_slice(body);
 
-    let mut stream = tokio::time::timeout(
-        Duration::from_secs(5),
-        tokio::net::TcpStream::connect(("127.0.0.1", port)),
-    )
-    .await
-    .map_err(|_| ())?
-    .map_err(|_| ())?;
+    let mut stream = crate::agent_browser::connect_verified_stream_peer(identity)
+        .await
+        .map_err(|_| ())?;
 
     // One write_all → the whole request lands in a single loopback segment,
     // satisfying the daemon's single-peek read.
@@ -541,7 +552,7 @@ mod tests {
         headers.insert(header::COOKIE, "session=private".parse().unwrap());
         headers.insert(header::AUTHORIZATION, "Bearer private".parse().unwrap());
         let response = forward(
-            port,
+            crate::agent_browser::current_process_stream_identity(port),
             &Method::POST,
             "command",
             None,
@@ -557,6 +568,33 @@ mod tests {
         assert!(request.contains(&format!("Origin: http://127.0.0.1:{port}\r\n")));
         assert!(!request.contains("session=private"));
         assert!(!request.contains("Bearer private"));
+    }
+
+    #[tokio::test]
+    async fn http_proxy_does_not_send_to_a_different_established_peer() {
+        let daemon = bind_test_daemon().await;
+        let port = daemon.local_addr().unwrap().port();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = daemon.accept().await.unwrap();
+            let mut buf = [0; 1];
+            tokio::time::timeout(Duration::from_secs(2), stream.read(&mut buf))
+                .await
+                .expect("proxy must close a rejected peer")
+                .unwrap()
+        });
+        let mut stale_identity = crate::agent_browser::current_process_stream_identity(port);
+        stale_identity.start_time += 1;
+        let response = forward(
+            stale_identity,
+            &Method::POST,
+            "command",
+            None,
+            &HeaderMap::new(),
+            br#"{"action":"stream_status"}"#,
+        )
+        .await;
+        assert!(response.is_err());
+        assert_eq!(server.await.unwrap(), 0, "rejected peer received request bytes");
     }
 
     #[tokio::test]

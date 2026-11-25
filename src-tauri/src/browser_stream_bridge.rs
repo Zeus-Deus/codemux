@@ -199,7 +199,7 @@ async fn bridge_ws<R: Runtime>(
             .await
             .is_some_and(|current| current.identity == target.identity)
         {
-            crate::web_remote::proxy::bridge_ws(socket, target.identity.port).await;
+            crate::web_remote::proxy::bridge_ws(socket, target.identity).await;
         }
     })
 }
@@ -243,7 +243,7 @@ async fn bridge_http<R: Runtime>(
         );
     }
     match crate::web_remote::proxy::forward(
-        target.identity.port,
+        target.identity,
         method,
         rest,
         None,

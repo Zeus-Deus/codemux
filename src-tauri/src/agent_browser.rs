@@ -1069,6 +1069,109 @@ fn listener_owned_by_pid(port: u16, pid: u32) -> bool {
     }
 }
 
+/// Open the stream socket and verify the process on the server side of that
+/// exact connection before either proxy sends an HTTP or WebSocket request.
+pub(crate) async fn connect_verified_stream_peer(
+    identity: BrowserStreamIdentity,
+) -> std::io::Result<tokio::net::TcpStream> {
+    let stream = tokio::time::timeout(
+        Duration::from_secs(5),
+        tokio::net::TcpStream::connect(("127.0.0.1", identity.port)),
+    )
+    .await
+    .map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, "Browser stream connection timed out"))??;
+    let local = stream.local_addr()?;
+    let peer = stream.peer_addr()?;
+    let owned = tokio::task::spawn_blocking(move || {
+        // On Unix the accepted socket may not appear in the daemon's file
+        // descriptors until its accept loop runs. Bound the retry and fail
+        // closed if the established peer never belongs to the daemon.
+        for _ in 0..10 {
+            if connected_stream_peer_owned_by_identity(local, peer, identity) {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        false
+    })
+    .await
+    .map_err(std::io::Error::other)?;
+    if !owned {
+        return Err(std::io::Error::other("Browser stream connection belongs to another process"));
+    }
+    Ok(stream)
+}
+
+fn connected_stream_peer_owned_by_identity(
+    local: std::net::SocketAddr,
+    peer: std::net::SocketAddr,
+    identity: BrowserStreamIdentity,
+) -> bool {
+    let (std::net::SocketAddr::V4(local), std::net::SocketAddr::V4(peer)) = (local, peer) else {
+        return false;
+    };
+    if !local.ip().is_loopback()
+        || !peer.ip().is_loopback()
+        || peer.port() != identity.port
+        || identity.pid == 0
+        || process_start_time(identity.pid) != Some(identity.start_time)
+    {
+        return false;
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let Ok(table) = std::fs::read_to_string("/proc/net/tcp") else { return false };
+        let server = format!("0100007F:{:04X}", peer.port());
+        let client = format!("0100007F:{:04X}", local.port());
+        let inodes: std::collections::HashSet<&str> = table
+            .lines()
+            .filter_map(|line| {
+                let fields: Vec<_> = line.split_whitespace().collect();
+                (fields.len() > 9
+                    && fields[1] == server
+                    && fields[2] == client
+                    && fields[3] == "01")
+                    .then_some(fields[9])
+            })
+            .collect();
+        if inodes.is_empty() {
+            return false;
+        }
+        let Ok(fds) = std::fs::read_dir(format!("/proc/{}/fd", identity.pid)) else { return false };
+        fds.flatten().any(|fd| {
+            let Ok(target) = std::fs::read_link(fd.path()) else { return false };
+            target.to_string_lossy()
+                .strip_prefix("socket:[")
+                .and_then(|inode| inode.strip_suffix(']'))
+                .is_some_and(|inode| inodes.contains(inode))
+        })
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let mut command = std::process::Command::new("lsof");
+        command.args([
+            "-nP", "-a", "-p", &identity.pid.to_string(),
+            &format!("-iTCP:{}", peer.port()), "-sTCP:ESTABLISHED", "-F", "n",
+        ]);
+        let expected = format!("n127.0.0.1:{}->127.0.0.1:{}", peer.port(), local.port());
+        output_capture_with_timeout(command, PROC_CONTROL_TIMEOUT)
+            .ok()
+            .filter(|output| output.status.success())
+            .is_some_and(|output| String::from_utf8_lossy(&output.stdout).lines().any(|line| line == expected))
+    }
+    #[cfg(windows)]
+    {
+        connected_tcp_peer_pid_for_addrs(
+            std::net::SocketAddr::V4(local),
+            std::net::SocketAddr::V4(peer),
+        ) == Some(identity.pid)
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
+    {
+        false
+    }
+}
+
 /// Check whether a PID is still alive without sending a real signal.
 /// Used by safe-adoption to decide whether a stale PID file points at a
 /// dead daemon (reap) or a still-running one (adopt).
@@ -1143,7 +1246,7 @@ pub struct AgentBrowserManager {
     /// from racing (e.g., React StrictMode double-mount, pane remount + agent action).
     start_lock: Mutex<()>,
     #[cfg(test)]
-    test_stream_ports: Mutex<std::collections::HashSet<u16>>,
+    test_stream_ports: Mutex<HashMap<u16, BrowserStreamIdentity>>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1170,6 +1273,30 @@ fn refresh_stream_session_identity(
         pid: record.pid,
         start_time: record.start_time,
         generation: stream.stream_generation,
+    }
+}
+
+fn process_start_time(pid: u32) -> Option<u64> {
+    use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System};
+
+    let process_id = Pid::from_u32(pid);
+    let mut system = System::new();
+    system.refresh_processes_specifics(
+        ProcessesToUpdate::Some(&[process_id]),
+        true,
+        ProcessRefreshKind::nothing(),
+    );
+    system.process(process_id).map(|process| process.start_time())
+}
+
+#[cfg(test)]
+pub(crate) fn current_process_stream_identity(port: u16) -> BrowserStreamIdentity {
+    let pid = std::process::id();
+    BrowserStreamIdentity {
+        port,
+        pid,
+        start_time: process_start_time(pid).expect("test process start time"),
+        generation: 1,
     }
 }
 
@@ -1951,7 +2078,8 @@ fn connect_verified_browser_control(
     let process = open_verified_browser_handle(record, session)
         .ok_or_else(|| std::io::Error::other("Browser daemon identity changed"))?;
     let dir = run_dir_for_session(session).ok_or_else(|| std::io::Error::other("Cannot prepare private browser control directory"))?;
-    let port = browser_control_port(session, &dir);
+    let port = browser_control_port(session, &dir)
+        .ok_or_else(|| std::io::Error::other("Browser control port is missing or invalid"))?;
     let address = std::net::SocketAddr::from(([127, 0, 0, 1], port));
     let stream = std::net::TcpStream::connect_timeout(&address, Duration::from_millis(500))?;
     if !connected_control_peer_owned_by_pid(&stream, record.pid) {
@@ -1969,13 +2097,21 @@ fn connected_control_peer_owned_by_pid(stream: &std::net::TcpStream, pid: u32) -
 
 #[cfg(windows)]
 fn connected_tcp_peer_pid(stream: &std::net::TcpStream) -> Option<u32> {
+    connected_tcp_peer_pid_for_addrs(stream.local_addr().ok()?, stream.peer_addr().ok()?)
+}
+
+#[cfg(windows)]
+fn connected_tcp_peer_pid_for_addrs(
+    local: std::net::SocketAddr,
+    peer: std::net::SocketAddr,
+) -> Option<u32> {
     use windows_sys::Win32::NetworkManagement::IpHelper::{
         GetExtendedTcpTable, MIB_TCPROW_OWNER_PID, MIB_TCP_STATE_ESTAB, TCP_TABLE_OWNER_PID_CONNECTIONS,
     };
     use windows_sys::Win32::Networking::WinSock::AF_INET;
 
-    let (Ok(std::net::SocketAddr::V4(peer)), Ok(std::net::SocketAddr::V4(local))) =
-        (stream.peer_addr(), stream.local_addr())
+    let (std::net::SocketAddr::V4(peer), std::net::SocketAddr::V4(local)) =
+        (peer, local)
     else {
         return None;
     };
@@ -2546,7 +2682,7 @@ impl AgentBrowserManager {
             sessions: Mutex::new(HashMap::new()),
             start_lock: Mutex::new(()),
             #[cfg(test)]
-            test_stream_ports: Mutex::new(std::collections::HashSet::new()),
+            test_stream_ports: Mutex::new(HashMap::new()),
         }
     }
 
@@ -2703,10 +2839,10 @@ impl AgentBrowserManager {
         Ok(refresh_stream_session_identity(stream, &record))
     }
 
-    pub(crate) async fn owns_stream_port(&self, port: u16) -> bool {
+    pub(crate) async fn verified_stream_identity_for_port(&self, port: u16) -> Option<BrowserStreamIdentity> {
         #[cfg(test)]
-        if self.test_stream_ports.lock().await.contains(&port) {
-            return true;
+        if let Some(identity) = self.test_stream_ports.lock().await.get(&port).copied() {
+            return Some(identity);
         }
         let browser_id = {
             let sessions = self.sessions.lock().await;
@@ -2714,14 +2850,19 @@ impl AgentBrowserManager {
                 .find(|(_, session)| session.port == port && session.running)
                 .map(|(browser_id, _)| browser_id.clone())
         };
-        let Some(browser_id) = browser_id else { return false };
+        let browser_id = browser_id?;
         self.verified_stream_identity(&browser_id).await
-            .is_ok_and(|identity| identity.port == port)
+            .ok()
+            .filter(|identity| identity.port == port)
+    }
+
+    pub(crate) async fn owns_stream_port(&self, port: u16) -> bool {
+        self.verified_stream_identity_for_port(port).await.is_some()
     }
 
     #[cfg(test)]
     pub(crate) async fn allow_test_stream_port(&self, port: u16) {
-        self.test_stream_ports.lock().await.insert(port);
+        self.test_stream_ports.lock().await.insert(port, current_process_stream_identity(port));
     }
 
     async fn clear_stale_running_stream_allocation(&self, session_key: &str, port: u16) {
