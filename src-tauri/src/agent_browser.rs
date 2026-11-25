@@ -1759,13 +1759,40 @@ fn output_capture_and_track_browser_daemon(
     timeout: Duration,
     session: &str,
 ) -> std::io::Result<std::process::Output> {
-    let outcome = output_capture_with_timeout(command, timeout);
+    output_capture_and_track_browser_daemon_with_status(command, timeout, session)
+        .map_err(|failure| failure.error)
+}
+
+#[cfg(not(windows))]
+struct UnixBrowserLaunchFailure {
+    error: std::io::Error,
+    may_have_launched: bool,
+}
+
+#[cfg(not(windows))]
+fn output_capture_and_track_browser_daemon_with_status(
+    mut command: std::process::Command,
+    timeout: Duration,
+    session: &str,
+) -> Result<std::process::Output, UnixBrowserLaunchFailure> {
+    command
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    let mut spawned = false;
+    let outcome = spawn_wait_collect_with_child(command, timeout, |_| {
+        spawned = true;
+        Ok(())
+    });
     // A first command may start the daemon before failing or timing out.
     // Persist its verified identity before the caller handles either result.
-    if track_current_browser_daemon(session).is_none() {
+    // A failed Command::spawn could not have started the launcher.
+    if spawned && track_current_browser_daemon(session).is_none() {
         track_late_browser_daemon(session);
     }
-    outcome
+    outcome.map_err(|error| UnixBrowserLaunchFailure {
+        error,
+        may_have_launched: spawned,
+    })
 }
 
 #[cfg(not(windows))]
@@ -2238,6 +2265,28 @@ fn require_unix_browser_launcher(binary: &str) -> Result<(), String> {
         .map_err(|_| "Browser launcher is unavailable".to_string())
 }
 
+#[cfg(not(windows))]
+fn browser_action_command(
+    binary: &str,
+    argv: &[String],
+    session: &str,
+    stream_port: u16,
+) -> Result<std::process::Command, String> {
+    let mut command = if binary == "npx agent-browser" {
+        let mut command = std::process::Command::new("npx");
+        command.arg("agent-browser");
+        command
+    } else {
+        std::process::Command::new(binary)
+    };
+    set_browser_owner_env(&mut command, session)?;
+    command.args(argv)
+        .env("AGENT_BROWSER_STREAM_PORT", stream_port.to_string())
+        .env("AGENT_BROWSER_ARGS", STEALTH_CHROMIUM_ARGS)
+        .env("AGENT_BROWSER_USER_AGENT", stealth_user_agent());
+    Ok(command)
+}
+
 #[cfg(not(target_os = "windows"))]
 fn browser_open_command(bin: &str, session: &str, port: u16) -> Result<std::process::Command, String> {
     let mut cmd = if bin == "npx agent-browser" {
@@ -2631,9 +2680,8 @@ fn format_dpr(dpr: f64) -> String {
     }
 }
 
-/// Argv-form sibling of `build_agent_browser_command`. Used only on Windows
-/// to spawn agent-browser.exe without depending on Git Bash being installed.
-#[cfg(target_os = "windows")]
+/// Argv-form sibling of `build_agent_browser_command`. Direct execution lets
+/// Unix distinguish an exec failure from a launcher that actually ran.
 fn build_agent_browser_argv_groups(
     session: &str,
     action: &str,
@@ -2653,7 +2701,10 @@ fn build_agent_browser_argv_groups(
             // the `open` subcommand and the binary exits silently —
             // exactly the "no log activity, browser never loads" mode
             // the user hit.
+            #[cfg(windows)]
             let mut open_argv: Vec<String> = windows_executable_path_args();
+            #[cfg(not(windows))]
+            let mut open_argv: Vec<String> = Vec::new();
             open_argv.extend(["open".into(), url, "--session".into(), s.clone()]);
             // agent-browser open already waits for load. A second wait
             // subscribes after that event and can stall until its timeout.
@@ -3751,22 +3802,31 @@ fn execute_agent_browser_action_with_status(
 
     #[cfg(not(target_os = "windows"))]
     let (stdout, stderr, status_success, may_have_launched) = {
-        let shell_cmd = build_agent_browser_command(session, action, &params)
+        let bin = resolve_binary();
+        let groups = build_agent_browser_argv_groups(session, action, &params)
             .map_err(BrowserActionFailure::before_launch)?;
-        let mut cmd = std::process::Command::new("sh");
-        set_browser_owner_env(&mut cmd, session).map_err(BrowserActionFailure::before_launch)?;
-        cmd.args(["-c", &shell_cmd])
-            .env("AGENT_BROWSER_STREAM_PORT", stream_port.to_string())
-            .env("AGENT_BROWSER_ARGS", STEALTH_CHROMIUM_ARGS)
-            .env("AGENT_BROWSER_USER_AGENT", stealth_user_agent());
-        let output = output_capture_and_track_browser_daemon(cmd, action_timeout(action), session)
-            .map_err(|error| BrowserActionFailure::after_launch(format!("Failed to run agent-browser: {}", error)))?;
-        (
-            String::from_utf8_lossy(&output.stdout).to_string(),
-            String::from_utf8_lossy(&output.stderr).to_string(),
-            output.status.success(),
-            true,
-        )
+        let mut combined_stdout = String::new();
+        let mut combined_stderr = String::new();
+        let mut all_ok = true;
+        let mut launched = false;
+        for argv in &groups {
+            let command = browser_action_command(&bin, argv, session, stream_port)
+                .map_err(|message| BrowserActionFailure { message, may_have_launched: launched })?;
+            let output = output_capture_and_track_browser_daemon_with_status(
+                command, action_timeout(action), session,
+            ).map_err(|failure| BrowserActionFailure {
+                message: format!("Failed to run agent-browser: {}", failure.error),
+                may_have_launched: launched || failure.may_have_launched,
+            })?;
+            launched = true;
+            combined_stdout.push_str(&String::from_utf8_lossy(&output.stdout));
+            combined_stderr.push_str(&String::from_utf8_lossy(&output.stderr));
+            if !output.status.success() {
+                all_ok = false;
+                break;
+            }
+        }
+        (combined_stdout, combined_stderr, all_ok, launched)
     };
 
     if (!may_have_launched && action != "close")
@@ -4192,7 +4252,8 @@ impl AgentBrowserManager {
         params: &serde_json::Value,
         binary: &str,
     ) -> Result<bool, String> {
-        build_agent_browser_command_for_binary(binary, session, action, params)?;
+        require_unix_browser_launcher(binary)?;
+        build_agent_browser_argv_groups(session, action, params)?;
         Ok(self.note_action_start(browser_id, action).await)
     }
 
@@ -5824,6 +5885,44 @@ mod tests {
         assert!(command.contains("open 'about:blank' --session 'browser-launcher-retry'"));
         assert!(!manager.prepare_unix_action(session, session, "open", &params, binary).await.unwrap(),
             "the same session must accept a fresh first action");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn unix_launcher_with_missing_interpreter_releases_first_action_for_retry() {
+        use std::os::unix::fs::{symlink, PermissionsExt};
+
+        let temp = tempfile::tempdir().unwrap();
+        let interpreter = temp.path().join("interpreter");
+        let launcher = temp.path().join("agent-browser");
+        std::fs::write(&launcher, format!("#!{}\nexit 0\n", interpreter.display())).unwrap();
+        std::fs::set_permissions(&launcher, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let binary = launcher.to_str().unwrap();
+        let session = format!("browser-exec-retry-{}", uuid::Uuid::new_v4().simple());
+        let params = serde_json::json!({"url": "about:blank"});
+        let manager = AgentBrowserManager::new();
+        let port = manager.allocate_port(&session).await.unwrap();
+        let was_running = manager.prepare_unix_action(&session, &session, "open", &params, binary).await.unwrap();
+        assert!(!was_running);
+
+        let argv = build_agent_browser_argv_groups(&session, "open", &params).unwrap().remove(0);
+        let command = browser_action_command(binary, &argv, &session, port).unwrap();
+        let failure = output_capture_and_track_browser_daemon_with_status(
+            command, Duration::from_secs(2), &session,
+        ).err().expect("a missing shebang interpreter must prevent exec");
+        assert_eq!(failure.error.kind(), std::io::ErrorKind::NotFound);
+        assert!(!failure.may_have_launched);
+        let result = Err(BrowserActionFailure::before_launch(failure.error.to_string()));
+        manager.reconcile_action_attempt(&session, &session, "open", was_running, false, &result).await;
+        assert!(!manager.sessions.lock().await.get(&session).unwrap().running);
+
+        symlink("/bin/sh", &interpreter).unwrap();
+        assert!(!manager.prepare_unix_action(&session, &session, "open", &params, binary).await.unwrap());
+        let command = browser_action_command(binary, &argv, &session, port).unwrap();
+        let output = output_capture_and_track_browser_daemon_with_status(
+            command, Duration::from_secs(2), &session,
+        ).unwrap();
+        assert!(output.status.success());
     }
 
     #[cfg(not(target_os = "windows"))]
