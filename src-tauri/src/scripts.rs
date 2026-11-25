@@ -104,14 +104,25 @@ pub struct IncludeResult {
 ///   2. `worktree_includes` from project settings
 ///   3. Hardcoded defaults (`DEFAULT_WORKTREE_INCLUDES`)
 ///
-/// Copy only between distinct checkouts registered in the source repository.
+/// Automatically copy top-level files into a distinct registered checkout.
 pub fn process_worktree_includes(
     root_path: &Path,
     worktree_path: &Path,
     setting_patterns: &[String],
 ) -> Result<IncludeResult, String> {
-    if let Some((source, destination)) = open_registered_include_dirs(root_path, worktree_path) {
-        return copy_worktree_includes(&source, &destination, setting_patterns);
+    process_registered_worktree_includes(root_path, worktree_path, setting_patterns, false)
+}
+
+fn process_registered_worktree_includes(
+    root_path: &Path,
+    worktree_path: &Path,
+    setting_patterns: &[String],
+    include_nested: bool,
+) -> Result<IncludeResult, String> {
+    if let Some((source, destination)) =
+        open_registered_include_dirs(root_path, worktree_path, include_nested)
+    {
+        return copy_worktree_includes(&source, &destination, setting_patterns, include_nested);
     }
     Ok(IncludeResult {
         copied: Vec::new(),
@@ -119,22 +130,24 @@ pub fn process_worktree_includes(
     })
 }
 
-fn open_registered_include_dirs(root: &Path, workspace: &Path) -> Option<(IncludeSourceDir, Dir)> {
+fn open_registered_include_dirs(
+    root: &Path,
+    workspace: &Path,
+    include_nested: bool,
+) -> Option<(IncludeSourceDir, Dir)> {
     let root = root.canonicalize().ok()?;
     let workspace = workspace.canonicalize().ok()?;
     let checkout_path = nearest_checkout(&workspace)?;
     if checkout_path == root {
         return None;
     }
+    let relative = workspace.strip_prefix(checkout_path).ok()?;
+    if !include_nested && !relative.as_os_str().is_empty() {
+        return None;
+    }
     let source = IncludeSourceDir::open(&root).ok()?;
     let checkout = Dir::open_ambient_dir(checkout_path, cap_std::ambient_authority()).ok()?;
-    // Open a subdirectory through the same checkout whose registration is verified.
-    let relative = workspace.strip_prefix(checkout_path).ok()?;
-    let destination = if relative.as_os_str().is_empty() {
-        checkout.try_clone().ok()?
-    } else {
-        checkout.open_dir_nofollow(relative).ok()?
-    };
+    let destination = open_include_parent(&checkout, relative, false).ok()?;
     verify_include_registration(&source, &checkout, checkout_path)?;
     Some((source, destination))
 }
@@ -181,12 +194,7 @@ fn read_registration_path(dir: &Dir, name: &str, prefix: &[u8]) -> Option<PathBu
     if bytes.len() as u64 > MAX_GIT_PATH_RECORD {
         return None;
     }
-    let bytes = crate::git::strip_git_line_ending(bytes);
-    let path = bytes.strip_prefix(prefix)?;
-    if path.is_empty() || path.contains(&0) {
-        return None;
-    }
-    crate::git::path_from_git_bytes(path.to_vec())
+    crate::git::git_registration_path(&bytes, prefix)
 }
 
 fn directory_matches(dir: &Dir, path: &Path) -> bool {
@@ -271,6 +279,7 @@ fn copy_worktree_includes(
     root: &IncludeSourceDir,
     destination: &Dir,
     setting_patterns: &[String],
+    include_nested: bool,
 ) -> Result<IncludeResult, String> {
     let include_file = Path::new(".codemuxinclude");
     let mut patterns = tempfile::NamedTempFile::new()
@@ -305,7 +314,7 @@ fn copy_worktree_includes(
         root.path.display()
     );
 
-    let copied = copy_matching_files(root, destination, patterns.path())?;
+    let copied = copy_matching_files(root, destination, patterns.path(), include_nested)?;
 
     if !copied.is_empty() {
         eprintln!(
@@ -334,6 +343,7 @@ fn copy_matching_files(
     root: &IncludeSourceDir,
     destination: &Dir,
     exclude_file: &Path,
+    include_nested: bool,
 ) -> Result<Vec<String>, String> {
     let output = root
         .git_command()
@@ -377,6 +387,11 @@ fn copy_matching_files(
                 .map_err(|e| format!("Invalid worktree include path: {e}"))?,
         );
 
+        // On Unix an open nested directory can still be moved out of the
+        // checkout. Automatic copies stay at the registered checkout root.
+        if !include_nested && relative_path.components().count() != 1 {
+            continue;
+        }
         if copy_confined_include(&root.dir, destination, relative_path).map_err(|error| {
             format!("Copy worktree include {}: {error}", relative_path.display())
         })? {
@@ -385,6 +400,32 @@ fn copy_matching_files(
     }
 
     Ok(copied)
+}
+
+fn open_include_parent(root: &Dir, path: &Path, create: bool) -> io::Result<Dir> {
+    let mut directory = root.try_clone()?;
+    for component in path.components() {
+        let Component::Normal(name) = component else {
+            return Err(ErrorKind::InvalidInput.into());
+        };
+        if create {
+            match directory.create_dir(name) {
+                Ok(()) => {}
+                Err(error) if error.kind() == ErrorKind::AlreadyExists => {}
+                Err(error) => return Err(error),
+            }
+        }
+        directory = directory.open_dir_nofollow(name)?;
+        #[cfg(windows)]
+        {
+            use cap_std::fs::MetadataExt;
+            use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT;
+            if directory.dir_metadata()?.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+                return Err(io::Error::other("Worktree include crosses a reparse point"));
+            }
+        }
+    }
+    Ok(directory)
 }
 
 fn copy_confined_include(source: &Dir, destination: &Dir, path: &Path) -> io::Result<bool> {
@@ -397,25 +438,50 @@ fn copy_confined_include(source: &Dir, destination: &Dir, path: &Path) -> io::Re
             "Invalid worktree include path",
         ));
     }
-    let parent = path.parent().ok_or_else(|| {
-        io::Error::new(ErrorKind::InvalidInput, "Missing worktree include parent")
-    })?;
+    let parent = path.parent().ok_or(ErrorKind::InvalidInput)?;
+    let name = Path::new(path.file_name().ok_or(ErrorKind::InvalidInput)?);
     let Some(mut input) = open_regular_include(source, path)? else {
         return Ok(false);
     };
-    let metadata = input.metadata()?;
+    let destination = open_include_parent(destination, parent, true)?;
 
-    match destination.symlink_metadata(path) {
+    match destination.symlink_metadata(name) {
         Ok(entry) if !is_regular_include(&entry) => return Ok(false),
         Ok(_) => {}
         Err(error) if error.kind() == ErrorKind::NotFound => {}
         Err(error) => return Err(error),
     }
-    destination.create_dir_all(parent)?;
+    stage_include(&mut input, &destination)?.publish(name)?;
+    Ok(true)
+}
 
+struct StagedInclude<'a> {
+    parent: &'a Dir,
+    name: String,
+    published: bool,
+}
+
+impl StagedInclude<'_> {
+    fn publish(mut self, name: &Path) -> io::Result<()> {
+        self.parent.rename(&self.name, self.parent, name)?;
+        self.published = true;
+        Ok(())
+    }
+}
+
+impl Drop for StagedInclude<'_> {
+    fn drop(&mut self) {
+        if !self.published {
+            let _ = self.parent.remove_file(&self.name);
+        }
+    }
+}
+
+fn stage_include<'a>(input: &mut File, parent: &'a Dir) -> io::Result<StagedInclude<'a>> {
     // A new file never truncates an existing inode that another path could
-    // share. The final rename replaces only the confined directory entry.
-    let stage = parent.join(format!(".codemux-include-{}.tmp", uuid::Uuid::new_v4()));
+    // share. Use the same parent for the temporary file, rename and cleanup.
+    let permissions = input.metadata()?.permissions();
+    let name = format!(".codemux-include-{}.tmp", uuid::Uuid::new_v4());
     let mut write = OpenOptions::new();
     write.write(true).create_new(true);
     #[cfg(unix)]
@@ -423,17 +489,12 @@ fn copy_confined_include(source: &Dir, destination: &Dir, path: &Path) -> io::Re
         use cap_std::fs::OpenOptionsExt;
         write.mode(0o600);
     }
-    let mut output = destination.open_with(&stage, &write)?;
-    let staged = io::copy(&mut input, &mut output)
-        .and_then(|_| output.set_permissions(metadata.permissions()));
+    let mut output = parent.open_with(&name, &write)?;
+    let stage = StagedInclude { parent, name, published: false };
+    let staged = io::copy(input, &mut output).and_then(|_| output.set_permissions(permissions));
     drop(output);
-    match staged.and_then(|_| destination.rename(&stage, destination, path)) {
-        Ok(()) => Ok(true),
-        Err(error) => {
-            let _ = destination.remove_file(&stage);
-            Err(error)
-        }
-    }
+    staged?;
+    Ok(stage)
 }
 
 fn open_regular_include(dir: &Dir, path: &Path) -> io::Result<Option<File>> {
@@ -542,7 +603,7 @@ pub fn run_setup_scripts<R: Runtime>(
         .unwrap_or_default();
 
     // Step 1: Process worktree includes (copy gitignored files from main worktree)
-    match process_worktree_includes(&root_path, workspace_path, &setting_patterns) {
+    match process_registered_worktree_includes(&root_path, workspace_path, &setting_patterns, true) {
         Ok(result) => {
             let _ = app_handle.emit(
                 "worktree-includes-applied",
@@ -924,7 +985,7 @@ mod tests {
     ) -> Result<IncludeResult, String> {
         let root = IncludeSourceDir::open(&root.canonicalize().unwrap()).unwrap();
         let destination = Dir::open_ambient_dir(destination, cap_std::ambient_authority()).unwrap();
-        super::copy_worktree_includes(&root, &destination, patterns)
+        super::copy_worktree_includes(&root, &destination, patterns, true)
     }
 
     // Bash-subprocess round-trip: spawn `sh -c 'echo -n "$VAR" > file'`, then
@@ -1261,6 +1322,9 @@ mod tests {
         let nested_registered = root.join("linked");
         let subdirectory = root.join("subdirectory");
         include_source_project(&root);
+        fs::write(root.join(".codemuxinclude"), ".env\nsettings/private.env\n").unwrap();
+        fs::create_dir(root.join("settings")).unwrap();
+        fs::write(root.join("settings/private.env"), "INCLUDE_FIXTURE=nested").unwrap();
         fs::create_dir(&subdirectory).unwrap();
         register_include_fixture(&root, &registered);
         register_include_fixture(&root, &nested_registered);
@@ -1274,6 +1338,12 @@ mod tests {
             assert_eq!(resolve_root_path(checkout), canonical_root);
             let includes = process_worktree_includes(&root, checkout, &[]).unwrap();
             assert_eq!(includes.copied, [".env"]);
+            assert!(!checkout.join("settings").exists());
+            let subdirectory = checkout.join("subdirectory");
+            fs::create_dir(&subdirectory).unwrap();
+            let includes = process_worktree_includes(&root, &subdirectory, &[]).unwrap();
+            assert!(includes.copied.is_empty());
+            assert!(!subdirectory.join(".env").exists());
         }
         for checkout in [fixture.path().join("unregistered"), root.join("nested")] {
             fs::create_dir(&checkout).unwrap();
@@ -1310,7 +1380,9 @@ mod tests {
         fs::create_dir(&subdirectory).unwrap();
         let source = resolve_root_path(&subdirectory);
         assert_eq!(source, root.canonicalize().unwrap());
-        let includes = process_worktree_includes(&source, &subdirectory, &[".env".into()]).unwrap();
+        let includes =
+            process_registered_worktree_includes(&source, &subdirectory, &[".env".into()], true)
+                .unwrap();
         assert_eq!(includes.source, IncludeSource::File);
         assert_eq!(includes.copied, ["local.settings"]);
         assert_eq!(
@@ -1318,6 +1390,58 @@ mod tests {
             "INCLUDE_FIXTURE=custom"
         );
         assert!(!subdirectory.join(".env").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn worktree_includes_accept_crlf_registration_records() {
+        let fixture = tempfile::tempdir().unwrap();
+        let root = fixture.path().join("project");
+        let checkout = fixture.path().join("linked\r\ncheckout");
+        include_source_project(&root);
+        register_include_fixture(&root, &checkout);
+
+        let admin = crate::git::git_path(&checkout, "--git-dir").unwrap();
+        for path in [checkout.join(".git"), admin.join("commondir"), admin.join("gitdir")] {
+            let mut record = fs::read(&path).unwrap();
+            assert_eq!(record.pop(), Some(b'\n'));
+            record.extend_from_slice(b"\r\n");
+            fs::write(path, record).unwrap();
+        }
+
+        assert_eq!(resolve_root_path(&checkout), root.canonicalize().unwrap());
+        let includes = process_worktree_includes(&root, &checkout, &[]).unwrap();
+        assert_eq!(includes.copied, [".env"]);
+        assert_eq!(
+            fs::read_to_string(checkout.join(".env")).unwrap(),
+            "INCLUDE_FIXTURE=local"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn failed_include_publication_cleans_up_after_the_parent_moves() {
+        let fixture = tempfile::tempdir().unwrap();
+        let checkout = fixture.path().join("checkout");
+        let original = checkout.join("settings");
+        let moved = fixture.path().join("moved-settings");
+        fs::create_dir_all(original.join(".env")).unwrap();
+        fs::write(fixture.path().join("source.env"), "INCLUDE_FIXTURE=private").unwrap();
+
+        let authority = cap_std::ambient_authority();
+        let source = Dir::open_ambient_dir(fixture.path(), authority).unwrap();
+        let checkout = Dir::open_ambient_dir(&checkout, authority).unwrap();
+        let parent = open_include_parent(&checkout, Path::new("settings"), false).unwrap();
+        let mut input = source.open("source.env").unwrap();
+        let stage = stage_include(&mut input, &parent).unwrap();
+        assert!(original.join(&stage.name).is_file());
+
+        fs::rename(&original, &moved).unwrap();
+        fs::create_dir(&original).unwrap();
+        assert!(stage.publish(Path::new(".env")).is_err());
+        assert_eq!(fs::read_dir(&moved).unwrap().count(), 1);
+        assert!(moved.join(".env").is_dir());
+        assert_eq!(fs::read_dir(&original).unwrap().count(), 0);
     }
 
     #[cfg(unix)]
@@ -1331,7 +1455,7 @@ mod tests {
         include_source_project(&root);
         register_include_fixture(&root, &checkout);
         fs::write(root.join(".codemuxinclude"), ".env\n").unwrap();
-        let (source, destination) = open_registered_include_dirs(&root, &checkout).unwrap();
+        let (source, destination) = open_registered_include_dirs(&root, &checkout, false).unwrap();
 
         fs::rename(&root, &moved_root).unwrap();
         fs::rename(&checkout, &moved_checkout).unwrap();
@@ -1340,7 +1464,7 @@ mod tests {
         fs::write(root.join(".codemuxinclude"), "different\n").unwrap();
         fs::create_dir(&checkout).unwrap();
 
-        let includes = super::copy_worktree_includes(&source, &destination, &[]).unwrap();
+        let includes = super::copy_worktree_includes(&source, &destination, &[], false).unwrap();
         assert_eq!(includes.source, IncludeSource::File);
         assert_eq!(includes.copied, [".env"]);
         assert_eq!(

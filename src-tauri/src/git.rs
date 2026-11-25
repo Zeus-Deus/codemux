@@ -1931,7 +1931,7 @@ fn registered_worktree_backlink(repo_path: &Path, checkout: &Path) -> Option<()>
     if !std::fs::symlink_metadata(&backlink).ok()?.is_file() {
         return None;
     }
-    let backlink = path_from_git_bytes(strip_git_line_ending(std::fs::read(backlink).ok()?))?;
+    let backlink = git_registration_path(&std::fs::read(backlink).ok()?, b"")?;
     (admin.join(backlink).canonicalize().ok()? == marker).then_some(())
 }
 
@@ -2019,7 +2019,7 @@ fn git_line(dir: &Path, args: &[&str]) -> Option<Vec<u8>> {
     Some(strip_git_line_ending(output.stdout))
 }
 
-pub(crate) fn strip_git_line_ending(mut bytes: Vec<u8>) -> Vec<u8> {
+fn strip_git_line_ending(mut bytes: Vec<u8>) -> Vec<u8> {
     if bytes.last() == Some(&b'\n') {
         bytes.pop();
         #[cfg(not(unix))]
@@ -2028,6 +2028,20 @@ pub(crate) fn strip_git_line_ending(mut bytes: Vec<u8>) -> Vec<u8> {
         }
     }
     bytes
+}
+
+/// Git accepts trailing CR and LF bytes in on-disk gitfiles, commondir
+/// records, and worktree backlinks. Keep command stdout and embedded path
+/// bytes separate from this record framing.
+pub(crate) fn git_registration_path(bytes: &[u8], prefix: &[u8]) -> Option<PathBuf> {
+    let mut path = bytes.strip_prefix(prefix)?;
+    while let Some((b'\r' | b'\n', rest)) = path.split_last() {
+        path = rest;
+    }
+    if path.is_empty() || path.contains(&0) {
+        return None;
+    }
+    path_from_git_bytes(path.to_vec())
 }
 
 /// Whether any worktree of `repo_path`'s repository is paused mid-rebase
