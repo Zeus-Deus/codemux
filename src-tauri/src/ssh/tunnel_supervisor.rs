@@ -21,7 +21,8 @@
 
 use crate::ssh::exec::validate_ssh_target;
 use crate::ssh::tunnel::{
-    build_tunnel_argv, has_private_socket_parent, prepare_local_socket, wait_for_socket, TunnelOptions,
+    build_tunnel_argv, has_private_socket_parent, prepare_local_socket, supervised_ssh_command,
+    wait_for_socket, TunnelOptions,
 };
 use crate::ssh::tunnel_paths::{discover_remote_socket, LocalSocket, DISCOVERY_TIMEOUT};
 use serde::Serialize;
@@ -29,7 +30,6 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncRead, AsyncReadExt};
-use tokio::process::Command;
 use tokio::sync::{watch, Mutex};
 
 /// Observable status of a supervised tunnel. Pushed via a `watch`
@@ -218,13 +218,12 @@ async fn run_supervisor(
                     remote_binary: &remote_binary,
                 });
                 remove_stale_socket(&local_socket);
-                let mut cmd = Command::new(&ssh_program);
+                let mut cmd = supervised_ssh_command(&ssh_program).await;
                 cmd.args(argv)
                     .stdin(std::process::Stdio::null())
                     .stdout(std::process::Stdio::piped())
                     .stderr(std::process::Stdio::piped())
                     .kill_on_drop(true);
-                crate::execution::sanitize_appimage_env_tokio(&mut cmd);
                 cmd.spawn().map_err(|error| error.to_string())
             } => result,
             _ = shutdown_rx.wait_for(|stop| *stop) => return,
@@ -454,6 +453,7 @@ fn circuit_open(failures: &[Instant]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::process::Command;
 
     fn private_test_dir() -> tempfile::TempDir {
         use std::os::unix::fs::PermissionsExt;
@@ -471,7 +471,7 @@ mod tests {
         let fake_ssh = dir.path().join("ssh");
         std::fs::write(
             &fake_ssh,
-            "#!/bin/sh\necho $$ > \"$0.pid\"\nprintf 'connection stalled\\n' >&2\nexec /bin/sleep 300\n",
+            "#!/bin/sh\n[ \"$1\" != -G ] || exit 1\necho $$ > \"$0.pid\"\nprintf 'connection stalled\\n' >&2\nexec /bin/sleep 300\n",
         )
         .unwrap();
         std::fs::set_permissions(&fake_ssh, std::fs::Permissions::from_mode(0o755)).unwrap();
@@ -543,7 +543,7 @@ mod tests {
         let fake_ssh = dir.path().join("ssh");
         std::fs::write(
             &fake_ssh,
-            "#!/bin/sh\necho $$ > \"$0.pid\"\nexec /bin/sleep 300\n",
+            "#!/bin/sh\n[ \"$1\" != -G ] || exit 1\necho $$ > \"$0.pid\"\nexec /bin/sleep 300\n",
         )
         .unwrap();
         std::fs::set_permissions(&fake_ssh, std::fs::Permissions::from_mode(0o755)).unwrap();
@@ -600,7 +600,7 @@ mod tests {
         let dir = private_test_dir();
         // An ssh that never binds the forward (e.g. stuck authenticating).
         let fake_ssh = dir.path().join("ssh");
-        std::fs::write(&fake_ssh, "#!/bin/sh\nexec /bin/sleep 300\n").unwrap();
+        std::fs::write(&fake_ssh, "#!/bin/sh\n[ \"$1\" != -G ] || exit 1\nexec /bin/sleep 300\n").unwrap();
         std::fs::set_permissions(&fake_ssh, std::fs::Permissions::from_mode(0o755)).unwrap();
         let local_socket = dir.path().join("tunnel.sock");
         // Left behind by a previous ssh that died.

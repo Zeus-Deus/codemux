@@ -41,6 +41,10 @@ const TUNNEL_READY: &str = "codemux:pty-tunnel-ready:v1";
 const PROBE_TIMEOUT: Duration = Duration::from_secs(15);
 const PROBE_CLEANUP_TIMEOUT: Duration = Duration::from_secs(3);
 const INSTALLED_PROBE_POLL_LIMIT: u32 = 200;
+const FORWARD_PROCESS_OPTIONS: [(&str, &str); 2] = [
+    ("forkafterauthentication ", "ForkAfterAuthentication=no"),
+    ("stdinnull ", "StdinNull=no"),
+];
 
 pub(super) fn has_private_socket_parent(path: &Path) -> bool {
     path.parent().is_some_and(is_private_directory)
@@ -172,8 +176,7 @@ exec sleep 2147483647"#,
     format!("exec sh -c {}", sh_quote(&script))
 }
 
-/// Build the ssh argv we use to spawn the tunneled daemon. Extracted
-/// so tests can assert the exact flags without forking ssh.
+/// Build the tunnel arguments shared by SSH clients after option detection.
 pub fn build_tunnel_argv(opts: &TunnelOptions<'_>) -> Vec<String> {
     build_forward_argv(
         opts.ssh_target,
@@ -191,12 +194,6 @@ fn build_forward_argv(
 ) -> Vec<String> {
     let mut args: Vec<_> = verified_ssh_args().into_iter().map(String::from).collect();
     args.extend([
-        // Keep SSH under our supervisor. For daemon probes, the remote
-        // command also uses EOF on the caller's pipe as its cleanup signal.
-        "-o".into(),
-        "ForkAfterAuthentication=no".into(),
-        "-o".into(),
-        "StdinNull=no".into(),
         "-o".into(),
         "ServerAliveInterval=30".into(),
         "-o".into(),
@@ -217,6 +214,42 @@ fn build_forward_argv(
         remote_command,
     ]);
     args
+}
+
+/// Keep SSH in the foreground and preserve the probe's stdin. Check which
+/// options exist without changing IgnoreUnknown on the real connection.
+pub(super) async fn supervised_ssh_command(program: &Path) -> Command {
+    let mut probe = crate::execution::host_command_tokio(program);
+    probe.args([
+        "-G",
+        "-F",
+        "/dev/null",
+        "-o",
+        "IgnoreUnknown=ForkAfterAuthentication,StdinNull",
+    ]);
+    for (_, option) in FORWARD_PROCESS_OPTIONS {
+        probe.args(["-o", option]);
+    }
+    probe.arg("localhost").kill_on_drop(true).stdin(Stdio::null());
+    let output = timeout(Duration::from_secs(1), probe.output())
+        .await
+        .ok()
+        .and_then(Result::ok)
+        .filter(|output| output.status.success());
+    let settings = output
+        .as_ref()
+        .map(|output| String::from_utf8_lossy(&output.stdout))
+        .filter(|config| config.lines().any(|line| line == "hostname localhost"));
+    let mut command = crate::execution::host_command_tokio(program);
+    // If detection fails, preserve the overrides and let SSH report errors.
+    for (setting, option) in FORWARD_PROCESS_OPTIONS {
+        if settings.as_ref().is_none_or(|config| {
+            config.lines().any(|line| line.starts_with(setting))
+        }) {
+            command.args(["-o", option]);
+        }
+    }
+    command
 }
 
 fn build_existing_daemon_command(remote_socket: &str) -> String {
@@ -341,7 +374,8 @@ pub(crate) async fn verify_workspace_daemon(
         ssh_target,
         &remote_socket,
         build_existing_daemon_command(&remote_socket),
-    )?;
+    )
+    .await?;
     let result = verify_daemon_forward(&local_socket.path, &mut child).await;
     let _ = child.kill().await;
     result.map(|()| true)
@@ -358,7 +392,8 @@ pub(crate) async fn verify_installed_workspace_daemon(ssh_target: &str) -> Resul
         &remote_socket,
         // The remote process ends even if the network never delivers EOF.
         build_installed_daemon_probe_command(&directory_name, INSTALLED_PROBE_POLL_LIMIT),
-    )?;
+    )
+    .await?;
     let result = verify_daemon_forward(&local_socket.path, &mut child).await;
     match timeout(PROBE_CLEANUP_TIMEOUT, child.wait()).await {
         Ok(Ok(status)) if status.success() => result,
@@ -369,21 +404,20 @@ pub(crate) async fn verify_installed_workspace_daemon(ssh_target: &str) -> Resul
     }
 }
 
-fn spawn_daemon_probe(
+async fn spawn_daemon_probe(
     ssh_target: &str,
     remote_socket: &str,
     remote_command: String,
 ) -> Result<(LocalSocket, Child), String> {
     let local_socket = LocalSocket::allocate()?;
     let argv = build_forward_argv(ssh_target, remote_socket, &local_socket.path, remote_command);
-    let mut command = Command::new("ssh");
+    let mut command = supervised_ssh_command(Path::new("ssh")).await;
     command
         .args(argv)
         .kill_on_drop(true)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    crate::execution::sanitize_appimage_env_tokio(&mut command);
     let child = command
         .spawn()
         .map_err(|error| format!("Could not open the device daemon probe: {error}"))?;
@@ -462,7 +496,7 @@ pub async fn spawn_ssh_tunnel(
     }
     prepare_local_socket(opts.local_socket)?;
     let argv = build_tunnel_argv(&opts);
-    let mut cmd = Command::new("ssh");
+    let mut cmd = supervised_ssh_command(Path::new("ssh")).await;
     cmd.args(&argv)
         .kill_on_drop(true)
         .stdin(Stdio::null())
@@ -543,18 +577,45 @@ mod tests {
         }
     }
 
-    #[test]
-    fn daemon_probe_argv_preserves_the_supervised_stdin_pipe() {
-        let (_, opts) = options();
-        let argv = build_forward_argv(
-            opts.ssh_target,
-            opts.remote_socket,
-            opts.local_socket,
-            build_existing_daemon_command(opts.remote_socket),
-        );
-        let flags = &argv[..argv.iter().position(|arg| arg == "--").unwrap()];
-        for setting in ["ForkAfterAuthentication=no", "StdinNull=no"] {
-            assert!(flags.windows(2).any(|pair| pair == ["-o", setting]));
+    #[tokio::test]
+    async fn supervised_forward_works_with_the_local_ssh_option_set() {
+        let baseline = Command::new("ssh")
+            .args(["-G", "-F", "/dev/null", "localhost"])
+            .output()
+            .await
+            .unwrap();
+        assert!(baseline.status.success(), "{baseline:?}");
+        let baseline = String::from_utf8(baseline.stdout).unwrap();
+        let fixture = tempfile::NamedTempFile::new().unwrap();
+        let mut saved_config =
+            String::from("IgnoreUnknown CodemuxFixtureOption\nCodemuxFixtureOption yes\n");
+        for (setting, _) in FORWARD_PROCESS_OPTIONS {
+            if baseline.lines().any(|line| line.starts_with(setting)) {
+                saved_config.push_str(&format!("{setting}yes\n"));
+            }
+        }
+        fs::write(fixture.path(), saved_config).unwrap();
+
+        let output = supervised_ssh_command(Path::new("ssh"))
+            .await
+            .args(["-G", "-F"])
+            .arg(fixture.path())
+            .args(verified_ssh_args())
+            .arg("localhost")
+            .output()
+            .await
+            .unwrap();
+        assert!(output.status.success(), "{output:?}");
+        let config = String::from_utf8(output.stdout).unwrap();
+        for (setting, _) in FORWARD_PROCESS_OPTIONS {
+            if baseline.lines().any(|line| line.starts_with(setting)) {
+                assert!(
+                    config.lines().any(|line| {
+                        matches!(line.strip_prefix(setting), Some("no" | "false"))
+                    }),
+                    "{config}",
+                );
+            }
         }
     }
 
