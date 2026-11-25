@@ -752,6 +752,11 @@ fn run_serve_status(state_dir_arg: Option<PathBuf>) -> ExitCode {
                 "[codemux-remote] no daemon manifest at {}. Not running.",
                 manifest_path.display()
             );
+            println!("{}", serde_json::json!({
+                "alive": false,
+                "live_terminals": null,
+                "running_version": null,
+            }));
             ExitCode::from(1)
         }
         Ok(Some(m)) => {

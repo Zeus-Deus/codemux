@@ -1125,6 +1125,12 @@ mod tests {
         assert_eq!(old.running_version, None);
         assert_eq!(old.serve_alive, None);
         assert!(old.providers.is_none() && old.error.unwrap().contains("Update Codemux"));
+        let stopped = parse_device_report(
+            7,
+            "{\"name\":\"codemux-remote\",\"version\":\"0.24.0\"}\n{\"alive\":false,\"running_version\":null}\n{\"providers\":[]}\n",
+        );
+        assert_eq!(stopped.serve_alive, Some(false));
+        assert_eq!(stopped.running_version, None);
         assert!(parse_device_report(7, "").error.unwrap().contains("isn't set up"));
     }
 

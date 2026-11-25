@@ -236,6 +236,10 @@ export const useUpdateAll = create<Store>((set, get) => {
           if (result.status === "skipped") throw new Error(result.message ?? "The device couldn't be updated");
           patchItem(key, { phase: "updated", message: result.message ?? undefined });
           patchMachine(machine, { helperVersion: result.to ?? get().machines[machine]?.appVersion });
+          // A newly installed helper can report the version of an older
+          // daemon, including when the previous helper could not. Refresh
+          // for both a single-row update and Update all.
+          await get().refreshDevice(hostId, true);
         } else if (machine === LOCAL) {
           replaceReport(machine, await invoke<ProviderUpdateReport>("provider_update_local", { provider: item }));
           patchItem(key, { phase: "updated" });
@@ -268,9 +272,8 @@ export const useUpdateAll = create<Store>((set, get) => {
             if (ordered[0]?.item === "helper" && (await get().updateOne(machine, "helper"))) {
               updated++;
               ordered.shift();
-              // An older helper couldn't list the device's agents. Now it can,
-              // so the same run picks up whatever it finds out of date.
-              await get().refreshDevice(Number(machine.slice(5)), true);
+              // The helper refresh in updateOne can discover providers an
+              // older helper could not list, so include them in this run.
               const planned = new Set(ordered.map((p) => p.item));
               for (const report of get().machines[machine]?.providers ?? []) {
                 if (report.available && report.can_update && !planned.has(report.provider)) {
