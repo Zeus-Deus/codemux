@@ -23,6 +23,8 @@ pub(crate) struct TimedOutput {
     pub success: bool,
     pub stdout: String,
     pub stderr: String,
+    /// Only set for a successful command using the bounded-prefix mode.
+    pub stdout_truncated: bool,
 }
 
 pub(crate) enum TimedFailure {
@@ -51,8 +53,25 @@ pub(crate) struct CapturedPipe {
 /// — only the stdio wiring is imposed here, because draining the pipes
 /// is the entire point.
 pub(crate) fn run_timed(
+    cmd: Command,
+    timeout: Duration,
+) -> Result<TimedOutput, TimedFailure> {
+    run_timed_with_policy(cmd, timeout, false)
+}
+
+/// Keep a successful command's bounded stdout prefix for callers that already
+/// label truncated output. Structured responses must use `run_timed` instead.
+pub(crate) fn run_timed_stdout_prefix(
+    cmd: Command,
+    timeout: Duration,
+) -> Result<TimedOutput, TimedFailure> {
+    run_timed_with_policy(cmd, timeout, true)
+}
+
+fn run_timed_with_policy(
     mut cmd: Command,
     timeout: Duration,
+    allow_successful_stdout_prefix: bool,
 ) -> Result<TimedOutput, TimedFailure> {
     cmd.stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -66,9 +85,11 @@ pub(crate) fn run_timed(
         Ok(status) => {
             let stdout = join(stdout);
             let stderr = join(stderr);
-            if stdout.exceeded_limit || stderr.exceeded_limit {
+            if stderr.exceeded_limit
+                || (stdout.exceeded_limit && (!allow_successful_stdout_prefix || !status.success()))
+            {
                 return Err(TimedFailure::OutputTooLarge {
-                    stream: if stdout.exceeded_limit { "stdout" } else { "stderr" },
+                    stream: if stderr.exceeded_limit { "stderr" } else { "stdout" },
                     limit_bytes: MAX_CAPTURE_BYTES,
                 });
             }
@@ -76,6 +97,7 @@ pub(crate) fn run_timed(
                 success: status.success(),
                 stdout: String::from_utf8_lossy(&stdout.bytes).into_owned(),
                 stderr: String::from_utf8_lossy(&stderr.bytes).into_owned(),
+                stdout_truncated: stdout.exceeded_limit,
             })
         }
         Err(failure) => {
@@ -315,6 +337,30 @@ mod tests {
                 limit_bytes: MAX_CAPTURE_BYTES
             })
         ));
+    }
+
+    #[test]
+    fn successful_prefix_mode_keeps_bounded_stdout() {
+        let script = format!("head -c {} /dev/zero", MAX_CAPTURE_BYTES + 200_000);
+        let output = run_timed_stdout_prefix(sh(&script), Duration::from_secs(20))
+            .ok()
+            .expect("successful diff output should retain its prefix");
+        assert!(output.success);
+        assert_eq!(output.stdout.len(), MAX_CAPTURE_BYTES);
+        assert!(output.stdout_truncated);
+    }
+
+    #[test]
+    fn prefix_mode_rejects_oversized_failed_or_stderr_output() {
+        for script in [
+            format!("head -c {} /dev/zero; exit 4", MAX_CAPTURE_BYTES + 200_000),
+            format!("head -c {} /dev/zero 1>&2", MAX_CAPTURE_BYTES + 200_000),
+        ] {
+            assert!(matches!(
+                run_timed_stdout_prefix(sh(&script), Duration::from_secs(20)),
+                Err(TimedFailure::OutputTooLarge { .. })
+            ));
+        }
     }
 
     #[test]

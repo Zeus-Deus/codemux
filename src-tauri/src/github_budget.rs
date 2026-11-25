@@ -1292,6 +1292,8 @@ fn execute(
     crate::execution::sanitize_gui_env_std_keep_dbus(&mut command);
     let output = if let Some(body) = stdin {
         run_with_stdin(command, body, timeout)
+    } else if is_full_pr_diff(args) {
+        crate::git_provider::exec::run_timed_stdout_prefix(command, timeout)
     } else {
         crate::git_provider::exec::run_timed(command, timeout)
     }
@@ -1304,6 +1306,19 @@ fn execute(
         }
     })?;
     output_result(args, output)
+}
+
+/// Full patches are rendered as labelled prefixes by their callers. Keep
+/// name-only and all other responses strict so incomplete data is never parsed.
+fn is_full_pr_diff(args: &[&str]) -> bool {
+    if args.first() != Some(&"pr")
+        || args.get(1) != Some(&"diff")
+        || args.get(2).and_then(|number| number.parse::<u32>().ok()).is_none()
+    {
+        return false;
+    }
+    let suffix = &args[3..];
+    suffix.is_empty() || (suffix.len() == 2 && suffix[0] == "--repo")
 }
 
 fn output_result(args: &[&str], output: TimedOutput) -> Result<String, String> {
@@ -1340,7 +1355,11 @@ fn output_result(args: &[&str], output: TimedOutput) -> Result<String, String> {
             ));
         }
     }
-    Ok(output.stdout.trim_end().to_string())
+    if output.stdout_truncated {
+        Ok(output.stdout)
+    } else {
+        Ok(output.stdout.trim_end().to_string())
+    }
 }
 
 /// API errors are never retried through gh: that would double-charge quota
@@ -1743,6 +1762,7 @@ fn run_with_stdin(
                     success: status.success(),
                     stdout: String::from_utf8_lossy(&stdout.bytes).into_owned(),
                     stderr: String::from_utf8_lossy(&stderr.bytes).into_owned(),
+                    stdout_truncated: false,
                 });
             }
             Ok(None) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(5)),
@@ -1761,6 +1781,74 @@ fn run_with_stdin(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_full_pr_diffs_allow_a_stdout_prefix() {
+        assert!(is_full_pr_diff(&["pr", "diff", "42"]));
+        assert!(is_full_pr_diff(&["pr", "diff", "42", "--repo", "github.com/o/r"]));
+        assert!(!is_full_pr_diff(&["pr", "diff", "42", "--name-only"]));
+        assert!(!is_full_pr_diff(&["pr", "diff", "not-a-number"]));
+        assert!(!is_full_pr_diff(&["pr", "view", "42"]));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn full_diff_keeps_bounded_prefix_but_name_only_remains_strict() {
+        use std::os::unix::fs::PermissionsExt;
+
+        if std::env::var_os("CODEMUX_BUDGET_DIFF_PREFIX_FIXTURE").is_none() {
+            let fixture = tempfile::tempdir().unwrap();
+            let gh = fixture.path().join("gh");
+            std::fs::write(
+                &gh,
+                format!(
+                    "#!/bin/sh\nif [ \"$1\" = pr ] && [ \"$2\" = diff ]; then printf x; head -c {} /dev/zero | tr '\\000' ' '; else exit 99; fi\n",
+                    MAX_CAPTURE_BYTES + 200_000
+                ),
+            )
+            .unwrap();
+            std::fs::set_permissions(&gh, std::fs::Permissions::from_mode(0o755)).unwrap();
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "github_budget::tests::full_diff_keeps_bounded_prefix_but_name_only_remains_strict",
+                    "--nocapture",
+                ])
+                .env("CODEMUX_BUDGET_DIFF_PREFIX_FIXTURE", fixture.path())
+                .env(
+                    "PATH",
+                    format!(
+                        "{}:{}",
+                        fixture.path().display(),
+                        std::env::var("PATH").unwrap_or_default()
+                    ),
+                )
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "stdout: {}\nstderr: {}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+
+        let root = PathBuf::from(std::env::var_os("CODEMUX_BUDGET_DIFF_PREFIX_FIXTURE").unwrap());
+        let output = execute(&root, &["pr", "diff", "42"], Duration::from_secs(20), None)
+            .unwrap();
+        assert_eq!(output.len(), MAX_CAPTURE_BYTES);
+        assert!(output.starts_with('x'));
+        assert!(output.ends_with(' '));
+        let error = execute(
+            &root,
+            &["pr", "diff", "42", "--name-only"],
+            Duration::from_secs(20),
+            None,
+        )
+        .unwrap_err();
+        assert!(error.contains("stdout exceeded the 8 MiB output limit"));
+    }
 
     #[test]
     fn review_reservation_pause_recovers_graphql_headroom() {
@@ -3070,6 +3158,7 @@ mod tests {
             success: false,
             stdout: stdout.into(),
             stderr: stderr.into(),
+            stdout_truncated: false,
         };
         assert!(output_result(&["pr", "checks"], output("", "API rate limit exceeded")).is_err());
         assert!(output_result(&["pr", "checks"], output("[]", "authentication failed")).is_err());
