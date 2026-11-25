@@ -14249,6 +14249,67 @@ mod tests {
         assert!(provider.has_session(&ThreadId(thread.to_string())).await);
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn pull_with_unverified_host_key_leaves_the_device_chat_running() {
+        use std::os::unix::fs::PermissionsExt;
+
+        const TEST: &str =
+            "commands::agent_chat::tests::pull_with_unverified_host_key_leaves_the_device_chat_running";
+        if crate::test_isolation::isolated(TEST) {
+            return;
+        }
+        let root = crate::test_isolation::isolated_root().unwrap();
+        let fixture = root.join("ssh");
+        std::fs::write(
+            &fixture,
+            r#"#!/bin/sh
+strict=no
+for arg do
+    if [ "$arg" = StrictHostKeyChecking=yes ]; then strict=yes; fi
+done
+[ "$strict" = yes ] || exit 2
+printf '%s\n' 'Host key verification failed.' >&2
+exit 255
+"#,
+        )
+        .unwrap();
+        std::fs::set_permissions(&fixture, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let path = std::env::var_os("PATH").unwrap_or_default();
+        let path = std::env::join_paths(
+            std::iter::once(root.clone()).chain(std::env::split_paths(&path)),
+        )
+        .unwrap();
+        std::env::set_var("PATH", path);
+
+        let thread = "unverified-pull-device-chat";
+        let provider = Arc::new(PlacementProvider::default());
+        let (app, workspace) = placement_app(thread, Some(1), provider.clone()).await;
+        let state = app.state::<AppStateStore>();
+        let host = state.find_workspace(&workspace).unwrap().host_id;
+        let local_target = root.join("pull-destination");
+        state.set_workspace_worktree(
+            &workspace,
+            local_target.display().to_string(),
+            "main".into(),
+        );
+        provider.live.lock().unwrap().insert(thread.to_string());
+        record_session_host(thread, host);
+
+        let outcome = super::super::hosts::workspace_pull_back_impl(
+            app.handle().clone(),
+            workspace.clone(),
+        )
+        .await
+        .unwrap();
+        assert!(!outcome.ok);
+        assert!(outcome.message.contains("Host key verification failed."), "{}", outcome.message);
+        assert_eq!(state.find_workspace(&workspace).unwrap().host_id, host);
+        assert!(provider.stopped.lock().unwrap().is_empty());
+        assert!(provider.has_session(&ThreadId(thread.to_string())).await);
+        assert!(!local_target.exists());
+    }
+
     /// A failed move leaves the workspace where it was, and a send waiting
     /// on it starts the chat there.
     #[tokio::test]

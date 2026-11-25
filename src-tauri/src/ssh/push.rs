@@ -115,7 +115,49 @@ impl<'a> PullOptions<'a> {
             step_timeout: Duration::from_secs(600),
         }
     }
+
+    /// Authenticate the host and confirm this source before the caller
+    /// stops chat sessions or creates any local transfer files.
+    pub(crate) async fn verify_source(self) -> Result<VerifiedPull<'a>, PullResult> {
+        if let Err(reason) = validate_ssh_target(self.ssh_target) {
+            return Err(PullResult::HostUnreachable { reason });
+        }
+
+        // Distinguish missing directories from transport failures by an
+        // explicit sentinel. Never run rsync --delete against an unconfirmed
+        // directory.
+        let remote_check = run_capture_with_timeout(
+            verified_ssh_command(self.ssh_target, 10).arg(format!(
+                "if test -d {} ; then echo CMX_REMOTE_DIR_OK ; else echo CMX_REMOTE_DIR_MISSING ; fi",
+                shell_escape(self.remote_path)
+            )),
+            self.step_timeout,
+        )
+        .await;
+        match remote_check {
+            Ok(stdout) if stdout.lines().any(|line| line == "CMX_REMOTE_DIR_MISSING") => {
+                Err(PullResult::RemoteNotFound {
+                    path: self.remote_path.to_string(),
+                })
+            }
+            Ok(stdout) if stdout.lines().any(|line| line == "CMX_REMOTE_DIR_OK") => {
+                Ok(VerifiedPull(self))
+            }
+            Ok(stdout) => Err(PullResult::HostUnreachable {
+                reason: format!(
+                    "remote_check returned unexpected output: {}",
+                    stdout.trim()
+                ),
+            }),
+            Err(reason) => Err(PullResult::HostUnreachable {
+                reason: format!("remote_check failed: {reason}"),
+            }),
+        }
+    }
 }
+
+/// A selected pull source whose path was checked over verified SSH.
+pub(crate) struct VerifiedPull<'a>(PullOptions<'a>);
 
 /// Build the rsync argv for `push`. Extracted for unit testing — getting
 /// the trailing-slash semantics wrong is the kind of bug that silently
@@ -262,83 +304,38 @@ pub async fn push_workspace(opts: PushOptions<'_>) -> PushResult {
 
 /// Pull the worktree back from the remote host.
 pub async fn pull_workspace_back(opts: PullOptions<'_>) -> PullResult {
-    if let Err(reason) = validate_ssh_target(opts.ssh_target) {
-        return PullResult::HostUnreachable { reason };
+    match opts.verify_source().await {
+        Ok(verified) => verified.transfer().await,
+        Err(result) => result,
     }
-    if !opts.local_worktree.exists() {
-        // The local target dir must exist for rsync to write into. Try
-        // to create it; if that fails (permissions, disk full), surface
-        // a useful error rather than letting rsync produce a cryptic
-        // one.
-        if let Err(error) = std::fs::create_dir_all(opts.local_worktree) {
-            return PullResult::RsyncFailed {
-                reason: format!(
-                    "could not create local target {}: {error}",
-                    opts.local_worktree.display()
-                ),
-            };
-        }
-    }
+}
 
-    // Verify the remote path actually exists. Without this, an empty
-    // mirror would happily delete every local file (because of
-    // --delete).
-    //
-    // We signal presence via a STDOUT sentinel rather than the remote
-    // command's exit code: the remote `if … then echo … fi` always exits
-    // 0, so a genuinely-missing directory is distinguished by the token,
-    // not by string-matching `ExitStatus`'s Display (whose exact shape —
-    // e.g. `exit status: 7` with a colon — is not contractual and bit us
-    // before: a missing path was misreported as `HostUnreachable`). Only
-    // a real SSH/transport failure yields a non-zero exit → `Err` here.
-    let remote_check = run_capture_with_timeout(
-        verified_ssh_command(opts.ssh_target, 10)
-            .arg(format!(
-                "if test -d {} ; then echo CMX_REMOTE_DIR_OK ; else echo CMX_REMOTE_DIR_MISSING ; fi",
-                shell_escape(opts.remote_path)
-            )),
-        opts.step_timeout,
-    )
-    .await;
-    match remote_check {
-        Ok(stdout) if stdout.contains("CMX_REMOTE_DIR_MISSING") => {
-            return PullResult::RemoteNotFound {
-                path: opts.remote_path.to_string(),
-            };
+impl VerifiedPull<'_> {
+    pub(crate) async fn transfer(self) -> PullResult {
+        let opts = self.0;
+        if !opts.local_worktree.exists() {
+            // Surface local preparation errors before invoking rsync.
+            if let Err(error) = std::fs::create_dir_all(opts.local_worktree) {
+                return PullResult::RsyncFailed {
+                    reason: format!(
+                        "could not create local target {}: {error}",
+                        opts.local_worktree.display()
+                    ),
+                };
+            }
         }
-        Ok(stdout) if stdout.contains("CMX_REMOTE_DIR_OK") => {
-            // Remote dir confirmed present — safe to rsync with --delete.
-        }
-        Ok(stdout) => {
-            // SSH connected but didn't return our sentinel (shell init
-            // noise, unexpected error). Treat as unreachable rather than
-            // risk a --delete against an unconfirmed remote.
-            return PullResult::HostUnreachable {
-                reason: format!(
-                    "remote_check returned unexpected output: {}",
-                    stdout.trim()
-                ),
-            };
-        }
-        Err(reason) => {
-            return PullResult::HostUnreachable {
-                reason: format!("remote_check failed: {reason}"),
-            };
-        }
-    }
 
-    let argv = build_pull_rsync_argv(&opts);
-    let mut cmd = Command::new("rsync");
-    for arg in &argv {
-        cmd.arg(arg);
-    }
-    let result = run_capture_with_timeout(&mut cmd, opts.step_timeout).await;
-    match result {
-        Ok(stdout) => PullResult::Pulled {
-            local_path: opts.local_worktree.display().to_string(),
-            rsync_summary: trim_rsync_output(&stdout),
-        },
-        Err(reason) => PullResult::RsyncFailed { reason },
+        // The preflight and rsync are separate SSH connections. Retain the
+        // verified transport on rsync itself.
+        let mut cmd = Command::new("rsync");
+        cmd.args(build_pull_rsync_argv(&opts));
+        match run_capture_with_timeout(&mut cmd, opts.step_timeout).await {
+            Ok(stdout) => PullResult::Pulled {
+                local_path: opts.local_worktree.display().to_string(),
+                rsync_summary: trim_rsync_output(&stdout),
+            },
+            Err(reason) => PullResult::RsyncFailed { reason },
+        }
     }
 }
 

@@ -374,10 +374,14 @@ pub async fn hosts_test_connection<R: tauri::Runtime>(
 }
 
 #[cfg(unix)]
-fn device_connection_error(reason: String) -> String {
-    if reason.contains("Host key verification failed")
+fn is_host_key_error(reason: &str) -> bool {
+    reason.contains("Host key verification failed")
         || reason.contains("REMOTE HOST IDENTIFICATION HAS CHANGED")
-    {
+}
+
+#[cfg(unix)]
+fn device_connection_error(reason: String) -> String {
+    if is_host_key_error(&reason) {
         format!(
             "SSH could not verify this device's host key. Confirm its fingerprint with the \
              device administrator, then add the matching key to your SSH known_hosts and retry.\n{reason}"
@@ -679,23 +683,9 @@ pub async fn workspace_push_to_host<R: tauri::Runtime>(
 
     #[cfg(unix)]
     {
-        // Auto-update the remote codemux-remote binary if our version
-        // doesn't match what's installed on the host. Skipping this is
-        // what made the cwd bug so painful: my fix lived in the local
-        // binary but pandora was still running the May-16 build, and
-        // every "the bug isn't fixed" loop was actually "the binary
-        // we sent commands to didn't have the fix yet."
-        //
-        // Cheap when versions match (one SSH probe, ~1s). When they
-        // differ we re-bootstrap (~10s) — but that only happens once
-        // per Codemux version bump, and the next call is back to fast.
-        //
-        // For dev users editing daemon code without bumping the version
-        // string, the version check passes and the stale-binary problem
-        // returns. Workaround: manually re-scp, or rebuild + clear
-        // ~/.local/bin/codemux-remote on the remote so the version
-        // probe sees MISSING and triggers a bootstrap.
-        ensure_remote_binary_current(&app, &host)
+        // Verify the device and its PTY protocol before stopping chats or
+        // copying files. A compatible helper may stay on its older release.
+        prepare_workspace_push(&app, &host)
             .await
             .map_err(|error| {
                 device_connection_error(format!("Could not prepare {}: {error}", host.name))
@@ -1038,35 +1028,38 @@ pub async fn workspace_pull_back_impl<R: tauri::Runtime>(
         // De-dup while preserving order (uid-keyed == basename when no uid).
         candidate_sources.dedup();
 
-        // The move lock prevents another push or pull from changing the
-        // source. A device can still be edited while its chats shut down.
-        crate::commands::agent_chat::stop_workspace_chat_sessions(&app, &workspace_id).await;
-        if !app
-            .state::<DatabaseStore>()
-            .list_hosts()
-            .iter()
-            .any(|current| current.id == host.id && current.ssh_target == host.ssh_target)
-        {
-            return Err("The saved SSH source changed before the copy.".into());
-        }
-
-        // Try each candidate; only a "remote path missing" outcome is
-        // worth retrying the next one — success / rsync error / host
-        // unreachable are all authoritative. Remember which source we
-        // settled on so the Claude JSONL sync below encodes the dir from
-        // the path we ACTUALLY pulled from (uid-keyed or origin_path),
-        // not a recomputed basename.
-        let mut result_opt = None;
+        // Resolve the source under the migration gate before interrupting
+        // active chats. Only a missing directory allows trying a fallback.
+        let mut preparation = None;
         for src in &candidate_sources {
             let opts = crate::ssh::PullOptions::new(&host.ssh_target, src, &local_worktree);
-            let result = crate::ssh::pull_workspace_back(opts).await;
-            let keep_trying = matches!(result, crate::ssh::PullResult::RemoteNotFound { .. });
-            result_opt = Some((result, src));
+            let verified = opts.verify_source().await;
+            let keep_trying = matches!(&verified, Err(crate::ssh::PullResult::RemoteNotFound { .. }));
+            preparation = Some((verified, src));
             if !keep_trying {
                 break;
             }
         }
-        let (result, pulled_src) = result_opt.expect("at least one pull source candidate");
+        let (verified, pulled_src) = preparation.expect("at least one pull source candidate");
+        let result = match verified {
+            Ok(verified) => {
+                // A device can be edited while SSH runs or its chats shut down.
+                let target_matches = || {
+                    app.state::<DatabaseStore>().list_hosts().iter().any(|current| {
+                        current.id == host.id && current.ssh_target == host.ssh_target
+                    })
+                };
+                if !target_matches() {
+                    return Err("The saved SSH source changed before the copy.".into());
+                }
+                crate::commands::agent_chat::stop_workspace_chat_sessions(&app, &workspace_id).await;
+                if !target_matches() {
+                    return Err("The saved SSH source changed before the copy.".into());
+                }
+                verified.transfer().await
+            }
+            Err(result) => result,
+        };
         let outcome = match result {
             crate::ssh::PullResult::Pulled { rsync_summary, .. } => {
                 sync_workspace_history(
@@ -1440,6 +1433,90 @@ async fn pull_claude_projects(
     Ok(())
 }
 
+#[cfg(unix)]
+#[derive(serde::Deserialize)]
+struct PushHelperVersion {
+    version: String,
+    protocol_version: u32,
+}
+
+#[cfg(unix)]
+impl PushHelperVersion {
+    fn verify_protocol(&self) -> Result<(), String> {
+        let expected = crate::pty_daemon::PROTOCOL_VERSION;
+        if self.protocol_version == expected {
+            Ok(())
+        } else {
+            Err(format!(
+                "codemux-remote {} uses PTY protocol {}, but this desktop requires {}. Set up the device again before moving the workspace.",
+                self.version, self.protocol_version, expected
+            ))
+        }
+    }
+}
+
+#[cfg(unix)]
+async fn probe_workspace_push_helper(ssh_target: &str) -> Result<Option<PushHelperVersion>, String> {
+    // Probe the executable the workspace tunnel actually starts. Print a
+    // marker even if it is missing or broken, so SSH failure stays distinct.
+    let output = crate::ssh::exec::run_remote(
+        ssh_target,
+        r#"printf 'CMX_PUSH_HELPER: '
+"$HOME/.local/bin/codemux-remote" version 2>/dev/null || printf '\n'"#,
+        std::time::Duration::from_secs(20),
+    )
+    .await
+    .map_err(|error| format!("version probe: {error}"))?;
+    let payload = output
+        .lines()
+        .rev()
+        .find_map(|line| line.strip_prefix("CMX_PUSH_HELPER: "))
+        .ok_or("The SSH version probe did not report the device helper's status")?;
+    Ok(serde_json::from_str(payload).ok())
+}
+
+#[cfg(unix)]
+async fn prepare_workspace_push<R: tauri::Runtime>(
+    app: &tauri::AppHandle<R>,
+    host: &crate::database::HostRecord,
+) -> Result<(), String> {
+    use crate::hosts_upgrade::UpgradeOutcome;
+
+    let setup = match probe_workspace_push_helper(&host.ssh_target).await? {
+        Some(helper) if !crate::hosts_upgrade::is_older(&helper.version, env!("CARGO_PKG_VERSION")) => {
+            return helper.verify_protocol();
+        }
+        Some(_) => match crate::hosts_upgrade::upgrade_host(app, host).await {
+            Ok(UpgradeOutcome::AlreadyCurrent | UpgradeOutcome::Upgraded { .. }) => Ok(()),
+            Ok(UpgradeOutcome::NotAttempted { reason }) | Err(reason) => Err(reason),
+        },
+        None => force_reinstall_remote_binary(app, host).await.map(|_| ()),
+    };
+    if let Err(error) = &setup {
+        if is_host_key_error(error) {
+            return Err(error.clone());
+        }
+    }
+
+    // An upgrade can fail before uploading anything, or it can leave a
+    // broken helper. Continue only after verifying the reachable helper.
+    let installed = probe_workspace_push_helper(&host.ssh_target)
+        .await?
+        .ok_or_else(|| {
+            setup.as_ref().err().cloned().unwrap_or_else(|| {
+                "The device helper did not report its PTY protocol after setup".into()
+            })
+        })?;
+    installed.verify_protocol()?;
+    if let Err(error) = setup {
+        eprintln!(
+            "[hosts] could not update {}: {error}. Continuing with the verified compatible helper.",
+            host.name,
+        );
+    }
+    Ok(())
+}
+
 /// Probe the remote `codemux-remote` binary's version. If it
 /// doesn't match what we'd ship from this Codemux build, re-bootstrap
 /// (scp the current binary + chmod + verify) so the daemon spawn the
@@ -1717,6 +1794,84 @@ async fn drain_terminal_closes(tasks: Vec<tauri::async_runtime::JoinHandle<()>>)
 #[cfg(test)]
 mod tests {
     use super::{interpret_github_probe, validate_host_fields};
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn push_keeps_a_verified_compatible_helper_without_a_bundled_upgrade() {
+        if crate::test_isolation::isolated(
+            "commands::hosts::tests::push_keeps_a_verified_compatible_helper_without_a_bundled_upgrade",
+        ) {
+            return;
+        }
+        use std::os::unix::fs::PermissionsExt;
+
+        let fixture = tempfile::tempdir().unwrap();
+        let ssh = fixture.path().join("ssh");
+        let log = fixture.path().join("ssh-log");
+        let protocol = crate::pty_daemon::PROTOCOL_VERSION;
+        std::fs::write(
+            &ssh,
+            format!(
+                r#"#!/bin/sh
+case " $* " in
+    *" StrictHostKeyChecking=yes "*" ControlPath=none "*) ;;
+    *) exit 255 ;;
+esac
+case "$*" in
+    *fixture-incompatible*CMX_PUSH_HELPER*)
+        printf 'CMX_PUSH_HELPER: {{"version":"{current}","protocol_version":0}}\n'
+        ;;
+    *CMX_PUSH_HELPER*)
+        printf 'verify\n' >> "$CODEMUX_PUSH_TEST_LOG"
+        printf 'CMX_PUSH_HELPER: {{"version":"0.26.0","protocol_version":{protocol}}}\n'
+        ;;
+    *CMR:*)
+        printf 'upgrade\n' >> "$CODEMUX_PUSH_TEST_LOG"
+        printf 'UNAME: Linux fixture-unsupported-cpu\nCMR: {{"version":"0.26.0","protocol_version":{protocol}}}\n'
+        ;;
+    *) exit 255 ;;
+esac
+"#,
+                current = env!("CARGO_PKG_VERSION"),
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&ssh, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let path = std::env::join_paths(
+            std::iter::once(fixture.path().to_owned())
+                .chain(std::env::split_paths(&std::env::var_os("PATH").unwrap())),
+        )
+        .unwrap();
+        // This test runs alone in the isolated child.
+        std::env::set_var("PATH", path);
+        std::env::set_var("CODEMUX_PUSH_TEST_LOG", &log);
+
+        let host = crate::database::HostRecord {
+            id: 1,
+            server_id: None,
+            name: "Fixture device".into(),
+            ssh_target: "fixture".into(),
+            created_at: String::new(),
+            updated_at: String::new(),
+            deleted_at: None,
+            dirty: false,
+            last_seen_at: None,
+            disk_bytes: None,
+            disk_measured_at: None,
+        };
+        let app = tauri::test::mock_app();
+        super::prepare_workspace_push(app.handle(), &host).await.unwrap();
+        assert_eq!(std::fs::read_to_string(log).unwrap(), "verify\nupgrade\nverify\n");
+
+        let incompatible = crate::database::HostRecord {
+            ssh_target: "fixture-incompatible".into(),
+            ..host
+        };
+        let error = super::prepare_workspace_push(app.handle(), &incompatible)
+            .await
+            .unwrap_err();
+        assert!(error.contains("uses PTY protocol 0"), "{error}");
+    }
 
     #[test]
     fn host_fields_are_trimmed_and_checked() {
