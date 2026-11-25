@@ -6,7 +6,7 @@ const commands = vi.hoisted(() => ({
 }));
 vi.mock("@/tauri/commands", () => commands);
 
-import { focusConfirmedPresetTab } from "./confirmed-preset-tabs";
+import { focusConfirmedPresetTab, partialPresetStatusMessage } from "./confirmed-preset-tabs";
 
 beforeEach(() => {
   commands.activateTab.mockReset().mockResolvedValue(undefined);
@@ -36,7 +36,16 @@ describe("focusConfirmedPresetTab", () => {
     commands.getAppState.mockRejectedValue(new Error("state unavailable"));
 
     await expect(focusConfirmedPresetTab("ws-new", ["tab-old"]))
-      .resolves.toEqual({ tabId: null, openTabCount: 0 });
+      .resolves.toEqual({ tabId: null, openTabCount: null });
+    expect(commands.getAppState).toHaveBeenCalledTimes(2);
     expect(commands.activateTab).not.toHaveBeenCalled();
+  });
+
+  it("reports confirmed delivery separately from unknown tab state", () => {
+    expect(partialPresetStatusMessage(
+      "Agent",
+      { confirmedCommands: 1, totalCommands: 2 },
+      { tabId: null, openTabCount: null },
+    )).toContain("1 of 2 preset commands reached terminals");
   });
 });

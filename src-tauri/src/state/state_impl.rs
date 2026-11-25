@@ -6368,6 +6368,15 @@ impl AppStateStore {
         workspace_id: &str,
         kind: TabKind,
     ) -> Result<(String, Option<SessionId>), String> {
+        self.create_tab_with_selection(workspace_id, kind, true)
+    }
+
+    pub fn create_tab_with_selection(
+        &self,
+        workspace_id: &str,
+        kind: TabKind,
+        select: bool,
+    ) -> Result<(String, Option<SessionId>), String> {
         let mut snapshot = self.inner.lock().unwrap();
         let workspace = snapshot
             .workspaces
@@ -6432,8 +6441,10 @@ impl AppStateStore {
                     browser_id: None,
                     icon: None,
                 });
-                workspace.active_tab_id = tab_id.clone();
-                workspace.active_surface_id = surface_id;
+                if select || workspace.active_tab_id.is_empty() {
+                    workspace.active_tab_id = tab_id.clone();
+                    workspace.active_surface_id = surface_id;
+                }
 
                 return Ok((tab_id, new_session_id));
             }
@@ -6464,7 +6475,9 @@ impl AppStateStore {
                     browser_id: Some(browser_id),
                     icon: None,
                 });
-                workspace.active_tab_id = tab_id.clone();
+                if select || workspace.active_tab_id.is_empty() {
+                    workspace.active_tab_id = tab_id.clone();
+                }
             }
             TabKind::Diff => {
                 workspace.tabs.push(TabSnapshot {
@@ -6475,7 +6488,9 @@ impl AppStateStore {
                     browser_id: None,
                     icon: None,
                 });
-                workspace.active_tab_id = tab_id.clone();
+                if select || workspace.active_tab_id.is_empty() {
+                    workspace.active_tab_id = tab_id.clone();
+                }
             }
             TabKind::Editor => {
                 workspace.tabs.push(TabSnapshot {
@@ -6486,7 +6501,9 @@ impl AppStateStore {
                     browser_id: None,
                     icon: None,
                 });
-                workspace.active_tab_id = tab_id.clone();
+                if select || workspace.active_tab_id.is_empty() {
+                    workspace.active_tab_id = tab_id.clone();
+                }
             }
         }
 

@@ -3281,6 +3281,7 @@ pub fn create_tab<R: tauri::Runtime>(
     state: State<'_, AppStateStore>,
     workspace_id: String,
     kind: String,
+    select: Option<bool>,
 ) -> Result<String, String> {
     let kind = match kind.as_str() {
         "terminal" => TabKind::Terminal,
@@ -3290,7 +3291,8 @@ pub fn create_tab<R: tauri::Runtime>(
         _ => return Err(format!("Unsupported tab kind: {kind}")),
     };
 
-    let (tab_id, session_id) = state.create_tab(&workspace_id, kind)?;
+    let (tab_id, session_id) =
+        state.create_tab_with_selection(&workspace_id, kind, select.unwrap_or(true))?;
 
     if let Some(session_id) = session_id {
         terminal::spawn_pty_for_session(app.clone(), session_id.0);
@@ -3298,6 +3300,66 @@ pub fn create_tab<R: tauri::Runtime>(
 
     crate::state::emit_app_state(&app);
     Ok(tab_id)
+}
+
+#[cfg(test)]
+mod create_tab_selection_tests {
+    use super::*;
+    use tauri::Manager;
+
+    #[test]
+    fn background_tab_creation_keeps_desktop_and_workspace_selection() {
+        let app = tauri::test::mock_app();
+        app.manage(AppStateStore::default());
+        let state = app.state::<AppStateStore>();
+        let background =
+            state.create_workspace_at_path(std::path::PathBuf::from("/tmp/background"));
+        let desktop = state.create_workspace_at_path(std::path::PathBuf::from("/tmp/desktop"));
+        assert!(state.activate_workspace(&desktop.0));
+        let before = state.snapshot();
+        let background_before = before
+            .workspaces
+            .iter()
+            .find(|workspace| workspace.workspace_id == background)
+            .unwrap();
+        let desktop_before = before
+            .workspaces
+            .iter()
+            .find(|workspace| workspace.workspace_id == desktop)
+            .unwrap();
+        let background_tab = background_before.active_tab_id.clone();
+        let background_surface = background_before.active_surface_id.clone();
+        let desktop_tab = desktop_before.active_tab_id.clone();
+
+        // A browser tab avoids spawning a real PTY while exercising the
+        // command's select argument and the same atomic state mutation.
+        let tab_id = create_tab(
+            app.handle().clone(),
+            state,
+            background.0.clone(),
+            "browser".into(),
+            Some(false),
+        )
+        .unwrap();
+
+        let after = app.state::<AppStateStore>().snapshot();
+        assert_eq!(after.active_workspace_id, desktop);
+        let background_after = after
+            .workspaces
+            .iter()
+            .find(|workspace| workspace.workspace_id == background)
+            .unwrap();
+        assert_eq!(background_after.tabs.len(), 2);
+        assert!(background_after.tabs.iter().any(|tab| tab.tab_id == tab_id));
+        assert_eq!(background_after.active_tab_id, background_tab);
+        assert_eq!(background_after.active_surface_id, background_surface);
+        assert_eq!(after
+            .workspaces
+            .iter()
+            .find(|workspace| workspace.workspace_id == desktop)
+            .unwrap()
+            .active_tab_id, desktop_tab);
+    }
 }
 
 #[tauri::command]

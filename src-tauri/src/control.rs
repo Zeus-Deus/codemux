@@ -1257,6 +1257,7 @@ pub(crate) async fn dispatch_request_as<R: Runtime>(
             let preset_id = request.params.get("preset_id").and_then(Value::as_str).unwrap_or_default().to_string();
             let override_mode = request.params.get("override_mode").and_then(Value::as_str).map(String::from);
             let initial_prompt = request.params.get("initial_prompt").and_then(Value::as_str).map(String::from);
+            let select = request.params.get("select").and_then(Value::as_bool);
             let fresh_terminal = request.params.get("fresh_terminal").and_then(Value::as_bool);
             let target_tab_id = request.params.get("target_tab_id").and_then(Value::as_str).map(String::from);
             let model_selection = request
@@ -1282,7 +1283,7 @@ pub(crate) async fn dispatch_request_as<R: Runtime>(
                 override_mode,
                 initial_prompt,
                 model_selection,
-                None,
+                select,
                 fresh_terminal,
                 target_tab_id,
             )

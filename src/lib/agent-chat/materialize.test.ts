@@ -6,6 +6,20 @@ import { PartialPresetLaunchError } from "@/lib/partial-preset-launch";
 
 // ── Module mocks ──
 
+function currentMockAppState() {
+  return Promise.resolve(
+    useAppStore.getState().appState ?? {
+      schema_version: 1,
+      active_workspace_id: "",
+      workspaces: [{
+        workspace_id: "ws-project",
+        tabs: [{ tab_id: "tab-cli", kind: "terminal" }],
+      }],
+    },
+  );
+}
+const mockGetAppState = vi.fn(currentMockAppState);
+
 vi.mock("@/tauri/commands", () => ({
   activateWorkspace: vi.fn().mockResolvedValue(undefined),
   activateTab: vi.fn().mockResolvedValue(undefined),
@@ -40,18 +54,7 @@ vi.mock("@/tauri/commands", () => ({
   // fallback path. Return the store's current snapshot so a poll never
   // clobbers seeded state; the worktree tests drive resolution via the
   // store subscription instead.
-  getAppState: vi.fn(() =>
-    Promise.resolve(
-      useAppStore.getState().appState ?? {
-        schema_version: 1,
-        active_workspace_id: "",
-        workspaces: [{
-          workspace_id: "ws-project",
-          tabs: [{ tab_id: "tab-cli", kind: "terminal" }],
-        }],
-      },
-    ),
-  ),
+  getAppState: () => mockGetAppState(),
 }));
 
 // Naming must run on the Utility agent's model; pin a known selection so the
@@ -149,6 +152,7 @@ function makeDraft(overrides: Partial<ChatDraft> = {}): ChatDraft {
 
 describe("materializeAndSend", () => {
   beforeEach(() => {
+    mockGetAppState.mockReset().mockImplementation(currentMockAppState);
     vi.mocked(activateWorkspace).mockClear().mockResolvedValue(undefined);
     vi.mocked(activateTab).mockClear().mockResolvedValue(undefined);
     vi.mocked(agentChatCreatePane).mockClear().mockResolvedValue("pane-new");
@@ -1562,7 +1566,9 @@ function makePreset(overrides: Partial<TerminalPreset> = {}): TerminalPreset {
 
 describe("materializeWithPreset", () => {
   beforeEach(() => {
+    mockGetAppState.mockReset().mockImplementation(currentMockAppState);
     vi.mocked(activateWorkspace).mockClear().mockResolvedValue(undefined);
+    vi.mocked(activateTab).mockClear().mockResolvedValue(undefined);
     vi.mocked(agentChatCreatePane).mockClear().mockResolvedValue("pane-new");
     vi.mocked(agentChatSendTurn).mockClear().mockResolvedValue({ turn_id: "turn-1", queued_id: null });
     vi.mocked(agentChatStartSession)
@@ -1724,6 +1730,42 @@ describe("materializeWithPreset", () => {
       expect(actions.markManualPromptRequired).toHaveBeenCalledWith(draft.draftId);
       expect(actions.markSendFailed).not.toHaveBeenCalled();
       expect(actions.markPromoted).not.toHaveBeenCalled();
+    });
+
+    it("retains the prompt without retrying when partial launch tab state is unavailable", async () => {
+      mockGetAppState.mockRejectedValue(new Error("state unavailable"));
+      vi.mocked(applyPreset).mockRejectedValueOnce(new PartialPresetLaunchError({
+        confirmed_tab_ids: ["tab-cli"],
+        confirmed_commands: 1,
+        total_commands: 2,
+        error: "second terminal rejected the write",
+      }));
+      const actions = makeActions();
+      const draft = makeDraft({ target: { kind: "project", projectPath: "/projects/foo" } });
+
+      const result = await materializeWithPreset(
+        draft,
+        makePreset({ commands: ["agent-one", "agent-two"] }),
+        "fix this bug",
+        actions,
+      );
+
+      expect(result).toMatchObject({
+        success: true,
+        retainedDraft: true,
+        partialPreset: {
+          confirmedTabId: null,
+          confirmedCommands: 1,
+          openTabCount: null,
+          totalCommands: 2,
+        },
+      });
+      expect(actions.markPromptRetained).toHaveBeenCalledWith(draft.draftId);
+      expect(actions.markManualPromptRequired).not.toHaveBeenCalled();
+      expect(actions.markSendFailed).not.toHaveBeenCalled();
+      expect(actions.markPromoted).not.toHaveBeenCalled();
+      expect(activateTab).not.toHaveBeenCalled();
+      expect(applyPreset).toHaveBeenCalledTimes(1);
     });
   });
 

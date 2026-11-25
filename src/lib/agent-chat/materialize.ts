@@ -67,7 +67,7 @@ export interface MaterializeActions {
   markSendFailed: (id: DraftId, error: string) => void;
   /** Keeps a successfully launched terminal preset's unsent prompt for manual entry. */
   markManualPromptRequired: (id: DraftId) => void;
-  /** Keeps an unsent prompt after opening a commandless shell. */
+  /** Keeps an unsent prompt without claiming a reachable agent tab. */
   markPromptRetained: (id: DraftId) => void;
   /** Idempotent — ensures a slice exists on the agent-chat store for
    *  the pre-minted `thread_id` so the optimistic user message has a
@@ -134,8 +134,9 @@ export type MaterializeResult =
       retainedDraft?: boolean;
       /** Earlier CLI commands reached their tabs before a later one failed. */
       partialPreset?: {
-        confirmedTabId: string;
+        confirmedTabId: string | null;
         confirmedCommands: number;
+        openTabCount: number | null;
         totalCommands: number;
       };
     }
@@ -754,27 +755,30 @@ export async function materializeWithPreset(
     );
   } catch (err) {
     if (err instanceof PartialPresetLaunchError) {
-      const { tabId, openTabCount } = await focusConfirmedPresetTab(workspaceId, err.confirmedTabIds);
-      if (tabId) {
+      const tab = await focusConfirmedPresetTab(workspaceId, err.confirmedTabIds);
+      if (tab.tabId) {
         if (prompt.length > 0) actions.markManualPromptRequired(draft.draftId);
         else actions.markPromoted(draft.draftId, {
           workspaceId,
           paneId: "cli-preset",
           threadId: draft.threadId,
         });
-        return {
-          success: true,
-          workspaceId,
-          paneId: "cli-preset",
-          threadId: draft.threadId,
-          ...(prompt.length > 0 ? { manualPromptRequired: true } : {}),
-          partialPreset: {
-            confirmedTabId: tabId,
-            confirmedCommands: openTabCount,
-            totalCommands: err.totalCommands,
-          },
-        };
-      }
+      } else actions.markPromptRetained(draft.draftId);
+      const manualPromptRequired = !!tab.tabId && prompt.length > 0;
+      return {
+        success: true,
+        workspaceId,
+        paneId: "cli-preset",
+        threadId: draft.threadId,
+        ...(manualPromptRequired ? { manualPromptRequired: true } : {}),
+        ...(!tab.tabId ? { retainedDraft: true } : {}),
+        partialPreset: {
+          confirmedTabId: tab.tabId,
+          confirmedCommands: err.confirmedCommands,
+          openTabCount: tab.openTabCount,
+          totalCommands: err.totalCommands,
+        },
+      };
     }
     const message = errorMessage(err);
     actions.markSendFailed(draft.draftId, message);

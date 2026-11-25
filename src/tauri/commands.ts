@@ -1452,7 +1452,7 @@ export const applyPreset = async (
   });
   if (isRemoteClient()) {
     try {
-      await refreshRemoteWorkspaceView(workspaceId, undefined, undefined, sequence);
+      await refreshRemoteWorkspaceView(workspaceId, targetTabId, undefined, sequence);
     } catch {
       // Refresh can fail after the preset command reached its PTY. The
       // backend launch result remains authoritative for caller guidance.

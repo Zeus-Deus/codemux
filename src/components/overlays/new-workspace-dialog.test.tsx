@@ -699,7 +699,7 @@ describe("Submit flow", () => {
     fireEvent.click(within(dialog).getByRole("button", { name: /Create/i }));
 
     await waitFor(() => expect(toast.warning).toHaveBeenCalledWith(
-      expect.stringContaining("could not be confirmed open"),
+      expect.stringContaining("1 of 2 preset commands reached terminals; no agent tab remains open"),
       expect.objectContaining({ action: expect.objectContaining({ label: "Copy prompt" }) }),
     ));
     const options = (toast.warning as Mock).mock.calls[0][1];
@@ -709,6 +709,7 @@ describe("Submit flow", () => {
     const saved = Object.values(useChatDraftStore.getState().draftsById)[0];
     expect(saved.inputDraft).toBe("Fix the login bug");
     expect(saved.manualPromptRequired).toBe(false);
+    expect(applyPreset).toHaveBeenCalledTimes(1);
   });
 
   it("threads a remembered model selection through to the confirmed preset launch", async () => {

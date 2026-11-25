@@ -3,6 +3,7 @@ import {
   agentChatCreatePane,
   applyPreset,
   createEmptyWorkspace,
+  createTab,
   createWorktreeWorkspaceResult,
 } from "./commands";
 import { PartialPresetLaunchError } from "@/lib/partial-preset-launch";
@@ -56,6 +57,51 @@ describe("background workspace creation IPC", () => {
 });
 
 describe("fresh preset launch IPC", () => {
+  it("keeps a remote fresh tab selected when the desktop selects another tab", async () => {
+    const { useAppStore } = await import("@/stores/app-store");
+    const { setRemoteViewHost } = await import("@/remote/client-view");
+    (window as { __CODEMUX_REMOTE__?: boolean }).__CODEMUX_REMOTE__ = true;
+    setRemoteViewHost("fresh-preset-selection");
+    const previous = useAppStore.getState();
+    const snapshot = {
+      active_workspace_id: "ws-new",
+      workspaces: [{
+        workspace_id: "ws-new",
+        active_tab_id: "tab-desktop",
+        active_surface_id: "surface-desktop",
+        tabs: ["desktop", "new"].map((name) => ({
+          tab_id: `tab-${name}`, surface_id: `surface-${name}`,
+          kind: "terminal", title: name, browser_id: null, icon: null,
+        })),
+        surfaces: ["desktop", "new"].map((name) => ({
+          surface_id: `surface-${name}`, active_pane_id: `pane-${name}`,
+          root: { kind: "terminal", pane_id: `pane-${name}` },
+        })),
+      }],
+    } as import("./types").AppStateSnapshot;
+
+    invoke.mockImplementation(async (command: string) => {
+      if (command === "create_tab") return "tab-new";
+      if (command === "get_app_state") return structuredClone(snapshot);
+      if (command === "apply_preset") return null;
+      return undefined;
+    });
+    try {
+      useAppStore.setState({ appState: null, remoteActiveWorkspaceId: null });
+      expect(await createTab("ws-new", "terminal")).toBe("tab-new");
+      expect(useAppStore.getState().appState?.workspaces[0].active_tab_id).toBe("tab-new");
+
+      await applyPreset("ws-new", "preset", "current_terminal", null, null, true, "tab-new");
+      expect(useAppStore.getState().appState?.workspaces[0].active_tab_id).toBe("tab-new");
+      expect(invoke).toHaveBeenCalledWith("apply_preset", expect.objectContaining({
+        targetTabId: "tab-new", freshTerminal: true,
+      }));
+    } finally {
+      useAppStore.setState(previous, true);
+      localStorage.clear();
+    }
+  });
+
   it("surfaces confirmed tabs when a later command fails", async () => {
     invoke.mockResolvedValue({
       confirmed_tab_ids: ["tab-original"],
@@ -75,6 +121,22 @@ describe("fresh preset launch IPC", () => {
       targetTabId: "tab-original",
       initialPrompt: null,
     }));
+  });
+
+  it("preserves confirmed write count when every delivered tab has closed", async () => {
+    invoke.mockResolvedValue({
+      confirmed_tab_ids: [],
+      confirmed_commands: 1,
+      total_commands: 2,
+      error: "the confirmed tab closed",
+    });
+
+    await expect(applyPreset("ws-new", "preset", "current_terminal", null, null, true, "tab-original"))
+      .rejects.toMatchObject({
+        confirmedTabIds: [],
+        confirmedCommands: 1,
+        totalCommands: 2,
+      });
   });
 
   it("resolves after all command writes are confirmed", async () => {

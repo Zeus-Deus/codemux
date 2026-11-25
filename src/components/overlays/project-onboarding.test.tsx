@@ -53,6 +53,7 @@ import {
   listWorktrees,
   activateWorkspace,
   activateTab,
+  getAppState,
 } from "@/tauri/commands";
 import { toast } from "@/lib/toast";
 import { useUIStore } from "@/stores/ui-store";
@@ -213,6 +214,37 @@ describe("ProjectOnboarding — task and agent", () => {
       }),
     );
     expect(toast.success).not.toHaveBeenCalled();
+    expect(mockApplyPreset).toHaveBeenCalledTimes(1);
+  });
+
+  it("warns and retains the task if fresh tab state cannot be loaded", async () => {
+    vi.mocked(getAppState)
+      .mockRejectedValueOnce(new Error("state unavailable"))
+      .mockRejectedValueOnce(new Error("state still unavailable"));
+    mockApplyPreset.mockRejectedValueOnce(new PartialPresetLaunchError({
+      confirmed_tab_ids: ["tab-default"],
+      confirmed_commands: 1,
+      total_commands: 2,
+      error: "second terminal rejected the write",
+    }));
+    const { onComplete } = renderOnboarding();
+    await flushMountEffects();
+    await goToSetupStep();
+
+    fireEvent.click(screen.getByRole("button", { name: "Create & start Claude Code" }));
+    await vi.waitFor(() => expect(onComplete).toHaveBeenCalledOnce());
+
+    expect(vi.mocked(toast.warning)).toHaveBeenCalledWith(
+      expect.stringContaining("open tabs could not be confirmed"),
+      expect.objectContaining({ action: expect.objectContaining({ label: "Copy prompt" }) }),
+    );
+    expect(vi.mocked(toast.warning).mock.calls[0][1]?.cancel).toBeUndefined();
+    expect(toast.success).not.toHaveBeenCalled();
+    expect(activateTab).not.toHaveBeenCalled();
+    const saved = Object.values(useChatDraftStore.getState().draftsById)[0];
+    expect(saved.inputDraft).toBe("Add dark mode");
+    expect(saved.manualPromptRequired).toBe(false);
+    expect(getAppState).toHaveBeenCalledTimes(2);
     expect(mockApplyPreset).toHaveBeenCalledTimes(1);
   });
 
