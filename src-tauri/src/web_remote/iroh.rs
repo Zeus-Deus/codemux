@@ -614,6 +614,15 @@ fn open_private_key_dir(parent: &Path) -> Result<std::fs::File, String> {
     use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
     use std::path::Component;
 
+    // Traversal needs search permission, not read permission. The final
+    // directory is reopened below with a usable descriptor for key I/O.
+    #[cfg(target_os = "linux")]
+    const SEARCH_ONLY: libc::c_int = libc::O_PATH;
+    #[cfg(target_os = "macos")]
+    const SEARCH_ONLY: libc::c_int = libc::O_SEARCH;
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    const SEARCH_ONLY: libc::c_int = libc::O_RDONLY;
+
     #[derive(Debug)]
     enum Part {
         Root,
@@ -670,7 +679,7 @@ fn open_private_key_dir(parent: &Path) -> Result<std::fs::File, String> {
         }
         let mode = parent_meta.permissions().mode();
         let writable_by_others = mode & 0o022 != 0;
-        if writable_by_others && mode & libc::S_ISVTX == 0 {
+        if writable_by_others && mode & (libc::S_ISVTX as u32) == 0 {
             return Err("iroh key ancestor allows other users to replace entries".to_string());
         }
 
@@ -748,7 +757,7 @@ fn open_private_key_dir(parent: &Path) -> Result<std::fs::File, String> {
             libc::openat(
                 directory.as_raw_fd(),
                 name.as_ptr(),
-                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                SEARCH_ONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
             )
         };
         if fd < 0 {
@@ -763,10 +772,28 @@ fn open_private_key_dir(parent: &Path) -> Result<std::fs::File, String> {
         }
         directories.push(opened);
     }
-    let directory = directories.pop().expect("root directory remains open");
-    let meta = directory
+    let search_handle = directories.pop().expect("root directory remains open");
+    let search_meta = search_handle
         .metadata()
         .map_err(|e| format!("inspect iroh key directory: {e}"))?;
+    let dot = std::ffi::CString::new(".").expect("static directory name has no NUL");
+    let fd = unsafe {
+        libc::openat(
+            search_handle.as_raw_fd(),
+            dot.as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )
+    };
+    if fd < 0 {
+        return Err(format!("open iroh key directory for I/O: {}", std::io::Error::last_os_error()));
+    }
+    let directory = unsafe { std::fs::File::from_raw_fd(fd) };
+    let meta = directory
+        .metadata()
+        .map_err(|e| format!("inspect usable iroh key directory: {e}"))?;
+    if meta.dev() != search_meta.dev() || meta.ino() != search_meta.ino() {
+        return Err("iroh key directory changed while opening for I/O".to_string());
+    }
     // The descriptor, not the pathname, identifies the directory we tighten.
     if !meta.is_dir() || meta.uid() != uid {
         return Err("iroh key directory is not an owned directory".to_string());
@@ -1469,6 +1496,30 @@ mod tests {
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
         let loaded = load_or_create_secret_key_at(&path).unwrap();
         assert_eq!(loaded.public(), key.public(), "loading must keep the device identity");
+        assert_eq!(std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777, 0o700);
+        assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn iroh_identity_key_works_through_search_only_ancestor() {
+        use std::os::unix::fs::PermissionsExt;
+
+        if unsafe { libc::geteuid() } == 0 {
+            return;
+        }
+        let temp = tempfile::tempdir().unwrap();
+        let ancestor = temp.path().join("search-only");
+        let dir = ancestor.join("codemux");
+        std::fs::create_dir(&ancestor).unwrap();
+        std::fs::create_dir(&dir).unwrap();
+        let path = dir.join(KEY_FILE);
+        std::fs::set_permissions(&ancestor, std::fs::Permissions::from_mode(0o111)).unwrap();
+
+        let result = load_or_create_secret_key_at(&path);
+        std::fs::set_permissions(&ancestor, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let key = result.unwrap();
+        assert_eq!(load_or_create_secret_key_at(&path).unwrap().public(), key.public());
         assert_eq!(std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777, 0o700);
         assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
     }
