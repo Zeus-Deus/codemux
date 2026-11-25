@@ -722,8 +722,10 @@ pub async fn workspace_push_to_host<R: tauri::Runtime>(
             crate::ssh::tunnel::verify_workspace_daemon(&host.ssh_target, &workspace_id)
                 .await
                 .map_err(prepare_error)?;
-        if !daemon_running {
-            helper.verify_prepared_spawn().map_err(prepare_error)?;
+        if !daemon_running && !helper.advertises_prepared_spawn().map_err(prepare_error)? {
+            crate::ssh::tunnel::verify_installed_workspace_daemon(&host.ssh_target)
+                .await
+                .map_err(prepare_error)?;
         }
         if !target_matches() {
             return Err("The saved SSH target changed before the copy.".into());
@@ -1446,10 +1448,8 @@ async fn pull_claude_projects(
 struct PushHelperVersion {
     version: String,
     protocol_version: u32,
-    #[serde(default)]
-    guarded_shells: bool,
-    #[serde(default)]
-    prepared_spawn: bool,
+    guarded_shells: Option<bool>,
+    prepared_spawn: Option<bool>,
 }
 
 #[cfg(unix)]
@@ -1466,21 +1466,23 @@ impl PushHelperVersion {
         }
     }
 
-    fn verify_prepared_spawn(&self) -> Result<(), String> {
-        if self.guarded_shells && self.prepared_spawn {
-            return Ok(());
+    /// Omitted metadata needs a live Hello; an explicit false is definitive.
+    fn advertises_prepared_spawn(&self) -> Result<bool, String> {
+        match (self.guarded_shells, self.prepared_spawn) {
+            (Some(false), _) | (_, Some(false)) => Err(format!(
+                "codemux-remote {} does not support prepared terminal spawns. Set up the device again before moving the workspace.",
+                self.version
+            )),
+            (Some(true), Some(true)) => Ok(true),
+            _ => Ok(false),
         }
-        Err(format!(
-            "codemux-remote {} does not advertise prepared terminal spawns. Set up the device again before moving the workspace.",
-            self.version
-        ))
     }
 }
 
 #[cfg(unix)]
 async fn verify_workspace_push_helper(ssh_target: &str) -> Result<PushHelperVersion, String> {
-    // Workspace moves only inspect the installed helper. Device setup can
-    // install or repair it, and ordinary upgrades can run independently.
+    // Device setup installs or repairs the helper. Workspace moves inspect
+    // it without replacing the executable or restarting live daemons.
     let output = crate::ssh::exec::run_remote(
         ssh_target,
         r#"helper="$HOME/.local/bin/codemux-remote"
@@ -1792,6 +1794,7 @@ HOME="$CODEMUX_PUSH_TEST_HOME/$target" exec sh -c "$1"
         for (target, command) in [
             ("older", format!("printf '%s\\n' '{{\"version\":\"0.26.0\",\"protocol_version\":{protocol},\"guarded_shells\":true,\"prepared_spawn\":true}}'")),
             ("unadvertised", format!("printf '%s\\n' '{{\"version\":\"0.26.0\",\"protocol_version\":{protocol}}}'")),
+            ("unsupported", format!("printf '%s\\n' '{{\"version\":\"0.26.0\",\"protocol_version\":{protocol},\"prepared_spawn\":false}}'")),
             ("incompatible", "printf '%s\\n' '{\"version\":\"0.26.0\",\"protocol_version\":0}'".into()),
             ("malformed", "printf '%s\\n' 'not a version'".into()),
             ("failed", "exit 3".into()),
@@ -1812,17 +1815,22 @@ HOME="$CODEMUX_PUSH_TEST_HOME/$target" exec sh -c "$1"
         std::env::set_var("CODEMUX_PUSH_TEST_LOG", &log);
         std::env::set_var("CODEMUX_PUSH_TEST_HOME", fixture.path());
 
-        super::verify_workspace_push_helper("older")
+        assert!(super::verify_workspace_push_helper("older")
             .await
             .unwrap()
-            .verify_prepared_spawn()
-            .unwrap();
-        let error = super::verify_workspace_push_helper("unadvertised")
+            .advertises_prepared_spawn()
+            .unwrap());
+        assert!(!super::verify_workspace_push_helper("unadvertised")
             .await
             .unwrap()
-            .verify_prepared_spawn()
+            .advertises_prepared_spawn()
+            .unwrap());
+        let error = super::verify_workspace_push_helper("unsupported")
+            .await
+            .unwrap()
+            .advertises_prepared_spawn()
             .unwrap_err();
-        assert!(error.contains("does not advertise prepared terminal spawns"), "{error}");
+        assert!(error.contains("does not support prepared terminal spawns"), "{error}");
         for (target, expected) in [
             ("incompatible", "uses PTY protocol 0"),
             ("malformed", "returned an unreadable version"),
@@ -1834,7 +1842,7 @@ HOME="$CODEMUX_PUSH_TEST_HOME/$target" exec sh -c "$1"
         }
         assert_eq!(
             std::fs::read_to_string(log).unwrap(),
-            "older\nunadvertised\nincompatible\nmalformed\nfailed\nmissing\n"
+            "older\nunadvertised\nunsupported\nincompatible\nmalformed\nfailed\nmissing\n"
         );
     }
 

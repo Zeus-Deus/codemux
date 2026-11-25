@@ -103,10 +103,18 @@ done
 case "$2" in
     *CMX_PUSH_HELPER*) step=helper;;
     *PROBE_ONLY=1*) step=discovery;;
+    *CODEMUX_PTY_DAEMON_DIR=*)
+        case "${forward#*:}" in /tmp/cmx-hello-*/pty.sock) ;; *) exit 1;; esac
+        printf '%s\n' "${forward%%:*}" > "$CODEMUX_TEST_PUSH_FORWARD"
+        printf '%s\n' isolated-hello >> "$CODEMUX_TEST_PUSH_LOG"
+        printf '%s\n' 'codemux:pty-tunnel-ready:v1'
+        IFS= read -r ignored
+        exit 0;;
     *codemux:pty-tunnel-ready:v1*)
         [ "${forward#*:}" = "$CODEMUX_TEST_PUSH_REMOTE_SOCKET" ] || exit 1
         printf '%s\n' "${forward%%:*}" > "$CODEMUX_TEST_PUSH_FORWARD"
         step=hello;;
+    mkdir\ -p\ *) printf '%s\n' mkdir >> "$CODEMUX_TEST_PUSH_LOG"; exit 0;;
     *) printf '%s\n' unexpected-ssh >> "$CODEMUX_TEST_PUSH_LOG"; exit 1;;
 esac
 printf '%s\n' "$step" >> "$CODEMUX_TEST_PUSH_LOG"
@@ -130,7 +138,7 @@ HOME="$CODEMUX_TEST_PUSH_HOME" exec /bin/sh -c "$2"
     std::env::set_var("CODEMUX_TEST_PUSH_HOME", &home);
     std::env::set_var("CODEMUX_TEST_PUSH_REMOTE_SOCKET", &remote_socket);
 
-    let wire = tokio::spawn(serve_forwarded_hello(forward));
+    let wire = tokio::spawn(serve_forwarded_hello(forward.clone(), false));
     let error =
         super::workspace_push_to_host(app.handle().clone(), db, workspace_id.clone(), host.id)
             .await
@@ -159,8 +167,8 @@ HOME="$CODEMUX_TEST_PUSH_HOME" exec /bin/sh -c "$2"
         "the live daemon socket must be preserved"
     );
 
-    // Without a listener, the installed helper would start at placement.
-    // An older helper with the same protocol also needs to fail preflight.
+    // An installed helper that explicitly lacks support fails without
+    // starting a capability probe or copying anything.
     drop(remote_listener);
     fs::remove_file(remote_socket).unwrap();
     fs::write(&log, "").unwrap();
@@ -169,6 +177,8 @@ HOME="$CODEMUX_TEST_PUSH_HOME" exec /bin/sh -c "$2"
         serde_json::json!({
             "version": "0.26.0",
             "protocol_version": PROTOCOL_VERSION,
+            "guarded_shells": true,
+            "prepared_spawn": false,
         }),
     );
     let error = super::workspace_push_to_host(
@@ -180,10 +190,10 @@ HOME="$CODEMUX_TEST_PUSH_HOME" exec /bin/sh -c "$2"
     .await
     .unwrap_err();
     assert!(
-        error.contains("does not advertise prepared terminal spawns"),
+        error.contains("does not support prepared terminal spawns"),
         "{error}"
     );
-    assert_eq!(fs::read_to_string(log).unwrap(), "helper\ndiscovery\n");
+    assert_eq!(fs::read_to_string(&log).unwrap(), "helper\ndiscovery\n");
     assert_eq!(
         app.state::<AppStateStore>()
             .find_workspace(&workspace_id)
@@ -191,9 +201,59 @@ HOME="$CODEMUX_TEST_PUSH_HOME" exec /bin/sh -c "$2"
             .host_id,
         None,
     );
+
+    // An older binary can omit capabilities from Version while supporting
+    // them in Hello. Only the isolated daemon's actual reply decides.
+    write_helper_version(
+        &helper,
+        serde_json::json!({
+            "version": "0.26.0",
+            "protocol_version": PROTOCOL_VERSION,
+        }),
+    );
+    for prepared_spawn in [false, true] {
+        if forward.exists() {
+            fs::remove_file(&forward).unwrap();
+        }
+        fs::write(&log, "").unwrap();
+        let wire = tokio::spawn(serve_forwarded_hello(forward.clone(), prepared_spawn));
+        let outcome = super::workspace_push_to_host(
+            app.handle().clone(),
+            app.state(),
+            workspace_id.clone(),
+            host.id,
+        )
+        .await;
+        tokio::time::timeout(Duration::from_secs(5), wire)
+            .await
+            .expect("the isolated Hello connection should close")
+            .unwrap();
+        let steps = fs::read_to_string(&log).unwrap();
+        if prepared_spawn {
+            // The rsync fixture turns the transfer into a controlled
+            // failure after demonstrating that preflight admitted it.
+            let outcome = outcome.unwrap();
+            assert!(!outcome.ok, "{outcome:?}");
+            assert_eq!(steps, "helper\ndiscovery\nisolated-hello\nmkdir\nrsync\n");
+        } else {
+            let error = outcome.unwrap_err();
+            assert!(
+                error.contains("does not support prepared terminal spawns"),
+                "{error}"
+            );
+            assert_eq!(steps, "helper\ndiscovery\nisolated-hello\n");
+        }
+        assert_eq!(
+            app.state::<AppStateStore>()
+                .find_workspace(&workspace_id)
+                .unwrap()
+                .host_id,
+            None,
+        );
+    }
 }
 
-async fn serve_forwarded_hello(path_file: PathBuf) {
+async fn serve_forwarded_hello(path_file: PathBuf, prepared_spawn: bool) {
     let socket = loop {
         match fs::read_to_string(&path_file) {
             Ok(path) if !path.trim().is_empty() => break PathBuf::from(path.trim()),
@@ -203,8 +263,7 @@ async fn serve_forwarded_hello(path_file: PathBuf) {
         }
         tokio::time::sleep(Duration::from_millis(10)).await;
     };
-    // Simulate OpenSSH's local bind. The remote listener advertises the
-    // current protocol but lacks a capability that placement requires.
+    // Simulate OpenSSH's local bind and report the listener's capabilities.
     let listener = UnixListener::bind(&socket).unwrap();
     fs::set_permissions(&socket, fs::Permissions::from_mode(0o600)).unwrap();
     let (stream, _) = listener.accept().await.unwrap();
@@ -221,7 +280,7 @@ async fn serve_forwarded_hello(path_file: PathBuf) {
         daemon_version: "0.26.0".into(),
         host_claude_plugin: true,
         guarded_shells: true,
-        prepared_spawn: false,
+        prepared_spawn,
     }))
     .unwrap();
     reply.push(b'\n');

@@ -39,6 +39,8 @@ use crate::pty_daemon::{PtyDaemonClient, PROTOCOL_VERSION};
 
 const TUNNEL_READY: &str = "codemux:pty-tunnel-ready:v1";
 const PROBE_TIMEOUT: Duration = Duration::from_secs(15);
+const PROBE_CLEANUP_TIMEOUT: Duration = Duration::from_secs(3);
+const INSTALLED_PROBE_POLL_LIMIT: u32 = 200;
 
 pub(super) fn has_private_socket_parent(path: &Path) -> bool {
     path.parent().is_some_and(is_private_directory)
@@ -227,6 +229,85 @@ IFS= read -r ignored"#,
     format!("exec sh -c {}", sh_quote(&script))
 }
 
+fn build_installed_daemon_probe_command(directory_name: &str, poll_limit: u32) -> String {
+    let script = format!(
+        "umask 077\nUID_NUMBER=$(id -u) || exit 1\nNAME={}\nPOLL_LIMIT={}\n{}{}",
+        sh_quote(directory_name),
+        poll_limit,
+        DIRECTORY_CHECKS,
+        r#"
+ROOT=$(absolute_dir /tmp) || exit 1
+trusted_directory "$ROOT" || exit 1
+# Verify the process ownership check before starting a child.
+ps -o ppid= -p "$$" >/dev/null 2>&1 || exit 1
+DIR="$ROOT/$NAME"
+SOCK="$DIR/pty.sock"
+BIN="$HOME/.local/bin/codemux-remote"
+DAEMON=
+READER=
+
+stop_child() {
+    [ -n "$1" ] || return 0
+    parent=$(ps -o ppid= -p "$1" 2>/dev/null) || return 0
+    # Only signal processes still reported as children of this supervisor.
+    if [ "$parent" -eq "$$" ] 2>/dev/null; then
+        kill -KILL "$1" 2>/dev/null || :
+        wait "$1" 2>/dev/null || :
+    fi
+}
+cleanup() {
+    trap '' HUP INT TERM
+    stop_child "$READER"
+    stop_child "$DAEMON"
+    rm -rf "$DIR"
+}
+
+# Do not accept an existing path. Defer soft signals while recording
+# ownership of the directory and child processes.
+trap '' HUP INT TERM
+mkdir -m 700 "$DIR" || exit 1
+trap 'status=$?; trap - 0; cleanup || status=1; exit "$status"' 0
+private_directory "$DIR" || exit 1
+mkdir "$DIR/home" "$DIR/tmp" "$DIR/run" || exit 1
+(
+    cd "$DIR" || exit 1
+    exec env -i PATH="$PATH" HOME="$DIR/home" TMPDIR="$DIR/tmp" \
+        XDG_DATA_HOME="$DIR/data" XDG_CONFIG_HOME="$DIR/config" \
+        XDG_CACHE_HOME="$DIR/cache" XDG_STATE_HOME="$DIR/state" \
+        XDG_RUNTIME_DIR="$DIR/run" CODEMUX_PTY_DAEMON_DIR="$DIR/daemon" \
+        "$BIN" pty-daemon --socket "$SOCK"
+) </dev/null >"$DIR/daemon.log" 2>&1 &
+DAEMON=$!
+
+# A separate reader lets the supervisor enforce a deadline even if the SSH
+# channel never delivers EOF. Its stdin is deliberately inherited, not the
+# implicit /dev/null of a non-interactive background command.
+exec 3<&0
+(
+    IFS= read -r ignored || :
+    : > "$DIR/client-closed"
+) <&3 &
+READER=$!
+exec 3<&-
+trap 'exit 1' HUP INT TERM
+
+i=0
+READY=0
+while [ "$i" -lt "$POLL_LIMIT" ]; do
+    [ ! -e "$DIR/client-closed" ] || exit 0
+    kill -0 "$DAEMON" 2>/dev/null || exit 1
+    if [ "$READY" = 0 ] && daemon_alive "$SOCK" && [ "$(cat "$SOCK.pid")" = "$DAEMON" ]; then
+        printf '%s\n' 'codemux:pty-tunnel-ready:v1'
+        READY=1
+    fi
+    i=$((i+1))
+    sleep 0.1
+done
+exit 1"#,
+    );
+    format!("exec sh -c {}", sh_quote(&script))
+}
+
 pub(super) fn verify_daemon_protocol(version: &str, protocol: u32) -> Result<(), String> {
     if protocol == PROTOCOL_VERSION {
         return Ok(());
@@ -246,13 +327,46 @@ pub(crate) async fn verify_workspace_daemon(
     let Some(remote_socket) = probe_remote_socket(ssh_target, workspace_id).await? else {
         return Ok(false);
     };
-    let local_socket = LocalSocket::allocate()?;
-    let argv = build_forward_argv(
+    let (local_socket, mut child) = spawn_daemon_probe(
         ssh_target,
         &remote_socket,
-        &local_socket.path,
         build_existing_daemon_command(&remote_socket),
-    );
+    )?;
+    let result = verify_daemon_forward(&local_socket.path, &mut child).await;
+    let _ = child.kill().await;
+    result.map(|()| true)
+}
+
+/// Older helpers may lack capability fields in their version output even
+/// when their daemon supports them. Verify a scratch daemon without using
+/// the device's workspace paths, shared manifest, or agent plugin state.
+pub(crate) async fn verify_installed_workspace_daemon(ssh_target: &str) -> Result<(), String> {
+    validate_ssh_target(ssh_target)?;
+    let directory_name = format!("cmx-hello-{}", uuid::Uuid::new_v4().simple());
+    let remote_socket = format!("/tmp/{directory_name}/pty.sock");
+    let (local_socket, mut child) = spawn_daemon_probe(
+        ssh_target,
+        &remote_socket,
+        // The remote process ends even if the network never delivers EOF.
+        build_installed_daemon_probe_command(&directory_name, INSTALLED_PROBE_POLL_LIMIT),
+    )?;
+    let result = verify_daemon_forward(&local_socket.path, &mut child).await;
+    match timeout(PROBE_CLEANUP_TIMEOUT, child.wait()).await {
+        Ok(Ok(status)) if status.success() => result,
+        _ => {
+            let _ = child.kill().await;
+            result.and(Err("The installed device daemon probe did not finish cleanup".into()))
+        }
+    }
+}
+
+fn spawn_daemon_probe(
+    ssh_target: &str,
+    remote_socket: &str,
+    remote_command: String,
+) -> Result<(LocalSocket, Child), String> {
+    let local_socket = LocalSocket::allocate()?;
+    let argv = build_forward_argv(ssh_target, remote_socket, &local_socket.path, remote_command);
     let mut command = Command::new("ssh");
     command
         .args(argv)
@@ -261,12 +375,10 @@ pub(crate) async fn verify_workspace_daemon(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     crate::execution::sanitize_appimage_env_tokio(&mut command);
-    let mut child = command
+    let child = command
         .spawn()
         .map_err(|error| format!("Could not open the device daemon probe: {error}"))?;
-    let result = verify_daemon_forward(&local_socket.path, &mut child).await;
-    let _ = child.kill().await;
-    result.map(|()| true)
+    Ok((local_socket, child))
 }
 
 async fn verify_daemon_forward(path: &Path, child: &mut Child) -> Result<(), String> {
@@ -542,6 +654,104 @@ mod tests {
 
         fs::set_permissions(&parent, fs::Permissions::from_mode(0o755)).unwrap();
         assert!(prepare_local_socket(&socket).is_err());
+    }
+
+    #[tokio::test]
+    async fn installed_daemon_probe_isolates_state_and_cleans_up_after_disconnect_or_timeout() {
+        use tokio::net::UnixListener;
+
+        let fixture = tempfile::tempdir().unwrap();
+        let helper = fixture.path().join(".local/bin/codemux-remote");
+        let record = fixture.path().join("isolated-helper-environment");
+        fs::create_dir_all(helper.parent().unwrap()).unwrap();
+        fs::write(
+            &helper,
+            format!(
+                r#"#!/bin/sh
+printf '%s\n' "$$" "$HOME" "$XDG_DATA_HOME" "$CODEMUX_PTY_DAEMON_DIR" "${{CLAUDE_CONFIG_DIR-unset}}" "$PWD" "$@" > {}
+exec sleep 60
+"#,
+                sh_quote(record.to_str().unwrap()),
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&helper, fs::Permissions::from_mode(0o700)).unwrap();
+
+        for disconnect in [true, false] {
+            let name = format!("cmx-hello-fixture-{}", uuid::Uuid::new_v4().simple());
+            let scratch = Path::new("/tmp").canonicalize().unwrap().join(&name);
+            let socket = scratch.join("pty.sock");
+            let argv = build_installed_daemon_probe_command(&name, if disconnect { 150 } else { 20 });
+            let mut child = Command::new("sh")
+                .args(["-c", &argv])
+                .env("HOME", fixture.path())
+                .env("XDG_DATA_HOME", fixture.path())
+                .env("CODEMUX_PTY_DAEMON_DIR", fixture.path())
+                .env("CLAUDE_CONFIG_DIR", fixture.path())
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .kill_on_drop(true)
+                .spawn()
+                .unwrap();
+            let stdin = child.stdin.take().unwrap();
+            let environment = timeout(Duration::from_secs(5), async {
+                loop {
+                    if let Ok(contents) = fs::read_to_string(&record) {
+                        if contents.lines().count() == 9 {
+                            break contents;
+                        }
+                    }
+                    sleep(Duration::from_millis(20)).await;
+                }
+            })
+            .await
+            .expect("the installed helper should start");
+            let mut lines = environment.lines();
+            let pid: i32 = lines.next().unwrap().parse().unwrap();
+            for (actual, expected) in lines.zip([
+                scratch.join("home"),
+                scratch.join("data"),
+                scratch.join("daemon"),
+                PathBuf::from("unset"),
+                scratch.clone(),
+                PathBuf::from("pty-daemon"),
+                PathBuf::from("--socket"),
+                socket.clone(),
+            ]) {
+                assert_eq!(Path::new(actual), expected);
+            }
+            assert!(is_private_directory(&scratch));
+
+            let status = if disconnect {
+                let _listener = UnixListener::bind(&socket).unwrap();
+                fs::set_permissions(&socket, fs::Permissions::from_mode(0o600)).unwrap();
+                let pidfile = socket.with_extension("sock.pid");
+                fs::write(&pidfile, pid.to_string()).unwrap();
+                fs::set_permissions(&pidfile, fs::Permissions::from_mode(0o600)).unwrap();
+                let mut reader = BufReader::new(child.stdout.take().unwrap());
+                let mut ready = String::new();
+                timeout(Duration::from_secs(5), reader.read_line(&mut ready))
+                    .await
+                    .expect("the probe should report readiness")
+                    .unwrap();
+                assert_eq!(ready.trim_end(), TUNNEL_READY);
+                drop(stdin);
+                timeout(Duration::from_secs(5), child.wait()).await
+            } else {
+                // Keep stdin open so the remote-side deadline has to clean up.
+                let result = timeout(Duration::from_secs(5), child.wait()).await;
+                drop(stdin);
+                result
+            };
+            assert_eq!(
+                status.expect("the probe should exit").unwrap().success(),
+                disconnect
+            );
+            assert!(!scratch.exists(), "the probe must remove its own state");
+            // SAFETY: this checks liveness without signaling the recorded PID.
+            assert_eq!(unsafe { libc::kill(pid, 0) }, -1);
+            fs::remove_file(&record).unwrap();
+        }
     }
 
     #[tokio::test]
