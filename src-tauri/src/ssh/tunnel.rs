@@ -347,9 +347,8 @@ pub(crate) async fn verify_workspace_daemon(
     result.map(|()| true)
 }
 
-/// Older helpers may lack capability fields in their version output even
-/// when their daemon supports them. Verify a scratch daemon without using
-/// the device's workspace paths, shared manifest, or agent plugin state.
+/// Verify the installed daemon and SSH socket forwarding on a cold device.
+/// The scratch daemon uses isolated workspace, manifest, and plugin paths.
 pub(crate) async fn verify_installed_workspace_daemon(ssh_target: &str) -> Result<(), String> {
     validate_ssh_target(ssh_target)?;
     let directory_name = format!("cmx-hello-{}", uuid::Uuid::new_v4().simple());

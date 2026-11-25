@@ -722,7 +722,9 @@ pub async fn workspace_push_to_host<R: tauri::Runtime>(
             crate::ssh::tunnel::verify_workspace_daemon(&host.ssh_target, &workspace_id)
                 .await
                 .map_err(prepare_error)?;
-        if !daemon_running && !helper.advertises_prepared_spawn().map_err(prepare_error)? {
+        if !daemon_running {
+            helper.check_prepared_spawn().map_err(prepare_error)?;
+            // Version metadata cannot tell whether sshd allows forwarding.
             crate::ssh::tunnel::verify_installed_workspace_daemon(&host.ssh_target)
                 .await
                 .map_err(prepare_error)?;
@@ -1466,15 +1468,14 @@ impl PushHelperVersion {
         }
     }
 
-    /// Omitted metadata needs a live Hello; an explicit false is definitive.
-    fn advertises_prepared_spawn(&self) -> Result<bool, String> {
+    /// An explicit false rejects the helper before starting a cold probe.
+    fn check_prepared_spawn(&self) -> Result<(), String> {
         match (self.guarded_shells, self.prepared_spawn) {
             (Some(false), _) | (_, Some(false)) => Err(format!(
                 "codemux-remote {} does not support prepared terminal spawns. Set up the device again before moving the workspace.",
                 self.version
             )),
-            (Some(true), Some(true)) => Ok(true),
-            _ => Ok(false),
+            _ => Ok(()),
         }
     }
 }
@@ -1815,20 +1816,20 @@ HOME="$CODEMUX_PUSH_TEST_HOME/$target" exec sh -c "$1"
         std::env::set_var("CODEMUX_PUSH_TEST_LOG", &log);
         std::env::set_var("CODEMUX_PUSH_TEST_HOME", fixture.path());
 
-        assert!(super::verify_workspace_push_helper("older")
+        super::verify_workspace_push_helper("older")
             .await
             .unwrap()
-            .advertises_prepared_spawn()
-            .unwrap());
-        assert!(!super::verify_workspace_push_helper("unadvertised")
+            .check_prepared_spawn()
+            .unwrap();
+        super::verify_workspace_push_helper("unadvertised")
             .await
             .unwrap()
-            .advertises_prepared_spawn()
-            .unwrap());
+            .check_prepared_spawn()
+            .unwrap();
         let error = super::verify_workspace_push_helper("unsupported")
             .await
             .unwrap()
-            .advertises_prepared_spawn()
+            .check_prepared_spawn()
             .unwrap_err();
         assert!(error.contains("does not support prepared terminal spawns"), "{error}");
         for (target, expected) in [

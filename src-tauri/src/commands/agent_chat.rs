@@ -14312,13 +14312,13 @@ exit 255
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn push_with_unusable_device_socket_paths_leaves_the_local_chat_running() {
+    async fn push_leaves_the_local_chat_running_when_tunnel_preflight_fails() {
         use std::collections::hash_map::DefaultHasher;
         use std::hash::{Hash, Hasher};
         use std::os::unix::fs::PermissionsExt;
 
         const TEST: &str =
-            "commands::agent_chat::tests::push_with_unusable_device_socket_paths_leaves_the_local_chat_running";
+            "commands::agent_chat::tests::push_leaves_the_local_chat_running_when_tunnel_preflight_fails";
         if crate::test_isolation::isolated(TEST) {
             return;
         }
@@ -14351,9 +14351,11 @@ exit 255
             &ssh,
             r#"#!/bin/sh
 strict=no
+forward=no
 while [ "$#" -gt 0 ]; do
     case "$1" in
         StrictHostKeyChecking=yes) strict=yes;;
+        -L) forward=yes; shift;;
         --) shift; break;;
     esac
     shift
@@ -14362,6 +14364,11 @@ done
 case "$2" in
     *CMX_PUSH_HELPER*) step=helper;;
     *PROBE_ONLY=1*) step=discovery;;
+    *CODEMUX_PTY_DAEMON_DIR=*)
+        [ "$forward" = yes ] || exit 1
+        printf 'forward\n' >> "$CODEMUX_TEST_PUSH_LOG"
+        exit 255;;
+    mkdir\ -p\ *) printf 'mkdir\n' >> "$CODEMUX_TEST_PUSH_LOG"; exit 0;;
     *) printf 'unexpected\n' >> "$CODEMUX_TEST_PUSH_LOG"; exit 1;;
 esac
 printf '%s\n' "$step" >> "$CODEMUX_TEST_PUSH_LOG"
@@ -14370,6 +14377,13 @@ HOME="$CODEMUX_TEST_PUSH_REMOTE_HOME" XDG_RUNTIME_DIR= exec /bin/sh -c "$2"
         )
         .unwrap();
         std::fs::set_permissions(ssh, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let rsync = root.join("rsync");
+        std::fs::write(
+            &rsync,
+            "#!/bin/sh\nprintf 'rsync\\n' >> \"$CODEMUX_TEST_PUSH_LOG\"\nexit 1\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(rsync, std::fs::Permissions::from_mode(0o700)).unwrap();
         let path = std::env::var_os("PATH").unwrap_or_default();
         let path = std::env::join_paths(
             std::iter::once(root.clone()).chain(std::env::split_paths(&path)),
@@ -14408,9 +14422,6 @@ HOME="$CODEMUX_TEST_PUSH_REMOTE_HOME" XDG_RUNTIME_DIR= exec /bin/sh -c "$2"
             .await
             .unwrap_err();
             assert!(error.contains("no usable private workspace socket directory"), "{error}");
-            assert_eq!(state.find_workspace(&workspace_id).unwrap().host_id, None);
-            assert!(provider.stopped.lock().unwrap().is_empty());
-            assert!(provider.has_session(&thread).await);
             assert_eq!(std::fs::read_to_string(&log).unwrap(), "helper\ndiscovery\n");
             assert_eq!(
                 std::fs::read_dir(&state_dir).unwrap().count(),
@@ -14423,6 +14434,21 @@ HOME="$CODEMUX_TEST_PUSH_REMOTE_HOME" XDG_RUNTIME_DIR= exec /bin/sh -c "$2"
                 std::fs::set_permissions(&state_dir, std::fs::Permissions::from_mode(0o700)).unwrap();
             }
         }
+
+        // The socket directory is usable and version metadata advertises
+        // both capabilities. The SSH server can still refuse forwarding.
+        std::fs::write(&log, "").unwrap();
+        let error = super::super::hosts::workspace_push_to_host(
+            app.handle().clone(), app.state(), workspace_id.clone(), host_id,
+        )
+        .await
+        .unwrap_err();
+        assert!(error.contains("ssh exited before tunnel came up"), "{error}");
+        assert_eq!(state.find_workspace(&workspace_id).unwrap().host_id, None);
+        assert!(provider.stopped.lock().unwrap().is_empty());
+        assert!(provider.has_session(&thread).await);
+        assert_eq!(std::fs::read_to_string(&log).unwrap(), "helper\ndiscovery\nforward\n");
+        assert_eq!(std::fs::read_dir(state_dir).unwrap().count(), 0);
     }
 
     /// A failed move leaves the workspace where it was, and a send waiting
