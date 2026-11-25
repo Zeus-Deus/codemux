@@ -116,7 +116,7 @@ fn open_private_dir_with_default(
     if meta.permissions().mode() & 0o077 != 0 {
         if dir != default {
             return Err(Error::new(ErrorKind::PermissionDenied, format!(
-                "custom state directory {} is accessible to other users; choose a private directory or chmod it to 0700",
+                "custom state directory {} is accessible to other users; use a fresh private state directory instead. To recover data, see https://github.com/Zeus-Deus/codemux/blob/main/docs/security/remote-state-recovery.md",
                 dir.display()
             )));
         }
@@ -125,7 +125,7 @@ fn open_private_dir_with_default(
         // so it needs user inspection before any automatic migration.
         if meta.permissions().mode() & 0o022 != 0 {
             return Err(Error::new(ErrorKind::PermissionDenied, format!(
-                "default state directory {} is writable by other users; inspect its contents, then chmod it to 0700 before retrying",
+                "default state directory {} was writable by other users; do not reuse it. Stop the remote service, isolate the old directory, and start with a fresh private state directory. Migrate only trusted workspace records; see https://github.com/Zeus-Deus/codemux/blob/main/docs/security/remote-state-recovery.md",
                 dir.display()
             )));
         }
@@ -259,6 +259,7 @@ mod tests {
         let error =
             ensure_private_dir_with_default(&root, &temp.path().join("default")).unwrap_err();
         assert!(error.to_string().contains("custom state directory"));
+        assert!(error.to_string().contains("fresh private state directory"));
         assert_eq!(mode(&root), 0o755);
 
         std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).unwrap();
@@ -285,7 +286,10 @@ mod tests {
         std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o775)).unwrap();
 
         let error = ensure_private_dir_with_default(&root, &root).unwrap_err();
-        assert!(error.to_string().contains("inspect its contents"), "{error}");
+        assert!(error.to_string().contains("do not reuse it"), "{error}");
+        assert!(error.to_string().contains("fresh private state directory"), "{error}");
+        assert!(error.to_string().contains("Migrate only trusted workspace records"), "{error}");
+        assert!(error.to_string().contains("remote-state-recovery.md"), "{error}");
         assert_eq!(mode(&root), 0o775);
     }
 

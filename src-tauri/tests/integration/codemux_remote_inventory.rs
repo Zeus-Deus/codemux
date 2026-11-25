@@ -32,6 +32,14 @@ use codemux_lib::hosts_inventory::{parse_inventory_json, reconcile_host_inventor
 use codemux_lib::remote::{config, workspace::WorkspaceStore};
 use tempfile::TempDir;
 
+fn private_state_tmp() -> TempDir {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = TempDir::new().unwrap();
+    std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    dir
+}
+
 fn binary_path() -> PathBuf {
     if let Ok(path) = std::env::var("CARGO_BIN_EXE_codemux-remote") {
         return PathBuf::from(path);
@@ -74,7 +82,7 @@ fn cli_to_reconcile_round_trip_publishes_remote_workspaces() {
     // Seed the host-side registry with two workspaces, matching the
     // shape the `workspace_create` MCP tool would produce on a real
     // host.
-    let state_tmp = TempDir::new().unwrap();
+    let state_tmp = private_state_tmp();
     let state_dir = state_tmp.path();
     let (alpha_uid, beta_uid) = {
         let store = WorkspaceStore::open(
@@ -192,7 +200,7 @@ fn cli_to_reconcile_propagates_project_identity() {
     git(&["init", "-q"]);
     git(&["remote", "add", "origin", "git@github.com:acme/passpage.git"]);
 
-    let state_tmp = TempDir::new().unwrap();
+    let state_tmp = private_state_tmp();
     let state_dir = state_tmp.path();
     let expected_uid = {
         let store = WorkspaceStore::open(
@@ -257,7 +265,7 @@ fn cli_to_reconcile_is_idempotent_across_polls() {
         return;
     }
 
-    let state_tmp = TempDir::new().unwrap();
+    let state_tmp = private_state_tmp();
     let state_dir = state_tmp.path();
     let uid = {
         let store = WorkspaceStore::open(
@@ -330,7 +338,7 @@ fn cli_to_reconcile_propagates_host_side_renames_and_closes() {
         return;
     }
 
-    let state_tmp = TempDir::new().unwrap();
+    let state_tmp = private_state_tmp();
     let state_dir = state_tmp.path();
 
     let (rename_uid, doomed_uid) = {
@@ -435,7 +443,7 @@ fn workspace_list_carries_host_facts_and_honours_skip_disk() {
         return;
     }
 
-    let state_tmp = TempDir::new().unwrap();
+    let state_tmp = private_state_tmp();
     let state_dir = state_tmp.path();
     let ws_dir = state_tmp.path().join("ws");
     std::fs::create_dir_all(&ws_dir).unwrap();
