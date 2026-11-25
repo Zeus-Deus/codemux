@@ -376,8 +376,8 @@ fn extract(archive: &Path, asset: &Asset, staging: &Path) -> Result<(), String> 
                 if !entry.is_file() || entry.is_symlink() {
                     continue;
                 }
-                let path = entry.name().to_owned();
-                let Some(name) = wanted(asset, &path) else {
+                let path = entry.name().map_err(|e| damaged(&e))?;
+                let Some(name) = wanted(asset, path.as_ref()) else {
                     continue;
                 };
                 if !found.insert(name) {
