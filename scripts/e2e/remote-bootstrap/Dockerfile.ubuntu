@@ -21,7 +21,7 @@ RUN apt-get update -qq \
       systemd systemd-sysv dbus dbus-user-session libpam-systemd \
       polkitd \
       openssh-server \
-      sudo curl ca-certificates iproute2 procps file sqlite3
+      sudo curl ca-certificates iproute2 procps file sqlite3 socat
 # NOTE: the apt package index is deliberately NOT deleted. `install.sh`'s .deb
 # path relies on apt resolving the package's own Depends (WebKitGTK/GTK) from
 # the archive, which is exactly what a real Debian/Ubuntu box can do — and a
@@ -51,6 +51,11 @@ RUN find /etc/systemd/system /lib/systemd/system -path '*.wants/*' \
 # sshd needs host keys and a place to drop its privsep dir before it can be
 # started by systemd at boot.
 RUN ssh-keygen -A && mkdir -p /run/sshd && systemctl enable ssh
+
+# The test account API is on a private Compose bridge. Give Codemux a
+# loopback endpoint so the production API URL policy can stay strict.
+COPY mock-api-loopback.service /etc/systemd/system/mock-api-loopback.service
+RUN systemctl enable mock-api-loopback.service
 
 # The unprivileged user the whole flow runs as. Passwordless sudo because
 # install.sh's .deb path needs root for `apt-get install`, exactly like a

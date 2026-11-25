@@ -36,7 +36,7 @@ E2E_EMAIL="test@example.com"
 E2E_PASSWORD="e2e-not-a-real-password"
 E2E_TOKEN="e2e-session-token"
 E2E_USER_ID="usr_e2e_1"
-MOCK_API="http://mock-api:8787"
+MOCK_API="http://127.0.0.1:8787"
 CODEMUX_PORT=4377
 
 # ── Options ──────────────────────────────────────────────────────────────────
@@ -391,6 +391,10 @@ run_distro() {
     uid=$(rexec "$distro" id -u "$E2E_USER" | tr -d '\r\n')
     info "container ip: ${ip}   ${E2E_USER} uid: ${uid}"
 
+    local proxy_health
+    proxy_health=$(uexec "$distro" "curl -fsS ${MOCK_API}/_e2e/health")
+    assert_contains "mock API loopback proxy is up" "$proxy_health" '"ok": true'
+
     # The session must be a *real* one, or step 3 tests nothing.
     local userbus
     userbus=$(uexec "$distro" "systemctl --user show-environment | head -1; echo RC=\$?")
@@ -450,7 +454,8 @@ run_distro() {
     unit_body=$(rexec "$distro" cat "$unit_path" 2>&1)
     assert_contains "unit file written" "$unit_body" "ExecStart="
     assert_contains "unit runs \`serve\`" "$unit_body" " serve"
-    assert_contains "unit carries CODEMUX_API_URL" "$unit_body" "Environment=CODEMUX_API_URL=${MOCK_API}"
+    assert_contains "unit carries an environment directive" "$unit_body" "Environment="
+    assert_contains "unit carries CODEMUX_API_URL" "$unit_body" "CODEMUX_API_URL=${MOCK_API}"
     info "unit file:"; printf '%s\n' "$unit_body" | sed 's/^/      /'
 
     local is_active is_enabled linger
@@ -785,6 +790,18 @@ except Exception as e:
         fail "port ${CODEMUX_PORT} listening again after reboot" "nothing bound"
         info "journal:"; rexec "$distro" journalctl "_UID=${uid}" -n 60 --no-pager 2>&1 | sed 's/^/      /'
     fi
+
+    # Probe the account API through the target's loopback proxy without
+    # opening an SSH login session. The inbound listener can recover even
+    # when the local proxy service did not restart.
+    local post_proxy_health=""
+    for _ in $(seq 1 45); do
+        post_proxy_health=$(rexec "$distro" curl --max-time 3 -fsS \
+            "${MOCK_API}/_e2e/health" 2>/dev/null || true)
+        [[ "$post_proxy_health" == *'"ok": true'* ]] && break
+        sleep 2
+    done
+    assert_contains "mock API loopback proxy survives reboot" "$post_proxy_health" '"ok": true'
 
     # And still reachable from off-box, which is the actual user-facing promise.
     ip=$(container_ip "$distro")

@@ -71,8 +71,8 @@ x-target-common: &target-common
       target: /repo-scripts
       read_only: true
   environment:
-    # Every codemux process in here talks to the mock, never the real API.
-    CODEMUX_API_URL: http://mock-api:8787
+    # Each target's systemd proxy forwards this loopback URL to the mock.
+    CODEMUX_API_URL: http://127.0.0.1:8787
 
 services:
   mock-api:

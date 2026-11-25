@@ -95,12 +95,61 @@ const ACTIVE_POLL_INTERVAL: Duration = Duration::from_millis(500);
 /// pointed at a self-hosted API would otherwise get a service that silently
 /// talks to the default host, because a systemd unit inherits nothing from the
 /// shell that installed it.
-pub fn systemd_unit(exec_path: &str, api_url: Option<&str>) -> String {
+fn unit_exec_path(path: &str) -> Result<String, String> {
+    // A systemd path is Unix-style even when this generator is tested on Windows.
+    if !path.starts_with('/')
+        || path.chars().any(char::is_control)
+        || path.contains('\\')
+        || path.contains('"')
+    {
+        return Err("The Codemux executable path cannot be used in a service unit".into());
+    }
+    // systemd expands % specifiers in the executable path. The first word
+    // does not expand $ variables, so keep dollar signs literal.
+    Ok(format!("\"{}\"", path.replace('%', "%%")))
+}
+
+fn unit_api_url(value: &str) -> Result<String, String> {
+    if value.len() > 2048
+        || value.chars().any(char::is_whitespace)
+        || value.chars().any(char::is_control)
+        || value.contains('\\')
+        || value.contains('"')
+    {
+        return Err("CODEMUX_API_URL must be a single HTTP(S) URL".into());
+    }
+    let url = url::Url::parse(value).map_err(|_| "CODEMUX_API_URL is not a valid URL")?;
+    let local = match url.host().ok_or("CODEMUX_API_URL needs a host")? {
+        url::Host::Domain(domain) => domain == "localhost",
+        url::Host::Ipv4(ip) => ip.is_loopback(),
+        url::Host::Ipv6(ip) => ip.is_loopback(),
+    };
+    if !(url.scheme() == "https" || (url.scheme() == "http" && local))
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.query().is_some()
+        || url.fragment().is_some()
+    {
+        return Err(
+            "CODEMUX_API_URL requires HTTPS (or loopback HTTP), without credentials or query"
+                .into(),
+        );
+    }
+    // systemd expands % specifiers in Environment= values. The quotes keep
+    // a future URL character from becoming another assignment or directive.
+    Ok(format!(
+        "Environment=\"CODEMUX_API_URL={}\"\n",
+        value.replace('%', "%%")
+    ))
+}
+
+pub fn systemd_unit(exec_path: &str, api_url: Option<&str>) -> Result<String, String> {
+    let exec_path = unit_exec_path(exec_path)?;
     let environment = match api_url {
-        Some(url) if !url.trim().is_empty() => format!("Environment=CODEMUX_API_URL={url}\n"),
+        Some(url) if !url.trim().is_empty() => unit_api_url(url)?,
         _ => String::new(),
     };
-    format!(
+    Ok(format!(
         "[Unit]\n\
          Description=Codemux remote access (headless web-remote server)\n\
          Documentation=https://codemux.org\n\
@@ -118,7 +167,7 @@ pub fn systemd_unit(exec_path: &str, api_url: Option<&str>) -> String {
          \n\
          [Install]\n\
          WantedBy=default.target\n"
-    )
+    ))
 }
 
 // ── What the unit should exec ────────────────────────────────────────
@@ -931,6 +980,12 @@ fn default_host() -> Option<SystemdUserHost> {
 
 /// `codemux connect [--email …] [--scope …] [--port N]`.
 pub async fn run_connect(opts: ConnectOptions) -> Result<(), String> {
+    // Validate the override before sign-in or any persisted config change:
+    // the same URL carries account credentials during both steps.
+    let api_override = std::env::var("CODEMUX_API_URL").ok();
+    if let Some(url) = api_override.as_deref().filter(|url| !url.trim().is_empty()) {
+        unit_api_url(url)?;
+    }
     let db = crate::database::init_database()?;
 
     // Step 1 — account. Everything downstream (relay registration, discovery
@@ -941,6 +996,21 @@ pub async fn run_connect(opts: ConnectOptions) -> Result<(), String> {
         .to_string();
 
     let instance_running = crate::control::control_server_reachable();
+    let host = default_host();
+    let host_ref = host.as_ref().map(|host| host as &dyn ServiceHost);
+    let unsupported = if instance_running {
+        None
+    } else {
+        unsupported_reason(host_ref)
+    };
+    // Validate the service unit before changing remote-access settings. A
+    // path the unit cannot represent must leave the previous config intact.
+    let prepared_unit = if !instance_running && unsupported.is_none() {
+        let exec = resolve_exec_path()?;
+        Some(systemd_unit(&exec.display().to_string(), api_override.as_deref())?)
+    } else {
+        None
+    };
 
     // Step 2 — configuration. Exactly one of the two write paths, per the
     // module note: the running instance owns its in-memory config, so with one
@@ -954,26 +1024,20 @@ pub async fn run_connect(opts: ConnectOptions) -> Result<(), String> {
     };
 
     // Step 3 — keep it running.
-    let host = default_host();
     let service = if instance_running {
         // `serve` refuses to start alongside another instance, so a unit here
         // would fail on every start. The running instance is already serving.
         ServiceReport::RunningInstance
     } else {
-        let host_ref = host.as_ref().map(|h| h as &dyn ServiceHost);
-        match unsupported_reason(host_ref) {
+        match unsupported {
             Some(reason) => ServiceReport::Unsupported {
                 reason,
                 fallback: manual_fallback(),
             },
             None => {
                 let host_ref = host_ref.expect("a supported host exists");
-                let exec = resolve_exec_path()?;
-                let unit = systemd_unit(
-                    &exec.display().to_string(),
-                    std::env::var("CODEMUX_API_URL").ok().as_deref(),
-                );
-                ServiceReport::Installed(install_service(host_ref, &unit)?)
+                let unit = prepared_unit.as_deref().expect("the supported service unit was prepared");
+                ServiceReport::Installed(install_service(host_ref, unit)?)
             }
         }
     };
@@ -1208,8 +1272,8 @@ mod tests {
 
     #[test]
     fn unit_runs_the_serve_subcommand_from_the_current_binary() {
-        let unit = systemd_unit("/usr/bin/codemux", None);
-        assert!(unit.contains("ExecStart=/usr/bin/codemux serve"));
+        let unit = systemd_unit("/usr/bin/codemux", None).unwrap();
+        assert!(unit.contains("ExecStart=\"/usr/bin/codemux\" serve"));
         // No `--relay`: relay mode rides the persisted config, so the unit
         // never has to be rewritten when the toggle changes.
         assert!(!unit.contains("--relay"), "unit must stay config-driven:\n{unit}");
@@ -1235,11 +1299,11 @@ mod tests {
 
     #[test]
     fn unit_carries_a_custom_api_url_but_omits_the_line_by_default() {
-        let default = systemd_unit("/usr/bin/codemux", None);
+        let default = systemd_unit("/usr/bin/codemux", None).unwrap();
         assert!(!default.contains("Environment="), "no stray env line:\n{default}");
 
-        let custom = systemd_unit("/usr/bin/codemux", Some("https://api.example.test"));
-        assert!(custom.contains("Environment=CODEMUX_API_URL=https://api.example.test\n"));
+        let custom = systemd_unit("/usr/bin/codemux", Some("https://api.example.test")).unwrap();
+        assert!(custom.contains("Environment=\"CODEMUX_API_URL=https://api.example.test\"\n"));
         // Still a well-formed unit: the env line sits inside [Service].
         let service_idx = custom.find("[Service]").unwrap();
         let install_idx = custom.find("[Install]").unwrap();
@@ -1247,7 +1311,41 @@ mod tests {
         assert!(service_idx < env_idx && env_idx < install_idx);
 
         // An empty value is treated as unset rather than written as a blank.
-        assert!(!systemd_unit("/usr/bin/codemux", Some("  ")).contains("Environment="));
+        assert!(!systemd_unit("/usr/bin/codemux", Some("  "))
+            .unwrap()
+            .contains("Environment="));
+    }
+
+    #[test]
+    fn unit_rejects_directive_injection_and_insecure_api_urls() {
+        for api_url in [
+            "https://api.example.test\nExecStartPre=/bin/false",
+            "https://api.example.test\r[Service]",
+            "https://api.example.test/\"\nExecStartPre=/bin/false",
+            "https://user:pass@api.example.test",
+            "http://api.example.test",
+            "https://api.example.test?redirect=bad",
+        ] {
+            assert!(
+                systemd_unit("/usr/bin/codemux", Some(api_url)).is_err(),
+                "{api_url:?}"
+            );
+        }
+        assert!(systemd_unit("/tmp/codemux\nExecStartPre=/bin/false", None).is_err());
+        assert!(systemd_unit("relative/codemux", None).is_err());
+        assert!(systemd_unit("/tmp/code\\mux", None).is_err());
+        assert!(systemd_unit("/tmp/code\"mux", None).is_err());
+    }
+
+    #[test]
+    fn unit_quotes_literal_paths_and_preserves_loopback_development_urls() {
+        let unit = systemd_unit(
+            "/opt/Code Mux/codemux$%",
+            Some("http://127.0.0.1:3000/api%20v2"),
+        )
+        .unwrap();
+        assert!(unit.contains("ExecStart=\"/opt/Code Mux/codemux$%%\" serve"));
+        assert!(unit.contains("Environment=\"CODEMUX_API_URL=http://127.0.0.1:3000/api%%20v2\""));
     }
 
     // ── Which binary the unit execs ──────────────────────────────
