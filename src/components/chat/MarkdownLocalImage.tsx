@@ -366,7 +366,7 @@ export function MarkdownLocalImage({
               {children ?? caption}
             </span>
             {offerLoad && (
-              <span className="mt-1 block max-h-24 overflow-auto break-all font-mono text-xs text-muted-foreground">
+              <span className="mt-1 block max-h-24 overflow-auto break-all font-mono text-label text-muted-foreground">
                 {path}
               </span>
             )}
