@@ -758,103 +758,15 @@ pub async fn workspace_push_to_host<R: tauri::Runtime>(
                     drain_terminal_closes(closing),
                 ).await.err();
 
-                // Sync Claude session JSONLs from
-                // ~/.claude/projects/<local-encoded>/ to the
-                // remote's matching encoded path, so a fresh
-                // `claude --resume <uuid>` on the remote finds the
-                // conversation history. Best-effort: failure here
-                // only loses continuity, never blocks the push.
-                //
-                // We need the REMOTE's absolute cwd (with remote
-                // $HOME) for the encoded dir name. Query $HOME via
-                // ssh — ~1s round trip, only when there's actually
-                // local history to sync.
-                let local_workspace_cwd =
-                    std::path::PathBuf::from(&ws.cwd);
-                if !local_workspace_cwd.as_os_str().is_empty() {
-                    match tokio::process::Command::new("ssh")
-                        .arg("-o")
-                        .arg("BatchMode=yes")
-                        .arg(&host.ssh_target)
-                        .arg("echo $HOME")
-                        .output()
-                        .await
-                    {
-                        Ok(out) if out.status.success() => {
-                            let remote_home =
-                                String::from_utf8_lossy(&out.stdout)
-                                    .trim()
-                                    .to_string();
-                            if !remote_home.is_empty() {
-                                // Build the remote absolute cwd from the path we
-                                // ACTUALLY pushed to (`remote_path_str`, already
-                                // uid-keyed and root-aware), not a recomputed
-                                // basename — otherwise a uid-keyed pushed
-                                // workspace's history syncs to the wrong encoded
-                                // dir and `claude --resume` finds nothing.
-                                let remote_absolute_cwd =
-                                    resolve_remote_cwd(&remote_home, &remote_path_str);
-                                if let Err(error) = sync_claude_projects(
-                                    &host.ssh_target,
-                                    &local_workspace_cwd,
-                                    &remote_absolute_cwd,
-                                )
-                                .await
-                                {
-                                    eprintln!(
-                                        "[hosts] Claude JSONL sync failed (continuing — \
-                                         agent will launch but conversation will be \
-                                         fresh): {error}"
-                                    );
-                                }
+                sync_workspace_history(
+                    &app,
+                    &workspace_id,
+                    &host.ssh_target,
+                    std::path::Path::new(&ws.cwd),
+                    &remote_path_str,
+                    HistoryDirection::Push,
+                ).await;
 
-                                // OpenCode conversation sync (issue #16):
-                                // export this workspace's active OpenCode
-                                // session from the laptop's opencode.db and
-                                // import it into the host's DB associated
-                                // with the remote cwd, so the remote
-                                // relaunch (`opencode --session <id>`)
-                                // continues the laptop's conversation. Only
-                                // this one session id is touched — the
-                                // host's other OpenCode sessions are never
-                                // clobbered. Best-effort, same as Claude.
-                                match crate::ssh::sync_opencode_session(
-                                    &host.ssh_target,
-                                    &local_workspace_cwd,
-                                    &remote_absolute_cwd,
-                                )
-                                .await
-                                {
-                                    Ok(Some(oc_session_id)) => {
-                                        // Stash the id so the daemon-backed
-                                        // remote relaunch can target the
-                                        // exact synced session.
-                                        record_opencode_session_capture(
-                                            &app,
-                                            &workspace_id,
-                                            &oc_session_id,
-                                        );
-                                    }
-                                    Ok(None) => {}
-                                    Err(error) => eprintln!(
-                                        "[hosts] OpenCode session sync failed (continuing \
-                                         — agent will launch with a fresh conversation): \
-                                         {error}"
-                                    ),
-                                }
-                            }
-                        }
-                        Ok(out) => eprintln!(
-                            "[hosts] ssh 'echo $HOME' failed (status {}); \
-                             skipping Claude JSONL sync",
-                            out.status
-                        ),
-                        Err(e) => eprintln!(
-                            "[hosts] ssh 'echo $HOME' spawn failed: {e}; \
-                             skipping Claude JSONL sync"
-                        ),
-                    }
-                }
                 // Close any pre-existing sessions on this workspace's
                 // remote daemon BEFORE respawning. The daemon process
                 // outlives the Codemux app — a session_id from a
@@ -1137,134 +1049,26 @@ pub async fn workspace_pull_back_impl<R: tauri::Runtime>(
         // the path we ACTUALLY pulled from (uid-keyed or origin_path),
         // not a recomputed basename.
         let mut result_opt = None;
-        let mut pulled_src: Option<String> = None;
         for src in &candidate_sources {
-            let opts =
-                crate::ssh::PullOptions::new(&host.ssh_target, src, &local_worktree);
-            let r = crate::ssh::pull_workspace_back(opts).await;
-            let keep_trying = matches!(r, crate::ssh::PullResult::RemoteNotFound { .. });
-            pulled_src = Some(src.clone());
-            result_opt = Some(r);
+            let opts = crate::ssh::PullOptions::new(&host.ssh_target, src, &local_worktree);
+            let result = crate::ssh::pull_workspace_back(opts).await;
+            let keep_trying = matches!(result, crate::ssh::PullResult::RemoteNotFound { .. });
+            result_opt = Some((result, src));
             if !keep_trying {
                 break;
             }
         }
-        // candidate_sources is never empty, so this always resolves.
-        let result = result_opt.expect("at least one pull source candidate");
+        let (result, pulled_src) = result_opt.expect("at least one pull source candidate");
         let outcome = match result {
             crate::ssh::PullResult::Pulled { rsync_summary, .. } => {
-                // Symmetric Claude JSONL sync (remote → local) BEFORE
-                // we kill the remote and respawn locally. Without this,
-                // any conversation continuation that happened on the
-                // remote would be lost on pull-back.
-                //
-                // SAFETY: we only sync the workspace's specific
-                // encoded directory (not the whole projects/ tree),
-                // and we use rsync's default per-file mtime/size
-                // comparison so newer files (the remote's continued
-                // session) overwrite older ones (laptop's pre-push
-                // version). We do NOT pass --delete, so any local-
-                // only session files (e.g. older runs that never
-                // went to the remote) survive untouched.
-                let local_workspace_cwd =
-                    std::path::PathBuf::from(&ws.cwd);
-                if !local_workspace_cwd.as_os_str().is_empty() {
-                    match tokio::process::Command::new("ssh")
-                        .arg("-o")
-                        .arg("BatchMode=yes")
-                        .arg(&host.ssh_target)
-                        .arg("echo $HOME")
-                        .output()
-                        .await
-                    {
-                        Ok(out) if out.status.success() => {
-                            let remote_home =
-                                String::from_utf8_lossy(&out.stdout)
-                                    .trim()
-                                    .to_string();
-                            if !remote_home.is_empty() {
-                                // Derive the remote cwd from the path we ACTUALLY
-                                // pulled from (`origin_path` or the uid-keyed
-                                // candidate that resolved), not a recomputed
-                                // basename — so a uid-keyed workspace's history
-                                // pulls back from the right encoded dir. The
-                                // fallback is unreachable in practice (a `Pulled`
-                                // result implies a source succeeded) but stays
-                                // safe by reconstructing the uid-keyed path.
-                                let remote_source = match pulled_src.as_deref() {
-                                    Some(src) => src.to_string(),
-                                    None => {
-                                        let p = if is_root {
-                                            crate::workspace_paths::conventional_remote_root_path_keyed(
-                                                puid,
-                                                &project_name,
-                                            )
-                                        } else {
-                                            crate::ssh::conventional_remote_path_keyed(
-                                                puid,
-                                                &project_name,
-                                                &branch,
-                                            )
-                                        };
-                                        p.to_string_lossy().to_string()
-                                    }
-                                };
-                                let remote_absolute_cwd =
-                                    resolve_remote_cwd(&remote_home, &remote_source);
-                                if let Err(error) = pull_claude_projects(
-                                    &host.ssh_target,
-                                    &remote_absolute_cwd,
-                                    &local_workspace_cwd,
-                                )
-                                .await
-                                {
-                                    eprintln!(
-                                        "[hosts] Claude JSONL pull-back failed \
-                                         (continuing — agent will launch with whatever \
-                                         conversation history was already local): {error}"
-                                    );
-                                }
-
-                                // OpenCode pull-back (issue #16): symmetric
-                                // to the push sync — export the host's
-                                // (possibly-extended) OpenCode session and
-                                // import it back into the laptop's DB so the
-                                // local relaunch continues the conversation
-                                // that happened on the host.
-                                match crate::ssh::pull_opencode_session(
-                                    &host.ssh_target,
-                                    &remote_absolute_cwd,
-                                    &local_workspace_cwd,
-                                )
-                                .await
-                                {
-                                    Ok(Some(oc_session_id)) => {
-                                        record_opencode_session_capture(
-                                            &app,
-                                            &workspace_id,
-                                            &oc_session_id,
-                                        );
-                                    }
-                                    Ok(None) => {}
-                                    Err(error) => eprintln!(
-                                        "[hosts] OpenCode pull-back failed (continuing — \
-                                         agent will launch with whatever conversation \
-                                         history was already local): {error}"
-                                    ),
-                                }
-                            }
-                        }
-                        Ok(out) => eprintln!(
-                            "[hosts] ssh 'echo $HOME' failed on pull-back (status {}); \
-                             skipping Claude JSONL sync",
-                            out.status
-                        ),
-                        Err(e) => eprintln!(
-                            "[hosts] ssh 'echo $HOME' spawn failed on pull-back: {e}; \
-                             skipping Claude JSONL sync"
-                        ),
-                    }
-                }
+                sync_workspace_history(
+                    &app,
+                    &workspace_id,
+                    &host.ssh_target,
+                    std::path::Path::new(&ws.cwd),
+                    pulled_src,
+                    HistoryDirection::Pull,
+                ).await;
 
                 // On success: clear host_id so the workspace is local
                 // again and the next pane spawn uses the local
@@ -1362,6 +1166,67 @@ fn schedule_background_sync<R: tauri::Runtime>(app: tauri::AppHandle<R>) {
     });
 }
 
+#[cfg(unix)]
+#[derive(Clone, Copy)]
+enum HistoryDirection {
+    Push,
+    Pull,
+}
+
+// The deadline covers both providers and the home-directory probe. A large
+// history transfer may time out, but should never keep terminal hydration
+// behind the workspace migration gate indefinitely.
+#[cfg(unix)]
+const WORKSPACE_HISTORY_BUDGET: std::time::Duration = std::time::Duration::from_secs(60);
+
+#[cfg(unix)]
+async fn sync_workspace_history<R: tauri::Runtime>(
+    app: &tauri::AppHandle<R>,
+    workspace_id: &str,
+    ssh_target: &str,
+    local_cwd: &std::path::Path,
+    remote_path: &str,
+    direction: HistoryDirection,
+) {
+    if local_cwd.as_os_str().is_empty() {
+        return;
+    }
+    use crate::ssh::history_process::{output, ssh_command, within_deadline};
+    let result = within_deadline(WORKSPACE_HISTORY_BUDGET, async {
+        let mut command = ssh_command(ssh_target);
+        command.arg("echo $HOME");
+        let probe = output(&mut command, None)
+            .await
+            .map_err(|error| format!("SSH home probe failed: {error}"))?;
+        if !probe.status.success() {
+            return Err(format!("SSH home probe exited with {}", probe.status));
+        }
+        let home = String::from_utf8_lossy(&probe.stdout);
+        let home = home.trim();
+        if home.is_empty() {
+            return Err("SSH home probe returned an empty path".into());
+        }
+        // Use the actual path selected by the workspace transfer.
+        let remote_cwd = resolve_remote_cwd(home, remote_path);
+        let claude = match direction {
+            HistoryDirection::Push => sync_claude_projects(ssh_target, local_cwd, &remote_cwd).await,
+            HistoryDirection::Pull => pull_claude_projects(ssh_target, &remote_cwd, local_cwd).await,
+        };
+        if let Err(error) = claude {
+            eprintln!("[hosts] Claude history sync failed: {error}");
+        }
+        match direction {
+            HistoryDirection::Push => crate::ssh::sync_opencode_session(ssh_target, local_cwd, &remote_cwd).await,
+            HistoryDirection::Pull => crate::ssh::pull_opencode_session(ssh_target, &remote_cwd, local_cwd).await,
+        }
+    }).await;
+    match result {
+        Ok(Some(session_id)) => record_opencode_session_capture(app, workspace_id, &session_id),
+        Ok(None) => {}
+        Err(error) => eprintln!("[hosts] Continuing workspace move after history sync: {error}"),
+    }
+}
+
 /// Resolve a remote workspace path — which may be `~/`-relative (the
 /// conventional / uid-keyed landing) or already absolute (a daemon-recorded
 /// `origin_path`) — into an absolute path under the remote `$HOME`.
@@ -1398,7 +1263,7 @@ async fn sync_claude_projects(
     local_cwd: &std::path::Path,
     remote_cwd: &std::path::Path,
 ) -> Result<(), String> {
-    use tokio::process::Command;
+    use crate::ssh::history_process::{output, rsync_transport, ssh_command};
 
     // Step 1: figure out the laptop-side source dir. If no Claude
     // session has ever been started in this workspace, the dir
@@ -1410,7 +1275,9 @@ async fn sync_claude_projects(
         .join(".claude")
         .join("projects")
         .join(&local_dir_name);
-    if !local_source.exists() {
+    if !tokio::fs::try_exists(&local_source).await.map_err(|error| {
+        format!("inspect local Claude history: {error}")
+    })? {
         eprintln!(
             "[hosts] no local Claude session history for this workspace \
              ({}); skipping JSONL sync",
@@ -1430,17 +1297,15 @@ async fn sync_claude_projects(
     // Step 3: ensure the remote dest dir exists. rsync creates the
     // LAST path component but not parents; mkdir -p covers the
     // ~/.claude/projects/<encoded>/ chain in one shot.
-    let mkdir = Command::new("ssh")
-        .arg("-o")
-        .arg("BatchMode=yes")
-        .arg(ssh_target)
-        .arg(format!(
-            "mkdir -p ~/.claude/projects/{}",
-            shell_word_quote(&remote_dir_name)
-        ))
-        .status()
+    let mut command = ssh_command(ssh_target);
+    command.arg(format!(
+        "mkdir -p ~/.claude/projects/{}",
+        shell_word_quote(&remote_dir_name)
+    ));
+    let mkdir = output(&mut command, None)
         .await
-        .map_err(|e| format!("ssh mkdir spawn: {e}"))?;
+        .map_err(|error| format!("ssh mkdir: {error}"))?
+        .status;
     if !mkdir.success() {
         return Err(format!("mkdir on remote failed (status: {mkdir})"));
     }
@@ -1450,17 +1315,16 @@ async fn sync_claude_projects(
     // --delete because the remote may have OTHER sessions started
     // there that we don't want to wipe.
     let source_with_slash = format!("{}/", local_source.display());
-    let rsync = Command::new("rsync")
-        .arg("-a")
-        .arg("--no-owner")
-        .arg("--no-group")
-        .arg("-e")
-        .arg("ssh -o BatchMode=yes")
+    let mut command = crate::execution::host_command_tokio("rsync");
+    command.args(["-a", "--no-owner", "--no-group", "-e"])
+        .arg(rsync_transport())
+        .arg("--")
         .arg(&source_with_slash)
-        .arg(&remote_dest)
-        .status()
+        .arg(&remote_dest);
+    let rsync = output(&mut command, None)
         .await
-        .map_err(|e| format!("rsync spawn: {e}"))?;
+        .map_err(|error| format!("rsync: {error}"))?
+        .status;
     if !rsync.success() {
         return Err(format!("rsync failed (status: {rsync})"));
     }
@@ -1503,7 +1367,7 @@ async fn pull_claude_projects(
     remote_cwd: &std::path::Path,
     local_cwd: &std::path::Path,
 ) -> Result<(), String> {
-    use tokio::process::Command;
+    use crate::ssh::history_process::{output, rsync_transport, ssh_command};
 
     let local_home = std::env::var("HOME")
         .map_err(|_| "HOME env var not set on laptop".to_string())?;
@@ -1514,25 +1378,23 @@ async fn pull_claude_projects(
         .join(&local_dir_name);
     // mkdir the local destination if it doesn't exist (first time
     // pulling a workspace whose Claude sessions never ran locally).
-    if !local_dest.exists() {
-        if let Err(e) = std::fs::create_dir_all(&local_dest) {
-            return Err(format!("create local dest: {e}"));
-        }
-    }
+    tokio::fs::create_dir_all(&local_dest)
+        .await
+        .map_err(|error| format!("create local dest: {error}"))?;
 
     let remote_dir_name = crate::ssh::claude_project_dir_name(remote_cwd);
     // Check the remote dir exists first — if not, nothing to pull.
-    let probe = Command::new("ssh")
-        .arg("-o")
-        .arg("BatchMode=yes")
-        .arg(ssh_target)
-        .arg(format!(
-            "test -d ~/.claude/projects/{} && echo EXISTS || echo MISSING",
-            shell_word_quote(&remote_dir_name)
-        ))
-        .output()
+    let mut command = ssh_command(ssh_target);
+    command.arg(format!(
+        "test -d ~/.claude/projects/{} && echo EXISTS || echo MISSING",
+        shell_word_quote(&remote_dir_name)
+    ));
+    let probe = output(&mut command, None)
         .await
-        .map_err(|e| format!("ssh probe spawn: {e}"))?;
+        .map_err(|error| format!("ssh history probe: {error}"))?;
+    if !probe.status.success() {
+        return Err(format!("ssh history probe exited with {}", probe.status));
+    }
     let probe_out = String::from_utf8_lossy(&probe.stdout).trim().to_string();
     if probe_out != "EXISTS" {
         eprintln!(
@@ -1547,17 +1409,16 @@ async fn pull_claude_projects(
         "{ssh_target}:~/.claude/projects/{remote_dir_name}/"
     );
     let local_dest_with_slash = format!("{}/", local_dest.display());
-    let rsync = Command::new("rsync")
-        .arg("-a")
-        .arg("--no-owner")
-        .arg("--no-group")
-        .arg("-e")
-        .arg("ssh -o BatchMode=yes")
+    let mut command = crate::execution::host_command_tokio("rsync");
+    command.args(["-a", "--no-owner", "--no-group", "-e"])
+        .arg(rsync_transport())
+        .arg("--")
         .arg(&remote_source)
-        .arg(&local_dest_with_slash)
-        .status()
+        .arg(&local_dest_with_slash);
+    let rsync = output(&mut command, None)
         .await
-        .map_err(|e| format!("rsync spawn: {e}"))?;
+        .map_err(|error| format!("rsync: {error}"))?
+        .status;
     if !rsync.success() {
         return Err(format!("rsync failed (status: {rsync})"));
     }

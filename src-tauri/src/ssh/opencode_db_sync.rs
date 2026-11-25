@@ -59,18 +59,11 @@
 
 #![cfg(unix)]
 
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
-use std::process::Stdio;
-use std::time::Duration;
-use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
-use tokio::time::timeout;
 
-/// Generous per-step ceiling. `opencode export`/`import` spin up the full
-/// OpenCode runtime and a large active session can be tens of MB; 3 minutes
-/// covers any realistic transcript without letting a hung host stall us
-/// forever.
-const SYNC_TIMEOUT: Duration = Duration::from_secs(180);
+use super::history_process::{output, ssh_command};
 
 // ── Pure helpers (unit-tested; no process / network) ──────────────────────
 
@@ -149,7 +142,8 @@ pub(crate) fn remote_extract_script(remote_cwd: &str, remote_bundle: &str) -> St
     // the query for any path containing an apostrophe (e.g. /Users/O'Brien/…),
     // silently yielding "nothing to pull".
     format!(
-        "sid=$(opencode db {sql} 2>/dev/null | grep -m1 '^ses_')\n\
+        "umask 077\n\
+         sid=$(opencode db {sql} 2>/dev/null | grep -m1 '^ses_')\n\
          if [ -n \"$sid\" ]; then\n\
            opencode export \"$sid\" > {bundle} 2>/dev/null && echo \"CMX_OC_SID=$sid\"\n\
          fi\n",
@@ -163,10 +157,6 @@ pub(crate) fn remote_extract_script(remote_cwd: &str, remote_bundle: &str) -> St
 /// file we delete immediately.
 fn unique_remote_bundle() -> String {
     format!("/tmp/codemux-opencode-{}.json", unique_token())
-}
-
-fn unique_local_bundle() -> PathBuf {
-    std::env::temp_dir().join(format!("codemux-opencode-{}.json", unique_token()))
 }
 
 fn unique_token() -> String {
@@ -222,13 +212,10 @@ pub async fn sync_opencode_session(
         }
     };
 
-    let local_bundle = unique_local_bundle();
-    export_session_local(&bin, &session_id, &local_bundle).await?;
-
     let remote_bundle = unique_remote_bundle();
-    let upload = upload_file(ssh_target, &local_bundle, &remote_bundle).await;
-    let _ = std::fs::remove_file(&local_bundle);
-    upload?;
+    let bundle = export_session_local(&bin, &session_id).await?;
+    upload_file(ssh_target, &bundle, &remote_bundle).await?;
+    drop(bundle);
 
     let script = remote_import_script(&remote_cwd.to_string_lossy(), &remote_bundle);
     let (ok, output) = run_remote_login_script(ssh_target, &script).await?;
@@ -282,14 +269,18 @@ pub async fn pull_opencode_session(
         return Ok(None);
     };
 
-    let local_bundle = unique_local_bundle();
+    // OpenCode imports from a path. Keep the bundle in a private directory
+    // that is also removed if the history deadline cancels this future.
+    let scratch = tempfile::Builder::new()
+        .permissions(std::fs::Permissions::from_mode(0o700))
+        .tempdir()
+        .map_err(|e| format!("create OpenCode import directory: {e}"))?;
+    let local_bundle = scratch.path().join("session.json");
     let download = download_file(ssh_target, &remote_bundle, &local_bundle).await;
-    let _ = run_remote_rm(ssh_target, &remote_bundle).await;
+    run_remote_rm(ssh_target, &remote_bundle).await;
     download?;
 
-    let import = import_session_local(&bin, local_cwd, &local_bundle).await;
-    let _ = std::fs::remove_file(&local_bundle);
-    import?;
+    import_session_local(&bin, local_cwd, &local_bundle).await?;
 
     eprintln!(
         "[hosts] pulled OpenCode session {session_id} back from {ssh_target} → {}",
@@ -304,15 +295,11 @@ async fn local_newest_session_id(
     bin: &Path,
     dir: &str,
 ) -> Result<Option<String>, String> {
-    let out = Command::new(bin)
-        .arg("db")
-        .arg(newest_session_sql(dir))
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .output()
+    let mut command = Command::new(bin);
+    command.arg("db").arg(newest_session_sql(dir));
+    let out = output(&mut command, None)
         .await
-        .map_err(|e| format!("spawn `opencode db`: {e}"))?;
+        .map_err(|e| format!("run `opencode db`: {e}"))?;
     if !out.status.success() {
         return Err(format!(
             "`opencode db` query failed: {}",
@@ -322,32 +309,22 @@ async fn local_newest_session_id(
     Ok(parse_session_id(&String::from_utf8_lossy(&out.stdout)))
 }
 
-async fn export_session_local(
-    bin: &Path,
-    session_id: &str,
-    out_path: &Path,
-) -> Result<(), String> {
-    let file = std::fs::File::create(out_path)
-        .map_err(|e| format!("create export bundle {}: {e}", out_path.display()))?;
-    let status = Command::new(bin)
-        .arg("export")
-        .arg(session_id)
-        .stdin(Stdio::null())
-        .stdout(Stdio::from(file))
-        .stderr(Stdio::null())
-        .status()
+async fn export_session_local(bin: &Path, session_id: &str) -> Result<Vec<u8>, String> {
+    let mut command = Command::new(bin);
+    command.arg("export").arg(session_id);
+    let out = output(&mut command, None)
         .await
-        .map_err(|e| format!("spawn `opencode export`: {e}"))?;
-    if !status.success() {
-        return Err(format!("`opencode export {session_id}` failed ({status})"));
+        .map_err(|e| format!("run `opencode export`: {e}"))?;
+    if !out.status.success() {
+        return Err(format!(
+            "`opencode export {session_id}` failed ({})",
+            out.status
+        ));
     }
-    // A zero-byte bundle means export produced nothing — treat as failure so
-    // we never upload an empty file the remote import would choke on.
-    match std::fs::metadata(out_path) {
-        Ok(m) if m.len() > 0 => Ok(()),
-        Ok(_) => Err("`opencode export` produced an empty bundle".to_string()),
-        Err(e) => Err(format!("stat export bundle: {e}")),
+    if out.stdout.is_empty() {
+        return Err("`opencode export` produced an empty bundle".into());
     }
+    Ok(out.stdout)
 }
 
 async fn import_session_local(
@@ -357,16 +334,11 @@ async fn import_session_local(
 ) -> Result<(), String> {
     // `import` derives the session's directory from the process cwd, so run
     // it from the workspace dir to associate the conversation locally.
-    let out = Command::new(bin)
-        .current_dir(cwd)
-        .arg("import")
-        .arg(bundle)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .output()
+    let mut command = Command::new(bin);
+    command.current_dir(cwd).arg("import").arg(bundle);
+    let out = output(&mut command, None)
         .await
-        .map_err(|e| format!("spawn `opencode import`: {e}"))?;
+        .map_err(|e| format!("run `opencode import`: {e}"))?;
     if !out.status.success() {
         return Err(format!(
             "`opencode import` failed: {}",
@@ -383,33 +355,14 @@ async fn import_session_local(
 /// carry no tilde to expand).
 async fn upload_file(
     ssh_target: &str,
-    local: &Path,
+    bundle: &[u8],
     remote_path: &str,
 ) -> Result<(), String> {
-    let data = tokio::fs::read(local)
+    let mut command = ssh_command(ssh_target);
+    // A cancelled connection may leave a partial bundle on the host.
+    command.arg(format!("umask 077; cat > {}", shell_sq(remote_path)));
+    let out = output(&mut command, Some(bundle))
         .await
-        .map_err(|e| format!("read local bundle {}: {e}", local.display()))?;
-    let mut child = Command::new("ssh")
-        .arg("-o")
-        .arg("BatchMode=yes")
-        .arg("-o")
-        .arg("ConnectTimeout=10")
-        .arg(ssh_target)
-        .arg(format!("cat > {}", shell_sq(remote_path)))
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|e| format!("ssh upload spawn: {e}"))?;
-    if let Some(mut stdin) = child.stdin.take() {
-        stdin
-            .write_all(&data)
-            .await
-            .map_err(|e| format!("stream bundle to remote: {e}"))?;
-    }
-    let out = timeout(SYNC_TIMEOUT, child.wait_with_output())
-        .await
-        .map_err(|_| "ssh upload timed out".to_string())?
         .map_err(|e| format!("ssh upload failed: {e}"))?;
     if !out.status.success() {
         return Err(format!(
@@ -427,19 +380,11 @@ async fn download_file(
     remote_path: &str,
     local: &Path,
 ) -> Result<(), String> {
-    let out = Command::new("ssh")
-        .arg("-o")
-        .arg("BatchMode=yes")
-        .arg("-o")
-        .arg("ConnectTimeout=10")
-        .arg(ssh_target)
-        .arg(format!("cat {}", shell_sq(remote_path)))
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .output()
+    let mut command = ssh_command(ssh_target);
+    command.arg(format!("cat {}", shell_sq(remote_path)));
+    let out = output(&mut command, None)
         .await
-        .map_err(|e| format!("ssh download spawn: {e}"))?;
+        .map_err(|e| format!("ssh download failed: {e}"))?;
     if !out.status.success() {
         return Err(format!(
             "ssh download exited {}: {}",
@@ -454,18 +399,10 @@ async fn download_file(
 }
 
 /// Best-effort remote `rm -f`.
-async fn run_remote_rm(ssh_target: &str, remote_path: &str) -> Result<(), String> {
-    let _ = Command::new("ssh")
-        .arg("-o")
-        .arg("BatchMode=yes")
-        .arg("-o")
-        .arg("ConnectTimeout=10")
-        .arg(ssh_target)
-        .arg(format!("rm -f {}", shell_sq(remote_path)))
-        .stdin(Stdio::null())
-        .status()
-        .await;
-    Ok(())
+async fn run_remote_rm(ssh_target: &str, remote_path: &str) {
+    let mut command = ssh_command(ssh_target);
+    command.arg(format!("rm -f {}", shell_sq(remote_path)));
+    let _ = output(&mut command, None).await;
 }
 
 /// Run a script on the remote via a **login** shell (`bash -ls`) so the
@@ -475,28 +412,10 @@ async fn run_remote_login_script(
     ssh_target: &str,
     script: &str,
 ) -> Result<(bool, String), String> {
-    let mut child = Command::new("ssh")
-        .arg("-o")
-        .arg("BatchMode=yes")
-        .arg("-o")
-        .arg("ConnectTimeout=10")
-        .arg(ssh_target)
-        .arg("bash -ls")
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|e| format!("ssh login-script spawn: {e}"))?;
-    if let Some(mut stdin) = child.stdin.take() {
-        stdin
-            .write_all(script.as_bytes())
-            .await
-            .map_err(|e| format!("stream script to remote shell: {e}"))?;
-        // drop closes stdin → the remote `bash -ls` sees EOF and runs.
-    }
-    let out = timeout(SYNC_TIMEOUT, child.wait_with_output())
+    let mut command = ssh_command(ssh_target);
+    command.arg("bash -ls");
+    let out = output(&mut command, Some(script.as_bytes()))
         .await
-        .map_err(|_| "ssh login-script timed out".to_string())?
         .map_err(|e| format!("ssh login-script failed: {e}"))?;
     let stdout = String::from_utf8_lossy(&out.stdout).to_string();
     if !out.status.success() {
@@ -581,6 +500,7 @@ mod tests {
         // The query is built by the shared SQL helper and passed as one
         // shell-quoted argument (no raw $dir splice into the SQL literal).
         assert!(s.contains(&shell_sq(&newest_session_sql("/home/me/ws"))));
+        assert!(s.starts_with("umask 077\n"));
         assert!(s.contains("opencode db"));
         assert!(s.contains("parent_id IS NULL"));
         assert!(s.contains("opencode export \"$sid\" > '/tmp/codemux-opencode-2.json'"));
@@ -605,11 +525,11 @@ mod tests {
     }
 
     #[test]
-    fn unique_tokens_differ() {
+    fn unique_remote_bundles_differ() {
         // Two bundles requested back to back must not collide.
-        let a = unique_local_bundle();
-        let b = unique_local_bundle();
+        let a = unique_remote_bundle();
+        let b = unique_remote_bundle();
         assert_ne!(a, b);
-        assert!(a.to_string_lossy().contains("codemux-opencode-"));
+        assert!(a.starts_with("/tmp/codemux-opencode-"));
     }
 }

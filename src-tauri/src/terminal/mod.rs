@@ -4618,6 +4618,14 @@ mod tests {
         assert!(futures_util::poll!(activation.as_mut()).is_pending());
         assert!(matches!(status().state, TerminalLifecycleState::Migrating));
 
+        let stalled_history = std::future::pending::<Result<(), String>>();
+        let result = crate::ssh::history_process::within_deadline(
+            Duration::from_millis(20),
+            stalled_history,
+        ).await;
+        assert!(result.unwrap_err().contains("history sync exceeded"));
+        assert!(futures_util::poll!(activation.as_mut()).is_pending());
+
         handle
             .state::<AppStateStore>()
             .set_workspace_host_id(&workspace_id, Some(2))

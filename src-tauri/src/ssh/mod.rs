@@ -31,6 +31,7 @@
 
 pub mod bootstrap;
 pub mod exec;
+pub(crate) mod history_process;
 pub mod opencode_db_sync;
 pub mod probe;
 pub mod push;
