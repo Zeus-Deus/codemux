@@ -1347,6 +1347,13 @@ impl McpRegistry {
                 }
                 for tool in &handle.tools {
                     if tool.prefixed_name == prefixed_name {
+                        if inner
+                            .cancel_calls
+                            .get(&handle.config.id)
+                            .is_some_and(|cancel| *cancel.borrow())
+                        {
+                            return Err("MCP server stopped during tools/call".into());
+                        }
                         if !handle.status.is_running() {
                             return Err(format!(
                                 "MCP server '{}' is not running",
@@ -1425,6 +1432,9 @@ impl McpRegistry {
         let cancellation = async {
             match cancelled.as_mut() {
                 Some(rx) => {
+                    if *rx.borrow() {
+                        return;
+                    }
                     let _ = rx.changed().await;
                 }
                 None => std::future::pending::<()>().await,
@@ -2662,6 +2672,35 @@ mod project_trust_tests {
             .await
             .unwrap();
         assert!(appears(&marker).await);
+        reg.shutdown_all().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn cancelled_project_stdio_generation_rejects_calls_before_shutdown() {
+        let project = tempfile::tempdir().unwrap();
+        let fixture = format!("{}/tests/fixtures/plugin_mcp.py", env!("CARGO_MANIFEST_DIR"));
+        write_project(project.path(), serde_json::json!({"lint": {
+            "command": "python3", "args": [fixture]
+        }}));
+        let app = app();
+        let reg = McpRegistry::new();
+        let config = discovered(project.path(), "lint");
+        let row = reg.ensure_started(Some(app.handle()), config.clone()).await;
+        let row = reg.approve_project_server(app.handle(), &config.id, &shown_fingerprint(&row))
+            .await.unwrap();
+        assert!(row.status.is_running());
+        let tool = reg.list_tools_for_server(&config.id).await.into_iter()
+            .find(|tool| tool.name == "echo").unwrap();
+
+        // Revocation marks every matching generation before it stops them
+        // one by one. This server is still running but must admit no call.
+        {
+            let inner = reg.inner.lock().await;
+            inner.cancel_calls.get(&config.id).unwrap().send_replace(true);
+        }
+        let result = reg.dispatch_tool_call(&tool.prefixed_name, serde_json::json!({}), None).await;
+        assert!(result.unwrap_err().contains("stopped during tools/call"));
         reg.shutdown_all().await;
     }
 
