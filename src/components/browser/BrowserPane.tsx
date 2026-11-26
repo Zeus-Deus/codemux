@@ -429,12 +429,13 @@ export const BrowserPane = memo(function BrowserPane({ browserId, focused, visib
         console.error("[browser] startBrowserStream FAILED", err);
         if (String(err).includes("Browser confirmation is pending")) {
           pendingConfirmationRef.current = true;
+          const revision = confirmationRevisionRef.current;
           const presetState = await browserPresetNavigationStatus(streamSessionId).catch(() => null);
-          if (!active || !paneIsCurrent()) return;
+          if (!active || !paneIsCurrent() || confirmationBusyRef.current || revision !== confirmationRevisionRef.current) return;
           if (presetState === "pending") setPendingPreset({ sessionId: streamSessionId, paneEpoch });
           if (!remoteClient) {
             const details = await agentBrowserPendingConfirmation(streamSessionId).catch(() => null);
-            if (!active || !paneIsCurrent()) return;
+            if (!active || !paneIsCurrent() || confirmationBusyRef.current || revision !== confirmationRevisionRef.current) return;
             if (details) showPendingConfirmation(streamSessionId, details);
           }
           setStatus("error");
@@ -617,8 +618,9 @@ export const BrowserPane = memo(function BrowserPane({ browserId, focused, visib
                         } else if (result === "pending") {
                           setPendingPreset({ sessionId: effectiveSessionId, paneEpoch });
                           if (!isRemoteClient()) {
+                            const revision = confirmationRevisionRef.current;
                             const pending = await agentBrowserPendingConfirmation(effectiveSessionId).catch(() => null);
-                            if (!active || !paneIsCurrent()) return;
+                            if (!active || !paneIsCurrent() || confirmationBusyRef.current || revision !== confirmationRevisionRef.current) return;
                             if (pending) {
                               showPendingConfirmation(effectiveSessionId, pending);
                               return;
@@ -812,12 +814,25 @@ export const BrowserPane = memo(function BrowserPane({ browserId, focused, visib
             showPendingConfirmation(effectiveSessionId, pending);
           }
         } else if (shown?.sessionId === effectiveSessionId && !confirmationBusyRef.current) {
+          // Another host pane may have approved this preset. Let the preset
+          // status poll settle its result instead of treating the missing
+          // prompt as an expired action.
+          const presetState = await browserPresetNavigationStatus(effectiveSessionId).catch(() => undefined);
+          if (!active || !paneIsCurrent() || confirmationBusyRef.current || revision !== confirmationRevisionRef.current
+              || presetState === undefined) return;
           confirmationRevisionRef.current++;
-          setPendingPreset(null);
-          presetErrorRef.current = true;
           visibleConfirmationRef.current = null;
           setPendingConfirmation(null);
           setConfirmationError(null);
+          if (presetState) {
+            setPendingPreset({ sessionId: effectiveSessionId, paneEpoch });
+            pendingConfirmationRef.current = true;
+            setErrorMsg("Waiting for browser approval to finish.");
+            setStatus("error");
+            return;
+          }
+          setPendingPreset(null);
+          presetErrorRef.current = true;
           setErrorMsg("Browser confirmation is no longer pending. Retry to reconnect.");
           setStatus("error");
         }
@@ -856,6 +871,7 @@ export const BrowserPane = memo(function BrowserPane({ browserId, focused, visib
             }
           }
         } else {
+          confirmationRevisionRef.current++;
           setPendingPreset(null);
           pendingConfirmationRef.current = false;
           visibleConfirmationRef.current = null;
