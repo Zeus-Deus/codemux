@@ -91,7 +91,8 @@ pub enum CommandSet {
         /// client's own name).
         #[arg(long, value_name = "NAME", value_parser = args::client_name)]
         client: Option<String>,
-        /// The most this client's calls may do (default: full-access).
+        /// Requested access ceiling (default: full-access). The running app
+        /// keeps unverified local socket peers read-only.
         #[arg(long, value_enum, value_name = "LEVEL")]
         access: Option<args::AccessArg>,
     },
@@ -280,16 +281,19 @@ pub enum ConnectCommand {
 
 #[derive(Subcommand)]
 pub enum RemoteCommand {
-    /// Pairing via CLI is unavailable until socket callers have owner proof;
-    /// use Remote Access in Settings.
+    /// Request a one-time pairing code for the web remote server. Standalone
+    /// CLI callers currently lack owner authentication and are refused; use
+    /// desktop Settings. With a LAN listener, foreground `serve` prints an
+    /// initial link at startup; the managed service discards stdout.
     Pair {
         /// Optional label for the paired device. Used as a fallback name if
         /// the connecting browser doesn't provide one of its own.
         #[arg(long)]
         name: Option<String>,
     },
-    /// Enabling via CLI is unavailable until socket callers have owner proof;
-    /// use Remote Access in Settings.
+    /// Turn web remote access on and optionally select its scope and port.
+    /// Standalone CLI callers currently lack owner authentication and are
+    /// refused; use desktop Settings.
     Enable {
         /// Which interfaces to expose the server on: `all` (every interface),
         /// `tailscale` (tailnet + loopback only), or `loopback` (this machine
@@ -300,8 +304,9 @@ pub enum RemoteCommand {
         #[arg(long)]
         port: Option<u16>,
     },
-    /// Disabling via CLI is unavailable until socket callers have owner proof;
-    /// use Remote Access in Settings.
+    /// Turn web remote access off and sever live connections. Standalone CLI
+    /// callers currently lack owner authentication and are refused; use
+    /// desktop Settings.
     Disable,
 }
 
@@ -564,7 +569,7 @@ impl CommandSet {
 /// flags first, then the root's. Commands that call the control socket fill
 /// the rest from the env (`var`); no other command reads it, so a blank or
 /// misspelled variable cannot stop the app, `serve` or a child from
-/// starting. Unnamed calls run as the owner.
+/// starting. An unnamed external socket peer remains unverified.
 fn caller_of(cli: &Cli, var: impl Fn(&str) -> Option<String>) -> Result<args::CallerArgs, String> {
     let flags = match &cli.command {
         Some(CommandSet::Mcp { client, access }) => args::CallerArgs {
@@ -1272,10 +1277,8 @@ pub(crate) fn print_pairing(data: &Value) {
     println!("device that can reach this machine — to pair it. One-time use.");
 }
 
-/// Print the outcome of `codemux remote enable`: the port + bind scope the
-/// server is now on, the recommended reachable endpoint, and a nudge toward
-/// `codemux remote pair`. Reads the `ControlEnableResult` JSON the
-/// `web_remote_enable` control command returns.
+/// Print the port, bind scope, and recommended endpoint from the
+/// `ControlEnableResult` returned by `web_remote_enable`.
 fn print_enable_result(data: &Value) {
     let status = &data["status"];
     let port = status["port"].as_u64().unwrap_or(0);
@@ -1316,7 +1319,7 @@ fn print_enable_result(data: &Value) {
         println!("               {endpoint_host} ({endpoint_kind}, {secure})");
     }
     println!();
-    println!("Use Remote Access in Settings to pair a phone or laptop.");
+    println!("Use desktop Settings to mint a pairing code for a phone or laptop.");
 }
 
 /// Render `text` to a compact terminal QR using the pure-Rust `qrcode`

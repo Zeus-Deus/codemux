@@ -21,12 +21,12 @@ pub(crate) const ACCESS_ENV: &str = "CODEMUX_ACCESS";
 #[derive(clap::Args, Clone, Debug, Default, PartialEq, Eq)]
 #[command(next_help_heading = "Caller")]
 pub struct CallerArgs {
-    /// Name to record this client's calls under (`local:<NAME>`; default
-    /// $CODEMUX_CLIENT). Without one, calls run as you.
+    /// Name for call attribution (default $CODEMUX_CLIENT). A name does not
+    /// grant owner access to a separate socket process.
     #[arg(long, value_name = "NAME", value_parser = client_name)]
     pub client: Option<String>,
-    /// The most this client's calls may do (default $CODEMUX_ACCESS, else
-    /// full-access).
+    /// Requested access ceiling (default $CODEMUX_ACCESS, else full-access).
+    /// Unverified socket peers remain read-only.
     #[arg(long, value_enum, value_name = "LEVEL")]
     pub access: Option<AccessArg>,
 }

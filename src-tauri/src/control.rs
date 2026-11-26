@@ -1194,12 +1194,12 @@ pub(crate) async fn dispatch_request<R: Runtime>(app: &AppHandle<R>, request: Co
     dispatch_request_as(app, &SocketCaller::owner(), request).await
 }
 
-/// The caller registry tools run as. The socket cannot tell which chat an
-/// agent process belongs to, so it never runs registry tools as one (and
-/// never as the owner).
-fn registry_caller(caller: &SocketCaller) -> Result<&crate::agent_control::ControlCaller, String> {
+/// The caller registry tools run as. A registered agent needs its chat's
+/// binding; an unverified socket peer has a separate read-only principal.
+fn registry_caller(caller: &SocketCaller) -> Result<crate::agent_control::ControlCaller, String> {
     match caller {
-        SocketCaller::Local(caller) => Ok(caller),
+        SocketCaller::Local(caller) => Ok(caller.clone()),
+        SocketCaller::Unverified => Ok(crate::agent_control::ControlCaller::unverified_socket()),
         SocketCaller::Agent { .. } => Err(crate::agent_control::ControlError::new(
             crate::agent_control::ErrorCode::AgentIdentityRequired,
             "This process runs under a Codemux agent; use your chat's own Codemux tools for thread control",
@@ -1338,15 +1338,15 @@ async fn dispatch_request_as<R: Runtime>(
         "delegation_host_info" | "delegation_grants" | "delegation_authorize" | "delegation_revoke" | "delegate_task" | "delegation_list" | "delegation_read" | "delegation_cancel" | "delegation_respond" | "delegation_deliver" => crate::delegation::app::invoke(app, &request.command, request.params).await,
         // The bare aliases keep returning raw data or `code: message`.
         name if crate::agent_control::registry::is_socket_alias(name) => match registry_caller(caller) {
-            Ok(caller) => crate::agent_control::execute(app, caller, name, request.params.clone())
+            Ok(caller) => crate::agent_control::execute(app, &caller, name, request.params.clone())
                 .await.map_err(|error| error.to_string()),
             Err(refused) => Err(refused),
         },
         "tool_call" => match registry_caller(caller) {
-            Ok(caller) => tool_call(app, caller, &request.params).await,
+            Ok(caller) => tool_call(app, &caller, &request.params).await,
             Err(refused) => Err(refused),
         },
-        "tools_list" => registry_caller(caller).and_then(|caller| tools_list(caller, &request.params)),
+        "tools_list" => registry_caller(caller).and_then(|caller| tools_list(&caller, &request.params)),
         "agent_connector_status" => {
             #[derive(Deserialize)] #[serde(deny_unknown_fields)] struct Args {}
             serde_json::from_value::<Args>(request.params.clone()).map_err(|e|e.to_string())
@@ -2456,11 +2456,9 @@ async fn dispatch_request_as<R: Runtime>(
         })(),
         // ── Web remote access ──
         //
-        // Mint a one-time web-remote pairing code from the terminal (the
-        // `codemux remote pair` CLI, typically over SSH). The control socket
-        // is same-machine + unauthenticated by design — over SSH you ARE on
-        // the machine — so this is the right transport for pairing without
-        // opening the desktop GUI. Reuses the exact token path + endpoint
+        // Mint a one-time web-remote pairing code through the owner gate.
+        // External socket peers have no owner proof and are refused before
+        // reaching this handler. Reuses the token path and endpoint
         // enumeration the Settings pane uses (`web_remote::control_pair`).
         "web_remote_pair" => {
             let name = request
@@ -2479,11 +2477,9 @@ async fn dispatch_request_as<R: Runtime>(
             serde_json::to_value(crate::web_remote::web_remote_status(app.clone()))
                 .map_err(|error| error.to_string())
         }
-        // Enable web remote access from the terminal (`codemux remote enable`),
-        // optionally selecting the bind scope and port. Shares the exact
-        // bind/rollback + state-emission paths the Settings pane uses; returns
-        // the resulting status plus the recommended endpoint so the caller can
-        // immediately run `codemux remote pair`.
+        // Enable web remote access through the owner gate, optionally
+        // selecting the bind scope and port. Shares the exact bind/rollback
+        // and state-emission paths the Settings pane uses.
         "web_remote_enable" => {
             let scope = request
                 .params
@@ -2723,13 +2719,10 @@ fn resolve_control_repo_path<R: Runtime>(
 }
 
 // ---------------------------------------------------------------------------
-// Transport-layer tests
+// Control and transport tests
 //
-// These exercise the platform abstraction in `transport` without involving
-// the Tauri runtime or any command handlers — the point is to prove that
-// bind / connect / accept / liveness-probe all work on every supported
-// platform. Higher-level control-command tests would require a real
-// AppHandle, which is out of scope for a unit test.
+// The Windows external-peer test crosses a real named pipe from a separate
+// process into request dispatch with a mock AppHandle.
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
@@ -3087,8 +3080,30 @@ mod tests {
         assert!(listed.len() < owner["tools"].as_array().unwrap().len());
         assert!(listed.iter().all(|tool| tool["annotations"]["readOnlyHint"] == true), "read-only callers see read tools only");
 
+        let unverified = dispatch_request_as(app.handle(), &SocketCaller::Unverified, request("tools_list", Value::Null)).await;
+        assert!(unverified.ok, "{:?}", unverified.error);
+        let unverified = unverified.data.unwrap();
+        assert_eq!(unverified["tools"], catalog(&ControlCaller::unverified_socket()));
+        assert_eq!(unverified["caller"], serde_json::json!({"principal": "socket:unverified", "access": "read_only"}));
+        assert!(unverified["tools"].as_array().unwrap().iter().all(|tool| tool["annotations"]["readOnlyHint"] == true));
+
         let extra = dispatch_request(app.handle(), request("tools_list", serde_json::json!({"cursor": "x"}))).await;
         assert!(refused_with(&extra, "invalid_arguments"), "{:?}", extra.error);
+    }
+
+    #[tokio::test]
+    async fn unverified_socket_can_call_registry_reads_but_not_writes() {
+        let app = operation_app();
+        let caller = SocketCaller::Unverified;
+        let read = dispatch_request_as(app.handle(), &caller,
+            request("tool_call", serde_json::json!({"name": "workspace_list", "arguments": {}}))).await;
+        assert!(read.ok, "{:?}", read.error);
+        assert_eq!(read.data.unwrap()["isError"], false);
+
+        let write = dispatch_request_as(app.handle(), &caller,
+            request("tool_call", serde_json::json!({"name": "workspace_create", "arguments": {"path": "/tmp"}}))).await;
+        assert!(write.ok, "a registry refusal is a tool result: {:?}", write.error);
+        assert_eq!(write.data.unwrap()["structuredContent"]["error"]["code"], "access_denied");
     }
 
     /// A persisted chat with no live session. A wait with `since` set to its
@@ -4460,6 +4475,63 @@ mod tests {
         assert_eq!(response.as_deref(), Some("hello"));
 
         server.abort();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "only run as a child of test_named_pipe_external_owner_claim_is_read_only"]
+    fn named_pipe_external_owner_claim_worker() {
+        let path = PathBuf::from(std::env::var_os("CODEMUX_TEST_CONTROL_PIPE").expect("test pipe path"));
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        runtime.block_on(async {
+            let mut connection = Connection::open(&[path]).await.expect("connect to test pipe");
+            let client = Some(ControlClient {
+                name: Some("owner".into()),
+                access: Some(crate::agent_control::ControlAccess::FullAccess),
+                agent: None,
+            });
+            let read = connection.exchange(&ControlEnvelope {
+                request: request("status", serde_json::json!({})), client: client.clone(),
+            }).await.unwrap();
+            assert!(read.ok, "an unverified peer can read: {:?}", read.error);
+            let write = connection.exchange(&ControlEnvelope {
+                request: request("notify", serde_json::json!({"message":"must not appear"})), client: client.clone(),
+            }).await.unwrap();
+            assert!(refused_with(&write, "access_denied"), "owner claim cannot write: {:?}", write.error);
+            assert!(write.error.as_deref().is_some_and(|error| error.contains("cannot prove owner authority")), "write refusal should explain the limit: {:?}", write.error);
+            let admin = connection.exchange(&ControlEnvelope {
+                request: request("web_remote_enable", serde_json::json!({})), client,
+            }).await.unwrap();
+            assert!(refused_with(&admin, "admin_refused"), "owner claim cannot administer: {:?}", admin.error);
+        });
+    }
+
+    #[cfg(windows)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_named_pipe_external_owner_claim_is_read_only() {
+        let path = random_pipe_path();
+        let listener = transport::bind(&path).expect("bind named pipe");
+        let child = tokio::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "control::tests::named_pipe_external_owner_claim_worker", "--ignored", "--nocapture"])
+            .env("CODEMUX_TEST_CONTROL_PIPE", &path)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .expect("launch separate pipe client");
+        let child_pid = child.id().expect("client pid");
+        let (stream, peer_pid) = tokio::time::timeout(std::time::Duration::from_secs(10), listener.accept())
+            .await.expect("client connected in time").expect("accept named-pipe client");
+        assert_eq!(peer_pid, Some(child_pid), "the pipe must report the external client's kernel PID");
+
+        let app = operation_app();
+        let served = tokio::spawn(handle_client(app.handle().clone(), stream, peer_pid));
+        let output = tokio::time::timeout(std::time::Duration::from_secs(10), child.wait_with_output())
+            .await.expect("client finished in time").expect("wait for pipe client");
+        assert!(output.status.success(), "client failed:\n{}\n{}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
+        assert_eq!(tokio::time::timeout(std::time::Duration::from_secs(5), served).await.unwrap().unwrap(), Ok(()));
+        assert!(app.state::<AppStateStore>().snapshot().notifications.is_empty(), "denied write changed app state");
     }
 
     #[cfg(windows)]

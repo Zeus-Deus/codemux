@@ -254,10 +254,10 @@ fn outside_agents_guide_cli_examples_parse() {
             }
         }
     }
-    for verb in ["mcp", "tools", "call", "workspace", "worktree", "thread"] {
+    for verb in ["mcp", "tools", "call", "capabilities"] {
         assert!(verbs.contains(verb), "the guide shows `codemux {verb}` in a shell example");
     }
-    assert!(checked >= 19, "only {checked} shell examples were checked");
+    assert!(checked >= 10, "only {checked} shell examples were checked");
     for kind in ["json", "yaml", "authorized_keys"] {
         assert!(configs.contains(kind), "a {kind} example that starts `codemux` was checked");
     }

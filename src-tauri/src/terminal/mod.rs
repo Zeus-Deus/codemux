@@ -2339,7 +2339,6 @@ fn spawn_pty_for_session_in_process<R: Runtime>(
     cmd.env("CODEMUX_SURFACE_ID", session_id.clone());
     cmd.env("CODEMUX_SESSION_ID", session_id.clone());
     cmd.env("CODEMUX_BROWSER_CMD", "codemux browser");
-    cmd.env("BROWSER", "codemux browser open");
 
     if let Some(ws) = owning_ws {
         cmd.env("CODEMUX_WORKSPACE_ID", &ws.workspace_id.0);

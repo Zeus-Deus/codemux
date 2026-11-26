@@ -70,7 +70,7 @@ Split panes with keybinds, open a browser pane for testing, and use the changes 
 
 ## Outside agents (MCP)
 
-Codemux is an MCP server. Claude Code, Codex, a Hermes chat bot, or any MCP client can drive it:
+Codemux is an MCP server. With an authenticated network grant, Claude Code, Codex, a Hermes chat bot, or another MCP client can:
 
 - open workspaces and create worktrees;
 - start Codemux threads with a chosen provider, model and permission mode;
@@ -83,7 +83,7 @@ On this computer, with Codemux running:
 claude mcp add --scope user codemux -- codemux mcp --client claude-code
 ```
 
-From another device, run the same `codemux mcp` over SSH, or turn on **Settings → Connections → Outside assistants → Over the network**, put HTTPS in front of it, and sign in with OAuth or a token. Connector administration through the CLI is temporarily unavailable while socket callers cannot be independently authenticated. Scripts can use the same tools with `codemux call` and the `codemux thread` commands.
+From another device, run the same `codemux mcp` over SSH for read-only access, or turn on **Settings → Connections → Outside assistants → Over the network**, put HTTPS in front of it, and sign in with OAuth or a token. A standalone local or SSH `codemux` process can read the running app but cannot change workspaces, threads, connector settings, or Remote Access. Manage those settings in the desktop app before starting headless `codemux serve`; an authenticated network grant has its own access policy.
 
 [docs/outside-agents.md](docs/outside-agents.md) covers per-client setup (including Hermes), the end-to-end flow, access levels and security. The [MCP Server docs](https://docs.codemux.org/mcp-server) list every tool.
 

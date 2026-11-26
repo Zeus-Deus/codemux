@@ -530,10 +530,8 @@ pub fn control_pair<R: Runtime>(
     control_pair_from(&shared, suggested_name)
 }
 
-/// Result of the `web_remote_enable` control-socket command (the
-/// `codemux remote enable` CLI over SSH): the resulting live status plus the
-/// recommended reachable endpoint, so the terminal can tell the user the port,
-/// bind scope, and where to point `codemux remote pair` next.
+/// Result of the owner-gated `web_remote_enable` control command: the live
+/// status plus the recommended reachable endpoint.
 #[derive(Debug, Clone, Serialize)]
 pub struct ControlEnableResult {
     /// The live server + device status after the enable (or config change).
@@ -616,9 +614,9 @@ fn recommended_endpoint(port: u16) -> Option<endpoints::Endpoint> {
         .cloned()
 }
 
-/// Enable web remote access from the same-machine control socket (the
-/// `codemux remote enable` CLI over SSH). Shares the exact bind/rollback and
-/// `web-remote-state-changed` emission paths the Tauri commands use:
+/// Enable web remote access through an owner-gated control path. Shares the
+/// exact bind/rollback and `web-remote-state-changed` emission paths the
+/// Tauri commands use:
 ///
 /// - Off (or on without the LAN listener, e.g. relay-only) → on: fold the
 ///   requested `scope`/`port` into config, turn the kill switch and the LAN
@@ -783,10 +781,10 @@ pub async fn control_set_relay<R: Runtime>(
     set_config_core(app, &shared, change).await
 }
 
-/// Disable web remote access from the same-machine control socket (the
-/// `codemux remote disable` CLI over SSH). Shares the exact [`disable_core`]
-/// path the Tauri command uses: severs live sockets, tears the iroh endpoint
-/// down, stops registration, and emits `web-remote-state-changed`.
+/// Disable web remote access through an owner-gated control path. Shares the
+/// [`disable_core`] path the Tauri command uses: severs live sockets, tears
+/// the iroh endpoint down, stops registration, and emits
+/// `web-remote-state-changed`.
 pub fn control_disable<R: Runtime>(app: &AppHandle<R>) -> Result<WebRemoteStatus, String> {
     let shared = app.state::<WebRemoteState>().shared();
     disable_core(app, &shared)
@@ -2060,7 +2058,7 @@ mod tests {
         assert_eq!(addrs.len(), 2, "exactly loopback + the one tailnet address");
     }
 
-    // ── Control-socket pairing (codemux remote pair over SSH) ───────
+    // ── Owner-gated control pairing ────────────────────────────────────
 
     #[test]
     fn control_pair_errors_when_disabled() {

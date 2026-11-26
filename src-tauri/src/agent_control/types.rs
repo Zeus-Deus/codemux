@@ -167,7 +167,7 @@ impl ControlCaller {
             _ => None,
         }
     }
-    /// Local socket access already confers application control authority.
+    /// Trusted in-app calls and verified requests from this app process.
     pub fn trusted() -> Self {
         Self {
             admitted: None,
@@ -180,9 +180,8 @@ impl ControlCaller {
         }
     }
 
-    /// A same-user client on the control socket. Unnamed callers are the
-    /// owner; a named one is an outside assistant with its own receipts and
-    /// attribution, still governed only by `access`.
+    /// A verified local client. Unnamed callers are the owner; a named one
+    /// has its own receipts and attribution, still governed by `access`.
     pub fn local(name: Option<&ClientName>, access: ControlAccess) -> Self {
         match name {
             None => Self { access, ..Self::trusted() },
@@ -193,6 +192,20 @@ impl ControlCaller {
                 label: Some(name.display().into()),
                 ..Self::trusted()
             },
+        }
+    }
+
+    /// A socket peer without owner proof may use only the outside read
+    /// catalog. It has no owner identity or connector grant.
+    pub(crate) fn unverified_socket() -> Self {
+        Self {
+            admitted: None,
+            identity: CallerPrincipal::OutsideClient,
+            created_by: crate::agent_provider::message::CreatedBy::Agent,
+            principal: "socket:unverified".into(),
+            access: ControlAccess::ReadOnly,
+            grant_id: None,
+            label: None,
         }
     }
 

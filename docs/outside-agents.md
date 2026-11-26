@@ -1,6 +1,6 @@
 # Outside agents
 
-Agents that Codemux didn't start can work with it through its MCP server: Claude Code or Codex in your own terminal, a Hermes chat bot, a script, or any other MCP client. They can:
+Agents that Codemux didn't start can use its MCP server: Claude Code or Codex in your own terminal, a Hermes chat bot, a script, or any other MCP client. Authenticated network assistants can:
 
 - list known projects, clone new ones, open workspaces and create git worktrees;
 - start Codemux threads with the provider, model and permission mode you pick;
@@ -14,14 +14,16 @@ There are two ways in:
 | | On this computer | From another device |
 |---|---|---|
 | How | `codemux mcp` over stdio, or the same command over SSH | HTTP at `…/mcp`, behind HTTPS |
-| Sign-in | None. It runs as you. | OAuth sign-in or a token, with an access level you choose |
+| Sign-in | No owner authentication is available; the app limits the local socket to reads | OAuth sign-in or a token, with an access level you choose |
 | Needs | Codemux open: the desktop app or `codemux serve` | **Over the network** turned on |
 
-`codemux mcp` serves the control tools in the [Tool reference](#tool-reference) and the older browser, git and terminal tools. The network door serves only the control tools. **Settings → Connections → Outside assistants** shows copy-ready setup commands for this computer. For the network door it shows the MCP URL, a Tailscale command and the tokens.
+`codemux mcp` serves the control tools in the [Tool reference](#tool-reference) and the older browser, git and terminal tools. A separate local process has no proof that it is the person, so app-bound mutations and administration are refused even under the same OS account. The network door serves only the control tools and authenticates its clients. **Settings → Connections → Outside assistants** shows copy-ready setup commands for this computer. For the network door it shows the MCP URL, a Tailscale command and the tokens.
 
 ## On this computer
 
 Codemux must be running: the desktop app, or `codemux serve` on a machine without a display. The commands below call it `codemux`. If `codemux` isn't on your PATH (an AppImage, for example), Settings shows the full path to use instead. If that path changes after an update, copy the command again.
+
+These local MCP setups can read from the running app. Requests to change its state return `access_denied` or `admin_refused` until an independent owner-authentication path exists. The `--client` name and `--access` flag cannot grant that proof; use the app's controls or an authenticated network connection for changes.
 
 ### Claude Code
 
@@ -53,13 +55,13 @@ codex mcp add codemux -- codemux mcp --client codex
 ### Hermes
 
 ```sh
-hermes mcp add codemux --command codemux --args mcp --client hermes --access supervised
+hermes mcp add codemux --command codemux --args mcp --client hermes --access read-only
 ```
 
 1. Run it as the user Hermes runs as. Hermes can list the tools while Codemux is closed, but its tool calls need Codemux running.
-2. At **Enable all tools?**, press Enter. To give the bot only the control tools, answer `select` and keep the ones in the [Tool reference](#tool-reference). A supervised bot isn't offered the tools that need full access, such as `workspace_create`, `worktree_create`, `workspace_close` and `thread_delete`.
+2. At **Enable all tools?**, press Enter. To give the bot only the control tools, answer `select` and keep the reads in the [Tool reference](#tool-reference).
 3. Run `/reload-mcp` in open chats, or start a new one.
-4. `hermes mcp test codemux` should list `thread_launch`.
+4. `hermes mcp test codemux` should list `workspace_list`.
 
 To set it up by hand, add this to `~/.hermes/config.yaml` instead:
 
@@ -67,19 +69,15 @@ To set it up by hand, add this to `~/.hermes/config.yaml` instead:
 mcp_servers:
   codemux:
     command: codemux
-    args: ["mcp", "--client", "hermes", "--access", "supervised"]
+    args: ["mcp", "--client", "hermes", "--access", "read-only"]
     timeout: 660
 ```
 
 `timeout` is how long Hermes waits for one tool call. Its default is 300 seconds. Keep it longer than the longest `thread_wait` you expect.
 
-**Why supervised.** A Hermes bot relays messages from other people, and anyone who can message it can try to steer it. Supervised lets it start threads in supervised permission modes, message, reopen, rename and close them, deny approvals and answer questions. Approvals stay with you in Codemux. If you are the bot's only user and you want it to create worktrees and allow approvals, use full access instead:
+**For changes, use an authenticated connection.** A Hermes bot relays other people's messages, so give it a Supervised network grant when it needs to start or message threads. Approvals stay with you in Codemux. A local `codemux mcp --access full-access` command still has no owner proof.
 
-```sh
-hermes mcp add codemux --command codemux --args mcp --client hermes --access full-access
-```
-
-Hermes also loads its MCP servers in the Hermes chats that Codemux starts. On Linux, Codemux recognises those as its own agents. They can still use the older tools, such as the browser and git tools, but every tool in the [Tool reference](#tool-reference) fails with `agent_identity_required`, and administration tools fail with `admin_refused`. On macOS and Windows it can't tell them apart, so they run as `hermes` with the access level above. That is one more reason to keep a bot supervised.
+Hermes also loads its MCP servers in chats that Codemux starts. A registered chat process can use the older browser and Git tools, but it needs its own chat-bound tools for thread control. A separate unverified process remains read-only on Linux, macOS and Windows, even if it supplies a client or agent name.
 
 ### Any other MCP client
 
@@ -98,7 +96,7 @@ For clients that read `mcpServers` JSON:
 ### Name and access level
 
 - `--client` names the assistant. Codemux shows the name on the threads and messages it creates, and keeps its retries apart from other assistants' retries. Pick a short name that never changes. Without `--client`, Codemux uses the name the MCP client reports about itself.
-- `--access` limits what the assistant may do: `read-only`, `supervised` or `full-access` (`read_only`, `full_access` and `full` work too). Without it, an assistant on this computer gets `full-access`. See [Access levels](#access-levels).
+- `--access` requests `read-only`, `supervised` or `full-access` (`read_only`, `full_access` and `full` work too). Without it, the process requests `full-access`; the running app still caps unverified local socket peers at read-only. See [Access levels](#access-levels).
 - `CODEMUX_CLIENT` and `CODEMUX_ACCESS` set the same defaults for `codemux mcp` and the `codemux` commands you run yourself. A flag wins over the variable. The desktop app and `codemux serve` ignore both and don't pass them on to the terminals and agents they start. An unusable value makes `codemux mcp` and every control command stop with exit code 64.
 - The name is a label, not a lock. Any program running as you can use any name.
 
@@ -158,16 +156,16 @@ claude mcp add --scope user codemux -- ssh -T desktop codemux mcp --client lapto
 Give the bot its own key, and let that key run only `codemux mcp`. On the computer running Codemux, add the bot's public key to `~/.ssh/authorized_keys` with a forced command:
 
 ```text
-restrict,command="codemux mcp --client vps-hermes --access supervised" ssh-ed25519 AAAA… vps-hermes
+restrict,command="codemux mcp --client vps-hermes --access read-only" ssh-ed25519 AAAA… vps-hermes
 ```
 
 Whatever the bot asks ssh to run, that key starts only this command, at the access level written here. `restrict` also turns off terminals and forwarding for the key. Use the full path to `codemux` here if a non-interactive SSH session can't find it. Then, on the bot's machine:
 
 ```sh
-hermes mcp add codemux --command ssh --args -T desktop codemux mcp --client vps-hermes --access supervised
+hermes mcp add codemux --command ssh --args -T desktop codemux mcp --client vps-hermes --access read-only
 ```
 
-If you can't restrict the key, use [the network door](#over-the-network) with a Supervised token instead. There, Codemux checks the access level itself.
+SSH does not provide owner proof to the Codemux socket. This setup is read-only. For changes, use [the network door](#over-the-network) with a Supervised grant instead. There, Codemux checks the access level itself.
 
 ### Over the network
 
@@ -175,9 +173,9 @@ The network door is an HTTP MCP endpoint. It is off until you turn it on, and it
 
 #### Turn it on
 
-Open **Settings → Connections → Outside assistants → Over the network** and turn it on. Connector administration from the CLI is temporarily unavailable while socket callers cannot prove they are the desktop owner; `codemux connector …` returns `admin_refused`.
+Open **Settings → Connections → Outside assistants → Over the network** and turn it on.
 
-Codemux listens on this computer only, on port 4378, at `http://127.0.0.1:4378/mcp`. If the port is taken, pick another one in Settings. Settings shows the listener, connected assistants, and sign-ins waiting for approval.
+Codemux listens on this computer only, on port 4378, at `http://127.0.0.1:4378/mcp`. If the port is taken, pick another one in Settings. Settings shows whether it is listening, its URLs, and the assistants connected or waiting to sign in. Standalone `codemux connector` commands currently require owner authentication that the socket cannot provide.
 
 #### Serve it over HTTPS
 
@@ -218,7 +216,7 @@ A sign-in renews itself while the assistant uses it. It lapses after 30 days wit
 A bot that can't sign in uses a token. Create one in **Assistants with access** (Supervised is the default).
 
 - Codemux shows the token once. Store it like a password.
-- A token lasts 30 days.
+- A token lasts 30 days by default. The longest supported lifetime is 365 days.
 - Issuing a token again for the same label replaces the old one.
 
 Hermes, on the bot's machine:
@@ -254,14 +252,14 @@ claude mcp add --scope user --transport http codemux "$CODEMUX_URL" --header "Au
 
 #### Remove an assistant
 
-Use **Revoke** in Settings. Revoking also stops that assistant's calls in progress: its waits end, and a change it started, such as a worktree being created or an answer on its way to the worker, stops before its next step. Their receipts fail with `grant_revoked`. Turning **Over the network** off in Settings pauses every network assistant: they can't connect, and they work again when you turn it back on. **Revoke all** ends them for good. Assistants on this computer aren't affected either way, because they run as you.
+Use **Revoke** in Settings. Revoking also stops that assistant's calls in progress: its waits end, and a change it started, such as a worktree being created or an answer on its way to the worker, stops before its next step. Their receipts fail with `grant_revoked`. Turning **Over the network** off in Settings pauses every network assistant: they can't connect, and they work again when you turn it back on. **Revoke all** ends them for good. Local read-only clients are unaffected.
 
 #### What differs over the network
 
 - The network door serves the control tools in the [Tool reference](#tool-reference), not the older browser, git and terminal tools of `codemux mcp`.
 - `workspace_create` and `worktree_create` only open folders of projects already opened in Codemux (`unknown_project_root` otherwise). `project_list` lists them.
 - `project_clone` only clones into a folder that holds such a project, and only from https, http, ssh and git URLs.
-- `thread_respond` can allow a request once or deny it. `allow_always` is only available on this computer.
+- `thread_respond` can allow a request once or deny it. `allow_always` is available only through trusted in-app controls.
 - `workspace_close` can remove a clean worktree and its branch, never with `force_delete`.
 - `worktree_create` can't start a terminal preset (`agent_preset_id`). Without a preset, `initial_prompt` is ignored.
 - At most 32 `thread_wait` calls wait at once, 8 per assistant. Over that, a call fails with `wait_budget_exhausted`; retry it shortly.
@@ -269,11 +267,13 @@ Use **Revoke** in Settings. Revoking also stops that assistant's calls in progre
 
 ### Codemux on a server
 
-Run `codemux serve` on the server. A bot on the same server uses the [On this computer](#on-this-computer) setup; a bot elsewhere can use the restricted SSH setup above. The server has no desktop Settings, and socket connector administration is suspended, so a new network connector cannot be configured or approved headlessly. A connector already configured on the server may still start, but new sign-ins, tokens, and revocation require desktop Settings on that same machine until a verified headless owner path is available.
+Run `codemux serve` on the server. A bot on the same server or over SSH can use the [read-only local setup](#on-this-computer). If the network door was already enabled and configured, authenticated remote assistants can continue using it. A fresh headless server currently has no supported way to enable or administer that door: the CLI has no independent owner proof, and the server has no Settings UI.
+
+For a managed headless service, `codemux connect off` stops the service and saves relay and LAN access as off. If the service cannot be removed, it reports that separately after saving the off settings.
 
 ## The end-to-end flow
 
-These are the tool calls, in order. Every tool takes explicit ids: an outside assistant has no current workspace or thread.
+These are the tool calls for an authenticated network assistant, in order. Every tool takes explicit ids: an outside assistant has no current workspace or thread. A standalone local socket process can use the read steps but cannot run the mutations.
 
 **Retries.** Every change takes a `client_request_id` that you choose. If a call fails or times out, retry it unchanged with the same id: Codemux runs it once and returns what the first call did. The same id with different arguments fails with `request_key_conflict`. Ids are kept per assistant name.
 
@@ -435,7 +435,7 @@ These are the tool calls, in order. Every tool takes explicit ids: an outside as
    → {"workspace_id": "workspace-9", "closed": true, "worktree_removed": true, …}
    ```
 
-   It stops the workspace's agents and terminals and runs its teardown. `delete_worktree` removes a worktree, never a project folder. It refuses one with uncommitted or unpushed work, including commits made on a detached HEAD that no branch holds (`workspace_close_refused`). `delete_branch` also deletes its branch, but only if a remote branch or the default branch holds all of its commits; another local branch doesn't count. Otherwise the close is refused. `force_delete` removes the worktree and branch anyway; only assistants on this computer can use it.
+   It stops the workspace's agents and terminals and runs its teardown. `delete_worktree` removes a worktree, never a project folder. It refuses one with uncommitted or unpushed work, including commits made on a detached HEAD that no branch holds (`workspace_close_refused`). `delete_branch` also deletes its branch, but only if a remote branch or the default branch holds all of its commits; another local branch doesn't count. Otherwise the close is refused. `force_delete` removes the worktree and branch anyway; it requires trusted in-app control.
 
    `workspace_archive` closes a workspace the same way but keeps its folder, worktree and branch, and returns an `archive_id`. `workspace_archive_list` lists the archived ones, and `workspace_unarchive` restores one. Both change the workspace's files and scripts, so they need full access.
 
@@ -455,44 +455,24 @@ If a client drops a `workspace_create`, `worktree_create`, `workspace_close`, `w
 
 ## From the shell
 
-The same tools work from scripts on this computer, with no MCP client:
+A standalone `codemux` process is an external control-socket peer, even when you start it from your own terminal under the same OS account. The socket cannot independently prove that this process is the person rather than a surviving setup script or Git hook. Until an owner-authentication path exists, standalone CLI and `codemux mcp` calls into the running app are limited to reads. A client name, an agent marker, and `--access full-access` do not lift that limit.
 
 ```sh
 codemux tools
 codemux call workspace_list '{}'
-WS=$(codemux worktree create --repo ~/src/api --branch fix/flaky-login)
-THREAD=$(codemux thread start --workspace "$WS" --provider claude --permission-mode default -m "Find out why test_login is flaky")
-codemux thread wait "$THREAD" --workspace "$WS" --timeout 10m
-codemux thread send "$THREAD" --workspace "$WS" -m "Now fix it" --wait
-codemux thread read "$THREAD" --workspace "$WS"
-codemux workspace close "$WS" --remove-worktree
+codemux json status '{}'
+codemux capabilities
 ```
 
-- `codemux tools` lists what this caller may run. `codemux call <tool> '<json>'` runs one (`-` reads the JSON from stdin), for example `agent_capabilities` to see the providers, models and permission modes. `codemux capabilities` describes every command and tool as JSON, without a running app.
-- `worktree create` and `workspace create ~/src/api` print the workspace id. `thread start` prints the thread id, and `thread send` prints `Sent.`, `Steered.` or `Queued.` With `--wait`, both print the reply. `thread start --worktree-branch fix/flaky-login` creates the worktree and starts the thread in one step.
-- Name the caller before the command: `codemux --client nightly-script --access supervised thread start …`.
-- `--workspace` defaults to `$CODEMUX_WORKSPACE_ID`, which Codemux sets in its own terminals.
-- `--json` prints one JSON object, even on failure.
-- `thread respond "$THREAD" "$REQUEST_ID" deny --workspace "$WS"` answers an approval. `thread answer` answers a question, with one `--answer` per prompt, in order. It prints the `turn_id` of the run that continues:
+`codemux tools` shows the read-only registry catalog the running app will serve. `codemux call` can run those reads; `codemux capabilities` describes commands without contacting the app. `--workspace` still defaults to `$CODEMUX_WORKSPACE_ID` for reads in Codemux terminals. `--json` prints one JSON object, including on failure.
 
-  ```sh
-  TURN=$(codemux thread answer "$THREAD" --workspace "$WS" --question "$QUESTION" --answer "Use the staging database")
-  codemux thread wait "$THREAD" --workspace "$WS" --turn "$TURN"
-  ```
-
-- `workspace close --remove-worktree` also removes the worktree; it refuses one with uncommitted or unpushed work unless you add `--force`.
-- Every mutation takes `--request-id` (`--request-key` for `thread respond`). Reuse it to retry safely.
-- `--wait` follows the run its message starts, also when the message was queued, and stops when that run ends or needs input. A message that never runs exits `1` with its receipt's error.
-- `thread wait` follows the thread's current run, then any runs queued behind it. It stops when a run needs input, or when a run ends with nothing queued after it. `--turn` keeps it on one run.
-- Neither stops while the work goes on. Pass `--timeout` in scripts.
+Standalone commands that change workspaces, worktrees, threads, terminals, connector settings, or Remote Access return `access_denied` or `admin_refused`. Use the app's controls and Settings for those actions. An authenticated connector grant or paired remote session has its own access policy below. A locally running `codemux mcp` may advertise tools from its requested `--access` level that the app refuses at the socket; use `codemux tools` for the effective local catalog.
 
 Exit codes: `0` done, `1` failed or error, `2` needs input, `3` timed out, `64` usage error.
 
-`codemux call` prints the tool's result unchanged, under `result`, and exits `0` for any result that isn't a tool error. That includes a receipt whose `state` is `failed`, which a retry of a failed keyed call returns (see "Errors" above). After `codemux call`, check `state` yourself. The typed verbs, such as `thread answer` and `workspace close`, exit `1` for a failed receipt.
-
-`codemux json <command> '<json>'` sends one raw control-socket command. It exits `1` when the reply is not ok. Scripts should prefer `codemux call`.
-
 ## Access levels
+
+The levels below apply to authenticated network grants and in-app callers. A standalone local or SSH socket process is capped at read-only, whatever access level it requests.
 
 | | Read-only | Supervised | Full access |
 |---|---|---|---|
@@ -503,16 +483,16 @@ Exit codes: `0` done, `1` failed or error, `2` needs input, `3` timed out, `64` 
 
 - Supervised permission modes are the ones that ask before acting, such as Claude's `default`, `acceptEdits` and `plan`, or Codex's `read-only`, `workspace-write` and `plan`. `agent_capabilities` lists the ones you may use as `allowed_permission_modes`.
 - Opening a workspace, cloning a project or creating a worktree runs the project's setup scripts. Closing or archiving a worktree workspace runs its teardown scripts, even when the worktree stays. That's why those need full access. Deleting a thread can't be undone, so it needs full access too.
-- `allow_always`, `force_delete`, and `worktree_create` with a terminal preset (`agent_preset_id`) are only for assistants on this computer.
-- Assistants on this computer at full access also get the older administration tools of `codemux mcp`, such as `automation_create`, `terminal_write` and `preset_apply`. Network assistants never do.
-- Approving connections, Remote Access and pairing devices are never MCP tools. Use Settings or the `codemux` CLI.
-- Agents that Codemux started are refused administration commands, even through the `codemux` CLI (`admin_refused`). They use their chat's own Codemux tools for threads and workspaces (`agent_identity_required` otherwise).
-- Codemux runs a project's setup and teardown scripts, and every git command it starts, as such agents, whoever asked for them. So a `codemux` command in a setup or teardown script, a git hook or a `core.fsmonitor` command gets the same refusals. Commands you type in your own terminal aren't affected.
+- `allow_always`, `force_delete`, and `worktree_create` with a terminal preset (`agent_preset_id`) require trusted in-app control; they are unavailable to standalone socket clients.
+- In-app clients can use their chat-bound tools. Standalone `codemux mcp` processes cannot use app-bound administration, terminal writes or automation changes through the local socket.
+- Approving connections, Remote Access and pairing devices are never MCP tools. Use Settings.
+- Agents that Codemux started are refused administration commands through the `codemux` CLI (`admin_refused`). They use their chat's own Codemux tools for threads and workspaces (`agent_identity_required` otherwise).
+- Codemux runs project setup and teardown scripts and Git commands as agent processes. A `codemux` command in their hooks or helpers stays read-only, including after the marked parent exits. A standalone command you type in your own terminal has the same socket limit until owner authentication exists.
 
 ## Security
 
 - **An assistant on this computer runs as you.** Names and access levels set limits and record who did what. They don't isolate one program from another under the same account.
-- **Full access lets an assistant run any program as you**, through the agents it starts and the setup scripts it triggers. Agents that Codemux started, setup and teardown scripts, and git hooks are refused administration commands as a safety net, not as a boundary. Give bots Supervised unless you trust everything that can reach them.
+- **Full access lets an authenticated assistant run programs as you**, through the agents it starts and setup scripts it triggers. Local socket peers without owner proof remain read-only. Give network bots Supervised unless you trust everything that can reach them.
 - **Chat bots relay other people's words.** A message to your Hermes bot can try to steer what it asks Codemux to do. That's prompt injection. Keep bots supervised, so approvals stay with you. Never approve worker requests automatically from a bot. Limit who can message the bot.
 - **What a thread says is data, not instructions.** `final_text` and `thread_read` can quote files, web pages or tool output that contain hostile text.
 - **Access covers every workspace.** Any level can read every workspace and every visible conversation, not just one project.
@@ -552,7 +532,7 @@ A paired phone or browser can remove a clean worktree, for example with **Device
 
 - **The network door moved to its own port, 4378.** It used to share Remote Access's port 4377, and it no longer needs Remote Access. Point your proxy at port 4378. Assistants that used `http://127.0.0.1:4377/mcp` directly need the new URL and a new sign-in.
 - **Network sign-ins renew themselves**, and bots can use labelled tokens. A used refresh token that comes back more than 30 seconds later ends its sign-in, so don't copy a client's saved sign-in between machines. Hermes can now connect over HTTP.
-- **`codemux mcp` lists 83 tools at full access.** `workspace_list`, `workspace_info`, `workspace_create`, `worktree_create` and `workspace_close` are now control tools there. If your scripts called them before:
+- **Local `codemux mcp` may list tools that its unverified socket peer cannot run.** The app serves registry reads, including `workspace_list` and `workspace_info`, but refuses app-bound writes until owner authentication exists. The schema notes below continue to apply to authenticated routes:
   - All five refuse unknown arguments (`invalid_arguments`), return compact JSON with `structuredContent`, and report errors as `isError` results with a code.
   - `workspace_list` returns summaries; `"detail": "full"` returns the old snapshots. Rows add `worktree_path` and `parent_workspace_id`, and workspaces on other machines read `native_control_available: false`.
   - `workspace_info` takes an optional `workspace_id`. Without one, while no workspace is focused in Codemux, it is the error `no_active_workspace`, not a result with an `error` key.
@@ -563,7 +543,7 @@ A paired phone or browser can remove a clean worktree, for example with **Device
   - A `codemux mcp` that serves a Codemux agent keeps the older versions unchanged.
 - **`workspace_archive`, `workspace_unarchive` and `workspace_archive_list` are control tools too**, so the network door has them. As with the five above, they refuse unknown arguments and report errors with a code, `workspace_archive` and `workspace_unarchive` take a `client_request_id`, and the older versions stay for Codemux agents. `workspace_unarchive` no longer switches to the restored workspace unless you pass `"select": true`. An unknown `archive_id` is `archive_not_found`.
 - **New control tools:** `project_list`, `project_clone`, `thread_search` (outside assistants can now use it too), `thread_open`, `thread_rename`, `thread_close` and `thread_delete`. `thread_not_bound` now points at `thread_open` instead of asking the person to reopen the thread.
-- **`--access` narrows `codemux mcp`.** A supervised or read-only client is offered fewer tools, and it refuses to work with an older Codemux that can't enforce its access level (`server_too_old`). `workspace_archive` needs full access, like `workspace_close`, because both run teardown scripts. So do the `archive_workspace` and `close_workspace` commands of `codemux json`.
+- **`--access` narrows `codemux mcp`; it cannot grant socket owner access.** A supervised or read-only client is offered fewer tools, and it refuses to work with an older Codemux that can't enforce its access level (`server_too_old`). `workspace_archive` needs full access on authenticated routes, like `workspace_close`, because both run teardown scripts. Standalone `codemux json` archive and close calls are refused.
 - **`thread_launch` needs `permission_mode`.** Without it, it fails with `invalid_arguments` (missing field `permission_mode`).
 - **`agent_capabilities` with `provider` reads that provider's catalog** if Codemux hasn't yet, for a Supervised or Full access caller. It used to list only catalogs Codemux had already read, so a provider no chat had used yet offered no models. A Read-only caller still gets only those.
 - **`thread_wait` returns `state`, `final_text`, `pending` and `wait_cursor`.** It waits up to 50 seconds by default and 10 minutes at most. With `operation_id` it follows the run a launch or send starts, also from the queue.
@@ -571,7 +551,7 @@ A paired phone or browser can remove a clean worktree, for example with **Device
 - **New worktrees branch from the repository's default branch**, not always `main`.
 - **`codemux json` and the older `codemux` commands exit `1` when the reply is not ok.** That includes the refusals below. Check scripts that use `set -e`.
 - **Agents that Codemux started are refused administration commands**, through MCP and through the `codemux` CLI, also on devices that run `codemux serve`. That includes Claude Code typed in a Codemux terminal (see [In a Codemux terminal](#in-a-codemux-terminal)).
-- **Setup and teardown scripts and git hooks run as Codemux agents.** This covers a project's setup and teardown commands, and the hooks and `core.fsmonitor` commands of every git command Codemux runs, itself or through `gh` and `glab`. A `codemux` command in them gets `admin_refused` for administration commands and `agent_identity_required` for control tools, and exits `1`. Such a setup command now stops the setup, and such a teardown command stops the close, unless it ends with `|| true`.
+- **Setup and teardown scripts and Git hooks cannot claim owner access.** A `codemux` command in them gets `admin_refused` for administration and `access_denied` for writes, even if the marked Git parent has exited. Read-only registry calls remain available as an unverified socket peer.
 - **Codex chats that Codemux starts turn off your own Codemux MCP entries**: every entry that runs `codemux mcp`, whatever its name, and any entry named `codemux`. Those chats have their own Codemux tools.
 - **Chats with "Let agents work with other chats" turned off** (Settings → Agents → Models & behavior) are offered no Codemux thread or plugin tools.
 - **`codemux-remote` no longer replaces a `codemux` entry it doesn't own.**
@@ -583,8 +563,8 @@ A paired phone or browser can remove a clean worktree, for example with **Device
 - **`server_too_old` from `codemux mcp` or the CLI, or `codemux_outdated` from the CLI.** The running Codemux is older than the `codemux` command: restart Codemux after an update. `server_too_old` means a read-only or supervised client refused to work with a Codemux that can't enforce its access level. From `codemux mcp`, a tool the older Codemux lacks fails with "Unknown control command".
 - **Only the older tools, no `thread_*`.** Claude Code runs in a Codemux terminal and uses its plugin; see [In a Codemux terminal](#in-a-codemux-terminal). Or a Codemux agent started this program, so it counts as that agent.
 - **No tools, and `obsolete_config` on every call.** That `codemux mcp` was started from an old entry Codemux wrote into a `.mcp.json`; see [Old entries Codemux wrote](#old-entries-codemux-wrote). Delete the entry.
-- **`admin_refused` or `agent_identity_required`.** A Codemux agent started this program, or it runs in a setup or teardown script or a git hook that Codemux ran. Run it from your own terminal.
-- **`access_denied`.** The access level is too low for that tool. Raise `--access`, or approve or issue the network assistant again with more access.
+- **`admin_refused` or `agent_identity_required`.** Administration needs verified owner access, and a registered agent must use its own chat-bound tools. A separate same-account CLI process has no owner proof; use Settings for administration.
+- **`access_denied`.** The access level is too low for that tool. A standalone local CLI remains read-only even with `--access full-access`; for authenticated network assistants, approve or issue a grant with more access when appropriate.
 - **`permission_ceiling`.** That permission mode needs full access. Pick one from `allowed_permission_modes`.
 - **A wait ends with a client timeout.** Lower `timeout_ms`, or raise the client's tool timeout (`timeout` for Hermes, `tool_timeout_sec` for Codex).
 - **"Couldn’t listen on port …".** Another program uses the port. Pick another one in Settings, then update your proxy and URLs.
@@ -604,7 +584,7 @@ The codes an outside assistant meets most often. "Retry" means retrying the iden
 | `permission_ceiling` | The permission mode or decision needs full access | No |
 | `permission_state_unconfirmed` | Supervised: the worker's live permission mode doesn't match its saved one. The person applies the mode in Codemux or restarts the worker | No |
 | `permission_denied` | Not allowed over the network (`allow_always`, `force_delete`), or read-only | No |
-| `admin_refused` | An agent that Codemux started asked for an administration command | No |
+| `admin_refused` | An agent or unverified socket peer asked for an administration command | No |
 | `agent_identity_required` | An agent that Codemux started called a control tool; it uses its chat's own tools | No |
 | `request_key_conflict` | This `client_request_id` was used with other arguments | No |
 | `operation_failed` | `codemux` CLI only: the app's error carried no code, or a receipt ended without an error of its own. As a `thread_wait` `failure`, the message never ran | No |

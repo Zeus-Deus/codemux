@@ -120,9 +120,9 @@ pub fn run_serve(opts: ServeOptions) -> Result<(), String> {
     //    web_remote restore_on_boot, every background loop) on MockRuntime.
     //    `build_headless_app` runs the Tauri `setup` hook explicitly — Tauri
     //    itself only runs it from the event loop, which serve never enters —
-    //    so the control server is listening (mutual exclusion in both
-    //    directions and `codemux connect status`) and the persisted web-remote
-    //    config is hydrated before the enable below merges the CLI flags into it.
+    //    so the control server is listening for read-only status calls and
+    //    mutual exclusion. The persisted web-remote config is hydrated before
+    //    the enable below merges the CLI flags into it.
     let app = match crate::build_headless_app() {
         Ok(app) => app,
         Err(e) => return Err(format!("failed to boot the headless backend: {e}")),
@@ -185,7 +185,8 @@ pub fn run_serve(opts: ServeOptions) -> Result<(), String> {
         if let Some(line) = connector.as_ref().and_then(connector_line) {
             println!("  {line}");
         }
-        print_footer(pairing_ready, connector.is_some_and(|status| status.enabled));
+        print_footer(pairing_ready, result.status.relay_mode_enabled && !result.status.lan_enabled,
+            connector.is_some_and(|status| status.enabled));
 
         // 5. Keep-alive: block until SIGINT / SIGTERM. Still no `app.run()` —
         //    `MockRuntime::run` is an infinite polling loop with no windowing
@@ -402,13 +403,18 @@ fn connector_line(status: &crate::mcp_connector::ConnectorStatus) -> Option<Stri
 }
 
 /// Print the closing lines with the supported management path and stop hint.
-fn print_footer(pairing_ready: bool, connector_enabled: bool) {
+fn print_footer(pairing_ready: bool, relay_only: bool, connector_enabled: bool) {
     println!();
     if pairing_ready {
         println!("Use the pairing code above to connect from a browser.");
     }
+    if relay_only {
+        println!("Remote Access is using the saved relay setting; stop serve to change its network scope in desktop Settings.");
+    } else if pairing_ready {
+        println!("Foreground serve prints a fresh pairing link when restarted; this disconnects active sessions.");
+    }
     if !connector_enabled {
-        println!("The outside-agent connector is off.");
+        println!("The agent connector is off; enable it in desktop Settings before starting headless serve.");
     }
     println!("Stop this server and use desktop Settings to change pairing, network, or connector access.");
     println!("Account-mode / hosted access continues to work if it was configured.");
