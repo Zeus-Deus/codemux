@@ -5747,6 +5747,102 @@ fn browser_confirmation_output(
     decision.ok_or_else(|| "Browser confirmation expired or the action failed".into())
 }
 
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn browser_confirmation_control_request(id: &str, approve: bool) -> Vec<u8> {
+    let mut request = serde_json::json!({
+        "id": uuid::Uuid::new_v4().simple().to_string(),
+        "action": if approve { "confirm" } else { "deny" },
+        "confirmationId": id,
+    }).to_string().into_bytes();
+    request.push(b'\n');
+    request
+}
+
+/// A confirmation must reach the daemon whose prompt the host displayed.
+/// The sidecar CLI can start another daemon if the socket disappears, so send
+/// on a connected peer whose kernel PID and owned record still match.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn send_verified_unix_browser_confirmation(
+    socket_path: &std::path::Path,
+    current: &BrowserPidRecord,
+    id: &str,
+    approve: bool,
+    deadline: Instant,
+    still_owned: impl FnOnce() -> bool,
+) -> Result<BrowserConfirmationResponse, BrowserConfirmationFailure> {
+    use std::io::{Read, Write};
+
+    let before_send = |message: &str| BrowserConfirmationFailure::BeforeSend(message.into());
+    let maybe_applied = |message: &str| {
+        BrowserConfirmationFailure::MaybeApplied(message.into(), Some(current.clone()))
+    };
+    let mut stream = connect_unix_browser_control_until(socket_path, deadline)
+        .map_err(|_| before_send("Browser confirmation socket is unavailable"))?;
+    if unix_browser_control_peer_pid(&stream).ok() != Some(current.pid) || !still_owned() {
+        return Err(before_send("Browser confirmation peer changed before dispatch"));
+    }
+
+    let request = browser_confirmation_control_request(id, approve);
+    let mut written = 0;
+    while written < request.len() {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(if written == 0 {
+                before_send("Browser confirmation deadline elapsed before dispatch")
+            } else {
+                maybe_applied("Browser confirmation request timed out")
+            });
+        }
+        if stream.set_write_timeout(Some(remaining.min(PROC_CONTROL_TIMEOUT))).is_err() {
+            return Err(if written == 0 {
+                before_send("Could not bound browser confirmation request")
+            } else {
+                maybe_applied("Could not bound browser confirmation request")
+            });
+        }
+        match stream.write(&request[written..]) {
+            Ok(0) => return Err(if written == 0 {
+                before_send("Browser confirmation socket closed before dispatch")
+            } else {
+                maybe_applied("Browser confirmation request ended early")
+            }),
+            Ok(count) => written += count,
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(_) => return Err(if written == 0 {
+                before_send("Browser confirmation socket closed before dispatch")
+            } else {
+                maybe_applied("Browser confirmation request failed")
+            }),
+        }
+    }
+
+    let mut response = Vec::new();
+    let mut chunk = [0u8; 512];
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(maybe_applied("Browser confirmation response timed out"));
+        }
+        stream.set_read_timeout(Some(remaining))
+            .map_err(|_| maybe_applied("Could not bound browser confirmation response"))?;
+        let read = stream.read(&mut chunk)
+            .map_err(|_| maybe_applied("Browser confirmation response timed out"))?;
+        if read == 0 {
+            return Err(maybe_applied("Browser confirmation response ended early"));
+        }
+        let end = chunk[..read].iter().position(|byte| *byte == b'\n');
+        response.extend_from_slice(&chunk[..end.map_or(read, |index| index + 1)]);
+        if response.len() > 64 * 1024 * 1024 {
+            return Err(maybe_applied("Browser confirmation response was too large"));
+        }
+        if end.is_some() {
+            break;
+        }
+    }
+    browser_confirmation_output(&response, true, approve)
+        .map_err(|error| BrowserConfirmationFailure::MaybeApplied(error, Some(current.clone())))
+}
+
 fn run_browser_confirmation_decision(
     session: &str,
     port: u16,
@@ -5763,24 +5859,32 @@ fn run_browser_confirmation_decision(
         return Err(BrowserConfirmationFailure::BeforeSend(
             "Browser daemon changed since confirmation was requested".into()));
     }
-    let bin = resolve_binary().map_err(BrowserConfirmationFailure::BeforeSend)?;
-    let action = if approve { "confirm" } else { "deny" };
     #[cfg(windows)]
     let output = {
+        let bin = resolve_binary().map_err(BrowserConfirmationFailure::BeforeSend)?;
+        let action = if approve { "confirm" } else { "deny" };
         let argv = vec![action.to_owned(), id.to_owned(), "--json".into(), "--session".into(), session.to_owned()];
         run_agent_browser_native_with_record(&bin, &argv, session, port, false, ACTION_TIMEOUT, current.clone())
             .map_err(|error| BrowserConfirmationFailure::MaybeApplied(
                 format!("Browser confirmation failed: {error}"), Some(current.clone())))?
     };
-    #[cfg(not(windows))]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    let decision = {
+        let _ = port;
+        let dir = run_dir_for_session(session)
+            .ok_or_else(|| BrowserConfirmationFailure::BeforeSend(
+                "Browser confirmation socket path is unavailable".into()))?;
+        let socket = dir.join(format!("{session}.sock"));
+        send_verified_unix_browser_confirmation(
+            &socket, &current, id, approve, Instant::now() + ACTION_TIMEOUT,
+            || live_owned_browser_record(session).as_ref() == Some(&current),
+        )?
+    };
+    #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
     let output = {
-        let mut command = if bin == "npx agent-browser" {
-            let mut command = std::process::Command::new("npx");
-            command.arg("agent-browser");
-            command
-        } else {
-            std::process::Command::new(&bin)
-        };
+        let bin = resolve_binary().map_err(BrowserConfirmationFailure::BeforeSend)?;
+        let action = if approve { "confirm" } else { "deny" };
+        let mut command = std::process::Command::new(&bin);
         set_browser_owner_env(&mut command, session)
             .map_err(BrowserConfirmationFailure::BeforeSend)?;
         command.args([action, id, "--json", "--session", session])
@@ -5789,6 +5893,7 @@ fn run_browser_confirmation_decision(
             .map_err(|error| BrowserConfirmationFailure::MaybeApplied(
                 format!("Browser confirmation failed: {error}"), Some(current.clone())))?
     };
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     let decision = browser_confirmation_output(&output.stdout, output.status.success(), approve)
         .map_err(|error| BrowserConfirmationFailure::MaybeApplied(error, Some(current.clone())))?;
     let after = live_owned_browser_record(session)
@@ -9584,6 +9689,130 @@ mod tests {
         assert_eq!(manager.confirmation_recovery_required.lock().unwrap()
             .get(&session).unwrap().daemon.as_ref(), Some(&verified));
         assert!(manager.verified_stream_identity(&session).await.is_err());
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn unix_confirmation_sends_both_decisions_to_the_verified_peer() {
+        use std::io::{BufRead, Write};
+        use std::os::unix::net::UnixListener;
+
+        let temp = tempfile::tempdir().unwrap();
+        let socket = temp.path().join("control.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let server = std::thread::spawn(move || {
+            let mut requests = Vec::new();
+            for response in [
+                serde_json::json!({"success": true, "data": {
+                    "confirmed": true,
+                    "result": {"success": true, "data": {"large": "x".repeat(70 * 1024)}},
+                }}),
+                serde_json::json!({"success": true, "data": {"denied": true}}),
+            ] {
+                let (mut stream, _) = listener.accept().unwrap();
+                stream.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+                let mut line = String::new();
+                std::io::BufReader::new(&stream).read_line(&mut line).unwrap();
+                requests.push(serde_json::from_str::<serde_json::Value>(&line).unwrap());
+                let mut response = response.to_string();
+                response.push('\n');
+                stream.write_all(response.as_bytes()).unwrap();
+            }
+            requests
+        });
+        let current = test_browser_record(std::process::id(), 1, browser_owner_token().to_owned());
+        for approve in [true, false] {
+            let result = send_verified_unix_browser_confirmation(
+                &socket, &current, "upstream-prompt", approve,
+                Instant::now() + Duration::from_secs(2), || true,
+            );
+            assert!(matches!(result, Ok(BrowserConfirmationResponse::Resolved)));
+        }
+        let requests = server.join().unwrap();
+        assert_eq!(requests[0]["action"], "confirm");
+        assert_eq!(requests[1]["action"], "deny");
+        for request in requests {
+            assert_eq!(request["confirmationId"], "upstream-prompt");
+            assert!(request["id"].as_str().is_some_and(|id| !id.is_empty()));
+        }
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn unix_confirmation_rejects_a_different_connected_peer_before_writing() {
+        use std::io::Read;
+        use std::os::unix::net::UnixListener;
+
+        let temp = tempfile::tempdir().unwrap();
+        let socket = temp.path().join("control.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+            let mut bytes = [0u8; 8];
+            stream.read(&mut bytes).unwrap()
+        });
+        let wrong = test_browser_record(std::process::id() + 1, 1, browser_owner_token().to_owned());
+        let result = send_verified_unix_browser_confirmation(
+            &socket, &wrong, "upstream-prompt", true,
+            Instant::now() + Duration::from_secs(2), || true,
+        );
+        assert!(matches!(result, Err(BrowserConfirmationFailure::BeforeSend(_))));
+        assert_eq!(server.join().unwrap(), 0, "no decision bytes may reach an unverified peer");
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[tokio::test]
+    async fn exited_unix_confirmation_peer_does_not_start_a_replacement() {
+        let (manager, session, record, host_id) = preset_pending_fixture().await;
+        let temp = tempfile::tempdir().unwrap();
+        let socket = temp.path().join("exited.sock");
+        let started = Instant::now();
+        let error = manager.respond_confirmation_locked_with(&session, &host_id, true,
+            move |_session, _port, _pending, upstream_id, approve| {
+                send_verified_unix_browser_confirmation(
+                    &socket, &record, &upstream_id, approve,
+                    Instant::now() + Duration::from_secs(2), || true,
+                ).map(|decision| (record, decision))
+            }).await.unwrap_err();
+        assert!(error.contains("socket is unavailable"), "{error}");
+        assert!(!temp.path().join("exited.sock").exists(), "decision dispatch must not start a daemon");
+        assert!(manager.confirmation_recovery_required.lock().unwrap().get(&session).is_none());
+        assert_eq!(manager.pending_confirmation(&session).await.unwrap().unwrap().id.as_deref(), Some(host_id.as_str()));
+        manager.close_locked(&session).await.unwrap();
+        assert!(started.elapsed() < Duration::from_secs(3), "close remained blocked after a before-send failure");
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[tokio::test]
+    async fn lost_unix_confirmation_reply_pins_the_verified_peer() {
+        use std::io::BufRead;
+        use std::os::unix::net::UnixListener;
+
+        let (manager, session, record, host_id) = preset_pending_fixture().await;
+        let temp = tempfile::tempdir().unwrap();
+        let socket = temp.path().join("control.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let server = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            stream.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+            let mut line = String::new();
+            std::io::BufReader::new(&stream).read_line(&mut line).unwrap();
+            serde_json::from_str::<serde_json::Value>(&line).unwrap()
+        });
+        let expected = record.clone();
+        let error = manager.respond_confirmation_locked_with(&session, &host_id, true,
+            move |_session, _port, _pending, upstream_id, approve| {
+                send_verified_unix_browser_confirmation(
+                    &socket, &record, &upstream_id, approve,
+                    Instant::now() + Duration::from_secs(2), || true,
+                ).map(|decision| (record, decision))
+            }).await.unwrap_err();
+        assert!(error.contains("ended early"), "{error}");
+        assert_eq!(server.join().unwrap()["action"], "confirm");
+        assert_eq!(manager.confirmation_recovery_required.lock().unwrap()
+            .get(&session).unwrap().daemon.as_ref(), Some(&expected));
+        assert!(manager.close_locked(&session).await.unwrap_err().contains("recovery"));
     }
 
     #[cfg(windows)]
