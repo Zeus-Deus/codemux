@@ -524,16 +524,83 @@ describe("BrowserPane start failures", () => {
     expect(screen.queryByText("Browser approval is waiting on the host device")).not.toBeInTheDocument();
   });
 
-  it("shows a settled preset failure during the pending startup check", async () => {
+  it("checks a settled preset failure after the pending startup reconnect", async () => {
     const browserId = "browser-startup-failed";
     setPresetBrowser(browserId);
     mocks.isRemoteClient.mockReturnValue(true);
-    mocks.startBrowserStream.mockRejectedValue("Browser confirmation is pending for session browser-startup-failed");
+    mocks.startBrowserStream
+      .mockRejectedValueOnce("Browser confirmation is pending for session browser-startup-failed")
+      .mockResolvedValue("ws://127.0.0.1:9223");
     mocks.browserPresetNavigationStatus.mockResolvedValue("failed");
+    mocks.ensureBrowserPresetNavigation.mockResolvedValue("failed");
 
     renderPane(browserId);
+    await vi.waitFor(() => expect(FakeWebSocket.opened).toBe(1), { timeout: 3000 });
+    act(emitFrame);
     await vi.waitFor(() => expect(screen.getByText("Preset navigation could not be confirmed. Check the page before retrying.")).toBeInTheDocument());
+    expect(mocks.startBrowserStream).toHaveBeenCalledTimes(2);
+    expect(mocks.agentBrowserPendingConfirmation).not.toHaveBeenCalled();
+  });
+
+  it.each(["completed", "failed"] as const)(
+    "waits out an unrelated approval despite a cached %s preset result",
+    async (cachedPreset) => {
+      vi.useFakeTimers();
+      const browserId = `browser-other-approval-${cachedPreset}`;
+      setPresetBrowser(browserId);
+      mocks.isRemoteClient.mockReturnValue(true);
+      let approvalPending = true;
+      mocks.startBrowserStream.mockImplementation(async () => {
+        if (approvalPending) throw new Error(`Browser confirmation is pending for session ${browserId}`);
+        return "ws://127.0.0.1:9223";
+      });
+      mocks.browserPresetNavigationStatus.mockImplementation(async () =>
+        approvalPending ? "approval_pending" : cachedPreset);
+      mocks.ensureBrowserPresetNavigation.mockResolvedValue(cachedPreset);
+
+      renderPane(browserId);
+      await act(async () => { await vi.advanceTimersByTimeAsync(1); });
+      expect(screen.getByText("Browser approval is waiting on the host device")).toBeInTheDocument();
+      await act(async () => { await vi.advanceTimersByTimeAsync(4_500); });
+      expect(mocks.startBrowserStream).toHaveBeenCalledTimes(1);
+      expect(FakeWebSocket.urls).toHaveLength(0);
+      expect(mocks.agentBrowserPendingConfirmation).not.toHaveBeenCalled();
+
+      approvalPending = false;
+      await act(async () => { await vi.advanceTimersByTimeAsync(2_100); });
+      expect(mocks.startBrowserStream).toHaveBeenCalledTimes(2);
+      await act(async () => { await vi.advanceTimersByTimeAsync(10); });
+      expect(FakeWebSocket.opened).toBe(1);
+      act(emitFrame);
+      await act(async () => { await vi.advanceTimersByTimeAsync(350); });
+      expect(mocks.ensureBrowserPresetNavigation).toHaveBeenCalledWith(browserId, "https://example.com", false);
+      if (cachedPreset === "failed") {
+        expect(screen.getByText("Preset navigation could not be confirmed. Check the page before retrying.")).toBeInTheDocument();
+      }
+    },
+  );
+
+  it("reconnects after an unrelated approval with no prior preset", async () => {
+    vi.useFakeTimers();
+    const browserId = "browser-other-approval-no-preset";
+    mocks.isRemoteClient.mockReturnValue(true);
+    let approvalPending = true;
+    mocks.startBrowserStream.mockImplementation(async () => {
+      if (approvalPending) throw new Error(`Browser confirmation is pending for session ${browserId}`);
+      return "ws://127.0.0.1:9223";
+    });
+    mocks.browserPresetNavigationStatus.mockImplementation(async () =>
+      approvalPending ? "approval_pending" : null);
+
+    renderPane(browserId);
+    await act(async () => { await vi.advanceTimersByTimeAsync(4_500); });
     expect(mocks.startBrowserStream).toHaveBeenCalledTimes(1);
+    expect(FakeWebSocket.urls).toHaveLength(0);
+    approvalPending = false;
+    await act(async () => { await vi.advanceTimersByTimeAsync(2_100); });
+    expect(mocks.startBrowserStream).toHaveBeenCalledTimes(2);
+    await act(async () => { await vi.advanceTimersByTimeAsync(10); });
+    expect(FakeWebSocket.opened).toBe(1);
     expect(mocks.agentBrowserPendingConfirmation).not.toHaveBeenCalled();
   });
 
