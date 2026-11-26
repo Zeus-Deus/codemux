@@ -1674,6 +1674,10 @@ fn require_owned_browser_session_in(session: &str, dir: &std::path::Path) -> Res
     let pid = read_daemon_pid_file(&path)
         .ok_or_else(|| format!("Browser session {session} has an invalid daemon PID file"))?;
     if !pid_alive(pid) {
+        // Windows cleanup retains the recorded port, or proves that a
+        // hash-port listener belongs to another process when .port is gone.
+        // Probe through that guard before rejecting the stale PID.
+        #[cfg(not(windows))]
         if browser_control_endpoint_ready_in_namespace(session, dir) {
             return Err(format!("Browser session {session} has a live control endpoint with a stale owner PID"));
         }
@@ -8491,14 +8495,14 @@ mod tests {
         assert!(browser_control_endpoint_ready_in_namespace(&session, &current),
             "the ordinary probe must keep an unattributed hash listener ambiguous");
 
-        cleanup_owned_browser_lock_files_in(&current, &session, pid);
+        assert!(require_owned_browser_session_in(&session, &current).is_ok(),
+            "startup must retire the dead PID while the foreign hash listener remains");
         for ext in ["pid", "port", "engine", "stream"] {
             assert!(!current.join(format!("{session}.{ext}")).exists(),
                 "partial shutdown left stale {ext} metadata");
         }
         assert!(std::net::TcpStream::connect(hash_listener.local_addr().unwrap()).is_ok());
-        assert!(require_owned_browser_session_in(&session, &current).is_ok(),
-            "the next start must be admitted while the foreign listener remains");
+        assert!(require_owned_browser_session_in(&session, &current).is_ok());
     }
 
     #[cfg(windows)]
@@ -8563,7 +8567,8 @@ mod tests {
         let pid_path = current.join(format!("{stale_session}.pid"));
         std::fs::write(&pid_path, stale_pid.to_string()).unwrap();
         assert!(browser_control_endpoint_ready_in_namespace(&stale_session, &current));
-        cleanup_owned_browser_lock_files_in(&current, &stale_session, stale_pid);
+        assert!(require_owned_browser_session_in(&stale_session, &current).is_ok(),
+            "startup must retire the stale PID while another browser owns the hash port");
         assert!(!pid_path.exists(), "stale metadata must not pin this browser session");
         assert_eq!(windows_loopback_listener_pid(port), Some(Some(child.0.id())),
             "cleanup must not stop the other session");
