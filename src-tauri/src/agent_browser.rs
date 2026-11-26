@@ -124,12 +124,12 @@ const OPEN_TIMEOUT: Duration = Duration::from_secs(60);
 const ACTION_TIMEOUT: Duration = Duration::from_secs(30);
 const PATCHED_BROWSER_VERSION: &str = "0.44.0+codemux.2";
 
-/// Per-action timeout for the agent-browser CLI. `open`/`wait` can block on a
-/// real page load, so they get [`OPEN_TIMEOUT`]; everything else is a fast,
-/// already-connected daemon round-trip bounded by [`ACTION_TIMEOUT`].
+/// Per-action timeout for the agent-browser CLI. `open`/`wait` and an approved
+/// `confirm` can block on a real page load, so they get [`OPEN_TIMEOUT`];
+/// everything else is a fast, already-connected daemon round-trip.
 fn action_timeout(action: &str) -> Duration {
     match action {
-        "open_url" | "open" | "wait" => OPEN_TIMEOUT,
+        "open_url" | "open" | "wait" | "confirm" => OPEN_TIMEOUT,
         _ => ACTION_TIMEOUT,
     }
 }
@@ -6108,10 +6108,11 @@ fn run_browser_confirmation_decision(
     }
     let bin = resolve_binary()?;
     let action = if approve { "confirm" } else { "deny" };
+    let timeout = action_timeout(action);
     #[cfg(windows)]
     let output = {
         let argv = vec![action.to_owned(), id.to_owned(), "--json".into(), "--session".into(), session.to_owned()];
-        run_agent_browser_native_with_record(&bin, &argv, session, port, false, ACTION_TIMEOUT, current.clone())
+        run_agent_browser_native_with_record(&bin, &argv, session, port, false, timeout, current.clone())
             .map_err(|error| format!("Browser confirmation failed: {error}"))?
     };
     #[cfg(not(windows))]
@@ -6120,7 +6121,7 @@ fn run_browser_confirmation_decision(
         set_browser_owner_env(&mut command, session)?;
         command.args([action, id, "--json", "--session", session])
             .env("AGENT_BROWSER_STREAM_PORT", port.to_string());
-        output_capture_with_timeout(command, ACTION_TIMEOUT)
+        output_capture_with_timeout(command, timeout)
             .map_err(|error| format!("Browser confirmation failed: {error}"))?
     };
     let decision = browser_confirmation_output(&output.stdout, output.status.success(), approve)?;
@@ -9541,6 +9542,12 @@ mod tests {
         assert_eq!(action_timeout("screenshot"), ACTION_TIMEOUT);
         assert_eq!(action_timeout("snapshot"), ACTION_TIMEOUT);
         assert_eq!(action_timeout("eval"), ACTION_TIMEOUT);
+    }
+
+    #[test]
+    fn approved_confirmation_gets_open_ceiling_for_replay() {
+        assert_eq!(action_timeout("confirm"), OPEN_TIMEOUT);
+        assert_eq!(action_timeout("deny"), ACTION_TIMEOUT);
     }
 
     #[cfg(unix)]

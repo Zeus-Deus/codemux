@@ -88,7 +88,7 @@ index 719543c..740c500 100644
  pub fn expected_token() -> Option<&'static str> {
      static TOKEN: OnceLock<Option<String>> = OnceLock::new();
 diff --git a/cli/src/connection.rs b/cli/src/connection.rs
-index 40e8f4a..d4dd973 100644
+index 40e8f4a..bdbf2b0 100644
 --- a/cli/src/connection.rs
 +++ b/cli/src/connection.rs
 @@ -23,6 +23,7 @@ use windows_sys::Win32::System::Threading::{
@@ -206,16 +206,17 @@ index 40e8f4a..d4dd973 100644
                      restarted = true;
                  }
              }
-@@ -1408,6 +1471,8 @@ fn has_os_error(error: &str, code: u32) -> bool {
+@@ -1408,6 +1471,9 @@ fn has_os_error(error: &str, code: u32) -> bool {
  }
 
  /// Socket read timeout for one request. Ordinary commands get a 30s floor.
 +/// A navigation may first launch managed Chrome, then wait for page load;
-+/// allow both phases to finish before declaring its mutating outcome unknown.
++/// `confirm` may replay that navigation after approval. Allow both phases to
++/// finish before declaring their mutating outcomes unknown.
  /// Commands carrying an operation timeout (the wait family, which
  /// parse_command stamps with AGENT_BROWSER_DEFAULT_TIMEOUT when no explicit
  /// --timeout is given) get that timeout plus margin, so the daemon can report
-@@ -1422,10 +1487,19 @@ fn has_os_error(error: &str, code: u32) -> bool {
+@@ -1422,10 +1488,19 @@ fn has_os_error(error: &str, code: u32) -> bool {
  /// avoiding the daemon's spawn-time env snapshot drifting from the client.
  pub(crate) fn read_timeout_for(cmd: &Value) -> Duration {
      let mut op_ms = cmd.get("timeout").and_then(|v| v.as_u64()).unwrap_or(0);
@@ -225,7 +226,7 @@ index 40e8f4a..d4dd973 100644
          op_ms = op_ms.max(cmd.get("duration").and_then(Value::as_u64).unwrap_or(0));
      }
 -    Duration::from_millis(op_ms.saturating_add(10_000).max(30_000))
-+    let floor = if action == Some("navigate") {
++    let floor = if matches!(action, Some("navigate" | "confirm")) {
 +        crate::native::browser::CHROME_PIPE_STARTUP_BUDGET
 +            + Duration::from_millis(crate::native::browser::DEFAULT_BROWSER_COMMAND_TIMEOUT_MS)
 +            // Keep the default below the desktop open command's 60s ceiling.
@@ -237,7 +238,7 @@ index 40e8f4a..d4dd973 100644
  }
 
  fn send_command_once(cmd: &Value, session: &str) -> Result<Response, SendError> {
-@@ -1438,8 +1512,8 @@ fn send_command_once(cmd: &Value, session: &str) -> Result<Response, SendError>
+@@ -1438,8 +1513,8 @@ fn send_command_once(cmd: &Value, session: &str) -> Result<Response, SendError>
          .ok_or_else(|| SendError::NotSent("Codemux browser token is missing".into()))?;
      let mut authenticated = cmd.clone();
      authenticated[crate::codemux_auth::FIELD] = Value::String(token.to_owned());
@@ -248,7 +249,7 @@ index 40e8f4a..d4dd973 100644
      json_str.push('\n');
 
      let stream = connect(session).map_err(SendError::NotSent)?;
-@@ -1488,6 +1562,68 @@ mod tests {
+@@ -1488,6 +1563,68 @@ mod tests {
      use super::*;
      use crate::test_utils::EnvGuard;
 
@@ -317,7 +318,7 @@ index 40e8f4a..d4dd973 100644
      #[cfg(unix)]
      #[test]
      fn unrelated_process_is_not_agent_browser() {
-@@ -1701,6 +1837,20 @@ mod tests {
+@@ -1701,6 +1838,22 @@ mod tests {
          );
      }
 
@@ -325,6 +326,8 @@ index 40e8f4a..d4dd973 100644
 +    fn cold_navigation_read_budget_covers_managed_startup_and_page_load() {
 +        let navigate = json!({"action":"navigate", "url":"https://example.test"});
 +        assert_eq!(read_timeout_for(&navigate), Duration::from_secs(55));
++        assert_eq!(read_timeout_for(&json!({"action":"confirm"})), Duration::from_secs(55));
++        assert_eq!(read_timeout_for(&json!({"action":"deny"})), Duration::from_secs(30));
 +        assert_eq!(
 +            read_timeout_for(&json!({"action":"launch"})),
 +            Duration::from_secs(30)
@@ -524,7 +527,7 @@ index afb567c..30e5501 100644
              &[],
          ),
 diff --git a/cli/src/native/actions.rs b/cli/src/native/actions.rs
-index aad976c..19a9003 100644
+index aad976c..fdb09ac 100644
 --- a/cli/src/native/actions.rs
 +++ b/cli/src/native/actions.rs
 @@ -5,12 +5,14 @@ use std::fs;
@@ -668,20 +671,30 @@ index aad976c..19a9003 100644
              appium: None,
              local_driver: None,
              webdriver_backend: None,
-@@ -3081,35 +3163,77 @@ pub async fn execute_command(cmd: &Value, state: &mut DaemonState) -> Value {
+@@ -3080,36 +3162,87 @@ pub async fn execute_command(cmd: &Value, state: &mut DaemonState) -> Value {
+     Box::pin(execute_command_flow(cmd, state)).await
  }
 
++fn confirms_parked_navigation(action: &str, state: &DaemonState) -> bool {
++    action == "confirm"
++        && state.pending_confirmation.as_ref().is_some_and(|pending| {
++            pending.cmd.get("action").and_then(Value::as_str) == Some("navigate")
++        })
++}
++
  async fn execute_command_flow(cmd: &Value, state: &mut DaemonState) -> Value {
 +    let cmd_start = std::time::Instant::now();
++    let action = cmd.get("action").and_then(Value::as_str).unwrap_or("");
++    let confirmation_replays_navigation = confirms_parked_navigation(action, state);
      let outer = state.flow.enter();
 -    let mut resp = execute_command_inner(cmd, state).await;
 +    let mut resp = execute_command_inner(cmd, state, cmd_start).await;
-+    let action = cmd.get("action").and_then(|v| v.as_str()).unwrap_or("");
-+    let tail_deadline = (action == "navigate"
-+        && state
-+            .browser
-+            .as_ref()
-+            .is_some_and(BrowserManager::owns_managed_chrome_process))
++    let tail_deadline = (confirmation_replays_navigation
++        || (action == "navigate"
++            && state
++                .browser
++                .as_ref()
++                .is_some_and(BrowserManager::owns_managed_chrome_process)))
 +    .then(|| cmd_start + COLD_MANAGED_NAVIGATION_BUDGET + std::time::Duration::from_secs(2));
      if let Some(seq) = state.flow.exit(outer) {
          let ok = resp.get("success") == Some(&json!(true));
@@ -760,7 +773,7 @@ index aad976c..19a9003 100644
  /// Adds a warning to the response when the connected browser is outdated with known CVEs. Checks each browser product once and never fails.
  async fn warn_if_browser_outdated(state: &mut DaemonState, response: &mut Value) {
      let disabled =
-@@ -3145,7 +3269,11 @@ async fn warn_if_browser_outdated(state: &mut DaemonState, response: &mut Value)
+@@ -3145,7 +3278,11 @@ async fn warn_if_browser_outdated(state: &mut DaemonState, response: &mut Value)
      }
  }
 
@@ -773,7 +786,7 @@ index aad976c..19a9003 100644
      state.error_data = None;
      state.pending_action_warning = None;
      let action = cmd.get("action").and_then(|v| v.as_str()).unwrap_or("");
-@@ -3165,7 +3293,7 @@ async fn execute_command_inner(cmd: &Value, state: &mut DaemonState) -> Value {
+@@ -3165,7 +3302,7 @@ async fn execute_command_inner(cmd: &Value, state: &mut DaemonState) -> Value {
          .unwrap_or("")
          .to_string();
 
@@ -782,7 +795,7 @@ index aad976c..19a9003 100644
 
      // A retry of the request that wedged the tab must not run on its blank
      // replacement: `url` would report about:blank as a success.
-@@ -3230,11 +3358,29 @@ async fn execute_command_inner(cmd: &Value, state: &mut DaemonState) -> Value {
+@@ -3230,11 +3367,29 @@ async fn execute_command_inner(cmd: &Value, state: &mut DaemonState) -> Value {
      // the browser and these settings alone.
      let launches = command_launches_browser(cmd);
      let mut launch_patch: Option<Patch> = None;
@@ -812,7 +825,7 @@ index aad976c..19a9003 100644
      let mut settings_outcome = if action == "close" {
          SettingsOutcome::default()
      } else {
-@@ -3247,9 +3393,11 @@ async fn execute_command_inner(cmd: &Value, state: &mut DaemonState) -> Value {
+@@ -3247,9 +3402,11 @@ async fn execute_command_inner(cmd: &Value, state: &mut DaemonState) -> Value {
          };
          if launches {
              let mut patch = patch;
@@ -827,7 +840,7 @@ index aad976c..19a9003 100644
              launch_patch = Some(patch);
          }
          outcome
-@@ -3270,10 +3418,19 @@ async fn execute_command_inner(cmd: &Value, state: &mut DaemonState) -> Value {
+@@ -3270,10 +3427,19 @@ async fn execute_command_inner(cmd: &Value, state: &mut DaemonState) -> Value {
          // Check if existing connection is stale and needs re-launch.
          // This must happen before policy evaluation so plugin capability
          // actions are gated when recovery relaunches would invoke plugins.
@@ -848,7 +861,7 @@ index aad976c..19a9003 100644
          } else {
              state.webdriver_backend.is_none()
          }
-@@ -3421,7 +3578,15 @@ async fn execute_command_inner(cmd: &Value, state: &mut DaemonState) -> Value {
+@@ -3421,7 +3587,15 @@ async fn execute_command_inner(cmd: &Value, state: &mut DaemonState) -> Value {
              lifecycle_relaunched_browser |= restore_applied.relaunched_browser;
              // The launch settings take effect now.
              if let (Some(patch), Some(_)) = (launch_patch.as_ref(), launch_plan.as_ref()) {
@@ -865,7 +878,7 @@ index aad976c..19a9003 100644
                      Ok(outcome) => settings_outcome.absorb(outcome),
                      Err(e) => {
                          let cleanup = Box::pin(rollback_restore_unit(
-@@ -3440,20 +3605,21 @@ async fn execute_command_inner(cmd: &Value, state: &mut DaemonState) -> Value {
+@@ -3440,20 +3614,21 @@ async fn execute_command_inner(cmd: &Value, state: &mut DaemonState) -> Value {
              lifecycle_relaunched_browser |=
                  state.browser.is_some() || state.active_provider_session.is_some();
              if state.browser.is_some() || state.active_provider_session.is_some() {
@@ -890,10 +903,11 @@ index aad976c..19a9003 100644
                  Err(e) => Err(e),
              };
              if let Err(e) = launched {
-@@ -3562,18 +3728,38 @@ async fn execute_command_inner(cmd: &Value, state: &mut DaemonState) -> Value {
+@@ -3562,18 +3737,39 @@ async fn execute_command_inner(cmd: &Value, state: &mut DaemonState) -> Value {
          }
      }
 
++    let confirmation_replays_navigation = confirms_parked_navigation(action, state);
 +    let cold_managed_navigation = action == "navigate"
 +        && lifecycle_launched
 +        && state
@@ -933,7 +947,7 @@ index aad976c..19a9003 100644
                  Err(e) => Err(e),
              };
              match result {
-@@ -3590,6 +3776,10 @@ async fn execute_command_inner(cmd: &Value, state: &mut DaemonState) -> Value {
+@@ -3590,6 +3786,10 @@ async fn execute_command_inner(cmd: &Value, state: &mut DaemonState) -> Value {
                  .await),
              }
          }
@@ -944,11 +958,11 @@ index aad976c..19a9003 100644
          "navigate" => handle_navigate(cmd, state).await,
          "read" => handle_read(cmd, state).await,
          "url" => handle_url(state).await,
-@@ -3765,8 +3955,15 @@ async fn execute_command_inner(cmd: &Value, state: &mut DaemonState) -> Value {
+@@ -3765,8 +3965,15 @@ async fn execute_command_inner(cmd: &Value, state: &mut DaemonState) -> Value {
          _ => Err(format!("Not yet implemented: {}", action)),
      };
 
-+    let cold_tail_deadline = cold_managed_navigation
++    let cold_tail_deadline = (cold_managed_navigation || confirmation_replays_navigation)
 +        .then(|| cmd_start + COLD_MANAGED_NAVIGATION_BUDGET + std::time::Duration::from_secs(1));
      if result.is_ok() && should_validate_restore_after_action(action) {
 -        validate_restore_if_pending(state).await;
@@ -961,7 +975,7 @@ index aad976c..19a9003 100644
      }
 
      // Stamp browser-touching commands so periodic autosave waits for an
-@@ -3779,11 +3976,22 @@ async fn execute_command_inner(cmd: &Value, state: &mut DaemonState) -> Value {
+@@ -3779,11 +3986,22 @@ async fn execute_command_inner(cmd: &Value, state: &mut DaemonState) -> Value {
      let mut wedge = None;
      if result.is_ok() {
          if let Some(mgr) = state.browser.as_mut() {
@@ -986,7 +1000,7 @@ index aad976c..19a9003 100644
              // A dialog opened by this command blocks the renderer like a
              // wedge does; its event is only seen once events are drained.
              let _ = state.drain_cdp_events_background().await;
-@@ -3875,7 +4083,14 @@ async fn execute_command_inner(cmd: &Value, state: &mut DaemonState) -> Value {
+@@ -3875,7 +4093,14 @@ async fn execute_command_inner(cmd: &Value, state: &mut DaemonState) -> Value {
 
      // Re-drain so a dialog opened by THIS command is reflected in the warning
      // below; events are otherwise only drained at the start of a command.
@@ -1002,7 +1016,7 @@ index aad976c..19a9003 100644
          resp = error_response(&id, &super::browser::to_ai_friendly_error(&e));
          attach_tab_gone_data(&mut resp, state);
          inject_lifecycle(
-@@ -3888,8 +4103,7 @@ async fn execute_command_inner(cmd: &Value, state: &mut DaemonState) -> Value {
+@@ -3888,8 +4113,7 @@ async fn execute_command_inner(cmd: &Value, state: &mut DaemonState) -> Value {
          attach_settings_outcome(&mut resp, &settings_outcome);
          attach_failed_lifecycle(&mut resp, lifecycle_launched, lifecycle_relaunched_browser);
      }
@@ -1012,7 +1026,7 @@ index aad976c..19a9003 100644
 
      // Auto-report pending JavaScript dialog so agents know why commands may hang
      if action != "dialog" {
-@@ -3916,9 +4130,17 @@ async fn execute_command_inner(cmd: &Value, state: &mut DaemonState) -> Value {
+@@ -3916,9 +4140,17 @@ async fn execute_command_inner(cmd: &Value, state: &mut DaemonState) -> Value {
          if let Some(ref mgr) = state.browser {
              let tabs = mgr.tab_list();
              let session_id = mgr.active_session_id().ok().map(|s| s.to_string());
@@ -1032,7 +1046,7 @@ index aad976c..19a9003 100644
          }
      }
 
-@@ -4931,9 +5153,28 @@ async fn auto_launch_with(
+@@ -4931,9 +5163,28 @@ async fn auto_launch_with(
      plugins: Vec<crate::plugins::PluginConfig>,
      cmd: &Value,
      strict_state: bool,
@@ -1062,7 +1076,7 @@ index aad976c..19a9003 100644
      if result.is_ok() && !resumed {
          state.attached_target = attached_target_for(&state.settings.connection());
      }
-@@ -4956,6 +5197,7 @@ async fn auto_launch_with_settings(
+@@ -4956,6 +5207,7 @@ async fn auto_launch_with_settings(
      plugins: Vec<crate::plugins::PluginConfig>,
      cmd: &Value,
      strict_state: bool,
@@ -1070,7 +1084,7 @@ index aad976c..19a9003 100644
  ) -> Result<Value, String> {
      if state.attached_target.is_some() && cmd.is_null() {
          // Resume the attached browser; the launch handler resolves the target.
-@@ -4966,14 +5208,14 @@ async fn auto_launch_with_settings(
+@@ -4966,14 +5218,14 @@ async fn auto_launch_with_settings(
      if matches!(connection, Connection::Cdp(_) | Connection::AutoConnect)
          || !matches!(&connection, Connection::Provider(provider) if provider_is_browser_use(provider))
      {
@@ -1087,7 +1101,7 @@ index aad976c..19a9003 100644
      )
      .await
      {
-@@ -4993,6 +5235,7 @@ async fn auto_launch_inner(
+@@ -4993,6 +5245,7 @@ async fn auto_launch_inner(
      plugins: Vec<crate::plugins::PluginConfig>,
      cmd: &Value,
      strict_state: bool,
@@ -1095,7 +1109,7 @@ index aad976c..19a9003 100644
  ) -> Result<Value, String> {
      // Only a browser agent-browser launches itself keeps its session setup
      // across a relaunch; an attached or provider browser starts without one,
-@@ -5003,7 +5246,8 @@ async fn auto_launch_inner(
+@@ -5003,7 +5256,8 @@ async fn auto_launch_inner(
              std::mem::take(&mut state.touch_sessions),
          )
      });
@@ -1105,12 +1119,12 @@ index aad976c..19a9003 100644
      if let (Err(_), Some((setup, touch))) = (&result, saved) {
          state.session_setup = setup;
          state.touch_sessions = touch;
-@@ -5016,9 +5260,34 @@ async fn launch_browser_from_settings(
+@@ -5016,9 +5270,34 @@ async fn launch_browser_from_settings(
      plugins: Vec<crate::plugins::PluginConfig>,
      cmd: &Value,
      strict_state: bool,
 +    managed_deadline: Option<std::time::Instant>,
-+) -> Result<Value, String> {
+ ) -> Result<Value, String> {
 +    launch_browser_from_settings_with_budget(
 +        state,
 +        plugins,
@@ -1129,7 +1143,7 @@ index aad976c..19a9003 100644
 +    strict_state: bool,
 +    managed_deadline: Option<std::time::Instant>,
 +    chrome_startup_budget: std::time::Duration,
- ) -> Result<Value, String> {
++) -> Result<Value, String> {
 +    ensure_managed_chrome_cleanup_settled(state)?;
      if has_active_browser_session(state) {
          close_before_implicit_relaunch(state).await?;
@@ -1140,7 +1154,7 @@ index aad976c..19a9003 100644
      }
      let mut options = state.settings.launch_options();
      let effective_ca_cert = state.effective_ca_cert.clone();
-@@ -5079,6 +5348,10 @@ async fn launch_browser_from_settings(
+@@ -5079,6 +5358,10 @@ async fn launch_browser_from_settings(
      } else {
          engine
      };
@@ -1151,7 +1165,7 @@ index aad976c..19a9003 100644
      state.engine = engine.as_deref().unwrap_or("chrome").to_string();
      write_engine_file(&state.session_id, &state.engine);
      write_extensions_file(&state.session_id, &state.settings);
-@@ -5250,7 +5523,20 @@ async fn launch_browser_from_settings(
+@@ -5250,7 +5533,20 @@ async fn launch_browser_from_settings(
          storage_state,
      })?;
 
@@ -1173,7 +1187,7 @@ index aad976c..19a9003 100644
      validate_ca_cert_launch_mode(&options, engine.as_deref(), false)?;
      ensure_allowed_domains_supported_for_launch(AllowedDomainsLaunchSupport {
          contained,
-@@ -5269,10 +5555,35 @@ async fn launch_browser_from_settings(
+@@ -5269,10 +5565,35 @@ async fn launch_browser_from_settings(
          options.extensions.as_deref(),
      );
      if let Some(ref ca) = effective_ca_cert {
@@ -1211,7 +1225,7 @@ index aad976c..19a9003 100644
      let rollback_setup = state.session_setup.clone();
      let previous_setup = std::mem::take(&mut state.session_setup);
      state.session_setup = previous_setup.carried_into_relaunch(launch_setup);
-@@ -5284,25 +5595,82 @@ async fn launch_browser_from_settings(
+@@ -5284,25 +5605,82 @@ async fn launch_browser_from_settings(
      state.subscribe_to_browser_events();
      state.start_fetch_handler();
      state.start_dialog_handler();
@@ -1300,7 +1314,7 @@ index aad976c..19a9003 100644
  /// Puts the pre-relaunch session setup back when the relaunch failed.
  fn restore_setup_unless_launched<T>(
      state: &mut DaemonState,
-@@ -5401,10 +5769,24 @@ async fn apply_launch_init_scripts(
+@@ -5401,10 +5779,24 @@ async fn apply_launch_init_scripts(
      }
 
      for path in init_script_paths {
@@ -1329,7 +1343,7 @@ index aad976c..19a9003 100644
              }
          }
      }
-@@ -5500,7 +5882,15 @@ async fn try_auto_restore_state(state: &mut DaemonState) {
+@@ -5500,7 +5892,15 @@ async fn try_auto_restore_state(state: &mut DaemonState) {
              return;
          }
      };
@@ -1346,7 +1360,7 @@ index aad976c..19a9003 100644
          if let Some(ref mgr) = state.browser {
              if let Ok(session_id) = mgr.active_session_id() {
                  match state::load_state(&mgr.client, session_id, &path).await {
-@@ -5537,15 +5927,15 @@ async fn validate_restore_if_pending(state: &mut DaemonState) {
+@@ -5537,15 +5937,15 @@ async fn validate_restore_if_pending(state: &mut DaemonState) {
      if !state.restore_validation_pending {
          return;
      }
@@ -1364,7 +1378,7 @@ index aad976c..19a9003 100644
              state.restore_status = "loaded_but_invalid".to_string();
              state.restore_status_detail = Some(err);
              state.restore_load_failed = true;
-@@ -5649,7 +6039,12 @@ pub(crate) async fn maybe_autosave_restore_state(state: &mut DaemonState, interv
+@@ -5649,7 +6049,12 @@ pub(crate) async fn maybe_autosave_restore_state(state: &mut DaemonState, interv
          return;
      }
      state.last_autosave_attempt = Some(std::time::Instant::now());
@@ -1378,7 +1392,7 @@ index aad976c..19a9003 100644
  }
 
  pub(crate) async fn auto_save_restore_state(
-@@ -5723,6 +6118,44 @@ pub(crate) async fn auto_save_restore_state(
+@@ -5723,6 +6128,44 @@ pub(crate) async fn auto_save_restore_state(
      }
  }
 
@@ -1423,7 +1437,7 @@ index aad976c..19a9003 100644
  /// Load storage state if a path is configured.
  ///
  /// Explicit launch should surface this error. Best-effort callers can ignore
-@@ -5848,17 +6281,54 @@ async fn handle_launch_with_deadline(
+@@ -5848,19 +6291,56 @@ async fn handle_launch_with_deadline(
      state: &mut DaemonState,
      deadline: std::time::Duration,
  ) -> Result<Value, String> {
@@ -1438,6 +1452,8 @@ index aad976c..19a9003 100644
 -        Box::pin(start_flow_capture(state)).await?;
 -    }
 -    result
+-}
+-
 +    handle_launch_with_managed_budget(
 +        cmd,
 +        state,
@@ -1486,10 +1502,12 @@ index aad976c..19a9003 100644
 +        }
 +    }
 +    result
- }
-
++}
++
  /// Starts flow capture on a freshly launched browser when the session's
-@@ -5877,6 +6347,35 @@ async fn start_flow_capture(state: &mut DaemonState) -> Result<(), String> {
+ /// `capture` setting asks for it. A session that already captures keeps its
+ /// steps.
+@@ -5877,6 +6357,35 @@ async fn start_flow_capture(state: &mut DaemonState) -> Result<(), String> {
      Ok(())
  }
 
@@ -1525,7 +1543,7 @@ index aad976c..19a9003 100644
  /// Rejects capture modes the daemon cannot record, before they are stored.
  fn check_capture_setting(patch: &Patch) -> Result<(), String> {
      match patch.value(Key::Capture) {
-@@ -5906,6 +6405,7 @@ async fn handle_launch_for_target(
+@@ -5906,6 +6415,7 @@ async fn handle_launch_for_target(
      cmd: &Value,
      state: &mut DaemonState,
      deadline: std::time::Duration,
@@ -1533,7 +1551,7 @@ index aad976c..19a9003 100644
  ) -> Result<Value, String> {
      if cmd.get("cdpUrl").and_then(Value::as_str).is_some()
          || cmd.get("cdpPort").and_then(Value::as_u64).is_some()
-@@ -5915,12 +6415,17 @@ async fn handle_launch_for_target(
+@@ -5915,12 +6425,17 @@ async fn handle_launch_for_target(
              .and_then(Value::as_str)
              .is_some_and(provider_is_browser_use)
      {
@@ -1553,7 +1571,7 @@ index aad976c..19a9003 100644
          Ok(result) => result,
          Err(_) => Err(browser_use_setup_timeout(state).await),
      };
-@@ -6237,15 +6742,25 @@ fn with_rollback_error(error: &str, rollback: Option<String>) -> String {
+@@ -6237,15 +6752,25 @@ fn with_rollback_error(error: &str, rollback: Option<String>) -> String {
  /// CA trust is compared by content, not by path: the same certificates from
  /// another path change nothing, and an edited file at the same path is a
  /// change.
@@ -1582,7 +1600,7 @@ index aad976c..19a9003 100644
      let digest = |ca: &Option<EffectiveCaCert>| ca.as_ref().map(|ca| *ca.bundle.digest());
      let running_path = state.settings.get(Key::CaCert).and_then(Value::as_str);
      match ca_trust_change(
-@@ -6261,7 +6776,7 @@ fn adjust_ca_patch(state: &mut DaemonState, patch: &mut Patch) -> Result<(), Str
+@@ -6261,7 +6786,7 @@ fn adjust_ca_patch(state: &mut DaemonState, patch: &mut Patch) -> Result<(), Str
          CaTrustChange::EditedInPlace => patch.mark_changed_in_place(Key::CaCert),
          CaTrustChange::Replaced => {}
      }
@@ -1591,7 +1609,7 @@ index aad976c..19a9003 100644
  }
 
  /// Writes `pin` into the session's tab binding, when one exists.
-@@ -6300,12 +6815,35 @@ async fn apply_settings_patch(
+@@ -6300,12 +6825,35 @@ async fn apply_settings_patch(
      state: &mut DaemonState,
      patch: &Patch,
      launches: bool,
@@ -1629,7 +1647,7 @@ index aad976c..19a9003 100644
 
      let full = state.settings.plan(&patch);
      if full.is_empty() && full.ignored.is_empty() {
-@@ -6324,15 +6862,23 @@ async fn apply_settings_patch(
+@@ -6324,15 +6872,23 @@ async fn apply_settings_patch(
          let live = patch.without_launch_settings_for(state.session_name.as_deref());
          (state.settings.plan(&live), deferred)
      };
@@ -1658,7 +1676,7 @@ index aad976c..19a9003 100644
      } else {
          None
      };
-@@ -6475,18 +7021,39 @@ async fn apply_settings_patch(
+@@ -6475,18 +7031,39 @@ async fn apply_settings_patch(
      state.settings = next;
 
      if relaunch && had_browser {
@@ -1703,7 +1721,7 @@ index aad976c..19a9003 100644
          }
          state.ref_map.invalidate_all_documents();
      }
-@@ -6563,6 +7130,15 @@ fn attach_settings_outcome(resp: &mut Value, outcome: &SettingsOutcome) {
+@@ -6563,6 +7140,15 @@ fn attach_settings_outcome(resp: &mut Value, outcome: &SettingsOutcome) {
  }
 
  async fn handle_launch_inner(cmd: &Value, state: &mut DaemonState) -> Result<Value, String> {
@@ -1719,7 +1737,7 @@ index aad976c..19a9003 100644
      let engine = cmd
          .get("engine")
          .and_then(Value::as_str)
-@@ -6571,14 +7147,30 @@ async fn handle_launch_inner(cmd: &Value, state: &mut DaemonState) -> Result<Val
+@@ -6571,14 +7157,30 @@ async fn handle_launch_inner(cmd: &Value, state: &mut DaemonState) -> Result<Val
      let patch = launch_envelope_patch(cmd, engine.as_deref())?;
      check_capture_setting(&patch)?;
      let had_browser_before_launch = has_active_browser_session(state);
@@ -1755,7 +1773,7 @@ index aad976c..19a9003 100644
      if reusable {
          return Ok(json!({ "launched": true, "reused": true, "relaunchedBrowser": false }));
      }
-@@ -6587,8 +7179,35 @@ async fn handle_launch_inner(cmd: &Value, state: &mut DaemonState) -> Result<Val
+@@ -6587,8 +7189,35 @@ async fn handle_launch_inner(cmd: &Value, state: &mut DaemonState) -> Result<Val
      let strict_state = patch.value(Key::StorageState).is_some()
          || Patch::from_wire(cmd.get("settings"))
              .is_ok_and(|settings| settings.value(Key::StorageState).is_some());
@@ -1792,7 +1810,7 @@ index aad976c..19a9003 100644
              let mut result = json!({
                  "launched": true,
                  "relaunchedBrowser": had_browser_before_launch,
-@@ -6701,6 +7320,18 @@ async fn launch_local_driver(
+@@ -6701,6 +7330,18 @@ async fn launch_local_driver(
      }))
  }
 
@@ -1811,7 +1829,7 @@ index aad976c..19a9003 100644
  async fn handle_navigate(cmd: &Value, state: &mut DaemonState) -> Result<Value, String> {
      let url = cmd
          .get("url")
-@@ -6903,6 +7534,9 @@ async fn handle_read(cmd: &Value, state: &DaemonState) -> Result<Value, String>
+@@ -6903,6 +7544,9 @@ async fn handle_read(cmd: &Value, state: &DaemonState) -> Result<Value, String>
 
  async fn handle_cdp_url(state: &DaemonState) -> Result<Value, String> {
      let mgr = state.browser.as_ref().ok_or("Browser not launched")?;
@@ -1821,7 +1839,7 @@ index aad976c..19a9003 100644
      if !mgr.is_connection_alive().await {
          return Err("Browser not launched".to_string());
      }
-@@ -6911,6 +7545,9 @@ async fn handle_cdp_url(state: &DaemonState) -> Result<Value, String> {
+@@ -6911,6 +7555,9 @@ async fn handle_cdp_url(state: &DaemonState) -> Result<Value, String> {
 
  async fn handle_inspect(state: &mut DaemonState) -> Result<Value, String> {
      let mgr = state.browser.as_ref().ok_or("Browser not launched")?;
@@ -1831,7 +1849,7 @@ index aad976c..19a9003 100644
 
      // Shut down any existing inspect server so we always target the current page
      if let Some(server) = state.inspect_server.take() {
-@@ -7014,12 +7651,21 @@ async fn handle_close(state: &mut DaemonState) -> Result<Value, String> {
+@@ -7014,12 +7661,21 @@ async fn handle_close(state: &mut DaemonState) -> Result<Value, String> {
  /// forgotten only when `forget_settings` is set and the close succeeded: the
  /// daemon restarts the CLI asks for (upgrade, changed options) keep them.
  async fn close_session(state: &mut DaemonState, forget_settings: bool) -> Result<Value, String> {
@@ -1854,7 +1872,7 @@ index aad976c..19a9003 100644
      state.attached_target = None;
 
      // Stop background Fetch handler
-@@ -16464,6 +17110,8 @@ fn error_response(id: &str, error: &str) -> Value {
+@@ -16464,6 +17120,8 @@ fn error_response(id: &str, error: &str) -> Value {
          resp["code"] = json!("tab_gone");
      } else if error.starts_with(super::browser::PAGE_WEDGED_PREFIX) {
          resp["code"] = json!("page_wedged");
@@ -1863,7 +1881,7 @@ index aad976c..19a9003 100644
      } else if let Some(code) = interaction::form_error_code(error) {
          resp["code"] = json!(code);
      } else if let Some(code) = super::browser::precondition_code(error) {
-@@ -16918,15 +17566,9 @@ mod tests {
+@@ -16918,15 +17576,9 @@ mod tests {
      #[tokio::test]
      #[ignore = "requires Chrome"]
      async fn e2e_attached_download_fails_before_browser_or_filesystem_changes() {
@@ -1881,7 +1899,7 @@ index aad976c..19a9003 100644
          let dir = tempfile::tempdir().unwrap();
          let destination = dir.path().join("new-directory").join("output.bin");
 
-@@ -16938,7 +17580,6 @@ mod tests {
+@@ -16938,7 +17590,6 @@ mod tests {
          .unwrap_err();
          assert!(error.contains("--cdp"), "{error}");
          assert!(!destination.parent().unwrap().exists());
@@ -1889,7 +1907,7 @@ index aad976c..19a9003 100644
      }
 
      async fn start_finished_download(
-@@ -17081,17 +17722,37 @@ mod tests {
+@@ -17081,17 +17732,37 @@ mod tests {
          let dir = tempfile::tempdir().unwrap();
          let download_dir = dir.path().join("downloads");
          std::fs::create_dir_all(&download_dir).unwrap();
@@ -1936,7 +1954,7 @@ index aad976c..19a9003 100644
 
          let mut attached = super::DaemonState::new();
          for cmd in [
-@@ -20886,6 +21547,7 @@ mod tests {
+@@ -20886,6 +21557,7 @@ mod tests {
              Vec::new(),
              &cmd,
              false,
@@ -1944,62 +1962,21 @@ index aad976c..19a9003 100644
          ));
          let outer = std::mem::size_of_val(&auto_launch_with(&mut state, Vec::new(), &cmd, false));
          assert!(
-@@ -20894,125 +21556,1652 @@ mod tests {
+@@ -20894,85 +21566,1702 @@ mod tests {
          );
      }
 
 +    #[cfg(unix)]
      #[tokio::test]
 -    async fn test_a_confirmed_launch_keeps_the_allowed_domains_it_was_parked_with() {
--        let (_env, mut state) = isolated_state();
--        let dir = tempfile::tempdir().unwrap();
--        let policy = dir.path().join("policy.json");
--        fs::write(&policy, r#"{"confirm":["navigate"]}"#).unwrap();
--
--        let parked = execute_command(
--            &json!({
--                "id": "parked",
--                "action": "navigate",
--                "url": "https://a.example",
--                "settings": {
--                    "action-policy": policy.to_str().unwrap(),
--                    "allowed-domains": ["a.example"],
--                    "executable-path": "/missing/chrome-for-test"
--                }
--            }),
--            &mut state,
--        )
--        .await;
--        assert_eq!(parked["data"]["confirmation_required"], true);
--        assert!(
--            state.domain_filter.read().await.is_none(),
--            "deferred to the launch"
--        );
--
--        // The launch fails (no browser binary) after the settings apply.
--        let _ = execute_command(&json!({ "id": "c", "action": "confirm" }), &mut state).await;
--
--        assert_eq!(
--            state.settings.security().allowed_domains,
--            Some(vec!["a.example".to_string()])
--        );
--        assert!(state.domain_filter.read().await.is_some());
--    }
 +    async fn pipe_cold_navigation_can_finish_after_ordinary_cli_read_floor() {
 +        use std::os::unix::fs::PermissionsExt;
 +        use std::time::{Duration, Instant};
-
--    #[tokio::test]
--    async fn test_confirm_rechecks_unapproved_plugin_action() {
--        let guard = EnvGuard::new(&["AGENT_BROWSER_PROVIDER"]);
--        guard.remove("AGENT_BROWSER_PROVIDER");
++
 +        let (_env, mut state) = isolated_state();
-         let dir = tempfile::tempdir().unwrap();
--        let policy_path = dir.path().join("policy.json");
++        let dir = tempfile::tempdir().unwrap();
 +        let executable = dir.path().join("chrome");
-         fs::write(
--            &policy_path,
--            r#"{"confirm":["navigate","plugin:stealth:launch.mutate"]}"#,
++        fs::write(
 +            &executable,
 +            r#"#!/bin/sh
 +set -eu
@@ -2039,48 +2016,18 @@ index aad976c..19a9003 100644
 +}
 +' "$root"
 +"#,
-         )
-         .unwrap();
--
--        let mut state = DaemonState::new();
--        state.policy = Some(ActionPolicy::load(policy_path.to_str().unwrap()).unwrap());
++        )
++        .unwrap();
 +        fs::set_permissions(&executable, fs::Permissions::from_mode(0o700)).unwrap();
 +        state.settings.set(Key::ExecutablePath, json!(executable));
-         let cmd = json!({
++        let cmd = json!({
 +            "id": "cold-navigate",
-             "action": "navigate",
--            "id": "policy-plugin-confirm",
--            "url": "https://example.com",
--            "plugins": [
--                {
--                    "name": "stealth",
--                    "command": "agent-browser-plugin-stealth",
--                    "capabilities": ["launch.mutate"]
--                }
--            ]
++            "action": "navigate",
 +            "url": "data:text/html,cold-navigation"
-         });
++        });
 +        let read_budget = crate::connection::read_timeout_for(&cmd);
 +        assert!(read_budget > Duration::from_secs(30));
-
--        let first = execute_command(&cmd, &mut state).await;
--        assert_eq!(first["data"]["confirmation_required"], true);
--        assert_eq!(first["data"]["action"], "navigate");
--
--        let second = execute_command(
--            &json!({ "id": "policy-plugin-confirm-2", "action": "confirm" }),
--            &mut state,
--        )
--        .await;
--
--        assert_eq!(second["success"], true);
--        assert_eq!(
--            second["data"]["result"]["data"]["confirmation_required"],
--            true
--        );
--        assert_eq!(
--            second["data"]["result"]["data"]["action"],
--            "plugin:stealth:launch.mutate"
++
 +        let start = Instant::now();
 +        let response = tokio::time::timeout(read_budget, execute_command(&cmd, &mut state))
 +            .await
@@ -2095,31 +2042,136 @@ index aad976c..19a9003 100644
 +                .unwrap()
 +                .abort_failed_managed_launch()
 +                .await
++        );
++    }
++
++    #[cfg(unix)]
++    #[tokio::test]
++    async fn pipe_confirm_replays_cold_navigation_with_full_read_budget() {
++        use std::os::unix::fs::PermissionsExt;
++        use std::time::{Duration, Instant};
++
+         let (_env, mut state) = isolated_state();
+         let dir = tempfile::tempdir().unwrap();
++        let executable = dir.path().join("chrome");
++        fs::write(
++            &executable,
++            r#"#!/bin/sh
++set -eu
++root=$(dirname "$0")
++printf '%s' "$$" > "$root/pid"
++exec perl -e '
++use strict;
++use warnings;
++my $root = shift;
++open my $input, "<&=3" or die $!;
++open my $output, ">&=4" or die $!;
++while (1) {
++    my $frame = "";
++    my $byte;
++    while (sysread($input, $byte, 1)) {
++        last if $byte eq "\0";
++        $frame .= $byte;
++    }
++    last unless length $frame;
++    my ($id) = $frame =~ /"id":(\d+)/;
++    my ($method) = $frame =~ /"method":"([^"]+)"/;
++    die "missing command id or method" unless defined $id && defined $method;
++    sleep 21 if $method eq "Browser.getVersion";
++    my $result = $method eq "Target.getTargets" ? q({"targetInfos":[]})
++        : $method eq "Target.createTarget" ? q({"targetId":"page-1"})
++        : $method eq "Target.attachToTarget" ? q({"sessionId":"session-1"})
++        : $method eq "Page.navigate" ? q({"frameId":"frame-1","loaderId":"loader-1"})
++        : q({});
++    syswrite($output, "{\"id\":$id,\"result\":$result}\0") or die $!;
++    if ($method eq "Page.navigate") {
++        open my $marker, ">", "$root/navigated" or die $!;
++        print $marker "ok";
++        close $marker;
++        sleep 10;
++        syswrite($output, q({"method":"Page.loadEventFired","params":{},"sessionId":"session-1"}) . "\0") or die $!;
++    }
++}
++' "$root"
++"#,
++        )
++        .unwrap();
++        fs::set_permissions(&executable, fs::Permissions::from_mode(0o700)).unwrap();
+         let policy = dir.path().join("policy.json");
+         fs::write(&policy, r#"{"confirm":["navigate"]}"#).unwrap();
++        state.policy = Some(ActionPolicy::load(policy.to_str().unwrap()).unwrap());
++        state.settings.set(Key::ExecutablePath, json!(executable));
+
+         let parked = execute_command(
+             &json!({
+-                "id": "parked",
++                "id": "parked-cold-navigation",
+                 "action": "navigate",
+-                "url": "https://a.example",
+-                "settings": {
+-                    "action-policy": policy.to_str().unwrap(),
+-                    "allowed-domains": ["a.example"],
+-                    "executable-path": "/missing/chrome-for-test"
+-                }
++                "url": "data:text/html,confirmed-cold-navigation"
+             }),
+             &mut state,
+         )
+         .await;
+-        assert_eq!(parked["data"]["confirmation_required"], true);
+-        assert!(
+-            state.domain_filter.read().await.is_none(),
+-            "deferred to the launch"
+-        );
+-
+-        // The launch fails (no browser binary) after the settings apply.
+-        let _ = execute_command(&json!({ "id": "c", "action": "confirm" }), &mut state).await;
++        assert_eq!(parked["data"]["confirmation_required"], true, "{parked}");
++        assert!(!dir.path().join("pid").exists(), "approval must gate Chrome spawn");
+
+-        assert_eq!(
+-            state.settings.security().allowed_domains,
+-            Some(vec!["a.example".to_string()])
++        let confirm = json!({"id":"approve-cold-navigation", "action":"confirm"});
++        let read_budget = crate::connection::read_timeout_for(&confirm);
++        assert_eq!(read_budget, Duration::from_secs(55));
++        let start = Instant::now();
++        let response = tokio::time::timeout(read_budget, execute_command(&confirm, &mut state))
++            .await
++            .expect("approved cold navigation exceeded its CLI read budget");
++        assert_eq!(response["success"], true, "{response}");
++        assert_eq!(response["data"]["result"]["success"], true, "{response}");
++        assert!(start.elapsed() > Duration::from_secs(30));
++        assert!(dir.path().join("navigated").exists());
++        assert!(
++            state
++                .browser
++                .take()
++                .unwrap()
++                .abort_failed_managed_launch()
++                .await
          );
--        let pending = state.pending_confirmation.as_ref().unwrap();
--        assert_eq!(pending.action, "plugin:stealth:launch.mutate");
--        assert!(pending.approved_actions.iter().any(|a| a == "navigate"));
+-        assert!(state.domain_filter.read().await.is_some());
      }
 
-     #[cfg(unix)]
++    #[cfg(unix)]
      #[tokio::test]
--    async fn test_auth_login_does_not_resolve_plugin_without_browser() {
+-    async fn test_confirm_rechecks_unapproved_plugin_action() {
+-        let guard = EnvGuard::new(&["AGENT_BROWSER_PROVIDER"]);
+-        guard.remove("AGENT_BROWSER_PROVIDER");
 +    async fn pipe_cold_navigation_stall_returns_with_managed_browser_owned() {
-         use std::os::unix::fs::PermissionsExt;
++        use std::os::unix::fs::PermissionsExt;
 +        use std::time::{Duration, Instant};
-
++
 +        let (_env, mut state) = isolated_state();
          let dir = tempfile::tempdir().unwrap();
--        let marker_path = dir.path().join("credential-plugin-invoked");
--        let plugin_path = dir.path().join("mock-credential-plugin");
+-        let policy_path = dir.path().join("policy.json");
 +        let executable = dir.path().join("chrome");
          fs::write(
--            &plugin_path,
+-            &policy_path,
+-            r#"{"confirm":["navigate","plugin:stealth:launch.mutate"]}"#,
 +            &executable,
-             r#"#!/bin/sh
--printf invoked > "$1"
--cat >/dev/null
--printf '%s' '{"protocol":"agent-browser.plugin.v1","success":true,"credential":{"username":"user","password":"pass","url":"https://example.com/login"}}'
++            r#"#!/bin/sh
 +set -eu
 +root=$(dirname "$0")
 +printf '%s' "$$" > "$root/pid"
@@ -2154,38 +2206,51 @@ index aad976c..19a9003 100644
 +    syswrite($output, "{\"id\":$id,\"result\":$result}\0") or die $!;
 +}
 +' "$root"
- "#,
++"#,
          )
          .unwrap();
--        let mut perms = fs::metadata(&plugin_path).unwrap().permissions();
--        perms.set_mode(0o755);
--        fs::set_permissions(&plugin_path, perms).unwrap();
 -
 -        let mut state = DaemonState::new();
+-        state.policy = Some(ActionPolicy::load(policy_path.to_str().unwrap()).unwrap());
 +        fs::set_permissions(&executable, fs::Permissions::from_mode(0o700)).unwrap();
 +        state.settings.set(Key::ExecutablePath, json!(executable));
          let cmd = json!({
--            "id": "auth-plugin-no-browser",
--            "action": "auth_login",
--            "name": "example",
--            "credentialProvider": "mock",
++            "id": "cold-stall",
+             "action": "navigate",
+-            "id": "policy-plugin-confirm",
+-            "url": "https://example.com",
 -            "plugins": [
 -                {
--                    "name": "mock",
--                    "command": plugin_path.to_string_lossy(),
-+            "id": "cold-stall",
-+            "action": "navigate",
+-                    "name": "stealth",
+-                    "command": "agent-browser-plugin-stealth",
+-                    "capabilities": ["launch.mutate"]
+-                }
+-            ]
 +            "url": "data:text/html,cold-navigation"
-+        });
+         });
+-
+-        let first = execute_command(&cmd, &mut state).await;
+-        assert_eq!(first["data"]["confirmation_required"], true);
+-        assert_eq!(first["data"]["action"], "navigate");
+-
+-        let second = execute_command(
+-            &json!({ "id": "policy-plugin-confirm-2", "action": "confirm" }),
 +        let start = Instant::now();
 +        launch_browser_from_settings_with_budget(
-+            &mut state,
+             &mut state,
 +            Vec::new(),
 +            &Value::Null,
 +            false,
 +            None,
 +            Duration::from_secs(7),
-+        )
+         )
+-        .await;
+-
+-        assert_eq!(second["success"], true);
+-        assert_eq!(
+-            second["data"]["result"]["data"]["confirmation_required"],
+-            true
+-        );
 +        .await
 +        .unwrap();
 +        let error = navigate_cold_managed_until(&cmd, &mut state, start + Duration::from_secs(8))
@@ -3649,50 +3714,10 @@ index aad976c..19a9003 100644
 +            second["data"]["result"]["data"]["confirmation_required"],
 +            true
 +        );
-+        assert_eq!(
-+            second["data"]["result"]["data"]["action"],
-+            "plugin:stealth:launch.mutate"
-+        );
-+        let pending = state.pending_confirmation.as_ref().unwrap();
-+        assert_eq!(pending.action, "plugin:stealth:launch.mutate");
-+        assert!(pending.approved_actions.iter().any(|a| a == "navigate"));
-+    }
-+
-+    #[cfg(unix)]
-+    #[tokio::test]
-+    async fn test_auth_login_does_not_resolve_plugin_without_browser() {
-+        use std::os::unix::fs::PermissionsExt;
-+
-+        let dir = tempfile::tempdir().unwrap();
-+        let marker_path = dir.path().join("credential-plugin-invoked");
-+        let plugin_path = dir.path().join("mock-credential-plugin");
-+        fs::write(
-+            &plugin_path,
-+            r#"#!/bin/sh
-+printf invoked > "$1"
-+cat >/dev/null
-+printf '%s' '{"protocol":"agent-browser.plugin.v1","success":true,"credential":{"username":"user","password":"pass","url":"https://example.com/login"}}'
-+"#,
-+        )
-+        .unwrap();
-+        let mut perms = fs::metadata(&plugin_path).unwrap().permissions();
-+        perms.set_mode(0o755);
-+        fs::set_permissions(&plugin_path, perms).unwrap();
-+
-+        let mut state = DaemonState::new();
-+        let cmd = json!({
-+            "id": "auth-plugin-no-browser",
-+            "action": "auth_login",
-+            "name": "example",
-+            "credentialProvider": "mock",
-+            "plugins": [
-+                {
-+                    "name": "mock",
-+                    "command": plugin_path.to_string_lossy(),
-                     "args": [marker_path.to_string_lossy()],
-                     "capabilities": ["credential.read"]
-                 }
-@@ -21351,15 +23540,10 @@ printf '%s' '{"protocol":"agent-browser.plugin.v1","success":true,"data":{}}'
+         assert_eq!(
+             second["data"]["result"]["data"]["action"],
+             "plugin:stealth:launch.mutate"
+@@ -21351,15 +23640,10 @@ printf '%s' '{"protocol":"agent-browser.plugin.v1","success":true,"data":{}}'
      #[tokio::test]
      #[ignore = "requires Chrome"]
      async fn e2e_browser_use_owned_connection_preserves_plain_command_state() {
@@ -3711,7 +3736,7 @@ index aad976c..19a9003 100644
          state.active_provider_session = Some(pending_browser_use_session());
          state.active_provider_connection = true;
          let target = state
-@@ -22330,6 +24514,57 @@ printf '%s' '{"protocol":"agent-browser.plugin.v1","success":true,"data":{}}'
+@@ -22330,6 +24614,57 @@ printf '%s' '{"protocol":"agent-browser.plugin.v1","success":true,"data":{}}'
          assert!(error.contains("Cannot use --ca-cert with --no-ca-cert"));
      }
 
