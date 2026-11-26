@@ -12175,17 +12175,24 @@ mod tests {
         assert!(!pid_path.exists(), "fixture published its PID before rollback");
 
         std::fs::write(&release, b"go").unwrap();
-        rollback_failed_unix_stream_open(&session, None, &attempt);
-        let started = Instant::now();
-        let status = loop {
-            if let Some(status) = daemon.try_wait().unwrap() { break Some(status); }
-            if started.elapsed() >= Duration::from_secs(3) { break None; }
-            std::thread::sleep(Duration::from_millis(25));
-        };
-        if status.is_none() {
-            let _ = daemon.kill();
-            let _ = daemon.wait();
-        }
+        // Unlike a detached daemon, this fixture is our direct child. Reap it
+        // while rollback waits for process exit, so macOS can confirm exit
+        // before the inode-guarded cleanup runs.
+        let status = std::thread::scope(|scope| {
+            let rollback = scope.spawn(|| rollback_failed_unix_stream_open(&session, None, &attempt));
+            let started = Instant::now();
+            let status = loop {
+                if let Some(status) = daemon.try_wait().unwrap() { break Some(status); }
+                if started.elapsed() >= Duration::from_secs(3) { break None; }
+                std::thread::sleep(Duration::from_millis(10));
+            };
+            if status.is_none() {
+                let _ = daemon.kill();
+                let _ = daemon.wait();
+            }
+            rollback.join().unwrap();
+            status
+        });
         let mut child_stderr = String::new();
         daemon.stderr.take().unwrap().read_to_string(&mut child_stderr).unwrap();
         assert!(status.as_ref().is_some_and(|status| status.success()),
