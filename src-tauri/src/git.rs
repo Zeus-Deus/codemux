@@ -130,7 +130,8 @@ pub(crate) const GIT_PROCESS_KIND: &str = "git-hook";
 /// Unlike setup scripts, git is not registered for ancestry (most callers wait
 /// on `output()`, which gives no pid). The socket checks this marker on a live
 /// git/gh/glab ancestor, even when a hook clears its own environment, and
-/// keeps external peers without an attested owner identity read-only on Linux.
+/// keeps external peers without an attested owner identity read-only on
+/// supported desktop platforms.
 ///
 /// Git also runs with `GIT_OPTIONAL_LOCKS=0`. Codemux reads status and
 /// diffs in the background while agents commit in the same checkout; an
