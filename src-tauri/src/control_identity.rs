@@ -205,8 +205,8 @@ fn peer_agent_status(pid: u32) -> Option<bool> {
 
 /// Git, gh and glab can run repository-controlled hooks or helpers. Their
 /// launch helpers add the agent marker, but `Command::output()` hides their
-/// pid from registration. The marker on the *ancestor* process survives a
-/// hook clearing its own environment.
+/// pid from registration. The marker on a live ancestor can rule out owner
+/// access; it is self-asserted and cannot grant agent write access.
 fn source_control_process(name: &str) -> bool {
     matches!(name.trim().to_ascii_lowercase().as_str(), "git" | "git.exe" | "gh" | "gh.exe" | "glab" | "glab.exe")
 }
@@ -273,7 +273,7 @@ mod ancestry {
         if chain.iter().any(|(pid, start)| roots.get(pid) == Some(start)) { return Some(true); }
         drop(roots);
         for (pid, _) in chain {
-            if source_control_marker(pid)? { return Some(true); }
+            if source_control_marker(pid)? { return None; }
         }
         Some(false)
     }
@@ -356,7 +356,7 @@ mod ancestry {
                 let process = system.process(pid)?;
                 if process.start_time() != start || process.environ().is_empty() { return None; }
                 if process.environ().iter().any(|entry| super::agent_env_entry(&entry.to_string_lossy())) {
-                    return Some(true);
+                    return None;
                 }
             }
             child_start = Some(start);
@@ -559,7 +559,9 @@ impl SocketCaller {
 /// Resolves who sent a socket request. A verified non-agent peer without a
 /// client is the owner; a named client is `local:<slug>`. An agent marker or
 /// registered agent ancestry wins over any name. Unverifiable peers get only
-/// read access, regardless of what they claim in the request.
+/// read access, regardless of what they claim in the request. On Linux, only
+/// this app process has positive owner identity: an external process with no
+/// attested agent ancestry stays read-only even if it claims an agent marker.
 pub(crate) fn resolve_socket_caller(client: Option<ControlClient>, peer_pid: Option<u32>) -> SocketCaller {
     let client = client.unwrap_or_default();
     let access = client.access.unwrap_or(ControlAccess::FullAccess);
@@ -567,6 +569,14 @@ pub(crate) fn resolve_socket_caller(client: Option<ControlClient>, peer_pid: Opt
         Some(is_agent) => is_agent,
         None => return SocketCaller::Agent { kind: "unverified".to_owned(), access: ControlAccess::ReadOnly },
     };
+    // A marked Git hook can clear its environment and outlive Git, losing
+    // every live ancestor that identified it. No client-provided field proves
+    // ownership, so an external Linux peer with no positive ancestry proof
+    // cannot regain write or machine access through this socket.
+    #[cfg(target_os = "linux")]
+    if !peer_agent && peer_pid != Some(std::process::id()) {
+        return SocketCaller::Agent { kind: "unverified".to_owned(), access: ControlAccess::ReadOnly };
+    }
     // The kind is only logged; bound what an arbitrary client may send.
     let agent = client.agent.map(|agent| AgentProcess::from_marker(&agent.kind).kind);
     if let Some(kind) = agent {
@@ -938,6 +948,42 @@ mod tests {
 
         fn sleeper() -> Started {
             Started(Command::new("sleep").arg("30").spawn().unwrap())
+        }
+
+        #[test]
+        fn external_unmarked_peer_has_read_only_socket_access() {
+            let peer = sleeper();
+            let claimed_owner = super::client(Some("owner"), Some(ControlAccess::FullAccess), None);
+            let caller = resolve_socket_caller(claimed_owner, Some(peer.0.id()));
+            assert!(matches!(&caller, SocketCaller::Agent { kind, access: ControlAccess::ReadOnly }
+                if kind == "unverified"), "unmarked peer claimed owner access: {caller:?}");
+            assert!(caller.permits("status", Access::Read).is_ok());
+            assert!(caller.permits("notify", Access::Write).is_err());
+            assert!(caller.permits("create_workspace", Access::Machine).is_err());
+            assert!(caller.permits("web_remote_enable", Access::Admin).is_err());
+        }
+
+        #[test]
+        fn forged_git_marker_cannot_grant_socket_write_access() {
+            let dir = tempfile::tempdir().unwrap();
+            let git = dir.path().join("git");
+            std::os::unix::fs::symlink(which::which("bash").unwrap(), &git).unwrap();
+            let marked = Started(Command::new(&git)
+                .args(["-c", "while :; do sleep 1; done"])
+                .env(AGENT_PROCESS_ENV, "claimed-agent")
+                .spawn().unwrap());
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            while std::fs::read_to_string(format!("/proc/{}/comm", marked.0.id()))
+                .unwrap_or_default().trim_end() != "git"
+            {
+                assert!(std::time::Instant::now() < deadline, "marked Git fixture never started");
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            let caller = resolve_socket_caller(None, Some(marked.0.id()));
+            assert!(matches!(&caller, SocketCaller::Agent { kind, access: ControlAccess::ReadOnly }
+                if kind == "unverified"), "forged Git marker granted socket authority: {caller:?}");
+            assert!(caller.permits("notify", Access::Write).is_err());
+            assert!(caller.permits("create_workspace", Access::Machine).is_err());
         }
 
         #[test]
