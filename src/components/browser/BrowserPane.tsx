@@ -745,7 +745,23 @@ export const BrowserPane = memo(function BrowserPane({ browserId, focused, visib
       if (approve) retryNow();
       else setErrorMsg("Browser action denied");
     } catch (err) {
-      setConfirmationError(String(err));
+      const message = String(err);
+      try {
+        const current = await agentBrowserPendingConfirmation(pending.sessionId);
+        if (!current) {
+          setPendingConfirmation(null);
+          setErrorMsg(message);
+          setStatus("error");
+          return;
+        }
+        if (current.id !== pending.details.id) {
+          showPendingConfirmation(pending.sessionId, current);
+          return;
+        }
+      } catch {
+        // Keep the prompt visible until its backend state can be checked.
+      }
+      setConfirmationError(message);
     } finally {
       setConfirmationBusy(false);
     }

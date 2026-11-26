@@ -5,10 +5,10 @@ use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU16, Ordering};
 use std::sync::{Arc, OnceLock};
-use std::time::{Duration, Instant};
-use tokio::sync::Mutex;
 use hmac::{Hmac, Mac};
 use rand::RngCore;
+use std::time::{Duration, Instant};
+use tokio::sync::{watch, Mutex};
 
 /// Stealth Chromium flags that reduce bot detection fingerprinting.
 /// Passed via the AGENT_BROWSER_ARGS env var (comma-separated).
@@ -301,6 +301,7 @@ struct BrowserConfirmationDetails {
 #[derive(Clone)]
 struct PendingBrowserConfirmation {
     details: BrowserPendingConfirmation,
+    upstream_id: Option<String>,
     daemon: Option<BrowserPidRecord>,
     expires_at: Instant,
 }
@@ -308,6 +309,7 @@ struct PendingBrowserConfirmation {
 impl PendingBrowserConfirmation {
     fn new(details: BrowserConfirmationDetails, daemon: Option<BrowserPidRecord>) -> Self {
         let ttl = Duration::from_secs(60);
+        let upstream_id = details.id;
         let now_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
@@ -315,10 +317,14 @@ impl PendingBrowserConfirmation {
             .min(u64::MAX as u128) as u64;
         Self {
             details: BrowserPendingConfirmation {
-                id: details.id,
+                // The daemon reuses its command ID when a replay asks for
+                // another approval. Each visible prompt needs a fresh ID so
+                // a delayed click cannot decide a later step.
+                id: upstream_id.as_ref().map(|_| format!("p_{}", uuid::Uuid::new_v4().simple())),
                 description: details.description,
                 expires_at_ms: now_ms.saturating_add(ttl.as_millis() as u64),
             },
+            upstream_id,
             daemon,
             expires_at: Instant::now() + ttl,
         }
@@ -2076,6 +2082,17 @@ fn browser_control_port(session: &str, dir: &std::path::Path) -> Option<u16> {
     std::fs::read_to_string(path)
         .ok()
         .and_then(|value| value.trim().parse::<u16>().ok())
+}
+
+#[cfg(windows)]
+fn browser_control_fallback_port(session: &str) -> u16 {
+    // The daemon still binds the session hash port. Use it only as an
+    // untrusted hint when classifying stale files and listeners; command
+    // routing requires the recorded port above.
+    let hash = session.chars().fold(0i32, |hash, ch| {
+        hash.wrapping_shl(5).wrapping_sub(hash).wrapping_add(ch as i32)
+    });
+    49152 + (hash.unsigned_abs() % 16383) as u16
 }
 
 #[cfg(windows)]
@@ -3841,11 +3858,20 @@ struct StreamSession {
     /// Rotates after every successful daemon launch, even if the OS reuses
     /// the same PID and stream port immediately.
     stream_generation: u128,
+    /// A new value closes bridges that were authorized before this session
+    /// became unavailable, including an approval parked by an agent.
+    stream_revocation: watch::Sender<u64>,
     /// Last time we saw signs of life on this session (TCP probe success
     /// or first-frame timestamp passed in by the frontend). Used by the
     /// optional reaper background task.
     #[allow(dead_code)]
     last_seen_at: Option<Instant>,
+}
+
+impl StreamSession {
+    fn revoke_active_bridges(&self) {
+        self.stream_revocation.send_modify(|epoch| *epoch = epoch.wrapping_add(1));
+    }
 }
 
 #[cfg(test)]
@@ -3860,7 +3886,7 @@ pub struct AgentBrowserManager {
     /// Per-session state keyed by session identifier (workspace_id or cli_session_name).
     sessions: Arc<Mutex<HashMap<String, StreamSession>>>,
     #[cfg(test)]
-    test_stream_ports: Arc<Mutex<HashMap<u16, BrowserStreamIdentity>>>,
+    test_stream_ports: Arc<Mutex<HashMap<u16, (BrowserStreamIdentity, watch::Sender<u64>)>>>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -3941,6 +3967,7 @@ fn refresh_stream_session_identity(
         || stream.pid_start_time.is_some_and(|start| start != record.start_time);
     if identity_changed {
         stream.stream_generation = uuid::Uuid::new_v4().as_u128();
+        stream.revoke_active_bridges();
     }
     stream.pid = Some(record.pid);
     stream.pid_start_time = Some(record.start_time);
@@ -5498,6 +5525,7 @@ fn browser_result_confirmation_details(result: &BrowserAutomationResult) -> Opti
 enum BrowserConfirmationResponse {
     Resolved,
     FollowUp(BrowserConfirmationDetails),
+    ConsumedFailure(String),
 }
 
 fn browser_confirmation_response(
@@ -5512,14 +5540,38 @@ fn browser_confirmation_response(
         return (data.get("denied").and_then(|value| value.as_bool()) == Some(true))
             .then_some(BrowserConfirmationResponse::Resolved);
     }
-    if data.get("confirmed").and_then(|value| value.as_bool()) != Some(true)
-        || data.pointer("/result/success").and_then(|value| value.as_bool()) != Some(true) {
+    if data.get("confirmed").and_then(|value| value.as_bool()) != Some(true) {
+        return None;
+    }
+    if data.pointer("/result/success").and_then(|value| value.as_bool()) == Some(false) {
+        let error = data.pointer("/result/error")
+            .or_else(|| data.pointer("/result/message"))
+            .and_then(|value| value.as_str())
+            .unwrap_or("The approved browser action failed")
+            .chars().take(512).collect();
+        return Some(BrowserConfirmationResponse::ConsumedFailure(error));
+    }
+    if data.pointer("/result/success").and_then(|value| value.as_bool()) != Some(true) {
         return None;
     }
     Some(match data.get("result").and_then(browser_json_confirmation) {
         Some(details) => BrowserConfirmationResponse::FollowUp(details),
         None => BrowserConfirmationResponse::Resolved,
     })
+}
+
+fn browser_confirmation_output(
+    stdout: &[u8],
+    status_success: bool,
+    approve: bool,
+) -> Result<BrowserConfirmationResponse, String> {
+    let response: serde_json::Value = serde_json::from_slice(stdout)
+        .map_err(|_| "Browser confirmation returned an invalid response".to_string())?;
+    let decision = browser_confirmation_response(&response, approve);
+    if !status_success && !matches!(&decision, Some(BrowserConfirmationResponse::ConsumedFailure(_))) {
+        return Err("Browser confirmation expired or the action failed".into());
+    }
+    decision.ok_or_else(|| "Browser confirmation expired or the action failed".into())
 }
 
 fn run_browser_confirmation_decision(
@@ -5553,13 +5605,7 @@ fn run_browser_confirmation_decision(
         output_capture_with_timeout(command, ACTION_TIMEOUT)
             .map_err(|error| format!("Browser confirmation failed: {error}"))?
     };
-    let response: serde_json::Value = serde_json::from_slice(&output.stdout)
-        .map_err(|_| "Browser confirmation returned an invalid response".to_string())?;
-    if !output.status.success() {
-        return Err("Browser confirmation expired or the action failed".into());
-    }
-    let decision = browser_confirmation_response(&response, approve)
-        .ok_or("Browser confirmation expired or the action failed")?;
+    let decision = browser_confirmation_output(&output.stdout, output.status.success(), approve)?;
     let after = live_owned_browser_record(session)
         .ok_or_else(|| "Could not verify browser daemon after confirmation".to_string())?;
     if after != current {
@@ -5884,6 +5930,7 @@ impl AgentBrowserManager {
                     pid: None,
                     pid_start_time: None,
                     stream_generation: 0,
+                    stream_revocation: watch::channel(0).0,
                     last_seen_at: None,
                 },
             );
@@ -5924,7 +5971,7 @@ impl AgentBrowserManager {
             (stream.port, stream.stream_generation)
         };
         #[cfg(test)]
-        let test_identity = self.test_stream_ports.lock().await.get(&port).copied();
+        let test_identity = self.test_stream_ports.lock().await.get(&port).map(|(identity, _)| *identity);
         #[cfg(test)]
         if let Some(identity) = test_identity {
             let sessions = self.sessions.lock().await;
@@ -5968,7 +6015,14 @@ impl AgentBrowserManager {
 
     pub(crate) async fn verified_stream_identity_for_port(&self, port: u16) -> Option<BrowserStreamIdentity> {
         #[cfg(test)]
-        if let Some(identity) = self.test_stream_ports.lock().await.get(&port).copied() {
+        if let Some(identity) = self.test_stream_ports.lock().await.get(&port).map(|(identity, _)| *identity) {
+            let sessions = self.sessions.lock().await;
+            if let Some(stream) = sessions.values().find(|stream| stream.port == port) {
+                return (stream.running && stream.browser_ready && !stream.confirmation_pending
+                    && stream.pending_confirmation.is_none() && stream.pid == Some(identity.pid)
+                    && stream.pid_start_time == Some(identity.start_time)
+                    && stream.stream_generation == identity.generation).then_some(identity);
+            }
             return Some(identity);
         }
         let browser_id = {
@@ -5983,6 +6037,28 @@ impl AgentBrowserManager {
             .filter(|identity| identity.port == port)
     }
 
+    /// Subscribing and checking readiness use the same session lock. A
+    /// confirmation parked during an upgrade either rejects the subscription
+    /// or notifies the bridge that already holds it.
+    pub(crate) async fn subscribe_active_stream(&self, identity: BrowserStreamIdentity) -> Option<watch::Receiver<u64>> {
+        let sessions = self.sessions.lock().await;
+        if let Some(stream) = sessions.values().find(|stream| stream.port == identity.port) {
+            return (stream.running && stream.browser_ready && !stream.confirmation_pending
+                && stream.pending_confirmation.is_none() && stream.pid == Some(identity.pid)
+                && stream.pid_start_time == Some(identity.start_time)
+                && stream.stream_generation == identity.generation)
+                .then(|| stream.stream_revocation.subscribe());
+        }
+        drop(sessions);
+        #[cfg(test)]
+        {
+            return self.test_stream_ports.lock().await.get(&identity.port)
+                .and_then(|(test_identity, sender)| (*test_identity == identity).then(|| sender.subscribe()));
+        }
+        #[cfg(not(test))]
+        None
+    }
+
     #[cfg(test)]
     pub(crate) async fn owns_stream_port(&self, port: u16) -> bool {
         self.verified_stream_identity_for_port(port).await.is_some()
@@ -5990,7 +6066,30 @@ impl AgentBrowserManager {
 
     #[cfg(test)]
     pub(crate) async fn allow_test_stream_port(&self, port: u16) {
-        self.test_stream_ports.lock().await.insert(port, current_process_stream_identity(port));
+        self.test_stream_ports.lock().await.insert(port, (current_process_stream_identity(port), watch::channel(0).0));
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn allow_test_stream_session(&self, browser_id: &str, port: u16) {
+        let identity = current_process_stream_identity(port);
+        self.allow_test_stream_port(port).await;
+        self.sessions.lock().await.insert(browser_id.to_string(), StreamSession {
+            port,
+            running: true,
+            browser_ready: true,
+            confirmation_pending: false,
+            pending_confirmation: None,
+            pid: Some(identity.pid),
+            pid_start_time: Some(identity.start_time),
+            stream_generation: identity.generation,
+            stream_revocation: watch::channel(0).0,
+            last_seen_at: None,
+        });
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn park_test_stream_confirmation(&self, browser_id: &str) {
+        self.note_stream_open_confirmation_pending(browser_id, true, None, None).await;
     }
 
     async fn clear_stale_running_stream_allocation(&self, session_key: &str, port: u16) {
@@ -6044,11 +6143,12 @@ impl AgentBrowserManager {
         if pending.details.id.as_deref() != Some(id) {
             return Err("Browser confirmation ID no longer matches this session".into());
         }
+        let upstream_id = pending.upstream_id.clone()
+            .ok_or("Browser confirmation has no daemon ID")?;
         let pending_for_command = pending.clone();
-        let id_for_command = id.to_owned();
         let session_for_command = session.clone();
         let result = tokio::task::spawn_blocking(move || {
-            run_browser_confirmation_decision(&session_for_command, port, &pending_for_command, &id_for_command, approve)
+            run_browser_confirmation_decision(&session_for_command, port, &pending_for_command, &upstream_id, approve)
         }).await.map_err(|error| format!("Browser confirmation task failed: {error}"))?;
         let mut sessions = self.sessions.lock().await;
         let entry = sessions.get_mut(browser_id).ok_or("Browser session closed during confirmation")?;
@@ -6056,7 +6156,7 @@ impl AgentBrowserManager {
             return Err("Browser confirmation changed while it was processed".into());
         }
         let (record, decision) = result?;
-        Ok(Self::finish_confirmation_decision(entry, &session, record, decision))
+        Self::finish_confirmation_decision(entry, &session, record, decision)
     }
 
     fn finish_confirmation_decision(
@@ -6064,7 +6164,8 @@ impl AgentBrowserManager {
         session: &str,
         record: BrowserPidRecord,
         decision: BrowserConfirmationResponse,
-    ) -> Option<BrowserPendingConfirmation> {
+    ) -> Result<Option<BrowserPendingConfirmation>, String> {
+        entry.revoke_active_bridges();
         entry.browser_ready = false;
         entry.running = true;
         refresh_stream_session_identity(entry, &record, session);
@@ -6072,14 +6173,19 @@ impl AgentBrowserManager {
             BrowserConfirmationResponse::Resolved => {
                 entry.confirmation_pending = false;
                 entry.pending_confirmation = None;
-                None
+                Ok(None)
             }
             BrowserConfirmationResponse::FollowUp(details) => {
                 let next = PendingBrowserConfirmation::new(details, Some(record));
                 let public = next.details.clone();
                 entry.confirmation_pending = true;
                 entry.pending_confirmation = Some(next);
-                Some(public)
+                Ok(Some(public))
+            }
+            BrowserConfirmationResponse::ConsumedFailure(error) => {
+                entry.confirmation_pending = false;
+                entry.pending_confirmation = None;
+                Err(format!("Browser action failed after confirmation: {error}"))
             }
         }
     }
@@ -6125,6 +6231,9 @@ impl AgentBrowserManager {
             .map_err(|error| format!("Could not inspect browser session {session}: {error}"))?;
         let mut ready = false;
         if let Some(entry) = self.sessions.lock().await.get_mut(browser_id) {
+            if outcome == BrowserActionOutcome::ConfirmationPending {
+                entry.revoke_active_bridges();
+            }
             if record.is_none() {
                 if (!confirmed_gone || endpoint_live) && (entry.running || entry.browser_ready || entry.confirmation_pending
                     || outcome == BrowserActionOutcome::ConfirmationPending) {
@@ -6283,6 +6392,9 @@ impl AgentBrowserManager {
         .map_err(|e| format!("agent-browser spawn task failed: {e}"))??;
 
         self.sessions.lock().await.entry(browser_id.to_string()).and_modify(|s| {
+            if outcome == BrowserActionOutcome::ConfirmationPending {
+                s.revoke_active_bridges();
+            }
             s.running = true;
             s.browser_ready = outcome == BrowserActionOutcome::Completed;
             s.confirmation_pending = outcome == BrowserActionOutcome::ConfirmationPending;
@@ -6832,6 +6944,7 @@ impl AgentBrowserManager {
         details: Option<BrowserConfirmationDetails>,
     ) {
         self.sessions.lock().await.entry(browser_id.to_string()).and_modify(|entry| {
+            entry.revoke_active_bridges();
             entry.running = port_alive;
             entry.browser_ready = false;
             entry.confirmation_pending = true;
@@ -8549,6 +8662,7 @@ mod tests {
             pid: Some(41),
             pid_start_time: Some(100),
             stream_generation: 1,
+            stream_revocation: watch::channel(0).0,
             last_seen_at: None,
         };
         let replacement = test_browser_record(42, 200, "a".repeat(32));
@@ -8583,6 +8697,7 @@ mod tests {
             pid: Some(identity.pid),
             pid_start_time: Some(identity.start_time),
             stream_generation: identity.generation,
+            stream_revocation: watch::channel(0).0,
             last_seen_at: None,
         });
         manager.allow_test_stream_port(identity.port).await;
@@ -11540,7 +11655,12 @@ mod tests {
         assert_eq!(browser_confirmation_response(
             &serde_json::json!({"success":true,"data":{"confirmed":true,"result":{"success":false,"error":"navigation failed"}}}),
             true,
-        ), None);
+        ), Some(BrowserConfirmationResponse::ConsumedFailure("navigation failed".into())));
+        assert_eq!(browser_confirmation_output(
+            br#"{"success":true,"data":{"confirmed":true,"result":{"success":false,"error":"navigation failed"}}}"#,
+            false,
+            true,
+        ), Ok(BrowserConfirmationResponse::ConsumedFailure("navigation failed".into())));
         assert_eq!(browser_confirmation_response(
             &serde_json::json!({"success":true,"data":{"confirmed":true,"result":{"success":true,"data":{"confirmation_required":true,"confirmation_id":"c_456","description":"Approve plugin action"}}}}),
             true,
@@ -11645,12 +11765,14 @@ mod tests {
         }
 
         std::fs::remove_file(&daemon_pid_path).unwrap();
-        let error = manager.respond_confirmation(&session, "pending123", true).await.unwrap_err();
+        let host_id = manager.pending_confirmation(&session).await.unwrap().unwrap().id.unwrap();
+        assert_ne!(host_id, "pending123");
+        let error = manager.respond_confirmation(&session, &host_id, true).await.unwrap_err();
         assert!(error.contains("Could not verify the pending browser daemon"), "{error}");
         let sessions = manager.sessions.lock().await;
         let entry = sessions.get(&session).unwrap();
         assert!(entry.confirmation_pending);
-        assert_eq!(entry.pending_confirmation.as_ref().unwrap().details.id.as_deref(), Some("pending123"));
+        assert_eq!(entry.pending_confirmation.as_ref().unwrap().details.id.as_deref(), Some(host_id.as_str()));
         drop(sessions);
 
         daemon.kill().unwrap();
@@ -11682,7 +11804,8 @@ mod tests {
             entry.confirmation_pending = true;
             entry.pending_confirmation = Some(pending);
         }
-        assert_eq!(manager.pending_confirmation(&session).await.unwrap().unwrap().id.as_deref(), Some("c_123"));
+        let host_id = manager.pending_confirmation(&session).await.unwrap().unwrap().id.unwrap();
+        assert_ne!(host_id, "c_123");
         let error = manager.respond_confirmation_locked(&session, "other", true).await.unwrap_err();
         assert!(error.contains("no longer matches"));
         assert!(manager.sessions.lock().await.get(&session).unwrap().confirmation_pending);
@@ -11718,36 +11841,82 @@ mod tests {
             entry.running = true;
             entry.confirmation_pending = true;
             entry.pending_confirmation = Some(PendingBrowserConfirmation::new(
-                BrowserConfirmationDetails { id: Some("c_first".into()), description: "Approve navigation".into() },
+                BrowserConfirmationDetails { id: Some("c_reused".into()), description: "Approve navigation".into() },
                 Some(record.clone()),
             ));
         }
+        let first_host_id = manager.pending_confirmation(&session).await.unwrap().unwrap().id.unwrap();
+        assert_ne!(first_host_id, "c_reused");
         let response = serde_json::json!({
             "success": true,
             "data": {"confirmed": true, "result": {"success": true, "data": {
                 "confirmation_required": true,
-                "confirmation_id": "c_second",
+                "confirmation_id": "c_reused",
                 "description": "Approve plugin action"
             }}}
         });
         let decision = browser_confirmation_response(&response, true).unwrap();
         let next = {
             let mut sessions = manager.sessions.lock().await;
-            AgentBrowserManager::finish_confirmation_decision(sessions.get_mut(&session).unwrap(), &session, record.clone(), decision).unwrap()
+            AgentBrowserManager::finish_confirmation_decision(sessions.get_mut(&session).unwrap(), &session, record.clone(), decision).unwrap().unwrap()
         };
-        assert_eq!(next.id.as_deref(), Some("c_second"));
+        assert_ne!(next.id.as_deref(), Some(first_host_id.as_str()));
+        assert_ne!(next.id.as_deref(), Some("c_reused"));
         assert_eq!(next.description, "Approve plugin action");
-        assert_eq!(manager.pending_confirmation(&session).await.unwrap().unwrap().id.as_deref(), Some("c_second"));
+        assert_eq!(manager.pending_confirmation(&session).await.unwrap().unwrap().id, next.id);
+        assert_eq!(manager.sessions.lock().await.get(&session).unwrap().pending_confirmation.as_ref().unwrap().upstream_id.as_deref(), Some("c_reused"));
         assert!(manager.verified_stream_identity(&session).await.is_err());
-        assert!(manager.respond_confirmation_locked(&session, "c_first", true).await.unwrap_err().contains("no longer matches"));
+        assert!(manager.respond_confirmation_locked(&session, &first_host_id, true).await.unwrap_err().contains("no longer matches"));
 
         {
             let mut sessions = manager.sessions.lock().await;
             assert!(AgentBrowserManager::finish_confirmation_decision(
                 sessions.get_mut(&session).unwrap(), &session, record, BrowserConfirmationResponse::Resolved,
-            ).is_none());
+            ).unwrap().is_none());
         }
         assert!(manager.pending_confirmation(&session).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn consumed_confirmation_failure_retires_prompt_and_keeps_stream_unready() {
+        let manager = AgentBrowserManager::new();
+        let session = format!("browser-consumed-confirm-{}", uuid::Uuid::new_v4().simple());
+        manager.allocate_port(&session).await.unwrap();
+        let pid = std::process::id();
+        let start_time = process_start_time(pid).unwrap();
+        let record = BrowserPidRecord {
+            pid,
+            start_time,
+            token: browser_owner_token().into(),
+            owner_pid: pid,
+            owner_start_time: start_time,
+            native_start: true,
+        };
+        {
+            let mut sessions = manager.sessions.lock().await;
+            let entry = sessions.get_mut(&session).unwrap();
+            entry.running = true;
+            entry.confirmation_pending = true;
+            entry.pending_confirmation = Some(PendingBrowserConfirmation::new(
+                BrowserConfirmationDetails { id: Some("same_upstream_id".into()), description: "Approve navigation".into() },
+                Some(record.clone()),
+            ));
+        }
+        let response = br#"{"success":true,"data":{"confirmed":true,"result":{"success":false,"error":"navigation failed"}}}"#;
+        let decision = browser_confirmation_output(response, false, true).unwrap();
+        let error = {
+            let mut sessions = manager.sessions.lock().await;
+            AgentBrowserManager::finish_confirmation_decision(sessions.get_mut(&session).unwrap(), &session, record, decision).unwrap_err()
+        };
+        assert!(error.contains("navigation failed"));
+        assert!(manager.pending_confirmation(&session).await.unwrap().is_none());
+        let sessions = manager.sessions.lock().await;
+        let entry = sessions.get(&session).unwrap();
+        assert!(entry.running);
+        assert!(!entry.browser_ready);
+        assert!(!entry.confirmation_pending);
+        drop(sessions);
+        assert!(manager.verified_stream_identity(&session).await.is_err());
     }
 
     #[cfg(target_os = "linux")]
@@ -12475,6 +12644,8 @@ mod tests {
         manager.note_stream_open_confirmation_pending(&session, true, Some(record.clone()), Some(
             BrowserConfirmationDetails { id: Some("c_first".into()), description: "Approve navigation".into() },
         )).await;
+        let host_id = manager.pending_confirmation(&session).await.unwrap().unwrap().id.unwrap();
+        assert_ne!(host_id, "c_first");
 
         let error = manager.reconcile_existing_stream_attachment(
             &session,
@@ -12502,7 +12673,7 @@ mod tests {
         let stream = sessions.get(&session).unwrap();
         assert!(!stream.browser_ready);
         assert!(stream.confirmation_pending);
-        assert_eq!(stream.pending_confirmation.as_ref().unwrap().details.id.as_deref(), Some("c_first"));
+        assert_eq!(stream.pending_confirmation.as_ref().unwrap().details.id.as_deref(), Some(host_id.as_str()));
         drop(sessions);
 
         {
@@ -12510,7 +12681,7 @@ mod tests {
             let stream = sessions.get_mut(&session).unwrap();
             assert!(AgentBrowserManager::finish_confirmation_decision(
                 stream, &session, record, BrowserConfirmationResponse::Resolved,
-            ).is_none());
+            ).unwrap().is_none());
         }
         assert!(manager.reconcile_existing_stream_attachment(
             &session, &session, BrowserAttachment::Attached,

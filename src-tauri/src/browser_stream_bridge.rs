@@ -221,7 +221,14 @@ async fn bridge_ws<R: Runtime>(
             .await
             .is_some_and(|current| current.identity == target.identity)
         {
-            crate::web_remote::proxy::bridge_ws(socket, target.identity).await;
+            if let Some(mut authorization) = state.app.state::<AgentBrowserManager>()
+                .subscribe_active_stream(target.identity).await {
+                tokio::select! {
+                    biased;
+                    _ = authorization.changed() => {}
+                    _ = crate::web_remote::proxy::bridge_ws(socket, target.identity) => {}
+                }
+            }
         }
     })
 }
@@ -310,6 +317,49 @@ async fn bridge_options<R: Runtime>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn active_desktop_bridge_closes_when_approval_becomes_pending() {
+        use futures_util::{SinkExt, StreamExt};
+        use tokio_tungstenite::tungstenite::{client::IntoClientRequest, Message};
+
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            let app = tauri::test::mock_app();
+            let manager = AgentBrowserManager::new();
+            app.manage(manager.clone());
+            let daemon = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let port = daemon.local_addr().unwrap().port();
+            manager.allow_test_stream_session("browser-pending", port).await;
+            let bridge = BrowserStreamBridge::default();
+            let endpoints = bridge.endpoints(app.handle().clone(), &manager, "browser-pending".into()).await.unwrap();
+
+            let upstream_task = tokio::spawn(async move {
+                let (stream, _) = daemon.accept().await.unwrap();
+                tokio_tungstenite::accept_async(stream).await.unwrap()
+            });
+            let mut request = endpoints.ws_url.clone().into_client_request().unwrap();
+            request.headers_mut().insert(header::ORIGIN, HeaderValue::from_static("tauri://localhost"));
+            let url = url::Url::parse(&endpoints.ws_url).unwrap();
+            let stream = tokio::net::TcpStream::connect(("127.0.0.1", url.port().unwrap())).await.unwrap();
+            let (mut client, _) = tokio_tungstenite::client_async(request.clone(), stream).await.unwrap();
+            let mut upstream = upstream_task.await.unwrap();
+            client.send(Message::text("before approval")).await.unwrap();
+            assert_eq!(upstream.next().await.unwrap().unwrap(), Message::text("before approval"));
+
+            manager.park_test_stream_confirmation("browser-pending").await;
+            let client_end = client.next().await;
+            let upstream_end = upstream.next().await;
+            assert!(matches!(&client_end, None | Some(Ok(Message::Close(_))) | Some(Err(_))),
+                "desktop socket stayed open after approval: {client_end:?}");
+            assert!(matches!(&upstream_end, None | Some(Ok(Message::Close(_))) | Some(Err(_))),
+                "daemon socket stayed open after approval: {upstream_end:?}");
+
+            let stream = tokio::net::TcpStream::connect(("127.0.0.1", url.port().unwrap())).await.unwrap();
+            let denied = tokio_tungstenite::client_async(request, stream).await.unwrap_err();
+            assert!(matches!(denied, tokio_tungstenite::tungstenite::Error::Http(response)
+                if response.status() == StatusCode::FORBIDDEN));
+        }).await.expect("approval must revoke existing and new desktop bridges");
+    }
 
     #[test]
     fn desktop_bridge_only_allows_known_origins_and_loopback_host() {
