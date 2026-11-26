@@ -164,7 +164,7 @@ it("opens the outside-agent guide", async () => {
 it.each([
   ["Copy Claude Code command", "claude mcp add --scope user codemux -- '/opt/My Apps/codemux' mcp --client claude-code"],
   ["Copy Codex command", "codex mcp add codemux -- '/opt/My Apps/codemux' mcp --client codex"],
-  ["Copy Hermes command", "hermes mcp add codemux --command '/opt/My Apps/codemux' --args mcp --client hermes --access supervised"],
+  ["Copy Hermes command", "hermes mcp add codemux --command '/opt/My Apps/codemux' --args mcp --client hermes --access read-only"],
   ["Copy command", "'/opt/My Apps/codemux' mcp --client my-agent"],
 ])("copies each client's local setup command: %s", async (button, command) => {
   api.status.mockResolvedValue(snapshot({ localExecutable: "/opt/My Apps/codemux" }));

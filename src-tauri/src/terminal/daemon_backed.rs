@@ -1429,7 +1429,6 @@ async fn spawn_prepared_session<R: Runtime>(
         ("CODEMUX_SURFACE_ID".into(), session_id.clone()),
         ("CODEMUX_SESSION_ID".into(), session_id.clone()),
         ("CODEMUX_BROWSER_CMD".into(), "codemux browser".into()),
-        ("BROWSER".into(), "codemux browser open".into()),
     ];
     env.push(("CODEMUX_WORKSPACE_ID".into(), workspace_id.clone()));
     for kv in workspace_env.iter() {

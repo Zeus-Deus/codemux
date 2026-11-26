@@ -93,6 +93,215 @@ async fn hooks_and_fsmonitor_run_with_the_agent_marker() {
     saw_marker(&hook, "git_command_tokio checkout");
 }
 
+/// `Command::output()` gives the caller no child pid to register. A hook can
+/// remove its own marker, so a live marked Git ancestor must narrow it without
+/// granting authority from that self-asserted environment value.
+#[cfg(unix)]
+#[test]
+fn hook_clearing_its_marker_cannot_claim_control_socket_owner() {
+    use crate::agent_control::Access;
+    use crate::control_identity::{resolve_socket_caller, SocketCaller};
+    use std::os::unix::fs::PermissionsExt;
+    use std::time::{Duration, Instant};
+
+    let dir = tempfile::tempdir().unwrap();
+    let repo = dir.path().join("repo");
+    std::fs::create_dir(&repo).unwrap();
+    let setup = |args: &[&str]| {
+        let output = std::process::Command::new("git").current_dir(&repo).args(args).output().unwrap();
+        assert!(output.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&output.stderr));
+    };
+    setup(&["init", "-q"]);
+    setup(&[
+        "-c", "user.name=Codemux test", "-c", "user.email=test@example.invalid", "-c", "commit.gpgsign=false",
+        "commit", "-q", "--allow-empty", "-m", "seed",
+    ]);
+
+    let pid_file = dir.path().join("hook.pid");
+    let marker_file = dir.path().join("hook.marker");
+    let release_file = dir.path().join("hook.go");
+    let hook = repo.join(".git/hooks/post-checkout");
+    setup(&["config", "core.hooksPath", hook.parent().unwrap().to_str().unwrap()]);
+    let body = format!(
+        "#!/bin/sh\nunset {AGENT_PROCESS_ENV}\nprintf '%s' \"${{{AGENT_PROCESS_ENV}-unset}}\" > '{}'\necho $$ > '{}'\nwhile [ ! -e '{}' ]; do sleep 0.05; done\n",
+        marker_file.display(), pid_file.display(), release_file.display()
+    );
+    std::fs::write(&hook, body).unwrap();
+    std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    struct Release(std::path::PathBuf);
+    impl Drop for Release {
+        fn drop(&mut self) { let _ = std::fs::write(&self.0, ""); }
+    }
+    let release = Release(release_file);
+    let command_repo = repo.clone();
+    let run = std::thread::spawn(move || git_command().current_dir(command_repo).args(["checkout", "-q", "-b", "probe"]).output());
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let hook_pid = loop {
+        if let Ok(text) = std::fs::read_to_string(&pid_file) {
+            if let Ok(pid) = text.trim().parse::<u32>() { break pid; }
+        }
+        assert!(Instant::now() < deadline, "Git did not start the checkout hook");
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    assert_eq!(std::fs::read_to_string(marker_file).unwrap(), "unset");
+    assert_eq!(crate::control_identity::peer_agent_status(hook_pid), None,
+        "the marked live Git ancestor must remain visible after the hook clears its own marker");
+    let caller = resolve_socket_caller(None, Some(hook_pid));
+    assert!(
+        matches!(&caller, SocketCaller::Unverified),
+        "cleared hook marker claimed write access through Git: {caller:?}"
+    );
+    assert!(caller.permits("notify", Access::Write).is_err());
+    assert!(caller.permits("create_workspace", Access::Machine).is_err());
+    assert!(caller.permits("web_remote_enable", Access::Admin).is_err());
+    drop(release);
+    let output = run.join().unwrap().unwrap();
+    assert!(output.status.success(), "checkout: {}", String::from_utf8_lossy(&output.stderr));
+}
+
+/// A registered agent root above Git still owns its descendants after the
+/// hook clears its marker. The Git marker restricts only unregistered peers.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn registered_agent_root_outweighs_marked_git_ancestor() {
+    use crate::control_identity::{peer_agent_status, register_agent_process};
+    use std::os::unix::fs::PermissionsExt;
+    use std::process::{Child, Command, Stdio};
+    use std::time::{Duration, Instant};
+
+    struct Started(Child);
+    impl Drop for Started {
+        fn drop(&mut self) { let _ = self.0.kill(); let _ = self.0.wait(); }
+    }
+    struct Release(std::path::PathBuf);
+    impl Drop for Release {
+        fn drop(&mut self) { let _ = std::fs::write(&self.0, "go"); }
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    let repo = dir.path().join("repo");
+    let hooks = dir.path().join("hooks");
+    std::fs::create_dir(&repo).unwrap();
+    std::fs::create_dir(&hooks).unwrap();
+    let setup = |args: &[&str]| {
+        let output = Command::new("git").current_dir(&repo).args(args).output().unwrap();
+        assert!(output.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&output.stderr));
+    };
+    setup(&["init", "-q"]);
+    setup(&["-c", "user.name=Codemux test", "-c", "user.email=test@example.invalid",
+        "-c", "commit.gpgsign=false", "commit", "-q", "--allow-empty", "-m", "seed"]);
+    setup(&["config", "core.hooksPath", hooks.to_str().unwrap()]);
+
+    let pid_file = dir.path().join("hook.pid");
+    let release = Release(dir.path().join("release"));
+    let hook = hooks.join("post-checkout");
+    std::fs::write(&hook, format!(
+        "#!/bin/sh\nunset {AGENT_PROCESS_ENV}\necho $$ > '{}'\nwhile [ ! -e '{}' ]; do sleep 0.05; done\n",
+        pid_file.display(), release.0.display(),
+    )).unwrap();
+    std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let mut root = Started(Command::new("sh")
+        .args(["-c", "git -C \"$CODEMUX_TEST_REPO\" checkout -q -b probe"])
+        .env("CODEMUX_TEST_REPO", &repo)
+        .env(AGENT_PROCESS_ENV, "registered-root")
+        .stdout(Stdio::null())
+        .spawn().unwrap());
+    register_agent_process(root.0.id());
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let hook_pid = loop {
+        if let Ok(text) = std::fs::read_to_string(&pid_file) {
+            if let Ok(pid) = text.trim().parse::<u32>() { break pid; }
+        }
+        assert!(Instant::now() < deadline, "registered root never reached its Git hook");
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    assert_eq!(peer_agent_status(hook_pid), Some(true), "the registered root above Git wins");
+    drop(release);
+    assert!(root.0.wait().unwrap().success(), "Git checkout failed");
+}
+
+/// The hook can survive after Git and its marked ancestry have exited. Its
+/// request must remain read-only even if it claims to be an owner or agent.
+#[cfg(target_os = "linux")]
+#[test]
+fn detached_git_hook_cannot_reclaim_owner_socket_access() {
+    use crate::agent_control::{Access, ControlAccess};
+    use crate::control_identity::{AgentProcess, ControlClient, SocketCaller, resolve_socket_caller};
+    use std::os::unix::fs::PermissionsExt;
+    use std::time::{Duration, Instant};
+
+    let dir = tempfile::tempdir().unwrap();
+    let repo = dir.path().join("repo");
+    let hooks = dir.path().join("hooks");
+    std::fs::create_dir(&repo).unwrap();
+    std::fs::create_dir(&hooks).unwrap();
+    let setup = |args: &[&str]| {
+        let output = std::process::Command::new("git").current_dir(&repo).args(args).output().unwrap();
+        assert!(output.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&output.stderr));
+    };
+    setup(&["init", "-q"]);
+    setup(&[
+        "-c", "user.name=Codemux test", "-c", "user.email=test@example.invalid", "-c", "commit.gpgsign=false",
+        "commit", "-q", "--allow-empty", "-m", "seed",
+    ]);
+    setup(&["config", "core.hooksPath", hooks.to_str().unwrap()]);
+
+    let pid_file = dir.path().join("detached.pid");
+    let release_file = dir.path().join("release");
+    let helper = dir.path().join("detached-hook");
+    std::fs::write(&helper, format!(
+        "#!/bin/sh\nunset {AGENT_PROCESS_ENV}\necho $$ > '{}'\nwhile [ ! -e '{}' ]; do sleep 0.05; done\n",
+        pid_file.display(), release_file.display(),
+    )).unwrap();
+    std::fs::set_permissions(&helper, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let hook = hooks.join("post-checkout");
+    std::fs::write(&hook, format!("#!/bin/sh\n'{}' </dev/null >/dev/null 2>&1 &\n", helper.display())).unwrap();
+    std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    struct Release(std::path::PathBuf);
+    impl Drop for Release {
+        fn drop(&mut self) { let _ = std::fs::write(&self.0, "go"); }
+    }
+    let release = Release(release_file);
+    let output = git_command().current_dir(&repo).args(["checkout", "-q", "-b", "detached"]).output().unwrap();
+    assert!(output.status.success(), "checkout: {}", String::from_utf8_lossy(&output.stderr));
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let hook_pid = loop {
+        if let Ok(text) = std::fs::read_to_string(&pid_file) {
+            if let Ok(pid) = text.trim().parse::<u32>() { break pid; }
+        }
+        assert!(Instant::now() < deadline, "detached hook did not publish its PID");
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    assert!(std::fs::read_to_string(format!("/proc/{hook_pid}/stat")).is_ok(), "detached hook exited early");
+
+    for client in [
+        None,
+        Some(ControlClient {
+            name: Some("owner".into()),
+            access: Some(ControlAccess::FullAccess),
+            agent: Some(AgentProcess { kind: "claimed-agent".into() }),
+        }),
+    ] {
+        let caller = resolve_socket_caller(client, Some(hook_pid));
+        assert!(matches!(&caller, SocketCaller::Unverified), "detached hook gained a caller identity: {caller:?}");
+        assert!(caller.permits("status", Access::Read).is_ok());
+        assert!(caller.permits("notify", Access::Write).is_err());
+        assert!(caller.permits("create_workspace", Access::Machine).is_err());
+        assert!(caller.permits("web_remote_enable", Access::Admin).is_err());
+    }
+    drop(release);
+    let stopped = Instant::now() + Duration::from_secs(5);
+    loop {
+        let Ok(stat) = std::fs::read_to_string(format!("/proc/{hook_pid}/stat")) else { break };
+        if stat.rsplit_once(')').is_some_and(|(_, fields)| fields.trim_start().starts_with('Z')) { break; }
+        assert!(Instant::now() < stopped, "detached hook did not stop after release");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
 /// What production code must not call: anything else that starts git, or
 /// `gh` and `glab`, which start git themselves.
 const RAW_GIT: [&str; 9] = [

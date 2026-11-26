@@ -9,6 +9,7 @@
 #![cfg(unix)]
 
 use serde_json::{json, Value};
+use futures_util::{SinkExt, StreamExt};
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::fs::{DirBuilderExt, FileTypeExt};
 use std::os::unix::net::UnixListener;
@@ -16,6 +17,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Output, Stdio};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
+use tokio_tungstenite::tungstenite::Message;
 
 const CODEMUX: &str = env!("CARGO_BIN_EXE_codemux");
 const FAKE_CURSOR: &str = env!("CARGO_BIN_EXE_fake_cursor_acp");
@@ -110,6 +112,8 @@ fn serve_command(root: &Path, port: u16) -> Command {
 struct Serve {
     child: Child,
     root: tempfile::TempDir,
+    port: u16,
+    session_token: String,
 }
 
 impl Serve {
@@ -128,20 +132,23 @@ impl Serve {
         // Keep startup and shutdown browser cleanup inside this fixture.
         std::os::unix::fs::symlink("/bin/true", bin.join("pkill")).unwrap();
         std::os::unix::fs::symlink("/bin/true", bin.join("fuser")).unwrap();
-        let cmd = serve_command(root.path(), free_loopback_port());
-        Self::spawn(root, cmd)
+        let port = free_loopback_port();
+        let cmd = serve_command(root.path(), port);
+        Self::spawn(root, cmd, port)
     }
 
-    fn spawn(root: tempfile::TempDir, mut cmd: Command) -> Self {
+    fn spawn(root: tempfile::TempDir, mut cmd: Command, port: u16) -> Self {
         let log = std::fs::File::create(root.path().join("serve.log")).unwrap();
         cmd.stdout(log.try_clone().unwrap()).stderr(log);
-        Self { child: cmd.spawn().unwrap(), root }
+        Self { child: cmd.spawn().unwrap(), root, port, session_token: String::new() }
     }
 
     fn restart(&mut self) {
         assert!(self.child.try_wait().unwrap().is_some());
         let log = std::fs::File::create(self.root.path().join("serve.log")).unwrap();
-        self.child = serve_command(self.root.path(), free_loopback_port())
+        self.port = free_loopback_port();
+        self.session_token.clear();
+        self.child = serve_command(self.root.path(), self.port)
             .stdout(log.try_clone().unwrap()).stderr(log).spawn().unwrap();
         self.wait_ready();
     }
@@ -165,11 +172,54 @@ impl Serve {
                     std::fs::symlink_metadata(&socket).is_ok_and(|meta| meta.file_type().is_socket()),
                     "serve answered outside its private runtime dir: {socket:?}"
                 );
+                self.pair_remote();
                 return;
             }
             assert!(Instant::now() < deadline, "codemux serve never became ready:\n{}", self.log());
             std::thread::sleep(Duration::from_millis(200));
         }
+    }
+
+    /// Pair through the one-time token printed by this isolated server.
+    /// Authenticated web-remote invokes set up mutations that a standalone
+    /// socket CLI is deliberately no longer allowed to perform.
+    fn pair_remote(&mut self) {
+        let token = self.log().lines()
+            .find_map(|line| line.trim().strip_prefix("Token:").map(str::trim))
+            .expect("serve printed its pairing token")
+            .to_owned();
+        let paired: Value = reqwest::blocking::Client::builder().timeout(Duration::from_secs(10)).build().unwrap()
+            .post(format!("http://127.0.0.1:{}/api/pair", self.port))
+            .json(&json!({"token": token})).send().unwrap().error_for_status().unwrap().json().unwrap();
+        assert_eq!(paired["approved"], true, "{paired}");
+        self.session_token = paired["session_token"].as_str().expect("paired session token").to_owned();
+    }
+
+    fn remote_invoke(&self, command: &str, args: Value) -> Value {
+        let ticket: Value = reqwest::blocking::Client::builder().timeout(Duration::from_secs(10)).build().unwrap()
+            .post(format!("http://127.0.0.1:{}/api/ws-ticket", self.port))
+            .header("Authorization", format!("Bearer {}", self.session_token))
+            .send().unwrap().error_for_status().unwrap().json().unwrap();
+        let ticket = ticket["ticket"].as_str().expect("websocket ticket");
+        let url = format!("ws://127.0.0.1:{}/ws?ticket={ticket}", self.port);
+        tauri::async_runtime::block_on(async {
+            let (mut socket, _) = tokio_tungstenite::connect_async(url).await.expect("remote websocket");
+            socket.send(Message::Text(json!({"t": "invoke", "id": 1, "cmd": command, "args": args}).to_string().into()))
+                .await.expect("remote invoke");
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+            loop {
+                let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+                let frame = tokio::time::timeout(remaining, socket.next()).await.expect("remote invoke timed out")
+                    .expect("remote websocket closed").expect("remote websocket frame");
+                if let Message::Text(text) = frame {
+                    let reply: Value = serde_json::from_str(&text).expect("remote JSON frame");
+                    if reply["id"] == 1 {
+                        assert_eq!(reply["t"], "ok", "{command}: {reply}");
+                        return reply["data"].clone();
+                    }
+                }
+            }
+        })
     }
 
     fn cli(&self, args: &[&str]) -> Output {
@@ -184,12 +234,12 @@ impl Serve {
         stdout_json(&output)
     }
 
-    /// A folder opened as a workspace through the legacy socket command.
+    /// A folder opened through the authenticated remote session.
     fn workspace(&self, name: &str) -> (String, PathBuf) {
         let folder = self.root.path().join(name);
         std::fs::create_dir_all(&folder).unwrap();
-        let created = self.ok(&["json", "create_workspace", &json!({"path": folder}).to_string()]);
-        (created["data"]["workspace_id"].as_str().expect("a workspace id").to_owned(), folder)
+        let created = self.remote_invoke("create_workspace", json!({"cwd": folder}));
+        (created.as_str().expect("a workspace id").to_owned(), folder)
     }
 
     fn shutdown(&mut self) -> Option<ExitStatus> {
@@ -616,11 +666,12 @@ fn tools_lists_registry_tools_for_the_named_client() {
     let serve = Serve::start();
     let listed = serve.ok(&["--client", "itest", "tools", "--json"]);
     assert_eq!((listed["ok"].clone(), listed["door"].clone()), (json!(true), json!("local")));
-    assert_eq!(listed["caller"]["principal"], "local:itest", "{listed}");
+    assert_eq!(listed["caller"]["principal"], "socket:unverified", "{listed}");
     let names: Vec<&str> = listed["tools"].as_array().unwrap().iter().filter_map(|tool| tool["name"].as_str()).collect();
-    for name in ["thread_launch", "thread_wait", "workspace_list"] {
+    for name in ["thread_wait", "workspace_list"] {
         assert!(names.contains(&name), "{name} in {names:?}");
     }
+    assert!(!names.contains(&"thread_launch"), "{names:?}");
     // A read-only client is offered only what it can run.
     let narrowed = serve.ok(&["--client", "itest", "--access", "read-only", "tools", "--json"]);
     let names: Vec<&str> = narrowed["tools"].as_array().unwrap().iter().filter_map(|tool| tool["name"].as_str()).collect();
@@ -655,43 +706,38 @@ fn call_round_trips_and_reports_coded_errors() {
 #[test]
 fn thread_start_needs_a_permission_mode_and_the_cli_adds_none() {
     let serve = Serve::start();
-    let (workspace, _) = serve.workspace("project");
+    let workspace = serve.ok(&["json", "status"])["data"]["active_workspace_id"].as_str().unwrap().to_owned();
     // The CLI refuses to guess one.
     let usage = serve.cli(&["thread", "start", "--workspace", &workspace, "--provider", "codex", "-m", "hi"]);
     assert_eq!(exit_code(&usage), 64);
-    // And the server refuses a launch that names none.
+    // Socket policy refuses the write before considering launch arguments.
     let launch = json!({"workspace_id": workspace, "client_request_id": "itest-no-mode", "provider": "codex", "message": "hi"});
     let refused = serve.cli(&["call", "thread_launch", &launch.to_string()]);
     assert_eq!(exit_code(&refused), 1);
     let error = &stdout_json(&refused)["error"];
-    assert_eq!(error["code"], "invalid_arguments", "{error}");
-    assert!(error["message"].as_str().unwrap().contains("permission_mode"), "{error}");
+    assert_eq!(error["code"], "access_denied", "{error}");
 }
 
 #[test]
-fn workspace_create_list_info_close_round_trip() {
+fn workspace_create_and_close_refused_while_reads_work() {
     let serve = Serve::start();
     let folder = serve.root.path().join("opened");
     std::fs::create_dir_all(&folder).unwrap();
     let folder = folder.display().to_string();
-
-    let created = serve.ok(&["workspace", "create", &folder, "--request-id", "itest-open", "--json"]);
-    assert_eq!(created["ok"], true, "{created}");
-    let workspace = created["result"]["workspace_id"].as_str().expect("a workspace id").to_owned();
-    // The same key replays the same outcome.
-    let replayed = serve.ok(&["workspace", "create", &folder, "--request-id", "itest-open", "--json"]);
-    assert_eq!(replayed["result"]["workspace_id"], workspace.as_str(), "{replayed}");
-
+    let create = serve.cli(&["workspace", "create", &folder, "--request-id", "itest-open", "--json"]);
+    assert_eq!(exit_code(&create), 1);
+    assert_eq!(stdout_json(&create)["error"]["code"], "access_denied");
+    let workspace = serve.ok(&["json", "status"])["data"]["active_workspace_id"].as_str().unwrap().to_owned();
     let text = serve.cli(&["workspace", "list"]);
     assert!(String::from_utf8_lossy(&text.stdout).contains(&workspace), "{}", String::from_utf8_lossy(&text.stdout));
     let info = serve.ok(&["workspace", "info", &workspace, "--json"]);
     assert_eq!(info["result"]["workspace_id"], workspace.as_str());
-
-    let closed = serve.ok(&["workspace", "close", &workspace, "--json"]);
-    assert_eq!(closed["ok"], true, "{closed}");
+    let closed = serve.cli(&["workspace", "close", &workspace, "--json"]);
+    assert_eq!(exit_code(&closed), 1);
+    assert_eq!(stdout_json(&closed)["error"]["code"], "access_denied");
     let listed = serve.ok(&["workspace", "list", "--json"]);
     let ids: Vec<&str> = listed["result"]["workspaces"].as_array().unwrap().iter().filter_map(|w| w["workspace_id"].as_str()).collect();
-    assert!(!ids.contains(&workspace.as_str()), "{ids:?}");
+    assert!(ids.contains(&workspace.as_str()), "{ids:?}");
 }
 
 #[test]
@@ -754,7 +800,7 @@ fn serve_keeps_a_repair_installed_during_recovery_through_shutdown() {
     let (id, _) = serve.workspace("flush-after-repair");
     // Closing a workspace forces a journaled layout flush. Normal shutdown
     // then drains the queued writer and does its guarded final save.
-    serve.ok(&["workspace", "close", &id, "--json"]);
+    serve.remote_invoke("close_workspace", json!({"workspaceId": id}));
     assert!(serve.shutdown().unwrap().success(), "{}", serve.log());
     assert_eq!(std::fs::read(&layout).unwrap(), repaired);
     serve.restart();
@@ -1044,7 +1090,7 @@ fn serve_refuses_to_share_a_layout_with_another_instance() {
     let contender_root = tempfile::tempdir().unwrap();
     let mut cmd = serve_command(owner.root.path(), port);
     cmd.env("XDG_RUNTIME_DIR", contender_root.path());
-    let mut contender = Serve::spawn(contender_root, cmd);
+    let mut contender = Serve::spawn(contender_root, cmd, port);
     let status = contender.wait_for_exit().unwrap_or_else(|| {
         panic!("second serve did not exit:\n{}", contender.log());
     });
@@ -1054,8 +1100,8 @@ fn serve_refuses_to_share_a_layout_with_another_instance() {
     assert_eq!(std::fs::read(&layout).unwrap(), saved);
     assert_eq!(std::fs::metadata(&layout).unwrap().ino(), layout_inode, "second serve replaced the layout");
 
-    let live = owner.ok(&["json", "status"]);
-    assert_eq!(live["data"]["active_workspace_id"].as_str(), Some(workspace_id.as_str()));
+    let live = owner.ok(&["workspace", "info", &workspace_id, "--json"]);
+    assert_eq!(live["result"]["workspace_id"], workspace_id);
 }
 
 #[test]
@@ -1076,79 +1122,23 @@ fn serve_preserves_an_unreadable_layout_link() {
 
 #[cfg(target_os = "linux")]
 #[test]
-fn serve_sigterm_drains_an_admitted_workspace_creation_before_saving() {
+fn standalone_workspace_creation_is_refused_before_project_git_runs() {
     use std::os::unix::fs::PermissionsExt;
 
-    // The wrapper blocks only the new project's Git read, before the
-    // admitted create command can insert the workspace into app state.
     let mut serve = Serve::start();
-    let root = serve.root.path().to_path_buf();
-    let folder = root.join("shutdown-workspace");
+    let root = serve.root.path();
+    let folder = root.join("refused-workspace");
     std::fs::create_dir_all(&folder).unwrap();
     let git = root.join("bin/git");
-    std::fs::write(&git, r#"#!/bin/sh
-if [ "$PWD" = "$HOME/shutdown-workspace" ] && [ "$1" = branch ] && [ "$2" = --show-current ]; then
-    : > "$HOME/workspace-git-entered"
-    remaining=3000
-    while [ ! -f "$HOME/workspace-git-release" ] && [ "$remaining" -gt 0 ]; do
-        remaining=$((remaining - 1))
-        sleep 0.01
-    done
-    [ -f "$HOME/workspace-git-release" ] || exit 124
-fi
-exec /usr/bin/git "$@"
-"#).unwrap();
+    std::fs::write(&git, "#!/bin/sh\n: > \"$HOME/workspace-git-entered\"\nexec /usr/bin/git \"$@\"\n").unwrap();
     std::fs::set_permissions(git, std::fs::Permissions::from_mode(0o755)).unwrap();
-    let params = json!({"path": folder}).to_string();
-    let pid = serve.child.id();
-    let entered = root.join("workspace-git-entered");
 
-    let output = std::thread::scope(|scope| {
-        struct ReleaseGit(PathBuf);
-        impl Drop for ReleaseGit {
-            fn drop(&mut self) {
-                let _ = std::fs::write(&self.0, b"");
-            }
-        }
-        let release = ReleaseGit(root.join("workspace-git-release"));
-        let creating = scope.spawn(|| cli_in(&root, &["json", "create_workspace", &params]));
-
-        let deadline = Instant::now() + Duration::from_secs(10);
-        while !entered.is_file() {
-            assert!(Instant::now() < deadline, "workspace creation never reached Git:\n{}", serve.log());
-            std::thread::sleep(Duration::from_millis(10));
-        }
-        assert_eq!(unsafe { libc::kill(pid as i32, libc::SIGTERM) }, 0);
-
-        let deadline = Instant::now() + Duration::from_secs(10);
-        loop {
-            let status = serve.cli(&["json", "status"]);
-            if !status.status.success()
-                && [&status.stdout, &status.stderr].iter().any(|bytes| {
-                    String::from_utf8_lossy(bytes).contains("Codemux is shutting down")
-                })
-            {
-                break;
-            }
-            assert!(serve.child.try_wait().unwrap().is_none(), "serve exited during the workspace mutation:\n{}", serve.log());
-            assert!(Instant::now() < deadline, "serve never closed admission:\n{}", serve.log());
-            std::thread::sleep(Duration::from_millis(10));
-        }
-
-        drop(release);
-        creating.join().unwrap()
-    });
-    assert!(output.status.success(), "admitted workspace creation failed:\n{}\n{}",
-        String::from_utf8_lossy(&output.stderr), serve.log());
-    let created = stdout_json(&output);
-    let workspace_id = created["data"]["workspace_id"].as_str().expect("a workspace id");
-
-    let status = serve.wait_for_exit().expect("serve should stop after draining the workspace creation");
-    assert!(status.success(), "serve exited with {status}:\n{}", serve.log());
-    let layout: Value = serde_json::from_slice(&std::fs::read(layout_path(&root)).unwrap()).unwrap();
-    assert!(layout["workspaces"].as_array().unwrap().iter().any(|workspace| {
-        workspace["workspace_id"].as_str() == Some(workspace_id)
-    }), "admitted workspace {workspace_id} was missing from the shutdown layout");
+    let refused = serve.cli(&["json", "create_workspace", &json!({"path": folder}).to_string()]);
+    assert_eq!(exit_code(&refused), 1);
+    assert!(stdout_json(&refused)["error"].as_str().unwrap_or_default().contains("access_denied"),
+        "{}", String::from_utf8_lossy(&refused.stdout));
+    assert!(!root.join("workspace-git-entered").exists(), "refused write reached Git");
+    assert!(serve.shutdown().expect("serve stops after the refusal").success());
 }
 
 #[test]
@@ -1172,11 +1162,9 @@ fn serve_sigterm_reports_layout_save_failure() {
 }
 
 #[test]
-fn thread_start_wait_completes_with_a_fixture_provider() {
+fn thread_start_is_refused_even_with_a_configured_fixture_provider() {
     let serve = Serve::start();
-    let (workspace, _) = serve.workspace("project");
-    // Providers register in the background after boot. A configured Cursor
-    // is enough: the launch checks the permission mode against its catalog.
+    let workspace = serve.ok(&["json", "status"])["data"]["active_workspace_id"].as_str().unwrap().to_owned();
     let deadline = Instant::now() + Duration::from_secs(60);
     loop {
         let probe = serve.cli(&["call", "agent_capabilities", &json!({"workspace_id": workspace, "provider": "cursor"}).to_string()]);
@@ -1184,102 +1172,56 @@ fn thread_start_wait_completes_with_a_fixture_provider() {
         if caps["result"]["providers"][0]["configured"] == true {
             break;
         }
-        // Only a provider still starting is worth waiting for.
         let code = caps["error"]["code"].as_str().unwrap_or("provider_not_ready");
         assert!(matches!(code, "provider_not_configured" | "provider_not_ready"), "{caps}");
         assert!(Instant::now() < deadline, "Cursor never registered: {caps}\n{}", serve.log());
         std::thread::sleep(Duration::from_millis(500));
     }
-
-    let start = |extra: &[&str]| {
-        let mut args = vec!["--client", "itest", "thread", "start", "--workspace", &workspace, "--provider", "cursor",
-            "--permission-mode", "agent", "-m", "echo-prompt PONG", "--request-id", "itest-launch", "--json"];
-        args.extend_from_slice(extra);
-        serve.cli(&args)
-    };
-    let waited = start(&["--wait", "--timeout", "2m"]);
-    assert_eq!(exit_code(&waited), 0, "{}\n{}\n{}", String::from_utf8_lossy(&waited.stdout), String::from_utf8_lossy(&waited.stderr), serve.log());
-    let report = stdout_json(&waited);
-    assert_eq!((report["ok"].clone(), report["state"].clone()), (json!(true), json!("done")), "{report}");
-    assert!(report["final_text"].as_str().unwrap_or_default().contains("PONG"), "{report}");
-    let thread = report["thread_id"].as_str().expect("a thread id").to_owned();
-    assert_eq!(report["client_request_id"], "itest-launch");
-
-    // Retrying the same key returns the same thread, not a second one.
-    let retried = start(&[]);
-    assert_eq!(exit_code(&retried), 0);
-    assert_eq!(stdout_json(&retried)["result"]["thread_id"], thread.as_str());
-
-    let page = serve.ok(&["--client", "itest", "thread", "read", &thread, "--workspace", &workspace, "--all", "--json"]);
-    assert!(page["result"]["messages"].as_array().is_some_and(|messages| !messages.is_empty()), "{page}");
-    let status = serve.ok(&["--client", "itest", "thread", "status", &thread, "--workspace", &workspace, "--json"]);
-    assert_eq!(status["result"]["state"], "done", "{status}");
-    // A finished run's wait returns at once.
-    let again = serve.ok(&["--client", "itest", "thread", "wait", &thread, "--workspace", &workspace, "--json"]);
-    assert_eq!(again["state"], "done", "{again}");
-    let stopped = serve.ok(&["--client", "itest", "thread", "stop", &thread, "--workspace", &workspace, "--json"]);
-    assert_eq!(stopped["ok"], true, "{stopped}");
+    let started = serve.cli(&["--client", "itest", "thread", "start", "--workspace", &workspace,
+        "--provider", "cursor", "--permission-mode", "agent", "-m", "echo-prompt PONG", "--json"]);
+    assert_eq!(exit_code(&started), 1, "{}", String::from_utf8_lossy(&started.stdout));
+    assert_eq!(stdout_json(&started)["error"]["code"], "access_denied");
 }
 
 #[test]
-fn connector_status_enable_and_disable_round_trip() {
+fn connector_admin_commands_are_refused_to_standalone_cli() {
     let serve = Serve::start();
-    let status = serve.ok(&["connector", "status", "--json"]);
-    assert_eq!((status["tool"].clone(), status["result"]["enabled"].clone()), (json!("agent_connector_status"), json!(false)));
-    // Integration builds default to the real 4378; never take it here.
-    let port = free_loopback_port();
-    let enabled = serve.ok(&["connector", "enable", "--port", &port.to_string(), "--json"]);
-    assert_eq!(enabled["result"]["enabled"], true, "{enabled}");
-    assert_eq!(enabled["result"]["port"], port, "{enabled}");
-    assert_eq!(enabled["result"]["localUrl"], format!("http://127.0.0.1:{port}/mcp"), "{enabled}");
-    let listed = serve.ok(&["connector", "list", "--json"]);
-    assert!(listed["result"]["clients"].is_array(), "{listed}");
-    let pending = serve.ok(&["connector", "pending", "--json"]);
-    assert!(pending["result"]["pending"].is_array(), "{pending}");
-    let disabled = serve.ok(&["connector", "disable", "--json"]);
-    assert_eq!(disabled["result"]["enabled"], false, "{disabled}");
-
-    // Revoking a name that matches nothing is refused, not a silent success.
-    let unknown = serve.cli(&["connector", "revoke", "nobody", "--json"]);
-    assert_eq!(exit_code(&unknown), 1);
-    assert_eq!(stdout_json(&unknown)["error"]["code"], "invalid_arguments");
+    let port = free_loopback_port().to_string();
+    for args in [
+        vec!["connector", "status", "--json"],
+        vec!["connector", "enable", "--port", &port, "--json"],
+        vec!["connector", "disable", "--json"],
+        vec!["connector", "list", "--json"],
+        vec!["connector", "pending", "--json"],
+        vec!["connector", "issue", "--label", "itest-bot", "--json"],
+        vec!["connector", "revoke", "itest-bot", "--json"],
+    ] {
+        let refused = serve.cli(&args);
+        assert_eq!(exit_code(&refused), 1, "{}: {}", args.join(" "), String::from_utf8_lossy(&refused.stdout));
+        assert_eq!(stdout_json(&refused)["error"]["code"], "admin_refused", "{}", args.join(" "));
+    }
 }
 
 #[test]
-fn connector_tokens_issue_list_and_revoke() {
+fn serve_banner_names_desktop_settings_for_connector_administration() {
     let serve = Serve::start();
-    // Its own port, so the door never touches the default 4378.
-    serve.ok(&["connector", "enable", "--port", &free_loopback_port().to_string(), "--json"]);
-    let issued = serve.ok(&["connector", "issue", "--label", "itest-bot", "--expires", "1d", "--json"]);
-    let token = issued["result"]["token"].as_str().expect("a token");
-    assert!(token.starts_with("cmcp_"), "{issued}");
-    assert_eq!(issued["result"]["access"], "supervised", "tokens default to supervised");
-
-    let text = serve.cli(&["connector", "list"]);
-    assert!(String::from_utf8_lossy(&text.stdout).contains("itest-bot"), "{}", String::from_utf8_lossy(&text.stdout));
-    serve.ok(&["connector", "revoke", "ITEST-BOT", "--json"]);
-    let listed = serve.ok(&["connector", "list", "--json"]);
-    assert!(!listed.to_string().contains("itest-bot"), "{listed}");
-
-    serve.ok(&["connector", "issue", "--label", "second-bot", "--access", "read-only", "--json"]);
-    serve.ok(&["connector", "issue", "--label", "third-bot", "--json"]);
-    assert_eq!(serve.ok(&["connector", "list", "--json"])["result"]["clients"].as_array().map(Vec::len), Some(2));
-    serve.ok(&["connector", "revoke", "--all", "--json"]);
-    let status = serve.ok(&["connector", "status", "--json"]);
-    assert_eq!(status["result"]["clients"], json!([]), "{status}");
-    assert_eq!(status["result"]["enabled"], true, "revoke --all leaves the door on: {status}");
+    let banner = serve.log();
+    assert!(banner.contains("agent connector is off; enable it in desktop Settings"), "{banner}");
+    assert!(banner.contains("Foreground serve prints a fresh pairing link when restarted"), "{banner}");
+    assert!(!banner.contains("Run `codemux connector enable`"), "{banner}");
+    assert!(!banner.contains("Run `codemux remote pair`"), "{banner}");
 }
 
-/// Settings and the guide print setup commands from these two fields.
 #[test]
-fn connector_status_names_the_executable_outside_assistants_launch() {
+fn standalone_remote_cli_cannot_mint_pairing_or_change_listener() {
     let serve = Serve::start();
-    let status = serve.ok(&["connector", "status", "--json"])["result"].clone();
-    let executable = status["localExecutable"].as_str().expect("localExecutable");
-    // PATH reaches no codemux, or another install, never this test build, so
-    // it names the binary itself.
-    assert!(Path::new(executable).is_absolute(), "{status}");
-    assert_eq!(std::fs::canonicalize(executable).unwrap(), std::fs::canonicalize(CODEMUX).unwrap());
-    let command = status["localCommand"].as_str().expect("localCommand");
-    assert!(command.ends_with(" mcp") && command.contains(executable), "{status}");
+    let pair = serve.cli(&["remote", "pair"]);
+    assert_eq!(exit_code(&pair), 1, "{}", String::from_utf8_lossy(&pair.stderr));
+    assert!(String::from_utf8_lossy(&pair.stderr).contains("needs verified owner access"));
+
+    let other_port = free_loopback_port().to_string();
+    let enable = serve.cli(&["remote", "enable", "--port", &other_port]);
+    assert_eq!(exit_code(&enable), 1, "{}", String::from_utf8_lossy(&enable.stderr));
+    assert!(String::from_utf8_lossy(&enable.stderr).contains("needs verified owner access"));
+    assert_eq!(serve.ok(&["json", "web_remote_status"])["data"]["port"].as_u64(), Some(serve.port as u64));
 }

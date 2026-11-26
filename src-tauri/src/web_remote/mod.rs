@@ -436,10 +436,9 @@ pub(crate) fn mint_pairing(shared: &Arc<Shared>, suggested_name: Option<String>)
     }
 }
 
-/// Result of the `web_remote_pair` control-socket command (the
-/// `codemux remote pair` CLI over SSH): a freshly minted pairing token plus
-/// the recommended endpoint's full pairing URL, so the terminal can print a
-/// scannable link + QR without the desktop GUI ever being opened.
+/// Result of the owner-gated `web_remote_pair` control command: a freshly
+/// minted pairing token plus the recommended endpoint's full pairing URL,
+/// which the headless startup banner can print as a link and QR.
 #[derive(Debug, Clone, Serialize)]
 pub struct ControlPairing {
     /// Full URL a browser opens to auto-pair, on the recommended endpoint:
@@ -513,10 +512,9 @@ pub(crate) fn control_pair_from(
     })
 }
 
-/// Mint a pairing token for the same-machine control socket (the
-/// `codemux remote pair` CLI over SSH). Reuses the shared [`mint_pairing`]
-/// token path and the endpoint enumeration, so the terminal flow and the
-/// GUI flow are the same code underneath.
+/// Mint a pairing token for a trusted owner path. Reuses the shared
+/// [`mint_pairing`] token path and endpoint enumeration, so the headless
+/// startup banner and GUI use the same code underneath.
 pub fn control_pair<R: Runtime>(
     app: &AppHandle<R>,
     suggested_name: Option<String>,
@@ -528,10 +526,8 @@ pub fn control_pair<R: Runtime>(
     control_pair_from(&shared, suggested_name)
 }
 
-/// Result of the `web_remote_enable` control-socket command (the
-/// `codemux remote enable` CLI over SSH): the resulting live status plus the
-/// recommended reachable endpoint, so the terminal can tell the user the port,
-/// bind scope, and where to point `codemux remote pair` next.
+/// Result of the owner-gated `web_remote_enable` control command: the live
+/// status plus the recommended reachable endpoint.
 #[derive(Debug, Clone, Serialize)]
 pub struct ControlEnableResult {
     /// The live server + device status after the enable (or config change).
@@ -611,9 +607,9 @@ fn recommended_endpoint(port: u16) -> Option<endpoints::Endpoint> {
         .cloned()
 }
 
-/// Enable web remote access from the same-machine control socket (the
-/// `codemux remote enable` CLI over SSH). Shares the exact bind/rollback and
-/// `web-remote-state-changed` emission paths the Tauri commands use:
+/// Enable web remote access through an owner-gated control path. Shares the
+/// exact bind/rollback and `web-remote-state-changed` emission paths the
+/// Tauri commands use:
 ///
 /// - Off (or on without the LAN listener, e.g. relay-only) → on: fold the
 ///   requested `scope`/`port` into config, turn the kill switch and the LAN
@@ -777,10 +773,10 @@ pub async fn control_set_relay<R: Runtime>(
     set_config_core(app, &shared, change).await
 }
 
-/// Disable web remote access from the same-machine control socket (the
-/// `codemux remote disable` CLI over SSH). Shares the exact [`disable_core`]
-/// path the Tauri command uses: severs live sockets, tears the iroh endpoint
-/// down, stops registration, and emits `web-remote-state-changed`.
+/// Disable web remote access through an owner-gated control path. Shares the
+/// [`disable_core`] path the Tauri command uses: severs live sockets, tears
+/// the iroh endpoint down, stops registration, and emits
+/// `web-remote-state-changed`.
 pub fn control_disable<R: Runtime>(app: &AppHandle<R>) -> Result<WebRemoteStatus, String> {
     let shared = app.state::<WebRemoteState>().shared();
     disable_core(app, &shared)
@@ -2037,7 +2033,7 @@ mod tests {
         assert_eq!(addrs.len(), 2, "exactly loopback + the one tailnet address");
     }
 
-    // ── Control-socket pairing (codemux remote pair over SSH) ───────
+    // ── Owner-gated control pairing ────────────────────────────────────
 
     #[test]
     fn control_pair_errors_when_disabled() {

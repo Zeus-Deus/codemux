@@ -1,7 +1,6 @@
-//! The control socket end to end through the built `codemux` binary: it tells
-//! the owner from processes Codemux started for agents, `codemux mcp` carries
-//! a client's name and access, and the legacy workspace commands keep their
-//! shapes.
+//! The control socket end to end through the built `codemux` binary: external
+//! CLI processes can read but cannot claim owner authority from a same-user
+//! PID, name, or agent marker.
 //!
 //! Each test runs its own `codemux serve` child in a throwaway home with its
 //! own `XDG_RUNTIME_DIR`, and drives it with the `codemux` CLI. Every child
@@ -24,8 +23,6 @@ const CODEMUX: &str = env!("CARGO_BIN_EXE_codemux");
 const SOCKET: &str = if cfg!(debug_assertions) { "codemux-dev.sock" } else { "codemux.sock" };
 const AGENT_PROCESS: &str = "CODEMUX_AGENT_PROCESS";
 const PROVIDER_ORIGIN: &str = "CODEMUX_MCP_PROVIDER_ORIGIN";
-const IDENTITY_VARS: [&str; 4] =
-    [AGENT_PROCESS, "CODEMUX_MCP_GATEWAY_URL", "CODEMUX_MCP_GATEWAY_TOKEN", PROVIDER_ORIGIN];
 
 /// A `codemux serve` child, stopped (SIGTERM, then kill) when dropped.
 struct Serve {
@@ -246,7 +243,7 @@ fn error_code(reply: &Value) -> &str {
 }
 
 #[test]
-fn agent_marked_cli_is_refused_admin_but_owner_is_not() {
+fn external_cli_reads_but_cannot_claim_owner_or_agent_access() {
     let serve = Serve::start(&[]);
     let marker = [(AGENT_PROCESS, "1")];
 
@@ -259,158 +256,72 @@ fn agent_marked_cli_is_refused_admin_but_owner_is_not() {
     assert_eq!(error_code(&terminal_agent), "admin_refused", "a terminal agent uses the current marker: {terminal_agent}");
 
     let legacy = serve.json("agent_connector_status", "{}", &[(PROVIDER_ORIGIN, "1")]);
-    assert_eq!(legacy["ok"], true, "the retired MCP marker does not identify a CLI agent: {legacy}");
+    assert_eq!(error_code(&legacy), "admin_refused", "the retired marker cannot claim owner access: {legacy}");
 
     let owner = serve.json("agent_connector_status", "{}", &[]);
-    assert_eq!(owner["ok"], true, "{owner}");
+    assert_eq!(error_code(&owner), "admin_refused", "a separate CLI has no owner proof: {owner}");
 
     let status = serve.json("status", "{}", &marker);
     assert_eq!(status["ok"], true, "agents keep read commands: {status}");
     let notify = serve.json("notify", r#"{"message":"from an agent"}"#, &marker);
-    assert_eq!(notify["ok"], true, "agents keep write commands: {notify}");
+    assert_eq!(error_code(&notify), "access_denied", "the marker cannot grant writes: {notify}");
 
     let native = serve.json("thread_list", r#"{"workspace_id":"none"}"#, &marker);
-    assert_eq!(error_code(&native), "agent_identity_required", "{native}");
+    assert_eq!(error_code(&native), "workspace_not_found", "registry reads reach the app as unverified: {native}");
+    let tools = serve.json("tools_list", "{}", &[]);
+    assert_eq!(tools["data"]["caller"], json!({"principal": "socket:unverified", "access": "read_only"}), "{tools}");
+    assert!(tools["data"]["tools"].as_array().unwrap().iter().all(|tool| tool["annotations"]["readOnlyHint"] == true));
+    let read = serve.json("tool_call", r#"{"name":"workspace_list","arguments":{}}"#, &[]);
+    assert_eq!(read["data"]["isError"], false, "{read}");
+    let write = serve.json("tool_call", r#"{"name":"workspace_create","arguments":{"path":"/tmp"}}"#, &[]);
+    assert_eq!(write["data"]["structuredContent"]["error"]["code"], "access_denied", "{write}");
 }
 
 #[test]
-fn pty_shell_is_the_owner() {
-    // An instance started from an agent's shell: every identity var is set.
+fn inherited_identity_cannot_authorize_an_external_cli() {
+    // The serve process may have been launched from an agent shell, but its
+    // separate CLI peers still need independent owner proof.
     let serve = Serve::start(&[
         (AGENT_PROCESS, "1"),
         (PROVIDER_ORIGIN, "1"),
         ("CODEMUX_MCP_GATEWAY_URL", "http://127.0.0.1:1/mcp"),
         ("CODEMUX_MCP_GATEWAY_TOKEN", "inherited"),
     ]);
-    let root = serve.root.path();
-    let project = root.join("project");
-    std::fs::create_dir_all(&project).unwrap();
-    let created = serve.json("create_workspace", &json!({ "path": project }).to_string(), &[]);
-    assert_eq!(created["ok"], true, "{created}");
-
-    // Type into the new workspace's terminal, as the owner.
-    let (env_dump, out) = (root.join("env.txt"), root.join("out.json"));
-    let line = format!(
-        "env > '{env}'; '{CODEMUX}' json agent_connector_status '{{}}' > '{out}.part' && mv '{out}.part' '{out}'\n",
-        env = env_dump.display(),
-        out = out.display(),
-    );
-    let params = json!({ "data": line }).to_string();
-    let deadline = Instant::now() + Duration::from_secs(60);
-    loop {
-        // The terminal registers shortly after the workspace opens.
-        let written = serve.json("write_terminal", &params, &[]);
-        if written["ok"] == true {
-            break;
-        }
-        assert!(Instant::now() < deadline, "the terminal never accepted input: {written}\n{}", serve.log());
-        std::thread::sleep(Duration::from_millis(200));
-    }
-    while !out.exists() {
-        assert!(Instant::now() < deadline, "the terminal never ran the command:\n{}", serve.log());
-        std::thread::sleep(Duration::from_millis(100));
-    }
-
-    let reply: Value = serde_json::from_str(&std::fs::read_to_string(&out).unwrap()).unwrap();
-    assert_eq!(reply["ok"], true, "a user's terminal is the owner: {reply}");
-    let env = std::fs::read_to_string(&env_dump).unwrap();
-    for key in IDENTITY_VARS {
-        assert!(!env.lines().any(|line| line.starts_with(&format!("{key}="))), "{key} reached the terminal");
-    }
-    assert!(env.contains("CODEMUX_SESSION_ID="), "the dump is the terminal's env");
+    let project = serve.root.path().join("project");
+    std::fs::create_dir(&project).unwrap();
+    assert_eq!(serve.json("status", "{}", &[])["ok"], true);
+    let admin = serve.json("agent_connector_status", "{}", &[]);
+    assert_eq!(error_code(&admin), "admin_refused", "{admin}");
+    let create = serve.json("create_workspace", &json!({ "path": project }).to_string(), &[]);
+    assert_eq!(error_code(&create), "access_denied", "{create}");
 }
 
-/// Setup scripts come from the folder's `.codemux/config.json`, which an
-/// agent can write, and an agent may run them (`create_workspace` and
-/// `rerun_setup` are Machine class). A `codemux` they start is an agent
-/// process whoever triggered the setup, so it cannot answer for the person
-/// or mint a connector token.
+/// An unverified CLI cannot start a project's setup script, even if it
+/// supplies or clears the old agent marker.
 #[test]
-fn setup_scripts_are_agent_processes() {
+fn external_cli_cannot_trigger_project_setup() {
     let serve = Serve::start(&[]);
-    let root = serve.root.path();
-    // Who opens the folder: the owner, then an agent's shell.
-    for (name, env) in [("owner", &[][..]), ("agent", &[(AGENT_PROCESS, "1")][..])] {
-        let project = root.join(name);
+    for (name, env) in [("plain", &[][..]), ("marked", &[(AGENT_PROCESS, "1")][..])] {
+        let project = serve.root.path().join(name);
         std::fs::create_dir_all(project.join(".codemux")).unwrap();
-        let file = |suffix: &str| root.join(format!("{name}.{suffix}"));
-        let (env_dump, marked, unmarked, done) = (file("env"), file("marked.json"), file("unmarked.json"), file("done"));
-        // An admin command, the way an agent's script would ask; the second
-        // call clears the marker, which only the process ancestry still catches.
-        let script = format!(
-            "env > '{env}'; '{CODEMUX}' json agent_connector_status '{{}}' > '{marked}'; \
-             env -u {AGENT_PROCESS} '{CODEMUX}' json agent_connector_status '{{}}' > '{unmarked}'; touch '{done}'",
-            env = env_dump.display(),
-            marked = marked.display(),
-            unmarked = unmarked.display(),
-            done = done.display(),
-        );
+        let ran = project.join("setup-ran");
+        let script = format!("touch '{}'", ran.display());
         std::fs::write(project.join(".codemux/config.json"), json!({ "setup": [script] }).to_string()).unwrap();
-
-        // The setup runs in the background once the folder is open.
         let created = serve.json("create_workspace", &json!({ "path": project }).to_string(), env);
-        assert_eq!(created["ok"], true, "{name}: {created}");
-        let deadline = Instant::now() + Duration::from_secs(60);
-        while !done.exists() {
-            assert!(Instant::now() < deadline, "{name}: the setup script never finished:\n{}", serve.log());
-            std::thread::sleep(Duration::from_millis(100));
-        }
-        let reply = |file: &Path| -> Value { serde_json::from_str(&std::fs::read_to_string(file).unwrap()).unwrap() };
-        let marked = reply(&marked);
-        assert_eq!(error_code(&marked), "admin_refused", "{name}: a setup script is an agent: {marked}");
-        if cfg!(target_os = "linux") {
-            let unmarked = reply(&unmarked);
-            assert_eq!(error_code(&unmarked), "admin_refused", "{name}: ancestry marks it too: {unmarked}");
-        }
-        let env = std::fs::read_to_string(&env_dump).unwrap();
-        assert!(env.lines().any(|line| line == format!("{AGENT_PROCESS}=setup-script")), "{name}: {env}");
+        assert_eq!(error_code(&created), "access_denied", "{name}: {created}");
+        assert!(!ran.exists(), "a refused setup ran for {name}");
     }
-    let owner = serve.json("agent_connector_status", "{}", &[]);
-    assert_eq!(owner["ok"], true, "the owner keeps admin commands: {owner}");
 }
 
-/// A socket `rerun_setup`, and a socket close that runs a worktree's
-/// teardown, wait for their scripts, and a script may call `codemux` back.
-/// The server must still answer that call while the command waits, so the
-/// script gets its agent refusal and the command returns.
+/// The legacy setup and close commands also gate access before they
+/// attempt to resolve a workspace or execute its scripts.
 #[test]
-fn socket_setup_and_teardown_scripts_can_call_codemux_back() {
+fn external_cli_cannot_run_setup_or_teardown_commands() {
     let serve = Serve::start(&[]);
-    let root = serve.root.path();
-    let repo = root.join("repo");
-    std::fs::create_dir_all(&repo).unwrap();
-    git(&repo, &["init", "-b", "trunk"]);
-    git(&repo, &["commit", "--allow-empty", "-m", "first"]);
-    let params = json!({ "repo_path": repo, "branch": "feat", "layout": "empty" });
-    let created = serve.json("create_worktree_workspace", &params.to_string(), &[]);
-    assert_eq!(created["ok"], true, "{created}");
-    let id = created["data"]["workspace_id"].as_str().unwrap().to_owned();
-    let checkout = Path::new(created["data"]["cwd"].as_str().unwrap()).to_path_buf();
-
-    // Written after creation, so only the commands below run these scripts.
-    // The refusal exits non-zero; the script still succeeds, so the command
-    // completes and the reply file is what this test checks.
-    let reply_file = |phase: &str| root.join(format!("{phase}.json"));
-    let script = |phase: &str| {
-        format!("'{CODEMUX}' json agent_connector_status '{{}}' > '{}' || true", reply_file(phase).display())
-    };
-    std::fs::create_dir_all(checkout.join(".codemux")).unwrap();
-    let config = json!({ "setup": [script("setup")], "teardown": [script("teardown")] });
-    std::fs::write(checkout.join(".codemux/config.json"), config.to_string()).unwrap();
-    let reply = |phase: &str| -> Value {
-        serde_json::from_str(&std::fs::read_to_string(reply_file(phase)).unwrap()).unwrap()
-    };
-
-    let limit = Duration::from_secs(60);
-    let rerun = serve.json_within("rerun_setup", &json!({ "workspace_id": id }).to_string(), limit);
-    assert_eq!(rerun["data"]["status"], "complete", "{rerun}");
-    let setup = reply("setup");
-    assert_eq!(error_code(&setup), "admin_refused", "the setup script was answered as an agent: {setup}");
-
-    let closed = serve.json_within("close_workspace", &json!({ "workspace_id": id }).to_string(), limit);
-    assert_eq!(closed["data"]["closed"], true, "{closed}");
-    let teardown = reply("teardown");
-    assert_eq!(error_code(&teardown), "admin_refused", "the teardown script was answered as an agent: {teardown}");
+    for command in ["rerun_setup", "close_workspace", "archive_workspace"] {
+        let reply = serve.json_within(command, r#"{"workspace_id":"missing"}"#, Duration::from_secs(10));
+        assert_eq!(error_code(&reply), "access_denied", "{command}: {reply}");
+    }
 }
 
 #[test]
@@ -447,16 +358,14 @@ fn mcp_supervised_client_sees_no_admin_tools_and_is_refused_them() {
     }
     let refused = read_only.call("notify", json!({"message": "x"}));
     assert!(refused["content"][0]["text"].as_str().unwrap().starts_with("access_denied: "), "{refused}");
-    // Outside stdio relays registry tools without a local access check, so
-    // the app's gate on the access this client carries is what refuses a
-    // write. It runs before the target checks: a client the app took for full
-    // access would get `workspace_not_found` here, as the supervised one does.
+    // The app caps every external stdio relay at read-only, regardless of a
+    // client's requested access, before resolving a write's target.
     let send = json!({"workspace_id": "none", "thread_id": "t", "client_request_id": "k", "message": "x"});
     let denied = read_only.call("thread_send", send.clone());
     assert_eq!(denied["isError"], true, "{denied}");
     assert_eq!(denied["structuredContent"]["error"]["code"], "access_denied", "{denied}");
     let reached = supervised.call("thread_send", send);
-    assert_eq!(reached["structuredContent"]["error"]["code"], "workspace_not_found", "{reached}");
+    assert_eq!(reached["structuredContent"]["error"]["code"], "access_denied", "{reached}");
 }
 
 /// The legacy git tools run inside `codemux mcp`, so no gate in the app sees
@@ -467,8 +376,10 @@ fn mcp_supervised_client_sees_no_admin_tools_and_is_refused_them() {
 fn mcp_git_tools_take_file_names_as_paths() {
     let serve = Serve::start(&[]);
     let root = serve.root.path();
-    let repo = root.join("repo");
-    std::fs::create_dir_all(&repo).unwrap();
+    // Legacy Git tools execute in the MCP process's launch directory when
+    // there is no workspace. No socket write is needed to exercise their
+    // path argument handling.
+    let repo = root.to_path_buf();
     git(&repo, &["init", "-b", "trunk"]);
     git(&repo, &["config", "user.name", "Codemux test"]);
     git(&repo, &["config", "user.email", "test@example.invalid"]);
@@ -477,35 +388,31 @@ fn mcp_git_tools_take_file_names_as_paths() {
     git(&repo, &["commit", "-m", "first"]);
     // A change, so a diff written anywhere would not be empty.
     std::fs::write(repo.join("tracked"), "two\n").unwrap();
-    let created = serve.json("create_workspace", &json!({ "path": repo }).to_string(), &[]);
-    assert_eq!(created["ok"], true, "{created}");
-    let id = created["data"]["workspace_id"].as_str().unwrap().to_owned();
-
     let (kept, fresh) = (root.join("kept.txt"), root.join("fresh.txt"));
     std::fs::write(&kept, "keep\n").unwrap();
     let mut read_only = Mcp::start(&serve, &["--client", "integration-bot", "--access", "read-only"]);
     for target in [&kept, &fresh] {
         let file = format!("--output={}", target.display());
-        let reply = read_only.call_in(&id, "git_diff", json!({ "file": file }));
+        let reply = read_only.call("git_diff", json!({ "file": file }));
         assert_ne!(reply["isError"], true, "{reply}");
         assert_eq!(reply["content"][0]["text"], "", "no file has that name: {reply}");
     }
     assert_eq!(std::fs::read_to_string(&kept).unwrap(), "keep\n", "git_diff overwrote a file");
     assert!(!fresh.exists(), "git_diff created a file");
-    let diff = read_only.call_in(&id, "git_diff", json!({ "file": "tracked" }));
+    let diff = read_only.call("git_diff", json!({ "file": "tracked" }));
     assert!(diff["content"][0]["text"].as_str().unwrap().contains("+two"), "{diff}");
 
     // `--all` as an option would stage the untracked file too.
     std::fs::write(repo.join("untracked"), "new\n").unwrap();
     let mut supervised = Mcp::start(&serve, &["--client", "integration-bot", "--access", "supervised"]);
-    let staged = supervised.call_in(&id, "git_stage", json!({ "file": "--all" }));
+    let staged = supervised.call("git_stage", json!({ "file": "--all" }));
     assert_eq!(staged["isError"], true, "no file has that name: {staged}");
     assert_eq!(git(&repo, &["diff", "--cached", "--name-only"]), "", "nothing was staged");
-    let staged = supervised.call_in(&id, "git_stage", json!({ "file": "tracked" }));
+    let staged = supervised.call("git_stage", json!({ "file": "tracked" }));
     assert_ne!(staged["isError"], true, "{staged}");
     assert_eq!(git(&repo, &["diff", "--cached", "--name-only"]), "tracked");
     // `-m` takes the next argument whatever it looks like.
-    let committed = supervised.call_in(&id, "git_commit", json!({ "message": "--amend" }));
+    let committed = supervised.call("git_commit", json!({ "message": "--amend" }));
     assert_ne!(committed["isError"], true, "{committed}");
     assert_eq!(git(&repo, &["log", "--format=%s"]), "--amend\nfirst", "a new commit, not an amended one");
 }
@@ -531,59 +438,27 @@ fn mcp_git_tools_use_launch_directory_only_without_a_workspace() {
     assert!(unscoped["content"][0]["text"].as_str().unwrap().contains("+edited in launch directory"), "{unscoped}");
 }
 
-/// Whether `id` is an open workspace.
-fn is_open(serve: &Serve, id: &str) -> bool {
-    let state = serve.json("get_app_state", "{}", &[]);
-    let workspaces = state["data"]["workspaces"].as_array().unwrap_or_else(|| panic!("no workspaces: {state}"));
-    workspaces.iter().any(|ws| ws["workspace_id"] == id || ws["workspace_id"]["0"] == id)
-}
-
-/// Archiving or closing a worktree workspace runs its teardown scripts, also
-/// when the worktree stays, and they run any command as the person. So a
-/// supervised client is refused both on the stdio and the socket route
-/// before any teardown starts.
+/// Even a client requesting Supervised access cannot trigger teardown through
+/// the stdio or legacy socket route. The gate runs before workspace lookup.
 #[test]
-fn supervised_clients_cannot_run_teardown_through_archive_or_close() {
+fn external_clients_cannot_run_archive_or_close() {
     let serve = Serve::start(&[]);
-    let root = serve.root.path();
-    let repo = root.join("repo");
-    std::fs::create_dir_all(&repo).unwrap();
-    git(&repo, &["init", "-b", "trunk"]);
-    git(&repo, &["commit", "--allow-empty", "-m", "first"]);
-    let params = json!({ "repo_path": repo, "branch": "feat", "layout": "empty" });
-    let created = serve.json("create_worktree_workspace", &params.to_string(), &[]);
-    assert_eq!(created["ok"], true, "{created}");
-    let id = created["data"]["workspace_id"].as_str().unwrap().to_owned();
-    let checkout = Path::new(created["data"]["cwd"].as_str().unwrap()).to_path_buf();
-    let ran = root.join("teardown-ran");
-    std::fs::create_dir_all(checkout.join(".codemux")).unwrap();
-    let config = json!({ "teardown": [format!("touch '{}'", ran.display())] });
-    std::fs::write(checkout.join(".codemux/config.json"), config.to_string()).unwrap();
-
     let mut supervised = Mcp::start(&serve, &["--client", "integration-bot", "--access", "supervised"]);
-    let archived = supervised.call("workspace_archive", json!({ "workspace_id": id }));
-    assert!(!ran.exists(), "a supervised workspace_archive ran the teardown: {archived}");
-    assert_eq!(archived["isError"], true, "{archived}");
-    assert!(archived["content"][0]["text"].as_str().unwrap().starts_with("access_denied: "), "{archived}");
-    let closed = supervised.call("workspace_close", json!({ "workspace_id": id }));
-    assert_eq!(closed["structuredContent"]["error"]["code"], "access_denied", "{closed}");
-    // The socket commands behind the legacy tools, from a supervised CLI.
+    for name in ["workspace_archive", "workspace_close"] {
+        let refused = supervised.call(name, json!({ "workspace_id": "missing" }));
+        assert_eq!(refused["structuredContent"]["error"]["code"], "access_denied", "{name}: {refused}");
+    }
     let as_bot = [("CODEMUX_CLIENT", "integration-bot"), ("CODEMUX_ACCESS", "supervised")];
     for command in ["archive_workspace", "close_workspace"] {
-        let refused = serve.json(command, &json!({ "workspace_id": id }).to_string(), &as_bot);
-        assert!(!ran.exists(), "a supervised {command} ran the teardown: {refused}");
-        assert_eq!(error_code(&refused), "access_denied", "{command}: {refused}");
+        for env in [&as_bot[..], &[][..]] {
+            let refused = serve.json(command, r#"{"workspace_id":"missing"}"#, env);
+            assert_eq!(error_code(&refused), "access_denied", "{command}: {refused}");
+        }
     }
-    assert!(is_open(&serve, &id), "a refused call closed the workspace");
     let names = supervised.tool_names();
     for hidden in ["workspace_archive", "workspace_close"] {
         assert!(!names.iter().any(|name| name == hidden), "supervised lists {hidden}: {names:?}");
     }
-
-    // The owner's archive runs it, so the refusals above are what kept it from running.
-    let archived = serve.json_within("archive_workspace", &json!({ "workspace_id": id }).to_string(), Duration::from_secs(60));
-    assert_eq!(archived["ok"], true, "{archived}");
-    assert!(ran.exists(), "the owner's archive ran the teardown");
 }
 
 /// A control socket like a Codemux build from before `client.access`
@@ -638,39 +513,22 @@ fn narrowed_mcp_refuses_an_old_app_that_replaced_a_new_one() {
     assert_eq!(*seen.lock().unwrap(), ["status"], "only the version probe reached the older app");
 }
 
-/// `get_app_state`'s focused workspace id.
-fn active_workspace(serve: &Serve) -> String {
-    let state = serve.json("get_app_state", "{}", &[]);
-    let active = &state["data"]["active_workspace_id"];
-    active.as_str().or_else(|| active["0"].as_str()).unwrap_or_else(|| panic!("no active workspace: {state}")).to_owned()
-}
-
 #[test]
-fn socket_legacy_create_arms_keep_shapes_and_focus() {
+fn legacy_workspace_writes_require_owner_proof() {
     let serve = Serve::start(&[]);
-    let root = serve.root.path();
-    let (first, second) = (root.join("first"), root.join("second"));
-    for dir in [&first, &second] {
-        std::fs::create_dir_all(dir).unwrap();
+    let project = serve.root.path().join("project");
+    std::fs::create_dir(&project).unwrap();
+    for (command, params) in [
+        ("create_workspace", json!({ "path": project })),
+        ("close_workspace", json!({ "workspace_id": "missing" })),
+    ] {
+        let refused = serve.json(command, &params.to_string(), &[]);
+        assert_eq!(error_code(&refused), "access_denied", "{command}: {refused}");
     }
-
-    let created = serve.json("create_workspace", &json!({ "path": first }).to_string(), &[]);
-    assert_eq!(created["ok"], true, "{created}");
-    let id = created["data"]["workspace_id"].as_str().unwrap().to_owned();
-    assert_eq!(created["data"]["cwd"], first.display().to_string());
-    assert_eq!(created["data"]["created"], true);
-    assert_eq!(active_workspace(&serve), id, "the legacy command still takes focus");
-
-    let background = serve.json("create_workspace", &json!({ "path": second, "select": false }).to_string(), &[]);
-    assert_eq!(background["ok"], true, "{background}");
-    let other = background["data"]["workspace_id"].as_str().unwrap().to_owned();
-    assert_ne!(other, id);
-    assert_eq!(active_workspace(&serve), id, "select:false keeps focus where it was");
-
-    let closed = serve.json("close_workspace", &json!({ "workspace_id": other }).to_string(), &[]);
-    assert_eq!(closed["data"], json!({"workspace_id": other, "closed": true, "worktree_removed": false}), "{closed}");
-    let missing = serve.json("close_workspace", "{}", &[]);
-    assert_eq!(missing["error"], "Missing required parameter: workspace_id", "{missing}");
+    let state = serve.json("get_app_state", "{}", &[]);
+    assert_eq!(state["ok"], true, "read-only state remains available: {state}");
+    assert!(!state["data"]["workspaces"].as_array().unwrap().iter().any(|workspace|
+        workspace["cwd"] == project.display().to_string()), "the refused create opened the project: {state}");
 }
 
 /// `git` in `dir` with a fixed identity; its trimmed stdout.
@@ -691,10 +549,8 @@ fn git(dir: &Path, args: &[&str]) -> String {
 }
 
 #[test]
-fn socket_worktree_default_base_is_repo_default_branch() {
+fn external_cli_cannot_create_a_worktree_branch() {
     let serve = Serve::start(&[]);
-    // A repository whose only branch is `trunk`: the old default base `main`
-    // does not exist there.
     let repo = serve.root.path().join("trunk-repo");
     std::fs::create_dir_all(&repo).unwrap();
     git(&repo, &["init", "-b", "trunk"]);
@@ -702,22 +558,8 @@ fn socket_worktree_default_base_is_repo_default_branch() {
     let trunk = git(&repo, &["rev-parse", "HEAD"]);
 
     let params = json!({ "repo_path": repo, "branch": "feat", "layout": "empty" });
-    let created = serve.json("create_worktree_workspace", &params.to_string(), &[]);
-    assert_eq!(created["ok"], true, "{created}");
-    let data = &created["data"];
-    assert_eq!(data["base_branch"], "trunk", "{created}");
-    assert_eq!(data["adopted"], false);
-    let checkout = Path::new(data["cwd"].as_str().unwrap());
-    assert_eq!(git(checkout, &["rev-parse", "HEAD"]), trunk);
-    assert_eq!(git(checkout, &["branch", "--show-current"]), "feat");
-    let id = data["workspace_id"].as_str().unwrap().to_owned();
-    assert_eq!(active_workspace(&serve), id, "the legacy command still takes focus");
-
-    let params = json!({ "repo_path": repo, "branch": "feat-2", "layout": "empty", "select": false });
-    let background = serve.json("create_worktree_workspace", &params.to_string(), &[]);
-    assert_eq!(background["data"]["base_branch"], "trunk", "{background}");
-    assert_eq!(active_workspace(&serve), id, "select:false keeps focus where it was");
-
-    let missing = serve.json("create_worktree_workspace", &json!({ "branch": "x" }).to_string(), &[]);
-    assert_eq!(missing["error"], "Missing required parameter: repo_path", "{missing}");
+    let refused = serve.json("create_worktree_workspace", &params.to_string(), &[]);
+    assert_eq!(error_code(&refused), "access_denied", "{refused}");
+    assert_eq!(git(&repo, &["rev-parse", "HEAD"]), trunk);
+    assert_eq!(git(&repo, &["branch", "--list", "feat"]), "", "a refused call created a branch");
 }

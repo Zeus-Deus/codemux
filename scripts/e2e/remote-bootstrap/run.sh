@@ -112,10 +112,8 @@ skip() {
     RESULTS+=("${CURRENT_DISTRO}|$1|SKIP|${2:-}")
     printf '%s ○ %s (%s)%s\n' "$C_YELLOW" "$1" "${2:-skipped}" "$C_RESET"
 }
-# NOTE: there is deliberately no "known issue" status any more. Every defect
-# this harness once tolerated that way (no control socket, relay mode reset on
-# boot, no device registration, persisted port ignored) is fixed, so each one is
-# now a hard assertion — a regression must turn the suite red, not yellow.
+# Every supported behavior in this harness is a hard assertion: a regression
+# must turn the suite red, not yellow.
 
 # assert_contains <step> <haystack> <needle> — the workhorse.
 assert_contains() {
@@ -251,6 +249,23 @@ uexec_pw() {
     local ip; ip=$(container_ip "$distro")
     ssh "${SSH_OPTS[@]}" -i "$SSH_KEY" "${E2E_USER}@${ip}" \
         "CODEMUX_API_URL='${MOCK_API}' CODEMUX_PASSWORD='${E2E_PASSWORD}' bash -lc $(printf '%q' "$*")" 2>&1
+}
+
+# Keep failure diagnostics free of service output: foreground `serve` can
+# print one-time pairing credentials, and a broken unit might journal them.
+service_state_diag() {
+    local distro="$1" state line shown=0
+    if state=$(uexec "$distro" "systemctl --user show codemux.service -p ActiveState -p Result --no-pager"); then
+        while IFS= read -r line; do
+            case "$line" in
+                ActiveState=active|ActiveState=inactive|ActiveState=failed|ActiveState=activating|ActiveState=deactivating|ActiveState=reloading|ActiveState=maintenance|Result=success|Result=exit-code|Result=signal|Result=core-dump|Result=timeout|Result=watchdog|Result=start-limit-hit|Result=oom-kill|Result=protocol|Result=resources)
+                    info "$line"
+                    shown=1
+                    ;;
+            esac
+        done <<< "$state"
+    fi
+    [ "$shown" -eq 1 ] || info "service state unavailable"
 }
 
 # Curl from *inside the mock-api container* — proves the target's listener is
@@ -451,6 +466,7 @@ run_distro() {
     assert_contains "unit file written" "$unit_body" "ExecStart="
     assert_contains "unit runs \`serve\`" "$unit_body" " serve"
     assert_contains "unit carries CODEMUX_API_URL" "$unit_body" "Environment=CODEMUX_API_URL=${MOCK_API}"
+    assert_contains "unit hides startup pairing credentials" "$unit_body" "StandardOutput=null"
     info "unit file:"; printf '%s\n' "$unit_body" | sed 's/^/      /'
 
     local is_active is_enabled linger
@@ -473,7 +489,7 @@ run_distro() {
         info "$(printf '%s' "$listening" | head -1)"
     else
         fail "port ${CODEMUX_PORT} listening" "nothing bound"
-        info "journal:"; rexec "$distro" journalctl "_UID=${uid}" -n 40 --no-pager 2>&1 | sed 's/^/      /'
+        service_state_diag "$distro"
     fi
 
     local health_local
@@ -496,29 +512,33 @@ run_distro() {
     assert_contains "GET / serves the embedded web UI (HTML)" "$root_html" "<!doctype html"
     assert_contains "embedded UI references a built asset bundle" "$root_html" "/assets/"
 
-    # ── (d) pairing URL uses the container IP, not loopback ──────────────
+    # ── (d) managed pairing credentials stay private ─────────────────────
     #
-    # Asked the way a user would: `codemux remote pair` from a second SSH
-    # session, which reaches the running unit over the control socket that
-    # `codemux serve` now publishes.
-    banner "${distro} · step d — pairing URL"
+    # The managed unit discards stdout so its startup pairing code never lands
+    # in a durable journal. A later SSH CLI has no owner proof and cannot mint
+    # another code over the control socket.
+    banner "${distro} · step d — managed pairing stays private"
 
-    local pair_out pair_url
-    pair_out=$(uexec "$distro" "codemux remote pair")
-    printf '%s\n' "$pair_out" | grep -E '^(Pairing link|Token|Endpoint|Expires):' | sed 's/^/      /'
-    pair_url=$(printf '%s' "$pair_out" | sed -n 's/^Pairing link:[[:space:]]*//p' | head -1 | tr -d '\r')
-
-    if [ -z "$pair_url" ]; then
-        fail "codemux remote pair works against the running unit" "no 'Pairing link:' line"
-        printf '%s\n' "$pair_out" | sed 's/^/      /' >&2
+    local pair_out serve_log
+    if pair_out=$(uexec "$distro" "codemux remote pair"); then
+        fail "standalone SSH cannot mint another pairing code" "unexpected success; output redacted"
     else
-        pass "codemux remote pair works against the running unit" "$pair_url"
-        assert_contains "pairing URL host is the container IP (${ip})" "$pair_url" "//${ip}:${CODEMUX_PORT}"
-        assert_not_contains "pairing URL is NOT loopback" "$pair_url" "127.0.0.1"
-        assert_not_contains "pairing URL is NOT localhost" "$pair_url" "localhost"
-        # The endpoint the CLI recommends should be the reachable one, and it
-        # must say so rather than silently picking loopback.
-        assert_contains "pair reports a non-loopback endpoint" "$pair_out" "Endpoint:      ${ip}"
+        pass "standalone SSH cannot mint another pairing code"
+    fi
+    if [[ "$pair_out" == *"needs verified owner access"* ]]; then
+        pass "standalone pairing reports owner access required"
+    else
+        fail "standalone pairing reports owner access required" "expected owner refusal; output redacted"
+    fi
+    if serve_log=$(rexec "$distro" journalctl "_UID=${uid}" --no-pager -o cat 2>&1); then
+        pass "managed service journal is readable"
+        if [[ "$serve_log" == *"Pairing link:"* ]]; then
+            fail "managed service journal has no pairing link" "unexpected pairing link; journal contents redacted"
+        else
+            pass "managed service journal has no pairing link"
+        fi
+    else
+        fail "managed service journal is readable" "journalctl exited non-zero; contents redacted"
     fi
 
     # ── (d2) a second `serve` refuses cleanly ────────────────────────────
@@ -526,12 +546,27 @@ run_distro() {
     # The mutual-exclusion guard depends on the control socket being visible
     # from another process. It must lose to `run_serve`'s own check, not to a
     # port collision deeper in the stack.
-    local second_serve
-    second_serve=$(uexec "$distro" "codemux serve; echo RC=\$?")
-    printf '%s\n' "$second_serve" | sed 's/^/      /'
-    assert_not_contains "second \`codemux serve\` exits non-zero" "$second_serve" "RC=0"
-    assert_contains "second \`serve\` reports mutual exclusion" "$second_serve" "already running on this machine"
-    assert_not_contains "second \`serve\` did NOT fail on a port collision" "$second_serve" "Address already in use"
+    local second_serve second_serve_rc
+    if second_serve=$(uexec "$distro" "timeout -k 5s 30s codemux serve"); then
+        second_serve_rc=0
+    else
+        second_serve_rc=$?
+    fi
+    if [ "$second_serve_rc" -eq 1 ]; then
+        pass "second \`codemux serve\` exits with status 1"
+    else
+        fail "second \`codemux serve\` exits with status 1" "exit status ${second_serve_rc}; output redacted"
+    fi
+    if [[ "$second_serve" == *"already running on this machine"* ]]; then
+        pass "second \`serve\` reports mutual exclusion"
+    else
+        fail "second \`serve\` reports mutual exclusion" "expected owner guard; output redacted"
+    fi
+    if [[ "$second_serve" == *"Address already in use"* ]]; then
+        fail "second \`serve\` did NOT fail on a port collision" "port collision; output redacted"
+    else
+        pass "second \`serve\` did NOT fail on a port collision"
+    fi
 
     # ── (e) device registration reached the mock ─────────────────────────
     banner "${distro} · step e — device registration"
@@ -544,7 +579,7 @@ run_distro() {
     if [ -z "$dev_line" ]; then
         fail "POST /api/devices arrived at the mock API" "no request recorded within 60s"
         info "recorded requests:"; mock_requests | sed 's/^/      /'
-        info "journal:"; rexec "$distro" journalctl "_UID=${uid}" -n 60 --no-pager 2>&1 | sed 's/^/      /'
+        service_state_diag "$distro"
     else
         pass "POST /api/devices arrived at the mock API"
         info "registration POST: ${dev_line}"
@@ -567,16 +602,15 @@ run_distro() {
     fi
 
     # The desktop's own view of registration, read back over the control
-    # socket. `web_remote_enable` with no scope/port is the no-op read path —
-    # its result carries the full live `WebRemoteStatus`, whose
+    # socket. `web_remote_status` carries the full live `WebRemoteStatus`, whose
     # `device_registered` / `iroh_node_id` / `device_id` are the registry facts
     # (see `WebRemoteStatus` in src-tauri/src/web_remote/mod.rs).
     local status_json reg_probe reg_registered reg_node reg_dev
-    status_json=$(uexec "$distro" "codemux json web_remote_enable '{}'")
+    status_json=$(uexec "$distro" "codemux json web_remote_status '{}'")
     reg_probe=$(printf '%s' "$status_json" | python3 -c '
 import json,sys
 try:
-    s = json.load(sys.stdin)["data"]["status"]
+    s = json.load(sys.stdin)["data"]
     print("%s|%s|%s|%s" % (s["device_registered"], s["iroh_node_id"],
                            s["device_id"], s["relay_mode_enabled"]))
 except Exception as e:
@@ -644,31 +678,22 @@ except Exception as e:
     assert_contains "port was not reset" "$row_after" "\"port\":${CODEMUX_PORT}"
     assert_contains "bind_scope was not reset" "$row_after" '"bind_scope":"all"'
 
-    # ── (e3) serve honours a persisted non-default port ─────────────────
-    #
-    # Config is applied on boot, not just when a flag is passed: change the
-    # persisted port through the running instance, restart, and the unit must
-    # come back on the new port with no `--port` anywhere.
-    banner "${distro} · step e3 — serve binds the persisted port"
-    local alt_port=4399
-    uexec "$distro" "codemux remote enable --port ${alt_port}" >/dev/null 2>&1
-    uexec "$distro" "systemctl --user restart codemux.service" >/dev/null
-    wait_for_port "$distro" "$alt_port"
-    local alt_listen
-    alt_listen=$(rexec "$distro" ss -ltn 2>/dev/null | grep ":${alt_port} ")
-    if [ -n "$alt_listen" ]; then
-        pass "serve rebinds to the persisted port ${alt_port}" "$(printf '%s' "$alt_listen" | awk '{print $4}' | head -1)"
+    # ── (e3) a second SSH CLI cannot change the live listener ────────────
+    banner "${distro} · step e3 — standalone Remote Access change refused"
+    local enable_out
+    if enable_out=$(uexec "$distro" "codemux remote enable --port 4399"); then
+        fail "standalone SSH cannot change Remote Access" "unexpected success; output redacted"
     else
-        fail "serve rebinds to the persisted port ${alt_port}" "nothing bound on ${alt_port}"
-        info "$(rexec "$distro" ss -ltn 2>/dev/null | grep -E ':(4377|4399) ')"
+        pass "standalone SSH cannot change Remote Access"
     fi
-    assert_contains "persisted port is in the settings row" "$(settings_row "$distro")" "\"port\":${alt_port}"
-
-    # Restore the default port for the remaining steps.
-    uexec "$distro" "codemux remote enable --port ${CODEMUX_PORT}" >/dev/null 2>&1
+    if [[ "$enable_out" == *"needs verified owner access"* ]]; then
+        pass "Remote Access change reports owner access required"
+    else
+        fail "Remote Access change reports owner access required" "expected owner refusal; output redacted"
+    fi
     uexec "$distro" "systemctl --user restart codemux.service" >/dev/null
     wait_for_port "$distro" "$CODEMUX_PORT"
-    assert_contains "port restored to ${CODEMUX_PORT}" "$(settings_row "$distro")" "\"port\":${CODEMUX_PORT}"
+    assert_contains "refused change did not persist port 4399" "$(settings_row "$distro")" "\"port\":${CODEMUX_PORT}"
 
     # ── (f) status / off / idempotence ───────────────────────────────────
     banner "${distro} · step f — status, off, idempotence"
@@ -694,7 +719,7 @@ except Exception as e:
     fi
     assert_contains "status names the device" "$status_out" "Device name:     codemux-e2e-${distro}"
     # `control_server_is_running()` must see the serve-managed instance — the
-    # same fact the mutual-exclusion guard and `remote pair` key off.
+    # same fact the mutual-exclusion guard and read-only status key off.
     assert_contains "status sees the running instance" "$status_out" "Codemux running: yes"
 
     local off_out
@@ -783,7 +808,7 @@ except Exception as e:
         info "$(printf '%s' "$post_listening" | head -1)"
     else
         fail "port ${CODEMUX_PORT} listening again after reboot" "nothing bound"
-        info "journal:"; rexec "$distro" journalctl "_UID=${uid}" -n 60 --no-pager 2>&1 | sed 's/^/      /'
+        service_state_diag "$distro"
     fi
 
     # And still reachable from off-box, which is the actual user-facing promise.

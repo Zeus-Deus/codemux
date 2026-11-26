@@ -121,7 +121,7 @@ pub fn run_serve(opts: ServeOptions) -> Result<(), String> {
     //    `build_headless_app` runs the Tauri `setup` hook explicitly — Tauri
     //    itself only runs it from the event loop, which serve never enters —
     //    so the control server is listening (mutual exclusion in both
-    //    directions, `codemux remote pair`, `codemux connect status`,
+    //    directions, read-only CLI status calls,
     //    `web_remote_set_relay`) and the persisted web-remote config is
     //    hydrated before the enable below merges the CLI flags into it.
     let app = match crate::build_headless_app() {
@@ -166,11 +166,11 @@ pub fn run_serve(opts: ServeOptions) -> Result<(), String> {
                     crate::cli::print_pairing(&value);
                 }
                 Err(e) => {
-                    // Shouldn't happen once the server is enabled — keep serving so
-                    // `codemux remote pair` from another session can still work.
+                    // Shouldn't happen once the server is enabled. Keep serving;
+                    // pairing can be managed in desktop Settings.
                     eprintln!(
                         "[codemux serve] could not mint a pairing code: {e} \
-                         (the server is still running — run `codemux remote pair` to try again)"
+                         (the server is still running — stop it to manage pairing in desktop Settings)"
                     );
                 }
             }
@@ -394,18 +394,17 @@ fn connector_line(status: &crate::mcp_connector::ConnectorStatus) -> Option<Stri
     })
 }
 
-/// Print the closing lines: how to mint more codes (or, relay-only, how to add
-/// the network listener), how to turn the connector on, the account-mode note,
-/// and the stop hint.
+/// Print the closing lines with the supported administration path and stop hint.
 fn print_footer(relay_only: bool, connector_enabled: bool) {
     println!();
     if relay_only {
-        println!("Run `codemux remote enable` from another SSH session to also listen on your network.");
+        println!("Remote Access is using the saved relay setting; stop serve to change its network scope in desktop Settings.");
     } else {
-        println!("Run `codemux remote pair` from another SSH session to mint more pairing codes.");
+        println!("Foreground serve prints a fresh pairing link when restarted; this disconnects active sessions.");
+        println!("Stop serve to manage pairing and Remote Access in desktop Settings.");
     }
     if !connector_enabled {
-        println!("Run `codemux connector enable` to let outside agents connect over HTTP.");
+        println!("The agent connector is off; enable it in desktop Settings before starting headless serve.");
     }
     println!("Account-mode / hosted access continues to work if it was configured.");
     println!("Press Ctrl-C (or send SIGTERM) to stop the server.");

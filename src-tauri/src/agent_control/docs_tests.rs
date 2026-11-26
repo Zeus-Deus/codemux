@@ -68,18 +68,18 @@ fn outside_agents_guide_lists_only_registered_tools() {
 }
 
 #[test]
-fn outside_agents_guide_counts_the_stdio_tools() {
-    // What outside `codemux mcp` lists at full access: the legacy tools no
-    // registry tool replaces, then the registry's outside catalog.
-    // `mcp_server`'s `tool_registry_has_all_tools` checks that `tools/list`
-    // serves exactly this many.
+fn outside_agents_guide_distinguishes_requested_and_effective_local_tools() {
+    // Stdio can advertise more than the unverified socket can execute.
+    // `mcp_server` checks the exact advertised tool count separately.
     let kept = crate::mcp_server::LEGACY_TOOL_NAMES
         .iter()
         .filter(|name| registry::served(name, Audience::Outside).is_none())
         .count();
-    let count = kept + registry::list(&CallerView::outside(ControlAccess::FullAccess)).len();
-    let claim = format!("`codemux mcp` lists {count} tools at full access");
-    assert!(GUIDE.contains(&claim), "the guide's release notes say {claim:?}");
+    let advertised = kept + registry::list(&CallerView::outside(ControlAccess::FullAccess)).len();
+    let effective = registry::list(&CallerView::outside(ControlAccess::ReadOnly)).len();
+    assert!(advertised > effective, "local socket policy narrows the advertised catalog");
+    assert!(GUIDE.contains("may advertise tools from its requested `--access` level"));
+    assert!(GUIDE.contains("use `codemux tools` for the effective local catalog"));
 }
 
 #[test]

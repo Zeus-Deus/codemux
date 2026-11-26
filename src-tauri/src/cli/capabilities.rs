@@ -78,7 +78,7 @@ const ENVIRONMENT: &[(&str, &str)] = &[
     ("CODEMUX_ACCESS", "Default --access of the commands that call the running app: read-only, supervised or full-access (blank is unset)"),
     ("CODEMUX_AGENT_PROCESS", "Set by Codemux on processes it starts for agents; the control socket refuses them admin commands"),
     ("CODEMUX_MCP_GATEWAY_URL", "Set by Codemux in agent processes, with CODEMUX_MCP_GATEWAY_TOKEN; `codemux mcp-call` uses them to call the chat's own tools"),
-    ("BROWSER", "Set to 'codemux browser open' for URL handling"),
+    ("BROWSER", "Set for local agent chat sessions; ordinary terminals keep the user's browser opener"),
 ];
 
 const EXIT_CODES: &[(i32, &str)] = &[
