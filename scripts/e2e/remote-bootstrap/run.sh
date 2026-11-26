@@ -508,9 +508,13 @@ run_distro() {
     assert_contains "standalone pairing reports owner access required" "$pair_out" "needs verified owner access"
     if serve_log=$(rexec "$distro" journalctl "_UID=${uid}" --no-pager -o cat 2>&1); then
         pass "managed service journal is readable"
-        assert_not_contains "managed service journal has no pairing link" "$serve_log" "Pairing link:"
+        if [[ "$serve_log" == *"Pairing link:"* ]]; then
+            fail "managed service journal has no pairing link" "unexpected pairing link; journal contents redacted"
+        else
+            pass "managed service journal has no pairing link"
+        fi
     else
-        fail "managed service journal is readable" "$serve_log"
+        fail "managed service journal is readable" "journalctl exited non-zero; contents redacted"
     fi
 
     # ── (d2) a second `serve` refuses cleanly ────────────────────────────
