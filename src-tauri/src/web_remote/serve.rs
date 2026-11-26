@@ -170,7 +170,7 @@ pub fn run_serve(opts: ServeOptions) -> Result<(), String> {
                     // pairing can be managed in desktop Settings.
                     eprintln!(
                         "[codemux serve] could not mint a pairing code: {e} \
-                         (the server is still running — manage pairing in desktop Settings)"
+                         (the server is still running — stop it to manage pairing in desktop Settings)"
                     );
                 }
             }
@@ -398,9 +398,9 @@ fn connector_line(status: &crate::mcp_connector::ConnectorStatus) -> Option<Stri
 fn print_footer(relay_only: bool, connector_enabled: bool) {
     println!();
     if relay_only {
-        println!("Remote Access is using the saved relay setting; change its network scope in desktop Settings.");
+        println!("Remote Access is using the saved relay setting; stop serve to change its network scope in desktop Settings.");
     } else {
-        println!("Manage pairing and Remote Access in desktop Settings.");
+        println!("Stop serve to manage pairing and Remote Access in desktop Settings.");
     }
     if !connector_enabled {
         println!("The agent connector is off; enable it in desktop Settings before starting headless serve.");

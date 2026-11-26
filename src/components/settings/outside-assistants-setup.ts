@@ -28,8 +28,8 @@ export function shellArg(value: string): string {
 
 /** The four local commands, in display order. `executable` is the raw durable
  *  path to `codemux`. Each names its client with `--client`, which only labels
- *  it in attribution; Hermes also starts Supervised because it relays chat
- *  messages from other people. */
+ *  it in attribution; Hermes requests only the read access the local socket
+ *  can actually grant. */
 export function localSetupCommands(executable: string): LocalSetupRow[] {
   const codemux = shellArg(executable);
   return [
@@ -48,7 +48,7 @@ export function localSetupCommands(executable: string): LocalSetupRow[] {
     {
       id: "hermes",
       label: "Hermes",
-      command: `hermes mcp add codemux --command ${codemux} --args mcp --client hermes --access supervised`,
+      command: `hermes mcp add codemux --command ${codemux} --args mcp --client hermes --access read-only`,
       copyLabel: "Copy Hermes command",
     },
     {

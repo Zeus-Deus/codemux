@@ -31,13 +31,13 @@ describe("localSetupCommands", () => {
     expect(localSetupCommands("/opt/My Apps/codemux").map(({ id, label, command, copyLabel }) => [id, label, command, copyLabel])).toEqual([
       ["claude-code", "Claude Code", "claude mcp add --scope user codemux -- '/opt/My Apps/codemux' mcp --client claude-code", "Copy Claude Code command"],
       ["codex", "Codex", "codex mcp add codemux -- '/opt/My Apps/codemux' mcp --client codex", "Copy Codex command"],
-      ["hermes", "Hermes", "hermes mcp add codemux --command '/opt/My Apps/codemux' --args mcp --client hermes --access supervised", "Copy Hermes command"],
+      ["hermes", "Hermes", "hermes mcp add codemux --command '/opt/My Apps/codemux' --args mcp --client hermes --access read-only", "Copy Hermes command"],
       ["other", "Other", "'/opt/My Apps/codemux' mcp --client my-agent", "Copy command"],
     ]);
     expect(localSetupCommands("codemux").map((row) => row.command)).toEqual([
       "claude mcp add --scope user codemux -- codemux mcp --client claude-code",
       "codex mcp add codemux -- codemux mcp --client codex",
-      "hermes mcp add codemux --command codemux --args mcp --client hermes --access supervised",
+      "hermes mcp add codemux --command codemux --args mcp --client hermes --access read-only",
       "codemux mcp --client my-agent",
     ]);
   });
@@ -45,7 +45,7 @@ describe("localSetupCommands", () => {
   it("starts Hermes supervised and leaves the others at the local default", () => {
     const withAccess = localSetupCommands("codemux").filter((row) => row.command.includes("--access"));
     expect(withAccess.map((row) => row.id)).toEqual(["hermes"]);
-    expect(withAccess[0].command).toMatch(/--access supervised$/);
+    expect(withAccess[0].command).toMatch(/--access read-only$/);
   });
 });
 
