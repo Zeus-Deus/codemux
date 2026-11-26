@@ -921,7 +921,14 @@ fn cleanup_stale_browser_lock_files_in(dir: &std::path::Path, session: &str, pid
             windows_loopback_listener_pid(port.port) != Some(None)
                 || !windows_browser_port_matches(&port_path, remaining_port)
         } else {
-            browser_control_endpoint_ready_in_namespace(session, dir)
+            // The daemon may have removed .port before exiting. A listener on
+            // the hash port is harmless only when the OS identifies a
+            // different, non-browser owner. Failed lookups remain ambiguous.
+            !windows_browser_port_matches(&port_path, None)
+                || !stale_browser_hash_listener_is_unrelated(
+                    pid, windows_loopback_listener_pid(browser_control_fallback_port(session)),
+                    process_looks_like_agent_browser,
+                )
         };
         #[cfg(not(windows))]
         let endpoint_ready = browser_control_endpoint_ready_in_namespace(session, dir);
@@ -938,6 +945,19 @@ fn cleanup_stale_browser_lock_files_in(dir: &std::path::Path, session: &str, pid
         let _ = removed;
         #[cfg(windows)]
         if ext == "port" { remaining_port = None; }
+    }
+}
+
+#[cfg(windows)]
+fn stale_browser_hash_listener_is_unrelated(
+    stale_pid: u32,
+    listener: Option<Option<u32>>,
+    looks_like_browser: impl Fn(u32) -> Option<bool>,
+) -> bool {
+    match listener {
+        Some(None) => true,
+        Some(Some(owner)) if owner != stale_pid => looks_like_browser(owner) == Some(false),
+        Some(Some(_)) | None => false,
     }
 }
 
@@ -8398,6 +8418,52 @@ mod tests {
             "unrelated hash listener must remain running");
         assert!(require_owned_browser_session_in(&session, &current).is_ok(),
             "the next start must be admitted while the hash port is occupied");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_partial_shutdown_without_port_allows_restart_past_foreign_hash_listener() {
+        let temp = tempfile::tempdir().unwrap();
+        let (session, hash_listener) = (0..32).find_map(|_| {
+            let session = format!("partial-cleanup-{}", uuid::Uuid::new_v4().simple());
+            std::net::TcpListener::bind(("127.0.0.1", browser_control_fallback_port(&session)))
+                .ok().map(|listener| (session, listener))
+        }).expect("a free hash-derived browser port");
+        let current = temp.path().join(BROWSER_DAEMON_DIR);
+        prepare_browser_directory(&current, true).unwrap();
+        let pid = u32::MAX;
+        let pid_path = current.join(format!("{session}.pid"));
+        std::fs::write(&pid_path, pid.to_string()).unwrap();
+        for ext in ["engine", "stream"] {
+            std::fs::write(current.join(format!("{session}.{ext}")), b"old").unwrap();
+        }
+        assert_eq!(windows_loopback_listener_pid(browser_control_fallback_port(&session)),
+            Some(Some(std::process::id())));
+        assert_eq!(process_looks_like_agent_browser(std::process::id()), Some(false));
+        assert!(browser_control_endpoint_ready_in_namespace(&session, &current),
+            "the ordinary probe must keep an unattributed hash listener ambiguous");
+
+        cleanup_owned_browser_lock_files_in(&current, &session, pid);
+        for ext in ["pid", "port", "engine", "stream"] {
+            assert!(!current.join(format!("{session}.{ext}")).exists(),
+                "partial shutdown left stale {ext} metadata");
+        }
+        assert!(std::net::TcpStream::connect(hash_listener.local_addr().unwrap()).is_ok());
+        assert!(require_owned_browser_session_in(&session, &current).is_ok(),
+            "the next start must be admitted while the foreign listener remains");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn failed_hash_listener_or_process_lookup_keeps_stale_cleanup_inconclusive() {
+        let stale = u32::MAX;
+        let foreign = std::process::id();
+        assert!(stale_browser_hash_listener_is_unrelated(stale, Some(None), |_| None));
+        assert!(stale_browser_hash_listener_is_unrelated(stale, Some(Some(foreign)), |_| Some(false)));
+        assert!(!stale_browser_hash_listener_is_unrelated(stale, None, |_| Some(false)));
+        assert!(!stale_browser_hash_listener_is_unrelated(stale, Some(Some(stale)), |_| Some(false)));
+        assert!(!stale_browser_hash_listener_is_unrelated(stale, Some(Some(foreign)), |_| None));
+        assert!(!stale_browser_hash_listener_is_unrelated(stale, Some(Some(foreign)), |_| Some(true)));
     }
 
     #[test]
