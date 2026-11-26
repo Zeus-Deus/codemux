@@ -596,6 +596,69 @@ fn classify_legacy_browser_listener(
     }
 }
 
+#[cfg(not(windows))]
+fn probe_current_browser_control_endpoint(
+    session: &str,
+    current: &std::path::Path,
+    _verified_legacy_pid: u32,
+) -> BrowserControlEndpointProbe {
+    probe_browser_control_endpoint(session, current)
+}
+
+#[cfg(windows)]
+fn probe_current_browser_control_endpoint(
+    session: &str,
+    current: &std::path::Path,
+    verified_legacy_pid: u32,
+) -> BrowserControlEndpointProbe {
+    let port_path = current.join(format!("{session}.port"));
+    let port = match std::fs::symlink_metadata(&port_path) {
+        Ok(meta) => {
+            use std::os::windows::fs::MetadataExt;
+            if !meta.is_file() || meta.file_attributes() & 0x400 != 0
+                || clack_private_fs::require_private_file(&port_path).is_err() {
+                return BrowserControlEndpointProbe::Inconclusive;
+            }
+            match std::fs::read_to_string(&port_path).ok()
+                .and_then(|value| value.trim().parse::<u16>().ok()) {
+                Some(port) if port != 0 => port,
+                _ => return BrowserControlEndpointProbe::Inconclusive,
+            }
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => browser_control_fallback_port(session),
+        Err(_) => return BrowserControlEndpointProbe::Inconclusive,
+    };
+    classify_current_browser_listener(windows_loopback_listener_pid(port), verified_legacy_pid)
+}
+
+#[cfg(windows)]
+fn classify_current_browser_listener(
+    listener: Option<Option<u32>>,
+    verified_legacy_pid: u32,
+) -> BrowserControlEndpointProbe {
+    match listener {
+        Some(None) => BrowserControlEndpointProbe::Absent,
+        Some(Some(pid)) if pid == verified_legacy_pid => BrowserControlEndpointProbe::Absent,
+        Some(Some(_)) | None => BrowserControlEndpointProbe::Inconclusive,
+    }
+}
+
+fn select_verified_legacy_browser_dir(
+    root: &std::path::Path,
+    current: &std::path::Path,
+    session: &str,
+    current_pid_path: &std::path::Path,
+    current_present: bool,
+    legacy_pid: u32,
+) -> Option<PathBuf> {
+    let current_conflict = current_present && !read_daemon_pid_file(current_pid_path)
+        .is_some_and(|pid| !pid_alive(pid));
+    (!current_conflict
+        && probe_current_browser_control_endpoint(session, current, legacy_pid)
+            == BrowserControlEndpointProbe::Absent)
+        .then_some(root.to_path_buf())
+}
+
 /// Select the new daemon namespace unless a live daemon is verified in the
 /// legacy root. A numeric legacy record for another prefixed session can have
 /// the same root filename; an absent root endpoint lets the new daemon use
@@ -629,10 +692,10 @@ fn browser_daemon_dir_in(root: &std::path::Path, session: &str) -> Option<PathBu
             return None;
         }
         if verified_legacy_browser_pid_in(root, session) {
-            let current_conflict = current_present && !read_daemon_pid_file(&current_pid)
-                .is_some_and(|pid| !pid_alive(pid));
-            return (!current_conflict && probe_browser_control_endpoint(session, &current) == BrowserControlEndpointProbe::Absent)
-                .then_some(root.to_path_buf());
+            let legacy_pid = read_daemon_pid_file(&legacy_pid)?;
+            return select_verified_legacy_browser_dir(
+                root, &current, session, &current_pid, current_present, legacy_pid,
+            );
         }
         return (current_fits && probe_legacy_browser_control_endpoint(session, root, &current) == BrowserControlEndpointProbe::Absent)
             .then_some(current);
@@ -7543,10 +7606,45 @@ mod tests {
             BrowserControlEndpointProbe::Absent);
         assert_eq!(classify_legacy_browser_listener(listener_pid, Some(u32::MAX), Some(std::process::id()), false),
             BrowserControlEndpointProbe::Inconclusive);
+        assert_eq!(probe_current_browser_control_endpoint(&session, &selected, std::process::id()),
+            BrowserControlEndpointProbe::Absent,
+            "a verified legacy daemon's hash listener is not a d/ endpoint");
+        assert_eq!(classify_current_browser_listener(Some(Some(std::process::id())), u32::MAX),
+            BrowserControlEndpointProbe::Inconclusive,
+            "another process's listener must keep the conflict blocked");
         assert_eq!(probe_legacy_browser_control_endpoint(&session, temp.path(), &selected),
             BrowserControlEndpointProbe::Inconclusive,
             "the fixture process is not an agent-browser daemon and must not be trusted");
         assert_eq!(std::fs::read_to_string(&foreign).unwrap(), u32::MAX.to_string());
+        drop(listener);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_verified_legacy_hash_listener_selects_root_without_daemon_child() {
+        let temp = tempfile::tempdir().unwrap();
+        let (session, listener) = (0..32).find_map(|_| {
+            let session = format!("legacy-{}", uuid::Uuid::new_v4().simple());
+            let port = browser_control_fallback_port(&session);
+            std::net::TcpListener::bind(("127.0.0.1", port)).ok().map(|listener| (session, listener))
+        }).expect("a free hash-derived browser port");
+        let current = temp.path().join(BROWSER_DAEMON_DIR);
+        prepare_browser_directory(&current, true).unwrap();
+        let pid = std::process::id();
+        let legacy_pid_path = temp.path().join(format!("{session}.pid"));
+        std::fs::write(&legacy_pid_path, pid.to_string()).unwrap();
+        let record = test_browser_record(pid, process_start_time(pid).unwrap(), browser_owner_token().to_owned());
+        let record_path = legacy_session_pid_path_in(temp.path(), &session).unwrap();
+        write_browser_pid_record(&record_path, &record).unwrap();
+        assert_eq!(read_browser_pid_record(&record_path), Some(record));
+
+        // The caller has already verified the root process identity; here
+        // the listener owner must not masquerade as a d/ endpoint.
+        assert_eq!(select_verified_legacy_browser_dir(
+            temp.path(), &current, &session, &current.join(format!("{session}.pid")), false, pid,
+        ), Some(temp.path().to_path_buf()));
+        assert_eq!(classify_current_browser_listener(Some(Some(pid)), u32::MAX),
+            BrowserControlEndpointProbe::Inconclusive);
         drop(listener);
     }
 
