@@ -122,7 +122,8 @@ pub(crate) fn client_access() -> Option<ControlAccess> {
 }
 
 impl ControlClient {
-    /// This process's identity, or `None` when it has nothing to say (the owner).
+    /// This process's claim, or `None` when it has nothing to say. The server
+    /// still decides whether the peer has owner authority.
     pub fn current() -> Option<Self> {
         Self::from_parts(|key| std::env::var_os(key), CLIENT_NAME.get().map(String::as_str), CLIENT_ACCESS.get().copied())
     }
@@ -205,8 +206,8 @@ fn peer_agent_status(pid: u32) -> Option<bool> {
 
 /// Git, gh and glab can run repository-controlled hooks or helpers. Their
 /// launch helpers add the agent marker, but `Command::output()` hides their
-/// pid from registration. The marker on the *ancestor* process survives a
-/// hook clearing its own environment.
+/// pid from registration. The marker on a live ancestor can rule out owner
+/// access; it is self-asserted and cannot grant agent write access.
 fn source_control_process(name: &str) -> bool {
     matches!(name.trim().to_ascii_lowercase().as_str(), "git" | "git.exe" | "gh" | "gh.exe" | "glab" | "glab.exe")
 }
@@ -273,7 +274,7 @@ mod ancestry {
         if chain.iter().any(|(pid, start)| roots.get(pid) == Some(start)) { return Some(true); }
         drop(roots);
         for (pid, _) in chain {
-            if source_control_marker(pid)? { return Some(true); }
+            if source_control_marker(pid)? { return None; }
         }
         Some(false)
     }
@@ -298,10 +299,39 @@ mod ancestry {
     use std::sync::{Mutex, PoisonError};
     use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System, UpdateKind};
 
+    #[cfg(windows)]
+    pub(super) fn process_start(_system: &System, pid: Pid) -> Option<u64> {
+        use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
+        use windows_sys::Win32::{
+            Foundation::FILETIME,
+            System::Threading::{GetProcessTimes, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION},
+        };
+
+        let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid.as_u32()) };
+        if handle.is_null() { return None; }
+        // SAFETY: OpenProcess returned this owned, non-null process handle.
+        let process = unsafe { OwnedHandle::from_raw_handle(handle) };
+        let mut created = FILETIME { dwLowDateTime: 0, dwHighDateTime: 0 };
+        let mut exited = created;
+        let mut kernel = created;
+        let mut user = created;
+        if unsafe { GetProcessTimes(process.as_raw_handle(), &mut created, &mut exited, &mut kernel, &mut user) } == 0 {
+            return None;
+        }
+        let ticks = (u64::from(created.dwHighDateTime) << 32) | u64::from(created.dwLowDateTime);
+        (ticks != 0).then_some(ticks)
+    }
+
+    #[cfg(target_os = "macos")]
+    fn process_start(system: &System, pid: Pid) -> Option<u64> {
+        system.process(pid).map(|process| process.start_time()).filter(|start| *start != 0)
+    }
+
     const PRUNE_AT: usize = 4096;
     const MAX_HOPS: usize = 64;
     // Start time prevents a reused pid from inheriting a previous agent's
-    // mark. sysinfo supplies the OS process table on both platforms.
+    // mark. Windows uses native 100 ns creation ticks; sysinfo supplies the
+    // parent relation on both platforms and macOS start time.
     static ROOTS: Mutex<BTreeMap<u32, u64>> = Mutex::new(BTreeMap::new());
 
     fn snapshot() -> System {
@@ -312,13 +342,11 @@ mod ancestry {
 
     pub(super) fn register(pid: u32) {
         let system = snapshot();
-        let Some(process) = system.process(Pid::from_u32(pid)) else { return };
-        let start = process.start_time();
-        if start == 0 { return; }
+        let Some(start) = process_start(&system, Pid::from_u32(pid)) else { return };
         let mut roots = ROOTS.lock().unwrap_or_else(PoisonError::into_inner);
         if roots.len() >= PRUNE_AT {
             roots.retain(|pid, start| {
-                system.process(Pid::from_u32(*pid)).is_some_and(|process| process.start_time() == *start)
+                process_start(&system, Pid::from_u32(*pid)) == Some(*start)
             });
         }
         roots.insert(pid, start);
@@ -336,16 +364,16 @@ mod ancestry {
             if current == 1 || (cfg!(windows) && current == 4) { return Some(false); }
             let pid = Pid::from_u32(current);
             let process = system.process(pid)?;
-            let start = process.start_time();
+            let start = process_start(&system, pid)?;
             let parent = process.parent()?.as_u32();
             let source_control = super::source_control_process(&process.name().to_string_lossy());
             // A live process in a parent's reused PID slot cannot be the
             // ancestor of a child that started before it.
-            if start == 0 || child_start.is_some_and(|child| start > child) {
+            if child_start.is_some_and(|child| start > child) {
                 return None;
             }
             if ROOTS.lock().unwrap_or_else(PoisonError::into_inner).get(&current) == Some(&start) {
-                return Some(true);
+                return (process_start(&system, pid) == Some(start)).then_some(true);
             }
             if source_control {
                 system.refresh_processes_specifics(
@@ -354,16 +382,27 @@ mod ancestry {
                     ProcessRefreshKind::nothing().with_environ(UpdateKind::Always),
                 );
                 let process = system.process(pid)?;
-                if process.start_time() != start || process.environ().is_empty() { return None; }
+                if process_start(&system, pid) != Some(start) || process.environ().is_empty() { return None; }
                 if process.environ().iter().any(|entry| super::agent_env_entry(&entry.to_string_lossy())) {
-                    return Some(true);
+                    return None;
                 }
             }
+            if process_start(&system, pid) != Some(start) { return None; }
             child_start = Some(start);
             current = parent;
         }
         // Excessive depth or an incomplete process snapshot is unverified.
         None
+    }
+
+    #[cfg(all(test, windows))]
+    pub(super) fn test_start(pid: u32) -> Option<u64> {
+        process_start(&snapshot(), Pid::from_u32(pid))
+    }
+
+    #[cfg(all(test, windows))]
+    pub(super) fn test_insert(pid: u32, start: u64) {
+        ROOTS.lock().unwrap_or_else(PoisonError::into_inner).insert(pid, start);
     }
 }
 
@@ -519,11 +558,11 @@ fn narrowed(command: &str, required: Access, access: ControlAccess) -> Result<()
 /// One socket request's caller, as far as the socket can establish it.
 #[derive(Debug, Clone)]
 pub(crate) enum SocketCaller {
-    /// The owner (principal `local`) or a named same-user client (`local:<slug>`).
+    /// A verified owner (principal `local`) or a named local client (`local:<slug>`).
     Local(ControlCaller),
-    /// A process started by a Codemux agent (env marker or process
-    /// ancestry). Never `CallerKind::Agent`: the socket cannot know the chat's
-    /// ceiling, so it rank-compares the process's own `access`.
+    /// A registered agent process or an unverified external peer. Never
+    /// `CallerKind::Agent`: the socket cannot know the chat's ceiling, so it
+    /// rank-compares the process's own `access`.
     Agent { kind: String, access: ControlAccess },
 }
 
@@ -556,10 +595,13 @@ impl SocketCaller {
     }
 }
 
-/// Resolves who sent a socket request. A verified non-agent peer without a
-/// client is the owner; a named client is `local:<slug>`. An agent marker or
+/// Resolves who sent a socket request. A verified non-agent peer can become
+/// `local` or `local:<slug>`; Windows external peers require independent
+/// owner proof that is not yet available, so they remain read-only. A
 /// registered agent ancestry wins over any name. Unverifiable peers get only
-/// read access, regardless of what they claim in the request.
+/// read access, regardless of what they claim in the request. On supported desktops, only
+/// this app process has positive owner identity: an external process with no
+/// attested agent ancestry stays read-only even if it claims an agent marker.
 pub(crate) fn resolve_socket_caller(client: Option<ControlClient>, peer_pid: Option<u32>) -> SocketCaller {
     let client = client.unwrap_or_default();
     let access = client.access.unwrap_or(ControlAccess::FullAccess);
@@ -567,6 +609,15 @@ pub(crate) fn resolve_socket_caller(client: Option<ControlClient>, peer_pid: Opt
         Some(is_agent) => is_agent,
         None => return SocketCaller::Agent { kind: "unverified".to_owned(), access: ControlAccess::ReadOnly },
     };
+    // A same-account external process is not thereby the owner. A marked
+    // hook can outlive Git and lose its live ancestry; client fields are
+    // self-asserted. Until there is independent owner authentication, only
+    // this app process may claim the local socket principal from negative
+    // ancestry evidence. The trusted in-app path does not use this socket.
+    #[cfg(any(target_os = "linux", target_os = "macos", windows))]
+    if !peer_agent && peer_pid != Some(std::process::id()) {
+        return SocketCaller::Agent { kind: "unverified".to_owned(), access: ControlAccess::ReadOnly };
+    }
     // The kind is only logged; bound what an arbitrary client may send.
     let agent = client.agent.map(|agent| AgentProcess::from_marker(&agent.kind).kind);
     if let Some(kind) = agent {
@@ -941,6 +992,42 @@ mod tests {
         }
 
         #[test]
+        fn external_unmarked_peer_has_read_only_socket_access() {
+            let peer = sleeper();
+            let claimed_owner = super::client(Some("owner"), Some(ControlAccess::FullAccess), None);
+            let caller = resolve_socket_caller(claimed_owner, Some(peer.0.id()));
+            assert!(matches!(&caller, SocketCaller::Agent { kind, access: ControlAccess::ReadOnly }
+                if kind == "unverified"), "unmarked peer claimed owner access: {caller:?}");
+            assert!(caller.permits("status", Access::Read).is_ok());
+            assert!(caller.permits("notify", Access::Write).is_err());
+            assert!(caller.permits("create_workspace", Access::Machine).is_err());
+            assert!(caller.permits("web_remote_enable", Access::Admin).is_err());
+        }
+
+        #[test]
+        fn forged_git_marker_cannot_grant_socket_write_access() {
+            let dir = tempfile::tempdir().unwrap();
+            let git = dir.path().join("git");
+            std::os::unix::fs::symlink(which::which("bash").unwrap(), &git).unwrap();
+            let marked = Started(Command::new(&git)
+                .args(["-c", "while :; do sleep 1; done"])
+                .env(AGENT_PROCESS_ENV, "claimed-agent")
+                .spawn().unwrap());
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            while std::fs::read_to_string(format!("/proc/{}/comm", marked.0.id()))
+                .unwrap_or_default().trim_end() != "git"
+            {
+                assert!(std::time::Instant::now() < deadline, "marked Git fixture never started");
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            let caller = resolve_socket_caller(None, Some(marked.0.id()));
+            assert!(matches!(&caller, SocketCaller::Agent { kind, access: ControlAccess::ReadOnly }
+                if kind == "unverified"), "forged Git marker granted socket authority: {caller:?}");
+            assert!(caller.permits("notify", Access::Write).is_err());
+            assert!(caller.permits("create_workspace", Access::Machine).is_err());
+        }
+
+        #[test]
         fn agent_descendant_is_detected_through_proc_ancestry() {
             let mut shell = Started(
                 Command::new("sh")
@@ -1028,5 +1115,80 @@ mod tests {
         assert!(matches!(caller, SocketCaller::Agent { kind, access: FullAccess } if kind == "process-tree"));
         let _ = child.kill();
         let _ = child.wait();
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn external_unregistered_process_has_read_only_socket_access() {
+        let mut child = std::process::Command::new("sleep").arg("30").spawn().unwrap();
+        let caller = resolve_socket_caller(client(Some("owner"), Some(FullAccess), None), Some(child.id()));
+        assert!(matches!(&caller, SocketCaller::Agent { kind, access: ReadOnly }
+            if kind == "unverified"), "unregistered external peer claimed owner access: {caller:?}");
+        assert!(caller.permits("notify", Access::Write).is_err());
+        assert!(caller.permits("create_workspace", Access::Machine).is_err());
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_same_second_pid_reuse_cannot_inherit_agent_access() {
+        use std::process::{Command, Stdio};
+
+        let mut child = Command::new("ping")
+            .args(["-n", "30", "127.0.0.1"])
+            .stdout(Stdio::null())
+            .spawn().unwrap();
+        let start = ancestry::test_start(child.id()).expect("native Windows process start");
+        let forged = if start % 10_000_000 == 0 { start + 1 } else { start - 1 };
+        assert_eq!(start / 10_000_000, forged / 10_000_000);
+        ancestry::test_insert(child.id(), forged);
+        assert_ne!(peer_agent_status(child.id()), Some(true), "a reused PID cannot inherit the mark");
+        let caller = resolve_socket_caller(client(Some("owner"), Some(FullAccess), Some("agent")), Some(child.id()));
+        assert!(matches!(caller, SocketCaller::Agent { access: ReadOnly, .. }));
+        register_agent_process(child.id());
+        assert_eq!(peer_agent_status(child.id()), Some(true));
+        let caller = resolve_socket_caller(None, Some(child.id()));
+        assert!(caller.permits("notify", Access::Write).is_ok());
+        assert_eq!(caller.permits("web_remote_enable", Access::Admin).unwrap_err().code, ErrorCode::AdminRefused);
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_peer_after_launcher_exit_has_no_owner_authority() {
+        use std::process::{Command, Stdio};
+
+        struct Started { pid: u32, start: u64 }
+        impl Drop for Started {
+            fn drop(&mut self) {
+                if ancestry::test_start(self.pid) == Some(self.start) {
+                    let _ = Command::new("taskkill")
+                        .args(["/PID", &self.pid.to_string(), "/F"])
+                        .output();
+                }
+            }
+        }
+
+        let temp = tempfile::tempdir().unwrap();
+        let pid_path = temp.path().join("peer-pid");
+        let status = Command::new("powershell")
+            .args(["-NoProfile", "-NonInteractive", "-Command",
+                "$child = Start-Process -FilePath ping.exe -ArgumentList '-n','30','127.0.0.1' -PassThru -WindowStyle Hidden; [System.IO.File]::WriteAllText($env:CODEMUX_TEST_PID_PATH, [string]$child.Id)"])
+            .env("CODEMUX_TEST_PID_PATH", &pid_path)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status().unwrap();
+        assert!(status.success(), "launcher failed");
+        let pid: u32 = std::fs::read_to_string(pid_path).unwrap().trim().parse().unwrap();
+        let peer = Started { pid, start: ancestry::test_start(pid).expect("launched peer remains alive") };
+        // The launcher is gone; whether the parent PID vanished or was
+        // recycled, this same-user peer lacks independent owner proof.
+        let caller = resolve_socket_caller(client(Some("owner"), Some(FullAccess), None), Some(peer.pid));
+        assert!(matches!(caller, SocketCaller::Agent { access: ReadOnly, .. }));
+        assert!(caller.permits("status", Access::Read).is_ok());
+        assert!(caller.permits("notify", Access::Write).is_err());
+        assert_eq!(caller.permits("web_remote_enable", Access::Admin).unwrap_err().code, ErrorCode::AdminRefused);
     }
 }

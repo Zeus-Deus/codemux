@@ -124,11 +124,14 @@ pub(crate) const GIT_PROCESS_KIND: &str = "git-hook";
 /// Git runs repository content: hooks (`.git/hooks`, `core.hooksPath`) and
 /// commands named in `.git/config` such as `core.fsmonitor`, which any agent
 /// working in the checkout can write. So git carries the agent-process marker,
-/// and everything it starts inherits it: a `codemux` that a hook runs reaches
-/// the control socket as an agent, refused admin commands, never as the owner.
+/// and everything it starts inherits it: a `codemux` that a hook runs cannot
+/// claim owner control. The marker is self-asserted, so it only narrows socket
+/// access; it never grants agent write access by itself.
 /// Unlike setup scripts, git is not registered for ancestry (most callers wait
 /// on `output()`, which gives no pid). The socket checks this marker on a live
-/// git/gh/glab ancestor, even when a hook clears its own environment.
+/// git/gh/glab ancestor, even when a hook clears its own environment, and
+/// keeps external peers without an attested owner identity read-only on
+/// supported desktop platforms.
 ///
 /// Git also runs with `GIT_OPTIONAL_LOCKS=0`. Codemux reads status and
 /// diffs in the background while agents commit in the same checkout; an
