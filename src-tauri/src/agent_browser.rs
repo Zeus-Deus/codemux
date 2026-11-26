@@ -3748,6 +3748,9 @@ enum PresetNavigationPhase {
     CompletedUnverified,
     Pending,
     Failed,
+    /// The open completed, but the daemon changed before its final probe.
+    /// The command peer is unknown, so only explicit retry may replay it.
+    FailedAmbiguous,
 }
 
 #[derive(Clone)]
@@ -3759,6 +3762,17 @@ struct PresetNavigationAttempt {
 
 fn same_stream_process(left: BrowserStreamIdentity, right: BrowserStreamIdentity) -> bool {
     left.port == right.port && left.pid == right.pid && left.start_time == right.start_time
+}
+
+#[cfg(any(test, target_os = "windows"))]
+fn require_preset_dispatch_record(
+    expected: Option<BrowserStreamIdentity>, stream_port: u16, record: &BrowserPidRecord,
+) -> std::io::Result<()> {
+    if expected.is_some_and(|identity| identity.port != stream_port
+        || identity.pid != record.pid || identity.start_time != record.start_time || !record.native_start) {
+        return Err(std::io::Error::other("Browser daemon changed before preset action"));
+    }
+    Ok(())
 }
 
 fn pending_preset_matches(stream: &StreamSession, attempt: &PresetNavigationAttempt) -> bool {
@@ -3782,11 +3796,17 @@ fn begin_preset_navigation(
     retry_failed: bool,
 ) -> Option<BrowserPresetNavigationStatus> {
     if let Some(attempt) = stream.preset_navigation.as_mut().filter(|attempt| {
-        attempt.identity == identity
+        attempt.phase == PresetNavigationPhase::FailedAmbiguous
+            || attempt.identity == identity
             || (attempt.phase != PresetNavigationPhase::Completed && same_stream_process(attempt.identity, identity))
     }) {
         match attempt.phase {
             PresetNavigationPhase::Completed => return Some(BrowserPresetNavigationStatus::Completed),
+            PresetNavigationPhase::FailedAmbiguous => {
+                if !retry_failed {
+                    return Some(BrowserPresetNavigationStatus::Failed);
+                }
+            }
             PresetNavigationPhase::CompletedUnverified => {
                 if attempt.identity == identity {
                     attempt.phase = PresetNavigationPhase::Completed;
@@ -3818,7 +3838,7 @@ fn classify_completed_preset_verification(
     match verified {
         Ok(current) if current == attempted =>
             (PresetNavigationPhase::Completed, Ok(BrowserPresetNavigationStatus::Completed)),
-        Ok(_) => (PresetNavigationPhase::Failed, Ok(BrowserPresetNavigationStatus::Failed)),
+        Ok(_) => (PresetNavigationPhase::FailedAmbiguous, Ok(BrowserPresetNavigationStatus::Failed)),
         Err(error) => (PresetNavigationPhase::CompletedUnverified,
             Err(format!("Browser preset navigation completed, but daemon identity could not be verified: {error}"))),
     }
@@ -4773,12 +4793,35 @@ fn run_agent_browser_native_with_status(
     discard_stderr: bool,
     timeout: Duration,
 ) -> Result<NativeBrowserCommandOutput, NativeBrowserLaunchFailure> {
+    run_agent_browser_native_with_status_expected(
+        bin, argv, session, stream_port, discard_stderr, timeout, None,
+    )
+}
+
+#[cfg(target_os = "windows")]
+fn run_agent_browser_native_with_status_expected(
+    bin: &str,
+    argv: &[String],
+    session: &str,
+    stream_port: u16,
+    discard_stderr: bool,
+    timeout: Duration,
+    expected_identity: Option<BrowserStreamIdentity>,
+) -> Result<NativeBrowserCommandOutput, NativeBrowserLaunchFailure> {
     let started = Instant::now();
     let (record, started_here) = ensure_owned_browser_daemon_with_status(bin, session, stream_port, timeout)?;
     // Retain the verified process handle across command teardown so an exit
     // check cannot accidentally observe a later occupant of the numeric PID.
     let retained = open_verified_browser_handle(&record, session);
     track_browser_daemon_before_command(session, bin, &record, started_here)
+        .map_err(|error| NativeBrowserLaunchFailure {
+            error,
+            may_have_launched: !browser_daemon_exit_confirmed(&record, retained.as_ref()),
+        })?;
+    // The first preset open must not silently move to a daemon that replaced
+    // the one verified by the manager before dispatch. The relay below pins
+    // CLI bytes to this checked record even if it exits a moment later.
+    require_preset_dispatch_record(expected_identity, stream_port, &record)
         .map_err(|error| NativeBrowserLaunchFailure {
             error,
             may_have_launched: !browser_daemon_exit_confirmed(&record, retained.as_ref()),
@@ -5648,6 +5691,7 @@ fn execute_agent_browser_action_with_status(
     action: &str,
     params: serde_json::Value,
     stream_port: u16,
+    expected_identity: Option<BrowserStreamIdentity>,
 ) -> Result<(BrowserAutomationResult, BrowserActionOutcome), BrowserActionFailure> {
     let session = session_name(browser_id);
     validate_session_name(session).map_err(BrowserActionFailure::before_launch)?;
@@ -5671,7 +5715,8 @@ fn execute_agent_browser_action_with_status(
         let mut all_ok = true;
         let mut previous_command_may_have_launched = false;
         for argv in &groups {
-            let command = run_agent_browser_native_with_status(&bin, argv, session, stream_port, false, action_timeout(action))
+            let command = run_agent_browser_native_with_status_expected(&bin, argv, session, stream_port, false,
+                action_timeout(action), expected_identity)
                 .map_err(|failure| BrowserActionFailure {
                     message: format!("Failed to run agent-browser: {}", failure.error),
                     may_have_launched: previous_command_may_have_launched || failure.may_have_launched,
@@ -5690,6 +5735,7 @@ fn execute_agent_browser_action_with_status(
 
     #[cfg(not(target_os = "windows"))]
     let (stdout, stderr, status_success, may_have_launched) = {
+        let _ = expected_identity;
         let groups = build_agent_browser_argv_groups(session, action, &params)
             .map_err(BrowserActionFailure::before_launch)?;
         let mut combined_stdout = String::new();
@@ -5814,7 +5860,7 @@ fn execute_agent_browser_action_with_status(
 }
 
 fn execute_agent_browser_action(browser_id: &str, action: &str, params: serde_json::Value, stream_port: u16) -> Result<BrowserAutomationResult, String> {
-    execute_agent_browser_action_with_status(browser_id, action, params, stream_port)
+    execute_agent_browser_action_with_status(browser_id, action, params, stream_port, None)
         .map(|(result, _)| result)
         .map_err(|error| error.message)
 }
@@ -6615,6 +6661,7 @@ impl AgentBrowserManager {
             }
             PresetNavigationPhase::Completed if tracked == Some(attempt.identity) => Some(BrowserPresetNavigationStatus::Completed),
             PresetNavigationPhase::Failed if tracked.is_some_and(|current| same_stream_process(current, attempt.identity)) => Some(BrowserPresetNavigationStatus::Failed),
+            PresetNavigationPhase::FailedAmbiguous => Some(BrowserPresetNavigationStatus::Failed),
             _ => None,
         };
         Ok(status)
@@ -6658,6 +6705,7 @@ impl AgentBrowserManager {
             "open",
             serde_json::json!({"url": url}),
             crate::browser_viewport::configured_default_viewport(),
+            Some(identity),
         ).await;
         let (pending_id, tracked_identity) = self.sessions.lock().await.get(browser_id).map_or((None, None), |stream| {
             let tracked = stream.pid.zip(stream.pid_start_time).map(|(pid, start_time)| BrowserStreamIdentity {
@@ -6698,7 +6746,7 @@ impl AgentBrowserManager {
         params: serde_json::Value,
         default_viewport: Option<crate::browser_viewport::ViewportSpec>,
     ) -> Result<BrowserAutomationResult, String> {
-        self.run_command_locked_with_outcome(browser_id, action, params, default_viewport)
+        self.run_command_locked_with_outcome(browser_id, action, params, default_viewport, None)
             .await.map(|(result, _)| result)
     }
 
@@ -6708,6 +6756,7 @@ impl AgentBrowserManager {
         action: &str,
         params: serde_json::Value,
         default_viewport: Option<crate::browser_viewport::ViewportSpec>,
+        expected_identity: Option<BrowserStreamIdentity>,
     ) -> Result<(BrowserAutomationResult, BrowserActionOutcome), String> {
         let session = session_name(browser_id).to_string();
         self.clear_expired_confirmation(browser_id).await;
@@ -6748,7 +6797,7 @@ impl AgentBrowserManager {
                 let bid = browser_id.to_string();
                 let vp_params = crate::browser_viewport::socket_action(spec);
                 let viewport_result = tokio::task::spawn_blocking(move || {
-                    execute_agent_browser_action_with_status(&bid, "viewport", vp_params, port)
+                    execute_agent_browser_action_with_status(&bid, "viewport", vp_params, port, None)
                 })
                 .await;
                 viewport_may_have_launched = match viewport_result {
@@ -6763,7 +6812,7 @@ impl AgentBrowserManager {
         let owned_browser_id = browser_id.to_string();
         let owned_action = action.to_string();
         let result = tokio::task::spawn_blocking(move || {
-            execute_agent_browser_action_with_status(&owned_browser_id, &owned_action, params, port)
+            execute_agent_browser_action_with_status(&owned_browser_id, &owned_action, params, port, expected_identity)
         })
         .await
         .map_err(|e| BrowserActionFailure::after_launch(format!("agent-browser action task failed: {e}")))
@@ -8838,6 +8887,19 @@ mod tests {
             Some(replaced_during_open), PresetNavigationPhase::Failed, None));
         assert_eq!(stream.preset_navigation.as_ref().unwrap().identity, same_process_new_generation);
         assert_eq!(begin_preset_navigation(&mut stream, replaced_during_open, false), None);
+
+        // A successful open with an unknown command peer must not be
+        // replayed automatically, even after verifying a replacement.
+        stream.preset_navigation = Some(PresetNavigationAttempt {
+            identity: same_process_new_generation,
+            phase: PresetNavigationPhase::FailedAmbiguous,
+            prompt_id: None,
+        });
+        assert_eq!(begin_preset_navigation(&mut stream, replaced_during_open, false),
+            Some(BrowserPresetNavigationStatus::Failed));
+        assert_eq!(stream.preset_navigation.as_ref().unwrap().phase, PresetNavigationPhase::FailedAmbiguous);
+        assert_eq!(begin_preset_navigation(&mut stream, replaced_during_open, true), None);
+        assert_eq!(stream.preset_navigation.as_ref().unwrap().identity, replaced_during_open);
     }
 
     #[tokio::test]
@@ -8893,6 +8955,31 @@ mod tests {
         assert_eq!(stream.preset_navigation.as_ref().unwrap().identity, replacement);
     }
 
+    #[test]
+    fn preset_dispatch_rejects_pre_command_replacement_and_post_command_replacement_is_not_completion() {
+        let identity = BrowserStreamIdentity { port: 9223, pid: 41, start_time: 100, generation: 1 };
+        let original = test_browser_record(identity.pid, identity.start_time, "a".repeat(32));
+        let replacement = test_browser_record(42, 200, "a".repeat(32));
+
+        // This guard runs after Windows selects a daemon but before the
+        // private relay and CLI can send the preset command.
+        assert!(require_preset_dispatch_record(Some(identity), identity.port, &original).is_ok());
+        assert!(require_preset_dispatch_record(Some(identity), identity.port, &replacement).is_err());
+        assert!(require_preset_dispatch_record(Some(identity), identity.port + 1, &original).is_err());
+
+        // A different daemon discovered only after the original command
+        // returns must not inherit the original command's completion.
+        let later = BrowserStreamIdentity {
+            pid: replacement.pid,
+            start_time: replacement.start_time,
+            generation: 2,
+            ..identity
+        };
+        let (phase, response) = classify_completed_preset_verification(identity, Ok(later));
+        assert_eq!(phase, PresetNavigationPhase::FailedAmbiguous);
+        assert_eq!(response.unwrap(), BrowserPresetNavigationStatus::Failed);
+    }
+
     #[tokio::test]
     async fn cached_preset_completion_and_matching_prompt_are_read_only() {
         let manager = AgentBrowserManager::new();
@@ -8935,6 +9022,12 @@ mod tests {
             let stream = sessions.get_mut(&session).unwrap();
             stream.preset_navigation.as_mut().unwrap().prompt_id = Some("other-prompt".into());
         }
+        assert_eq!(manager.preset_navigation_status(&session).await.unwrap(), Some(BrowserPresetNavigationStatus::Failed));
+        manager.sessions.lock().await.get_mut(&session).unwrap().preset_navigation = Some(PresetNavigationAttempt {
+            identity,
+            phase: PresetNavigationPhase::FailedAmbiguous,
+            prompt_id: None,
+        });
         assert_eq!(manager.preset_navigation_status(&session).await.unwrap(), Some(BrowserPresetNavigationStatus::Failed));
     }
 
