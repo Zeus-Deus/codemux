@@ -2685,13 +2685,10 @@ fn resolve_control_repo_path<R: Runtime>(
 }
 
 // ---------------------------------------------------------------------------
-// Transport-layer tests
+// Control and transport tests
 //
-// These exercise the platform abstraction in `transport` without involving
-// the Tauri runtime or any command handlers — the point is to prove that
-// bind / connect / accept / liveness-probe all work on every supported
-// platform. Higher-level control-command tests would require a real
-// AppHandle, which is out of scope for a unit test.
+// The Windows external-peer test crosses a real named pipe from a separate
+// process into request dispatch with a mock AppHandle.
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
@@ -4379,6 +4376,63 @@ mod tests {
         assert_eq!(response.as_deref(), Some("hello"));
 
         server.abort();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "only run as a child of test_named_pipe_external_owner_claim_is_read_only"]
+    fn named_pipe_external_owner_claim_worker() {
+        let path = PathBuf::from(std::env::var_os("CODEMUX_TEST_CONTROL_PIPE").expect("test pipe path"));
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        runtime.block_on(async {
+            let mut connection = Connection::open(&[path]).await.expect("connect to test pipe");
+            let client = Some(ControlClient {
+                name: Some("owner".into()),
+                access: Some(crate::agent_control::ControlAccess::FullAccess),
+                agent: None,
+            });
+            let read = connection.exchange(&ControlEnvelope {
+                request: request("status", serde_json::json!({})), client: client.clone(),
+            }).await.unwrap();
+            assert!(read.ok, "an unverified peer can read: {:?}", read.error);
+            let write = connection.exchange(&ControlEnvelope {
+                request: request("notify", serde_json::json!({"message":"must not appear"})), client: client.clone(),
+            }).await.unwrap();
+            assert!(refused_with(&write, "access_denied"), "owner claim cannot write: {:?}", write.error);
+            assert!(write.error.as_deref().is_some_and(|error| error.contains("cannot prove owner authority")), "write refusal should explain the limit: {:?}", write.error);
+            let admin = connection.exchange(&ControlEnvelope {
+                request: request("web_remote_enable", serde_json::json!({})), client,
+            }).await.unwrap();
+            assert!(refused_with(&admin, "admin_refused"), "owner claim cannot administer: {:?}", admin.error);
+        });
+    }
+
+    #[cfg(windows)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_named_pipe_external_owner_claim_is_read_only() {
+        let path = random_pipe_path();
+        let listener = transport::bind(&path).expect("bind named pipe");
+        let child = tokio::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "control::tests::named_pipe_external_owner_claim_worker", "--ignored", "--nocapture"])
+            .env("CODEMUX_TEST_CONTROL_PIPE", &path)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .expect("launch separate pipe client");
+        let child_pid = child.id().expect("client pid");
+        let (stream, peer_pid) = tokio::time::timeout(std::time::Duration::from_secs(10), listener.accept())
+            .await.expect("client connected in time").expect("accept named-pipe client");
+        assert_eq!(peer_pid, Some(child_pid), "the pipe must report the external client's kernel PID");
+
+        let app = operation_app();
+        let served = tokio::spawn(handle_client(app.handle().clone(), stream, peer_pid));
+        let output = tokio::time::timeout(std::time::Duration::from_secs(10), child.wait_with_output())
+            .await.expect("client finished in time").expect("wait for pipe client");
+        assert!(output.status.success(), "client failed:\n{}\n{}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
+        assert_eq!(tokio::time::timeout(std::time::Duration::from_secs(5), served).await.unwrap().unwrap(), Ok(()));
+        assert!(app.state::<AppStateStore>().snapshot().notifications.is_empty(), "denied write changed app state");
     }
 
     #[cfg(windows)]
