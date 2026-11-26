@@ -5871,17 +5871,24 @@ enum BrowserConfirmationResponse {
 
 enum BrowserConfirmationFailure {
     BeforeSend(String),
-    MaybeApplied(String),
+    MaybeApplied(String, Option<BrowserPidRecord>),
 }
 
 impl BrowserConfirmationFailure {
     fn may_have_applied(&self) -> bool {
-        matches!(self, Self::MaybeApplied(_))
+        matches!(self, Self::MaybeApplied(_, _))
+    }
+
+    fn verified_daemon(&self) -> Option<&BrowserPidRecord> {
+        match self {
+            Self::MaybeApplied(_, daemon) => daemon.as_ref(),
+            Self::BeforeSend(_) => None,
+        }
     }
 
     fn into_message(self) -> String {
         match self {
-            Self::BeforeSend(message) | Self::MaybeApplied(message) => message,
+            Self::BeforeSend(message) | Self::MaybeApplied(message, _) => message,
         }
     }
 }
@@ -5955,7 +5962,7 @@ fn run_browser_confirmation_decision(
         let argv = vec![action.to_owned(), id.to_owned(), "--json".into(), "--session".into(), session.to_owned()];
         run_agent_browser_native_with_record(&bin, &argv, session, port, false, ACTION_TIMEOUT, current.clone())
             .map_err(|error| BrowserConfirmationFailure::MaybeApplied(
-                format!("Browser confirmation failed: {error}")))?
+                format!("Browser confirmation failed: {error}"), Some(current.clone())))?
     };
     #[cfg(not(windows))]
     let output = {
@@ -5966,16 +5973,16 @@ fn run_browser_confirmation_decision(
             .env("AGENT_BROWSER_STREAM_PORT", port.to_string());
         output_capture_with_timeout(command, ACTION_TIMEOUT)
             .map_err(|error| BrowserConfirmationFailure::MaybeApplied(
-                format!("Browser confirmation failed: {error}")))?
+                format!("Browser confirmation failed: {error}"), Some(current.clone())))?
     };
     let decision = browser_confirmation_output(&output.stdout, output.status.success(), approve)
-        .map_err(BrowserConfirmationFailure::MaybeApplied)?;
+        .map_err(|error| BrowserConfirmationFailure::MaybeApplied(error, Some(current.clone())))?;
     let after = live_owned_browser_record(session)
         .ok_or_else(|| BrowserConfirmationFailure::MaybeApplied(
-            "Could not verify browser daemon after confirmation".to_string()))?;
+            "Could not verify browser daemon after confirmation".to_string(), Some(current.clone())))?;
     if after != current {
         return Err(BrowserConfirmationFailure::MaybeApplied(
-            "Browser daemon changed while confirmation was processed".into()));
+            "Browser daemon changed while confirmation was processed".into(), Some(current)));
     }
     Ok((after, decision))
 }
@@ -6573,7 +6580,7 @@ impl AgentBrowserManager {
         let result = tokio::task::spawn_blocking(move || {
             decide(session_for_command, port, pending_for_command, upstream_id, approve)
         }).await.map_err(|error| BrowserConfirmationFailure::MaybeApplied(
-            format!("Browser confirmation task failed: {error}")))
+            format!("Browser confirmation task failed: {error}"), None))
             .and_then(|result| result);
         let mut sessions = self.sessions.lock().await;
         let entry = sessions.get_mut(browser_id).ok_or("Browser session closed during confirmation")?;
@@ -6581,12 +6588,16 @@ impl AgentBrowserManager {
             if result.as_ref().map_or_else(
                 |error| error.may_have_applied(), |_| true,
             ) {
+                let verified_daemon = match &result {
+                    Ok((record, _)) => Some(record.clone()),
+                    Err(error) => error.verified_daemon().cloned().or_else(|| pending.daemon.clone()),
+                };
                 if approve {
                     mark_uncertain_preset_confirmation(entry, id);
                 }
                 self.confirmation_recovery_required.lock().unwrap()
                     .entry(browser_id.to_owned()).or_insert_with(|| BrowserConfirmationRecovery {
-                        daemon: pending.daemon.clone(), port,
+                        daemon: verified_daemon, port,
                     });
                 entry.revoke_active_bridges();
                 entry.browser_ready = false;
@@ -6608,7 +6619,7 @@ impl AgentBrowserManager {
                     mark_uncertain_preset_confirmation(entry, id);
                     self.confirmation_recovery_required.lock().unwrap()
                         .entry(browser_id.to_owned()).or_insert_with(|| BrowserConfirmationRecovery {
-                            daemon: pending.daemon.clone(), port,
+                            daemon: error.verified_daemon().cloned().or_else(|| pending.daemon.clone()), port,
                         });
                     entry.revoke_active_bridges();
                     entry.browser_ready = false;
@@ -7420,8 +7431,9 @@ impl AgentBrowserManager {
     ///      control peer, with a Linux pidfd fallback when necessary.
     ///   4. Clean up our PID file in the private record directory.
     ///
-    /// Returns Ok even if individual steps fail — close is idempotent and
-    /// callers should not be blocked from retrying or moving on.
+    /// Returns Ok for ordinary best-effort close. An uncertain confirmation
+    /// returns a retryable error until teardown or a verified reset clears
+    /// its recovery guard.
     pub async fn close(&self, browser_id: &str) -> Result<(), String> {
         let session = session_name(browser_id).to_string();
         validate_session_name(&session)?;
@@ -7582,6 +7594,12 @@ impl AgentBrowserManager {
                     guards.remove(browser_id);
                 }
             }
+        }
+
+        if self.confirmation_recovery_required.lock().unwrap().contains_key(browser_id) {
+            return Err(format!(
+                "Browser confirmation recovery for session {session} is unverified; retry close after the daemon exits",
+            ));
         }
 
         Ok(())
@@ -9679,7 +9697,7 @@ mod tests {
         let identity = current_process_stream_identity(manager.get_port(&session).await.unwrap());
         manager.respond_confirmation_locked_with(&session, &prompt_id, true,
             |_session, _port, _pending, _upstream_id, _approve| {
-                Err(BrowserConfirmationFailure::MaybeApplied("reply lost".into()))
+                Err(BrowserConfirmationFailure::MaybeApplied("reply lost".into(), None))
             }).await.unwrap_err();
         assert!(manager.confirmation_recovery_required.lock().unwrap().contains_key(&session));
         assert!(manager.reconcile_existing_stream_attachment(
@@ -9703,7 +9721,7 @@ mod tests {
         assert!(manager.run_direct_input_action(&session, "click_os", serde_json::json!({"x": 1, "y": 1}))
             .await.unwrap_err().contains("confirmation outcome is uncertain"));
 
-        manager.close_locked(&session).await.unwrap();
+        assert!(manager.close_locked(&session).await.unwrap_err().contains("recovery"));
         // Unit-test close skips process shutdown. A still-live daemon cannot
         // qualify as recovery, even after its session allocation is removed.
         assert!(manager.confirmation_recovery_required.lock().unwrap().contains_key(&session));
@@ -9747,7 +9765,7 @@ mod tests {
                 daemon: Some(record), port,
             });
 
-        manager.close_locked(&session).await.unwrap();
+        assert!(manager.close_locked(&session).await.unwrap_err().contains("recovery"));
         assert!(manager.confirmation_recovery_required.lock().unwrap().contains_key(&session));
         child.kill().unwrap();
         child.wait().unwrap();
@@ -9769,7 +9787,7 @@ mod tests {
         manager.confirmation_recovery_required.lock().unwrap().insert(session.clone(),
             BrowserConfirmationRecovery { daemon: None, port });
 
-        manager.close_locked(&session).await.unwrap();
+        assert!(manager.close_locked(&session).await.unwrap_err().contains("recovery"));
         assert!(manager.confirmation_recovery_required.lock().unwrap().contains_key(&session));
         std::fs::remove_file(pid_path).unwrap();
         manager.close_locked(&session).await.unwrap();
@@ -9777,11 +9795,51 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn lost_reply_pins_verified_sender_when_prompt_was_unpinned() {
+        let (manager, session, record, host_id) = preset_pending_fixture().await;
+        manager.sessions.lock().await.get_mut(&session).unwrap()
+            .pending_confirmation.as_mut().unwrap().daemon = None;
+        let verified = record.clone();
+        manager.respond_confirmation_locked_with(&session, &host_id, true,
+            move |_session, _port, pending, _upstream_id, _approve| {
+                assert!(pending.daemon.is_none());
+                Err(BrowserConfirmationFailure::MaybeApplied("reply lost".into(), Some(record)))
+            }).await.unwrap_err();
+        assert_eq!(manager.confirmation_recovery_required.lock().unwrap()
+            .get(&session).unwrap().daemon.as_ref(), Some(&verified));
+        assert!(manager.verified_stream_identity(&session).await.is_err());
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn unpinned_reply_recovery_accepts_windows_retained_owner_record() {
+        let (manager, session, _record, host_id) = preset_pending_fixture().await;
+        manager.sessions.lock().await.get_mut(&session).unwrap()
+            .pending_confirmation.as_mut().unwrap().daemon = None;
+        let verified = test_browser_record(u32::MAX, 1, browser_owner_token().to_owned());
+        let record_path = session_pid_path(&session).unwrap();
+        write_browser_pid_record(&record_path, &verified).unwrap();
+        let sent_by = verified.clone();
+        manager.respond_confirmation_locked_with(&session, &host_id, true,
+            move |_session, _port, pending, _upstream_id, _approve| {
+                assert!(pending.daemon.is_none());
+                Err(BrowserConfirmationFailure::MaybeApplied("reply lost".into(), Some(sent_by)))
+            }).await.unwrap_err();
+        assert_eq!(manager.confirmation_recovery_required.lock().unwrap()
+            .get(&session).unwrap().daemon.as_ref(), Some(&verified));
+
+        manager.close_locked(&session).await.unwrap();
+        assert!(!manager.confirmation_recovery_required.lock().unwrap().contains_key(&session));
+        assert!(record_path.exists(), "Windows retains the owner record after close");
+        std::fs::remove_file(record_path).unwrap();
+    }
+
+    #[tokio::test]
     async fn fresh_verified_resolved_prompt_clears_uncertain_confirmation() {
         let (manager, session, record, old_host_id) = preset_pending_fixture().await;
         manager.respond_confirmation_locked_with(&session, &old_host_id, true,
             |_session, _port, _pending, _upstream_id, _approve| {
-                Err(BrowserConfirmationFailure::MaybeApplied("reply lost".into()))
+                Err(BrowserConfirmationFailure::MaybeApplied("reply lost".into(), None))
             }).await.unwrap_err();
         let fresh = PendingBrowserConfirmation::new(
             BrowserConfirmationDetails { id: Some("upstream-next".into()), description: "Approve follow-up".into() },
@@ -9807,19 +9865,23 @@ mod tests {
     #[tokio::test]
     async fn changed_confirmation_after_send_requires_recovery() {
         let (manager, session, record, old_host_id) = preset_pending_fixture().await;
+        manager.sessions.lock().await.get_mut(&session).unwrap()
+            .pending_confirmation.as_mut().unwrap().daemon = None;
         let changed = manager.clone();
         let changed_session = session.clone();
+        let verified = record.clone();
         manager.respond_confirmation_locked_with(&session, &old_host_id, true,
             move |_session, _port, _pending, _upstream_id, _approve| {
                 let mut sessions = changed.sessions.blocking_lock();
                 let stream = sessions.get_mut(&changed_session).unwrap();
                 stream.pending_confirmation = Some(PendingBrowserConfirmation::new(
                     BrowserConfirmationDetails { id: Some("upstream-next".into()), description: "Follow-up".into() },
-                    Some(record),
+                    Some(record.clone()),
                 ));
-                Err(BrowserConfirmationFailure::MaybeApplied("reply lost".into()))
+                Err(BrowserConfirmationFailure::MaybeApplied("reply lost".into(), Some(record)))
             }).await.unwrap_err();
-        assert!(manager.confirmation_recovery_required.lock().unwrap().contains_key(&session));
+        assert_eq!(manager.confirmation_recovery_required.lock().unwrap()
+            .get(&session).unwrap().daemon.as_ref(), Some(&verified));
         assert!(!manager.sessions.lock().await.get(&session).unwrap().browser_ready);
         assert!(manager.verified_stream_identity(&session).await.is_err());
     }
@@ -10105,7 +10167,7 @@ mod tests {
         let old_port = manager.get_port(&session).await.unwrap();
         let error = manager.respond_confirmation_locked_with(&session, &prompt_id, true,
             |_session, _port, _pending, _upstream_id, _approve| {
-                Err(BrowserConfirmationFailure::MaybeApplied("approval reply was lost".into()))
+                Err(BrowserConfirmationFailure::MaybeApplied("approval reply was lost".into(), None))
             }).await.unwrap_err();
         assert_eq!(error, "approval reply was lost");
         {
@@ -10168,7 +10230,7 @@ mod tests {
         let (manager, session, record, old_host_id) = preset_pending_fixture().await;
         manager.respond_confirmation_locked_with(&session, &old_host_id, true,
             |_session, _port, _pending, _upstream_id, _approve| {
-                Err(BrowserConfirmationFailure::MaybeApplied("reply lost".into()))
+                Err(BrowserConfirmationFailure::MaybeApplied("reply lost".into(), None))
             }).await.unwrap_err();
         let stale = manager.respond_confirmation_locked_with(&session, &old_host_id, true,
             |_session, _port, _pending, _upstream_id, _approve| {
