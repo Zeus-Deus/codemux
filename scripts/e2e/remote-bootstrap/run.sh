@@ -251,6 +251,23 @@ uexec_pw() {
         "CODEMUX_API_URL='${MOCK_API}' CODEMUX_PASSWORD='${E2E_PASSWORD}' bash -lc $(printf '%q' "$*")" 2>&1
 }
 
+# Keep failure diagnostics free of service output: foreground `serve` can
+# print one-time pairing credentials, and a broken unit might journal them.
+service_state_diag() {
+    local distro="$1" state line shown=0
+    if state=$(uexec "$distro" "systemctl --user show codemux.service -p ActiveState -p Result --no-pager"); then
+        while IFS= read -r line; do
+            case "$line" in
+                ActiveState=active|ActiveState=inactive|ActiveState=failed|ActiveState=activating|ActiveState=deactivating|ActiveState=reloading|ActiveState=maintenance|Result=success|Result=exit-code|Result=signal|Result=core-dump|Result=timeout|Result=watchdog|Result=start-limit-hit|Result=oom-kill|Result=protocol|Result=resources)
+                    info "$line"
+                    shown=1
+                    ;;
+            esac
+        done <<< "$state"
+    fi
+    [ "$shown" -eq 1 ] || info "service state unavailable"
+}
+
 # Curl from *inside the mock-api container* — proves the target's listener is
 # reachable from another host on the network, which loopback-bound would not be.
 mock_curl() {
@@ -472,7 +489,7 @@ run_distro() {
         info "$(printf '%s' "$listening" | head -1)"
     else
         fail "port ${CODEMUX_PORT} listening" "nothing bound"
-        info "journal:"; rexec "$distro" journalctl "_UID=${uid}" -n 40 --no-pager 2>&1 | sed 's/^/      /'
+        service_state_diag "$distro"
     fi
 
     local health_local
@@ -547,7 +564,7 @@ run_distro() {
     if [ -z "$dev_line" ]; then
         fail "POST /api/devices arrived at the mock API" "no request recorded within 60s"
         info "recorded requests:"; mock_requests | sed 's/^/      /'
-        info "journal:"; rexec "$distro" journalctl "_UID=${uid}" -n 60 --no-pager 2>&1 | sed 's/^/      /'
+        service_state_diag "$distro"
     else
         pass "POST /api/devices arrived at the mock API"
         info "registration POST: ${dev_line}"
@@ -776,7 +793,7 @@ except Exception as e:
         info "$(printf '%s' "$post_listening" | head -1)"
     else
         fail "port ${CODEMUX_PORT} listening again after reboot" "nothing bound"
-        info "journal:"; rexec "$distro" journalctl "_UID=${uid}" -n 60 --no-pager 2>&1 | sed 's/^/      /'
+        service_state_diag "$distro"
     fi
 
     # And still reachable from off-box, which is the actual user-facing promise.
