@@ -20,7 +20,7 @@
 
 #![cfg(unix)]
 
-use codemux_lib::agent_control::ControlAccess;
+use codemux_lib::agent_control::{ControlAccess, ControlCaller};
 use codemux_lib::mcp_connector;
 use serde_json::{json, Value};
 use std::collections::{BTreeSet, HashMap};
@@ -90,7 +90,7 @@ struct World {
     env: ChildEnv,
     /// A git repository whose default branch is `trunk`, not `main`.
     repo: PathBuf,
-    /// The repository opened as a workspace by the fixture client, which
+    /// The repository opened as a workspace by the trusted app, which
     /// makes it a project connector clients may branch.
     repo_workspace: String,
     /// The connector's `/mcp` URL on its own loopback port.
@@ -242,14 +242,11 @@ fn boot() -> World {
     assert!(status.listener_running, "the connector never bound a free loopback port: {:?}", status.bind_error);
     let mcp_url = status.local_url.expect("the connector's local URL");
 
-    let mut fixture = StdioDoor::named(&env, "fixture", None);
-    let opened = fixture
-        .call("workspace_create", json!({"path": repo, "client_request_id": "fixture-repo"}))
-        .expect("open the repository as a workspace");
+    let opened = trusted_run(&handle, "workspace_create", json!({"path": repo, "client_request_id": "fixture-repo"}));
     let repo_workspace = opened["workspace_id"].as_str().expect("a workspace id").to_owned();
     // Providers register in the background after boot.
     eventually("Cursor is configured", Duration::from_secs(60), || {
-        let probe = fixture.call("agent_capabilities", json!({"workspace_id": repo_workspace, "provider": "cursor"}));
+        let probe = trusted_call(&handle, "agent_capabilities", json!({"workspace_id": repo_workspace, "provider": "cursor"}));
         match probe {
             Ok(caps) => caps["providers"][0]["configured"] == true,
             Err(error) => {
@@ -258,8 +255,29 @@ fn boot() -> World {
             }
         }
     });
-    assert!(fixture.close().success());
     World { handle, root, env, repo, repo_workspace, mcp_url }
+}
+
+fn trusted_call(handle: &AppHandle<MockRuntime>, tool: &str, args: Value) -> Result<Value, codemux_lib::agent_control::ControlError> {
+    tauri::async_runtime::block_on(codemux_lib::agent_control::execute(handle, &ControlCaller::trusted(), tool, args))
+}
+
+fn trusted_run(handle: &AppHandle<MockRuntime>, tool: &str, args: Value) -> Value {
+    let receipt = trusted_call(handle, tool, args).unwrap_or_else(|error| panic!("trusted {tool}: {error:?}"));
+    let Some(id) = receipt["operation_id"].as_str() else { return receipt };
+    let deadline = Instant::now() + SETTLE;
+    loop {
+        let result = trusted_call(handle, "operation_status", json!({"operation_id": id}))
+            .unwrap_or_else(|error| panic!("trusted {tool} status: {error:?}"));
+        match result["state"].as_str() {
+            Some("succeeded") => return result,
+            Some("failed") => panic!("trusted {tool}: {result}"),
+            _ => {
+                assert!(Instant::now() < deadline, "trusted {tool} did not settle: {result}");
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        }
+    }
 }
 
 impl World {
@@ -280,19 +298,11 @@ impl World {
         id_text(&state["data"]["active_workspace_id"])
     }
 
-    fn open_workspace_ids(&self) -> Vec<String> {
-        let state = self.cli_ok(&["json", "get_app_state", "{}"]);
-        state["data"]["workspaces"].as_array().into_iter().flatten().filter_map(|w| id_text(&w["workspace_id"])).collect()
-    }
-
     /// A fresh plain folder opened as a workspace by the fixture client.
     fn fresh_workspace(&self, name: &str, cleanup: &mut Cleanup) -> String {
         let folder = self.root.join("folders").join(name);
         std::fs::create_dir_all(&folder).unwrap();
-        let mut fixture = StdioDoor::named(&self.env, "fixture", None);
-        let opened = fixture
-            .call("workspace_create", json!({"path": folder, "client_request_id": format!("folder-{name}")}))
-            .expect("open a folder as a workspace");
+        let opened = trusted_run(&self.handle, "workspace_create", json!({"path": folder, "client_request_id": format!("folder-{name}")}));
         let workspace = opened["workspace_id"].as_str().unwrap().to_owned();
         cleanup.workspaces.push(workspace.clone());
         workspace
@@ -791,7 +801,7 @@ impl Drop for Cleanup {
         let Some(world) = WORLD.get() else { return };
         let call = |tool: &str, mut args: Value| {
             args["client_request_id"] = json!(format!("cleanup-{}", tag()));
-            let _ = world.cli(&["call", tool, &args.to_string()], &[]);
+            let _ = trusted_call(&world.handle, tool, args);
         };
         for (workspace, thread) in &self.threads {
             call("thread_stop", json!({"workspace_id": workspace, "thread_id": thread}));
@@ -897,11 +907,9 @@ fn created_worktree(world: &World, created: &Value, branch: &str) -> (String, Pa
 // ── The flows ─────────────────────────────────────────────────────────────
 
 #[test]
-fn stdio_door_drives_the_full_outside_flow() {
+fn stdio_door_reads_and_refuses_mutation() {
     let w = world();
     let t = tag();
-    let mut cleanup = Cleanup::default();
-    let focus = w.active_workspace();
     let mut door = StdioDoor::named(&w.env, "hermes", None);
 
     let init = door.initialized["result"].clone();
@@ -911,85 +919,18 @@ fn stdio_door_drives_the_full_outside_flow() {
 
     let listed = door.ok("workspace_list", json!({}));
     assert!(listed["workspaces"].as_array().unwrap().iter().any(|row| row["workspace_id"] == w.repo_workspace.as_str()), "{listed}");
-
+    assert!(door.ok("thread_list", json!({"workspace_id": w.repo_workspace}))["threads"].is_array());
     let branch = format!("oa-stdio-{t}");
-    let created = door.ok("worktree_create", json!({"repo_path": w.repo, "branch": branch, "client_request_id": format!("wt-{t}")}));
-    let (workspace, cwd) = created_worktree(w, &created, &branch);
-    cleanup.worktrees.push(workspace.clone());
-    assert!(!cwd.join(".mcp.json").exists(), "workspace creation must not write ambient MCP config");
-
-    let caps = door.ok("agent_capabilities", json!({"workspace_id": workspace, "provider": "cursor"}));
-    let allowed = modes(&caps);
-    assert!(allowed.contains(&"ask".into()) && allowed.contains(&"agent".into()), "{caps}");
-
-    let receipt = door.ok("thread_launch", json!({"workspace_id": workspace, "provider": "cursor", "model": "fake-model",
-        "permission_mode": "agent", "title": format!("Outside {t}"), "message": format!("echo-prompt launch-{t}"),
-        "client_request_id": format!("launch-{t}")}));
-    let thread = text(&receipt["thread_id"]).to_owned();
-    assert!(!thread.is_empty(), "the receipt names the thread at once: {receipt}");
-    cleanup.threads.push((workspace.clone(), thread.clone()));
-    let launched = door.settle(&receipt);
-    assert_eq!(launched["state"], "succeeded", "{launched}");
-    let waited = door.finish(&workspace, &thread, turn_of(&launched).as_deref());
-    assert_eq!((waited["state"].clone(), waited["timed_out"].clone()), (json!("done"), json!(false)), "{waited}");
-    assert!(text(&waited["final_text"]).contains(&format!("launch-{t}")), "{waited}");
-    assert_eq!(waited["pending"], json!({"approvals": [], "questions": [], "secrets": []}));
-    assert_eq!(waited["failure"], Value::Null);
-    // The fields waits returned before stay.
-    assert!(waited["status"].is_object() && waited["settled"] == true && waited.get("selected_turn").is_some(), "{waited}");
-
-    let page = door.ok("thread_read", json!({"workspace_id": workspace, "thread_id": thread}));
-    let messages = page["messages"].as_array().unwrap();
-    assert!(messages.iter().any(|m| m["role"] == "user" && text(&m["content"]).contains(&format!("echo-prompt launch-{t}"))), "{page}");
-    assert!(messages.iter().any(|m| m["role"] == "assistant" && text(&m["content"]).contains(&format!("launch-{t}"))), "{page}");
-
-    let turn = send(&mut door, &workspace, &thread, &format!("echo-prompt send-{t}"), &format!("send-{t}"));
-    assert!(turn.is_some(), "an idle thread starts the message as a run");
-    let waited = door.finish(&workspace, &thread, turn.as_deref());
-    assert_eq!(waited["state"], "done", "{waited}");
-    assert!(text(&waited["final_text"]).contains(&format!("send-{t}")), "{waited}");
-
-    // A held run: a short wait times out without ending it; an interrupt does.
-    let held = send(&mut door, &workspace, &thread, "await-cancel", &format!("hold-{t}")).expect("the held run");
-    until_started(&mut door, &workspace, &thread, Some(&held));
-    let early = door.wait(&workspace, &thread, Some(&held), 500);
-    assert_eq!((early["timed_out"].clone(), early["state"].clone()), (json!(true), json!("running")), "{early}");
-    let interrupted = door.run("thread_interrupt", json!({"workspace_id": workspace, "thread_id": thread, "turn_id": held,
-        "client_request_id": format!("int-{t}")}));
-    assert_eq!(interrupted["result"]["reached_provider"], true, "{interrupted}");
-    let ended = door.finish(&workspace, &thread, Some(&held));
-    assert_eq!((ended["state"].clone(), ended["failure"].clone()), (json!("failed"), json!("interrupted")), "{ended}");
-
-    // Messages from an outside assistant say so, under its name.
-    let rows = w.sql(
-        "SELECT json_extract(payload, '$.created_by') AS created_by, json_extract(payload, '$.creation_source') AS source, \
-         json_extract(payload, '$.sender_title') AS sender FROM agent_chat_messages \
-         WHERE thread_id = ?1 AND json_extract(payload, '$.type') = 'user_message'",
-        &[&thread],
-    );
-    assert_eq!(rows.len(), 3, "{rows:?}");
-    for row in &rows {
-        assert_eq!((row["created_by"].clone(), row["source"].clone(), row["sender"].clone()), (json!("agent"), json!("mcp"), json!("hermes")), "{row:?}");
+    for (tool, args) in [
+        ("worktree_create", json!({"repo_path": w.repo, "branch": branch, "client_request_id": format!("wt-{t}")})),
+        ("thread_launch", json!({"workspace_id": w.repo_workspace, "provider": "cursor", "permission_mode": "agent",
+            "message": "echo-prompt refused", "client_request_id": format!("launch-{t}")})),
+        ("workspace_close", json!({"workspace_id": w.repo_workspace, "client_request_id": format!("close-{t}")})),
+    ] {
+        assert_eq!(door.refused(tool, args).code, "access_denied", "{tool}");
     }
-
-    let closed = door.ok("workspace_close", json!({"workspace_id": workspace, "client_request_id": format!("close-{t}"), "delete_worktree": true}));
-    assert_eq!((closed["closed"].clone(), closed["worktree_removed"].clone()), (json!(true), json!(true)), "{closed}");
-    assert!(!cwd.exists(), "the worktree is removed");
-    assert!(!w.open_workspace_ids().contains(&workspace));
-    match door.call("thread_status", json!({"workspace_id": workspace, "thread_id": thread})) {
-        Ok(status) => assert_eq!(status["runtime_live"], false, "{status}"),
-        Err(error) => assert!(matches!(error.code.as_str(), "thread_not_found" | "workspace_not_found"), "{error:?}"),
-    }
-
-    let receipts = receipts(w, &t);
-    assert!(receipts.iter().all(|(principal, _)| principal == "local:hermes"), "{receipts:?}");
-    let tools: BTreeSet<&str> = receipts.iter().map(|(_, tool)| tool.as_str()).collect();
-    for tool in ["worktree_create", "thread_launch", "thread_send", "thread_interrupt", "workspace_close"] {
-        assert!(tools.contains(tool), "{tool} in {tools:?}");
-    }
-    // Outside callers never move the desktop's focus.
-    assert_eq!(w.active_workspace(), focus);
-    assert!(door.close().success());
+    assert_eq!(worktrees_on(&w.repo, &branch), 0);
+    assert!(receipts(w, &t).is_empty(), "refused calls must not create operations");
 }
 
 #[test]
@@ -1078,7 +1019,7 @@ fn doors_list_the_same_outside_tools_with_the_same_result_shape() {
 /// (as Claude Code does) and then sends no `initialize` drives the same flow,
 /// through the same app, as an initialize-era client.
 #[test]
-fn stateless_era_stdio_client_drives_a_thread_without_initialize() {
+fn stateless_era_stdio_client_reads_without_initialize() {
     if !codemux_lib::mcp::protocol::MODERN_ERA_ENABLED {
         // Switched off, every request is initialize-era, which the other tests cover.
         eprintln!("skipped: the stateless era is switched off (mcp::protocol::MODERN_ERA_ENABLED)");
@@ -1086,7 +1027,6 @@ fn stateless_era_stdio_client_drives_a_thread_without_initialize() {
     }
     let w = world();
     let t = tag();
-    let mut cleanup = Cleanup::default();
     let client = format!("modern-{t}");
     let mut door = StdioDoor::stateless(&w.env, &client);
 
@@ -1124,19 +1064,10 @@ fn stateless_era_stdio_client_drives_a_thread_without_initialize() {
     assert_eq!(reply["result"]["isError"], true, "{reply}");
     assert_eq!(reply["result"]["structuredContent"]["error"]["code"], "workspace_not_found", "{reply}");
 
-    // The whole loop: launch, a wait that parks on the stateless path, read.
-    let workspace = w.fresh_workspace(&format!("modern{t}"), &mut cleanup);
-    let (thread, turn) = launch(&mut door, &workspace, "agent", &format!("echo-prompt modern-{t}"), &format!("launch-{t}"));
-    cleanup.threads.push((workspace.clone(), thread.clone()));
-    let waited = door.finish(&workspace, &thread, turn.as_deref());
-    assert_eq!(waited["state"], "done", "{waited}");
-    assert!(text(&waited["final_text"]).contains(&format!("modern-{t}")), "{waited}");
-    let page = door.ok("thread_read", json!({"workspace_id": workspace, "thread_id": thread}));
-    assert!(page["messages"].as_array().unwrap().iter().any(|m| m["role"] == "assistant"), "{page}");
-
-    // `clientInfo` in the requests named the client: it owns the receipts.
-    let receipts = receipts(w, &t);
-    assert!(!receipts.is_empty() && receipts.iter().all(|(principal, _)| *principal == format!("local:{client}")), "{receipts:?}");
+    let refused = door.refused("thread_launch", json!({"workspace_id": w.repo_workspace, "provider": "cursor",
+        "permission_mode": "agent", "message": "echo-prompt refused", "client_request_id": format!("launch-{t}")}));
+    assert_eq!(refused.code, "access_denied", "{refused:?}");
+    assert!(receipts(w, &t).is_empty(), "the stateless write must not create an operation");
 
     // A revision Codemux does not speak lists the ones it does; the process keeps serving.
     let mut future = door.params(json!({}));
@@ -1232,7 +1163,8 @@ fn token_revoked_mid_wait_ends_the_wait_with_grant_revoked() {
     let t = tag();
     let mut cleanup = Cleanup::default();
     let label = format!("rev-{t}");
-    let mut door = w.http(&w.issue(&label, ControlAccess::FullAccess));
+    let issued = w.issue(&label, ControlAccess::FullAccess);
+    let mut door = w.http(&issued);
     let workspace = w.repo_workspace.clone();
     let (thread, turn) = launch(&mut door, &workspace, "agent", "await-cancel", &format!("launch-{t}"));
     cleanup.threads.push((workspace.clone(), thread.clone()));
@@ -1254,8 +1186,7 @@ fn token_revoked_mid_wait_ends_the_wait_with_grant_revoked() {
         door.call("thread_wait", probe.clone()).err().is_some_and(|error| error.code == "wait_budget_exhausted")
     });
     let revoked_at = Instant::now();
-    let revoked = w.cli(&["connector", "revoke", &label, "--json"], &[]);
-    assert_eq!(exit_code(&revoked), 0, "{}", describe(&revoked));
+    mcp_connector::agent_connector_revoke(w.handle.clone(), issued.client_id).expect("trusted app revokes the grant");
     for waiter in waiters {
         let (result, returned_at) = waiter.join().unwrap();
         assert_eq!(result.expect_err("the wait ends with the grant").code, "grant_revoked");
@@ -1264,8 +1195,8 @@ fn token_revoked_mid_wait_ends_the_wait_with_grant_revoked() {
     }
     assert_eq!(door.ping(), 401);
 
-    // The owner can still stop what the revoked client started.
-    let mut owner = StdioDoor::named(&w.env, &format!("owner-{t}"), None);
+    // Another authenticated client can still stop what the revoked client started.
+    let mut owner = w.http(&w.issue(&format!("owner-{t}"), ControlAccess::FullAccess));
     let stopped = owner.run("thread_stop", json!({"workspace_id": workspace, "thread_id": thread, "client_request_id": format!("stop-{t}")}));
     assert_eq!(stopped["result"]["stopped"], true, "{stopped}");
 }
@@ -1321,41 +1252,11 @@ fn parked_http_waits_release_permits_and_respect_the_waiter_budget() {
 }
 
 #[test]
-fn retry_with_the_same_client_request_id_is_deduplicated_across_processes() {
+fn retry_with_the_same_client_request_id_is_deduplicated_across_authenticated_connections() {
     let w = world();
     let t = tag();
     let mut cleanup = Cleanup::default();
     let workspace = w.fresh_workspace(&format!("dedupe-{t}"), &mut cleanup);
-    let client = format!("dedupe-{t}");
-    let launch_args = json!({"workspace_id": workspace, "provider": "cursor", "permission_mode": "agent",
-        "message": format!("echo-prompt dedupe-{t}"), "client_request_id": format!("k-{t}")});
-    let first = {
-        let mut door = StdioDoor::named(&w.env, &client, None);
-        let receipt = door.ok("thread_launch", launch_args.clone());
-        let settled = door.settle(&receipt);
-        assert!(door.close().success());
-        settled
-    };
-    cleanup.threads.push((workspace.clone(), text(&first["thread_id"]).to_owned()));
-    let sessions = w.sessions_in(&workspace);
-    assert_eq!(sessions, 1);
-    // A new process of the same client is the same principal.
-    let mut again = StdioDoor::named(&w.env, &client, None);
-    let second = again.ok("thread_launch", launch_args);
-    assert_eq!((second["operation_id"].clone(), second["thread_id"].clone()), (first["operation_id"].clone(), first["thread_id"].clone()), "{second}");
-    assert_eq!(w.sessions_in(&workspace), sessions);
-
-    let branch = format!("dd-{t}");
-    let worktree = json!({"repo_path": w.repo, "branch": branch, "client_request_id": format!("wt-{t}")});
-    let created = again.ok("worktree_create", worktree.clone());
-    cleanup.worktrees.push(text(&created["workspace_id"]).to_owned());
-    assert!(again.close().success());
-    let mut third = StdioDoor::named(&w.env, &client, None);
-    let replayed = third.ok("worktree_create", worktree);
-    assert_eq!(replayed["workspace_id"], created["workspace_id"], "{replayed}");
-    assert_eq!(replayed["replayed"], true, "{replayed}");
-    assert_eq!(worktrees_on(&w.repo, &branch), 1);
-
     // Over HTTP, and across a token reissued for the same label.
     let label = format!("dd-http-{t}");
     let issued = w.issue(&label, ControlAccess::FullAccess);
@@ -1378,9 +1279,9 @@ fn reused_client_request_id_with_a_different_payload_conflicts() {
     let t = tag();
     let mut cleanup = Cleanup::default();
     let workspace = w.fresh_workspace(&format!("conflict-{t}"), &mut cleanup);
-    let mut stdio = StdioDoor::named(&w.env, &format!("conflict-{t}"), None);
-    let mut http = w.http(&w.issue(&format!("conflict-{t}"), ControlAccess::FullAccess));
-    for (index, door) in [&mut stdio as &mut dyn Door, &mut http].into_iter().enumerate() {
+    let mut first = w.http(&w.issue(&format!("conflict-a-{t}"), ControlAccess::FullAccess));
+    let mut second = w.http(&w.issue(&format!("conflict-b-{t}"), ControlAccess::FullAccess));
+    for (index, door) in [&mut first as &mut dyn Door, &mut second].into_iter().enumerate() {
         let key = format!("k{index}-{t}");
         let (thread, _) = launch(door, &workspace, "agent", &format!("echo-prompt first-{t}"), &key);
         cleanup.threads.push((workspace.clone(), thread));
@@ -1397,8 +1298,8 @@ fn same_request_key_from_two_clients_is_two_operations() {
     let w = world();
     let t = tag();
     let mut cleanup = Cleanup::default();
-    let mut alpha = StdioDoor::named(&w.env, &format!("alpha-{t}"), None);
-    let mut beta = StdioDoor::named(&w.env, &format!("beta-{t}"), None);
+    let mut alpha = w.http(&w.issue(&format!("alpha-{t}"), ControlAccess::FullAccess));
+    let mut beta = w.http(&w.issue(&format!("beta-{t}"), ControlAccess::FullAccess));
     let args = json!({"workspace_id": w.repo_workspace, "provider": "cursor", "permission_mode": "agent",
         "message": format!("echo-prompt pair-{t}"), "client_request_id": format!("same-{t}")});
     let a = alpha.ok("thread_launch", args.clone());
@@ -1418,11 +1319,12 @@ fn interrupt_during_a_wait_on_one_stdio_connection() {
     let w = world();
     let t = tag();
     let mut cleanup = Cleanup::default();
-    let mut door = StdioDoor::named(&w.env, &format!("concurrent-{t}"), None);
+    let mut owner = w.http(&w.issue(&format!("concurrent-owner-{t}"), ControlAccess::FullAccess));
     let workspace = w.repo_workspace.clone();
-    let (thread, turn) = launch(&mut door, &workspace, "agent", "await-cancel", &format!("launch-{t}"));
+    let (thread, turn) = launch(&mut owner, &workspace, "agent", "await-cancel", &format!("launch-{t}"));
     cleanup.threads.push((workspace.clone(), thread.clone()));
-    until_started(&mut door, &workspace, &thread, turn.as_deref());
+    until_started(&mut owner, &workspace, &thread, turn.as_deref());
+    let mut door = StdioDoor::named(&w.env, &format!("concurrent-{t}"), None);
     let mut wait = json!({"workspace_id": workspace, "thread_id": thread, "timeout_ms": 60_000});
     let mut interrupt = json!({"workspace_id": workspace, "thread_id": thread, "client_request_id": format!("int-{t}")});
     if let Some(turn) = &turn {
@@ -1435,11 +1337,9 @@ fn interrupt_during_a_wait_on_one_stdio_connection() {
     let status = door.response(status, Duration::from_secs(3));
     assert_eq!(status["result"]["isError"], false, "{status}");
     assert!(!door.answered(waiting), "the wait is still parked");
-    let interrupted = door.send("tools/call", json!({"name": "thread_interrupt", "arguments": interrupt}));
-    let receipt = door.response(interrupted, Duration::from_secs(5));
-    // Answers are read in arrival order: the wait's would be held as early.
-    assert!(!door.early.contains_key(&waiting), "the interrupt's receipt came before the wait's answer");
-    tool_result(&receipt["result"]).expect("an interrupt receipt");
+    let refused = door.refused("thread_interrupt", interrupt.clone());
+    assert_eq!(refused.code, "access_denied", "{refused:?}");
+    owner.run("thread_interrupt", interrupt);
     let ended = tool_result(&door.response(waiting, Duration::from_secs(5))["result"]).expect("the wait's result");
     assert_eq!((ended["state"].clone(), ended["failure"].clone()), (json!("failed"), json!("interrupted")), "{ended}");
 }
@@ -1449,17 +1349,17 @@ fn stdio_eof_during_a_wait_exits_promptly() {
     let w = world();
     let t = tag();
     let mut cleanup = Cleanup::default();
-    let mut door = StdioDoor::named(&w.env, &format!("eof-{t}"), None);
+    let mut owner = w.http(&w.issue(&format!("eof-owner-{t}"), ControlAccess::FullAccess));
     let workspace = w.repo_workspace.clone();
-    let (thread, _) = launch(&mut door, &workspace, "agent", "await-cancel", &format!("launch-{t}"));
+    let (thread, _) = launch(&mut owner, &workspace, "agent", "await-cancel", &format!("launch-{t}"));
     cleanup.threads.push((workspace.clone(), thread.clone()));
+    let mut door = StdioDoor::named(&w.env, &format!("eof-{t}"), None);
     door.send("tools/call", json!({"name": "thread_wait", "arguments": {"workspace_id": workspace, "thread_id": thread, "timeout_ms": 60_000}}));
     std::thread::sleep(Duration::from_millis(300));
     door.stdin.take();
     let status = door.wait_exit(Duration::from_secs(3)).expect("codemux mcp exits within 3 s of EOF during a wait");
     assert!(status.success(), "{status}");
     // Ending the wait ended nothing else.
-    let mut owner = StdioDoor::named(&w.env, &format!("owner-{t}"), None);
     let status = owner.ok("thread_status", json!({"workspace_id": workspace, "thread_id": thread}));
     assert_eq!(status["state"], "running", "{status}");
 }
@@ -1514,7 +1414,8 @@ fn refresh_token_rotation_keeps_receipts_and_rejects_replay() {
             .unwrap()
     };
     assert_eq!(complete().status(), 202, "the sign-in waits for the owner");
-    w.cli_ok(&["json", "agent_connector_approve", &json!({"request_id": request_id, "access": "supervised"}).to_string()]);
+    mcp_connector::agent_connector_approve(w.handle.clone(), request_id.clone(), ControlAccess::Supervised)
+        .expect("trusted app approves the connector request");
     let redirect = complete();
     assert_eq!(redirect.status(), 303);
     let location = url::Url::parse(redirect.headers()["location"].to_str().unwrap()).unwrap();
@@ -1569,7 +1470,7 @@ fn agent_processes_are_refused_admin_and_native_tools() {
     let w = world();
     let t = tag();
     let mut cleanup = Cleanup::default();
-    let mut owner = StdioDoor::named(&w.env, &format!("agents-{t}"), None);
+    let mut owner = w.http(&w.issue(&format!("agents-{t}"), ControlAccess::FullAccess));
     let workspace = w.repo_workspace.clone();
     let list = json!({"workspace_id": workspace}).to_string();
     let approve = json!({"request_id": "x", "access": "full_access"}).to_string();
@@ -1592,21 +1493,20 @@ fn agent_processes_are_refused_admin_and_native_tools() {
     assert_eq!(exit_code(&listed), 0, "{}", describe(&listed));
     assert!(String::from_utf8_lossy(&listed.stdout).contains("thread_send"), "{}", describe(&listed));
 
-    // The env marker alone refuses (the only signal off Linux).
+    // A self-asserted marker cannot grant authority or hide public reads.
     let marker = [("CODEMUX_AGENT_PROCESS", "1")];
     let marked = w.cli(&["json", "agent_connector_approve", &approve], &marker);
     assert_eq!(exit_code(&marked), 1, "{}", describe(&marked));
     assert!(String::from_utf8_lossy(&marked.stdout).contains("admin_refused"), "{}", describe(&marked));
     let marked = w.cli(&["call", "thread_list", &list], &marker);
-    assert_eq!(stdout_json(&marked)["error"]["code"], "agent_identity_required", "{}", describe(&marked));
+    assert_eq!(exit_code(&marked), 0, "{}", describe(&marked));
+    assert!(stdout_json(&marked)["result"]["threads"].is_array());
 
-    // The refusals are about the caller: the owner runs the same administration command.
+    // The trusted app can administer connector grants after the CLI refusals.
     let owner_label = format!("owner-{t}");
-    let issued = w.cli(&["connector", "issue", "--label", &owner_label, "--access", "read-only", "--json"], &[]);
-    assert_eq!(exit_code(&issued), 0, "{}", describe(&issued));
-    assert!(text(&stdout_json(&issued)["result"]["token"]).starts_with("cmcp_"), "{}", describe(&issued));
-    let revoked = w.cli(&["connector", "revoke", &owner_label, "--json"], &[]);
-    assert_eq!(exit_code(&revoked), 0, "{}", describe(&revoked));
+    let issued = w.issue(&owner_label, ControlAccess::ReadOnly);
+    assert!(issued.token.starts_with("cmcp_"));
+    mcp_connector::agent_connector_revoke(w.handle.clone(), issued.client_id).expect("trusted app revokes the grant");
 
     #[cfg(target_os = "linux")]
     refused_by_ancestry(w, &mut owner, &workspace, &thread, &t);
@@ -1615,7 +1515,7 @@ fn agent_processes_are_refused_admin_and_native_tools() {
 /// The fake agent runs each command with no agent marker in its env: only
 /// its process ancestry tells the app it is an agent. Linux only.
 #[cfg(target_os = "linux")]
-fn refused_by_ancestry(w: &World, owner: &mut StdioDoor, workspace: &str, thread: &str, t: &str) {
+fn refused_by_ancestry(w: &World, owner: &mut dyn Door, workspace: &str, thread: &str, t: &str) {
     let label = format!("agent-{t}");
     let list = json!({"workspace_id": workspace}).to_string();
     let approve = json!({"request_id": "x", "access": "full_access"}).to_string();
@@ -1649,7 +1549,7 @@ fn approvals_from_outside_follow_the_access_level() {
     let w = world();
     let t = tag();
     let mut cleanup = Cleanup::default();
-    let mut owner = StdioDoor::named(&w.env, &format!("approver-{t}"), None);
+    let mut owner = w.http(&w.issue(&format!("approver-{t}"), ControlAccess::FullAccess));
     let workspace = w.repo_workspace.clone();
     // Ask mode: the fake's approval reaches the person (here, outside clients).
     // It asks 2 s into the run, so the wait below parks first.
@@ -1683,7 +1583,7 @@ fn approvals_from_outside_follow_the_access_level() {
     // Connector clients never allow always, even at full access.
     let mut full = w.http(&w.issue(&format!("ap-full-{t}"), ControlAccess::FullAccess));
     assert_eq!(full.refused("thread_respond", respond(&second, "allow_always", format!("always-{t}"))).code, "permission_denied");
-    owner.run("thread_respond", respond(&second, "allow_once", format!("once-{t}")));
+    full.run("thread_respond", respond(&second, "allow_once", format!("once-{t}")));
     let allowed = owner.finish(&workspace, &thread, turn.as_deref());
     assert!(text(&allowed["final_text"]).contains("permission:yes"), "{allowed}");
 
@@ -1694,103 +1594,55 @@ fn approvals_from_outside_follow_the_access_level() {
 }
 
 #[test]
-fn cli_verbs_drive_a_thread_with_exit_codes() {
+fn cli_verbs_keep_reads_and_refuse_thread_writes() {
     let w = world();
     let t = tag();
-    let mut cleanup = Cleanup::default();
     let mut http = w.http(&w.issue(&format!("cli-{t}"), ControlAccess::FullAccess));
     let listed = w.cli_ok(&["tools", "--json"]);
-    assert_eq!(
-        names(listed["tools"].as_array().unwrap()).into_iter().collect::<BTreeSet<_>>(),
-        names(&http.list()).into_iter().collect::<BTreeSet<_>>(),
-    );
+    let local_names = names(listed["tools"].as_array().unwrap());
+    let network_names = names(&http.list());
+    assert!(local_names.iter().all(|name| network_names.contains(name)), "{local_names:?}");
+    assert!(local_names.contains(&"thread_read".into()) && !local_names.contains(&"thread_launch".into()));
+
     let workspace = w.repo_workspace.as_str();
     let client = format!("cli-{t}");
-    let start = |mode: &str, message: String| {
-        w.cli(&["--client", &client, "thread", "start", "--workspace", workspace, "--provider", "cursor", "--permission-mode", mode,
-            "-m", &message, "--wait", "--json"], &[])
-    };
-    let done = start("agent", format!("echo-prompt cli-{t}"));
-    assert_eq!(exit_code(&done), 0, "{}", describe(&done));
-    let report = stdout_json(&done);
-    assert_eq!((report["ok"].clone(), report["state"].clone()), (json!(true), json!("done")), "{report}");
-    assert!(text(&report["final_text"]).contains(&format!("cli-{t}")), "{report}");
-    cleanup.threads.push((workspace.into(), text(&report["thread_id"]).to_owned()));
-
-    let asks = start("ask", format!("hold-permission cli2-{t}"));
-    assert_eq!(exit_code(&asks), 2, "needs input: {}", describe(&asks));
-    let report = stdout_json(&asks);
-    let thread = text(&report["thread_id"]).to_owned();
-    cleanup.threads.push((workspace.into(), thread.clone()));
-    let request = text(&report["pending"]["approvals"][0]["request_id"]).to_owned();
-    assert!(!request.is_empty(), "{report}");
-    let denied = w.cli(&["thread", "respond", &thread, &request, "deny", "--workspace", workspace, "--json"], &[]);
-    assert_eq!(exit_code(&denied), 0, "{}", describe(&denied));
+    let start = w.cli(&["--client", &client, "thread", "start", "--workspace", workspace, "--provider", "cursor",
+        "--permission-mode", "agent", "-m", "echo-prompt refused", "--json"], &[]);
+    assert_eq!(exit_code(&start), 1, "{}", describe(&start));
+    assert_eq!(stdout_json(&start)["error"]["code"], "access_denied", "{}", describe(&start));
+    let answer = w.cli(&["thread", "respond", "missing", "request", "deny", "--workspace", workspace, "--json"], &[]);
+    assert_eq!(exit_code(&answer), 1, "{}", describe(&answer));
+    assert_eq!(stdout_json(&answer)["error"]["code"], "access_denied", "{}", describe(&answer));
 
     let missing = json!({"workspace_id": format!("missing-{t}"), "thread_id": "x"}).to_string();
     let called = w.cli(&["call", "thread_read", &missing], &[]);
     assert_eq!(exit_code(&called), 1);
     assert_eq!(stdout_json(&called)["error"]["code"], "workspace_not_found", "{}", describe(&called));
-    let raw = w.cli(&["json", "thread_read", &missing], &[]);
-    assert_eq!(exit_code(&raw), 1);
-    assert_eq!(stdout_json(&raw)["ok"], false, "{}", describe(&raw));
+    assert!(receipts(w, &t).is_empty(), "refused CLI writes created an operation");
 }
 
 #[test]
-fn cli_worktree_verbs_replay_refuse_supervised_and_clean_up() {
+fn cli_worktree_verbs_refuse_standalone_mutation() {
     let w = world();
     let t = tag();
-    let mut cleanup = Cleanup::default();
     let repo = w.repo.display().to_string();
-    let branch = format!("cw-{t}");
-    let key = format!("cw-{t}");
-    let create = ["worktree", "create", "--repo", &repo, "--branch", &branch, "--request-id", &key, "--json"];
-    let created = w.cli_ok(&create);
-    let workspace = text(&created["result"]["workspace_id"]).to_owned();
-    let checkout = PathBuf::from(text(&created["result"]["cwd"]));
-    cleanup.worktrees.push(workspace.clone());
-    assert_eq!(created["result"]["base_branch"], "trunk", "{created}");
-    assert!(checkout.exists(), "{created}");
-    let replayed = w.cli_ok(&create);
-    assert_eq!((replayed["result"]["workspace_id"].clone(), replayed["result"]["replayed"].clone()), (json!(workspace), json!(true)), "{replayed}");
-    assert_eq!(worktrees_on(&w.repo, &branch), 1);
-
-    let narrowed = format!("cw-sup-{t}");
-    let refused = w.cli(&["--client", &narrowed, "--access", "supervised", "worktree", "create", "--repo", &repo, "--branch", &narrowed, "--json"], &[]);
-    assert_eq!(exit_code(&refused), 1, "{}", describe(&refused));
-    assert_eq!(stdout_json(&refused)["error"]["code"], "access_denied", "{}", describe(&refused));
-    assert_eq!(worktrees_on(&w.repo, &narrowed), 0);
-
-    // One command launches a thread in a new worktree and waits for it.
-    let launch_branch = format!("cwt-{t}");
-    let launch_key = format!("cwt-{t}");
-    let message = format!("echo-prompt cwt-{t}");
-    let start = ["thread", "start", "--workspace", w.repo_workspace.as_str(), "--provider", "cursor", "--permission-mode", "agent",
-        "-m", &message, "--worktree-branch", &launch_branch, "--request-id", &launch_key, "--json"];
-    let waited = w.cli(&[&start[..], &["--wait"][..]].concat(), &[]);
-    assert_eq!(exit_code(&waited), 0, "{}", describe(&waited));
-    let report = stdout_json(&waited);
-    assert_eq!(report["state"], "done", "{report}");
-    assert!(text(&report["final_text"]).contains(&format!("cwt-{t}")), "{report}");
-    let launched = text(&report["workspace_id"]).to_owned();
-    assert!(!launched.is_empty() && launched != w.repo_workspace, "the run is in the new workspace: {report}");
-    cleanup.worktrees.push(launched.clone());
-    cleanup.threads.push((launched.clone(), text(&report["thread_id"]).to_owned()));
-    let retried = w.cli_ok(&start);
-    let receipt = &retried["result"];
-    assert_eq!(receipt["operation_id"], report["operation_id"], "{retried}");
-    let worktree = &receipt["result"]["worktree"];
-    assert_eq!((worktree["branch"].clone(), worktree["base"].clone(), worktree["base_commit"].clone()),
-        (json!(launch_branch), json!("trunk"), json!(w.trunk())), "{retried}");
-    let path = PathBuf::from(text(&worktree["path"]));
-    assert!(path.exists());
-
-    for (id, checkout) in [(launched.as_str(), path), (workspace.as_str(), checkout)] {
-        let closed = w.cli_ok(&["workspace", "close", id, "--remove-worktree", "--json"]);
-        assert_eq!(closed["result"]["worktree_removed"], true, "{closed}");
-        assert!(!checkout.exists());
+    for (access, branch) in [(None, format!("cw-{t}")), (Some("supervised"), format!("cw-sup-{t}"))] {
+        let mut args = vec!["worktree", "create", "--repo", &repo, "--branch", branch.as_str(), "--json"];
+        if let Some(level) = access {
+            args.splice(0..0, ["--access", level]);
+        }
+        let refused = w.cli(&args, &[]);
+        assert_eq!(exit_code(&refused), 1, "{}", describe(&refused));
+        assert_eq!(stdout_json(&refused)["error"]["code"], "access_denied", "{}", describe(&refused));
+        assert_eq!(worktrees_on(&w.repo, &branch), 0);
     }
-    assert_eq!(worktrees_on(&w.repo, &branch) + worktrees_on(&w.repo, &launch_branch), 0);
+    let branch = format!("cwt-{t}");
+    let start = w.cli(&["thread", "start", "--workspace", w.repo_workspace.as_str(), "--provider", "cursor",
+        "--permission-mode", "agent", "-m", "echo-prompt refused", "--worktree-branch", &branch, "--json"], &[]);
+    assert_eq!(exit_code(&start), 1, "{}", describe(&start));
+    assert_eq!(stdout_json(&start)["error"]["code"], "access_denied", "{}", describe(&start));
+    assert_eq!(worktrees_on(&w.repo, &branch), 0);
+    assert!(receipts(w, &t).is_empty(), "refused CLI writes created an operation");
 }
 
 #[test]
@@ -1821,10 +1673,10 @@ fn agent_stdio_keeps_in_app_tools_and_refuses_native_control() {
 
     // The outside door serves the same name from the registry, and keeps its shape.
     let mut outside = StdioDoor::spawn(&w.env, &["mcp"], &[], "local");
-    let info = outside.ok("workspace_info", json!({}));
-    assert_eq!(id_text(&info["workspace_id"]), Some(active), "{info}");
+    let info = outside.ok("workspace_info", json!({"workspace_id": active}));
+    assert_eq!(id_text(&info["workspace_id"]), Some(active.clone()), "{info}");
     assert!(info["surfaces"].is_array(), "{info}");
-    let panes = outside.ok("pane_list", json!({}));
+    let panes = outside.ok("pane_list", json!({"workspace_id": active}));
     assert!(panes["surfaces"].is_array(), "{panes}");
     assert!(outside.close().success());
 }
@@ -1834,7 +1686,7 @@ fn thread_launch_into_a_new_worktree_is_one_idempotent_operation() {
     let w = world();
     let t = tag();
     let mut cleanup = Cleanup::default();
-    let mut door = StdioDoor::named(&w.env, &format!("wl-{t}"), None);
+    let mut door = w.http(&w.issue(&format!("wl-{t}"), ControlAccess::FullAccess));
     let branch = format!("wl-{t}");
     let args = json!({"workspace_id": w.repo_workspace, "worktree": {"branch": branch}, "provider": "cursor", "permission_mode": "agent",
         "message": format!("echo-prompt wl-{t}"), "client_request_id": format!("wl-{t}")});
@@ -1873,7 +1725,7 @@ fn user_scope_codemux_mcp_inside_an_agent_is_refused_admin() {
     let w = world();
     let t = tag();
     let mut cleanup = Cleanup::default();
-    let mut owner = StdioDoor::named(&w.env, &format!("user-scope-{t}"), None);
+    let mut owner = w.http(&w.issue(&format!("user-scope-{t}"), ControlAccess::FullAccess));
     let workspace = w.repo_workspace.clone();
     // What an in-app Codex or Hermes chat would start from a user-level entry:
     // `codemux mcp --client claude-code` with an env allow-list, so no marker.
@@ -1912,7 +1764,7 @@ fn outside_answer_resolves_a_codex_question_and_the_wait_returns_done() {
     let w = world();
     let t = tag();
     let mut cleanup = Cleanup::default();
-    let mut door = StdioDoor::named(&w.env, &format!("answer-{t}"), None);
+    let mut door = w.http(&w.issue(&format!("answer-{t}"), ControlAccess::FullAccess));
     let workspace = w.repo_workspace.clone();
     // A configured Codex is enough: the launch checks the model against the fake's catalog.
     eventually("Codex is configured", Duration::from_secs(60), || {
