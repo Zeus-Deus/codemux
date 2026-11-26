@@ -4090,12 +4090,11 @@ fn settle_preset_confirmation(
 ) -> bool {
     let next_prompt_id = stream.pending_confirmation.as_ref().and_then(|next| next.details.id.clone());
     let Some(attempt) = stream.preset_navigation.as_mut().filter(|attempt| {
-        matches!(attempt.phase, PresetNavigationPhase::Pending | PresetNavigationPhase::FailedAmbiguous)
+        attempt.phase == PresetNavigationPhase::Pending
             && attempt.prompt_id.as_deref() == Some(prior_prompt_id)
             && attempt.identity.port == stream.port
     }) else { return false };
     let same_daemon = attempt.identity.pid == record_pid && attempt.identity.start_time == record_start;
-    let was_ambiguous = attempt.phase == PresetNavigationPhase::FailedAmbiguous;
     attempt.identity = BrowserStreamIdentity {
         port: stream.port,
         pid: record_pid,
@@ -4103,11 +4102,7 @@ fn settle_preset_confirmation(
         generation: stream.stream_generation,
         listener_token: attempt.identity.listener_token,
     };
-    attempt.phase = if same_daemon { phase } else if was_ambiguous {
-        PresetNavigationPhase::FailedAmbiguous
-    } else {
-        PresetNavigationPhase::Failed
-    };
+    attempt.phase = if same_daemon { phase } else { PresetNavigationPhase::Failed };
     attempt.prompt_id = if attempt.phase == PresetNavigationPhase::Pending { next_prompt_id } else { None };
     true
 }
@@ -4118,9 +4113,10 @@ fn mark_uncertain_preset_confirmation(stream: &mut StreamSession, prompt_id: &st
             && attempt.prompt_id.as_deref() == Some(prompt_id)
             && attempt.identity.port == stream.port
     }) {
-        // The approved open may already have run. Keep the prompt ID so a
-        // later explicit, known decision can settle it, but never auto-open.
+        // The decision may already have run. Its old host token must not
+        // decide a later prompt, and reconnect must never auto-open.
         attempt.phase = PresetNavigationPhase::FailedAmbiguous;
+        attempt.prompt_id = None;
     }
 }
 
@@ -6502,12 +6498,20 @@ impl AgentBrowserManager {
             }
             return Err("Browser confirmation changed while it was processed".into());
         }
-        entry.pending_confirmation.as_mut().unwrap().decision_in_flight = false;
         let (record, decision) = match result {
-            Ok(known) => known,
+            Ok(known) => {
+                entry.pending_confirmation.as_mut().unwrap().decision_in_flight = false;
+                known
+            }
             Err(error) => {
-                if approve && error.may_have_applied() {
+                if error.may_have_applied() {
                     mark_uncertain_preset_confirmation(entry, id);
+                    entry.revoke_active_bridges();
+                    entry.browser_ready = false;
+                    entry.confirmation_pending = false;
+                    entry.pending_confirmation = None;
+                } else {
+                    entry.pending_confirmation.as_mut().unwrap().decision_in_flight = false;
                 }
                 return Err(error.into_message());
             }
@@ -9745,7 +9749,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn uncertain_preset_approval_keeps_no_replay_guard_after_expiry_and_reallocation() {
+    async fn uncertain_preset_approval_keeps_no_replay_guard_after_reallocation() {
         let (manager, session, _record, prompt_id) = preset_pending_fixture().await;
         let old_port = manager.get_port(&session).await.unwrap();
         let error = manager.respond_confirmation_locked_with(&session, &prompt_id, true,
@@ -9758,10 +9762,9 @@ mod tests {
             let stream = sessions.get_mut(&session).unwrap();
             assert_eq!(stream.preset_navigation.as_ref().unwrap().phase,
                 PresetNavigationPhase::FailedAmbiguous);
-            assert_eq!(stream.preset_navigation.as_ref().unwrap().prompt_id.as_deref(),
-                Some(prompt_id.as_str()));
-            assert!(!stream.pending_confirmation.as_ref().unwrap().decision_in_flight);
-            stream.pending_confirmation.as_mut().unwrap().expires_at = Instant::now() - Duration::from_millis(1);
+            assert_eq!(stream.preset_navigation.as_ref().unwrap().prompt_id, None);
+            assert!(!stream.confirmation_pending);
+            assert!(stream.pending_confirmation.is_none());
         }
         manager.clear_expired_confirmation(&session).await;
         assert_eq!(manager.preset_navigation_status(&session).await.unwrap(),
@@ -9801,15 +9804,48 @@ mod tests {
         assert_eq!(manager.preset_navigation_status(&session).await.unwrap(),
             Some(BrowserPresetNavigationStatus::Pending));
 
-        let error = manager.respond_confirmation_locked_with(&session, &prompt_id, true,
-            |_session, _port, _pending, _upstream_id, _approve| {
-                Err(BrowserConfirmationFailure::MaybeApplied("reply lost".into()))
-            }).await.unwrap_err();
-        assert_eq!(error, "reply lost");
         apply_preset_decision_for_test(&manager, &session, &prompt_id, record, true,
             BrowserConfirmationResponse::Resolved).await.unwrap();
         assert_eq!(manager.preset_navigation_status(&session).await.unwrap(),
             Some(BrowserPresetNavigationStatus::Completed));
+    }
+
+    #[tokio::test]
+    async fn uncertain_preset_approval_invalidates_old_token_even_if_upstream_id_is_reused() {
+        let (manager, session, record, old_host_id) = preset_pending_fixture().await;
+        manager.respond_confirmation_locked_with(&session, &old_host_id, true,
+            |_session, _port, _pending, _upstream_id, _approve| {
+                Err(BrowserConfirmationFailure::MaybeApplied("reply lost".into()))
+            }).await.unwrap_err();
+        let stale = manager.respond_confirmation_locked_with(&session, &old_host_id, true,
+            |_session, _port, _pending, _upstream_id, _approve| {
+                panic!("stale host token dispatched a second decision")
+            }).await.unwrap_err();
+        assert!(stale.contains("no pending confirmation"), "{stale}");
+
+        // The daemon may have advanced to a follow-up using the same upstream
+        // command ID. Its new host token must not be the spent token.
+        let followup = PendingBrowserConfirmation::new(
+            BrowserConfirmationDetails { id: Some("upstream".into()), description: "Follow-up".into() },
+            Some(record),
+        );
+        let new_host_id = followup.details.id.clone().unwrap();
+        assert_ne!(new_host_id, old_host_id);
+        {
+            let mut sessions = manager.sessions.lock().await;
+            let stream = sessions.get_mut(&session).unwrap();
+            stream.confirmation_pending = true;
+            stream.pending_confirmation = Some(followup);
+        }
+        let stale = manager.respond_confirmation_locked_with(&session, &old_host_id, true,
+            |_session, _port, _pending, _upstream_id, _approve| {
+                panic!("stale host token decided a reused upstream ID")
+            }).await.unwrap_err();
+        assert!(stale.contains("no longer matches"), "{stale}");
+        assert_eq!(manager.pending_confirmation(&session).await.unwrap().unwrap().id,
+            Some(new_host_id));
+        assert_eq!(manager.sessions.lock().await.get(&session).unwrap()
+            .preset_navigation.as_ref().unwrap().phase, PresetNavigationPhase::FailedAmbiguous);
     }
 
     #[tokio::test]
