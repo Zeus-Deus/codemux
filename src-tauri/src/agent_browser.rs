@@ -2114,6 +2114,17 @@ fn listener_ownership(port: u16, pid: u32) -> Option<bool> {
     }
 }
 
+async fn inspect_existing_stream_identity_with<F>(
+    lookup: F,
+) -> Result<(Option<BrowserPidRecord>, Option<bool>), String>
+where
+    F: FnOnce() -> (Option<BrowserPidRecord>, Option<bool>) + Send + 'static,
+{
+    tokio::task::spawn_blocking(lookup)
+        .await
+        .map_err(|error| format!("Could not inspect browser stream identity: {error}"))
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum BrowserAttachment {
     Attached,
@@ -4242,6 +4253,8 @@ impl AgentBrowserManager {
 
     async fn spawn_locked(&self, browser_id: &str) -> Result<(), String> {
         let session = session_name(browser_id).to_string();
+        #[cfg(not(windows))]
+        self.settle_provisional_session(browser_id, &session, None).await;
         let port = self.allocate_port(browser_id).await?;
 
         let was_running = {
@@ -4392,23 +4405,25 @@ impl AgentBrowserManager {
     }
 
     #[cfg(not(windows))]
-    async fn settle_provisional_action(
+    async fn settle_provisional_session(
         &self,
         browser_id: &str,
         session: &str,
-        action: &str,
-        result: &Result<(BrowserAutomationResult, BrowserActionOutcome), BrowserActionFailure>,
+        action_result: Option<(&str, &Result<(BrowserAutomationResult, BrowserActionOutcome), BrowserActionFailure>)>,
     ) {
         // A CLI can exit before its detached daemon publishes a PID. Hold
         // the per-session lifecycle gate through the late tracker, then
-        // retire only a first action with no verified process or endpoint.
+        // retire a provisional session only when both PID files and the
+        // endpoint are absent. Spawn, command, and pane retries call this too.
         let provisional = self.sessions.lock().await.get(browser_id).is_some_and(|entry| {
             entry.running && entry.pid.is_none() && !entry.browser_ready && !entry.confirmation_pending
         });
         if !provisional || !wait_for_late_browser_daemon_tracking(session).await {
             return;
         }
-        self.reconcile_action_result(browser_id, session, action, result).await;
+        if let Some((action, result)) = action_result {
+            self.reconcile_action_result(browser_id, session, action, result).await;
+        }
         let lookup_session = session.to_owned();
         let confirmed_absent = tokio::task::spawn_blocking(move || {
             let file_absent = |path: Option<PathBuf>| path.is_some_and(|path| {
@@ -4456,6 +4471,8 @@ impl AgentBrowserManager {
         default_viewport: Option<crate::browser_viewport::ViewportSpec>,
     ) -> Result<BrowserAutomationResult, String> {
         let session = session_name(browser_id).to_string();
+        #[cfg(not(windows))]
+        self.settle_provisional_session(browser_id, &session, None).await;
         let port = self.allocate_port(browser_id).await?;
         // Reject an invalid requested action before a configured viewport
         // could launch a daemon for a command that will never run.
@@ -4539,7 +4556,7 @@ impl AgentBrowserManager {
             self.reconcile_action_result(browser_id, session, action, result).await;
             #[cfg(not(windows))]
             if !was_running && action != "close" {
-                self.settle_provisional_action(browser_id, session, action, result).await;
+                self.settle_provisional_session(browser_id, session, Some((action, result))).await;
             }
         }
     }
@@ -4883,6 +4900,8 @@ impl AgentBrowserManager {
 
     async fn start_stream_locked(&self, browser_id: &str) -> Result<String, String> {
         let session = session_name(browser_id).to_string();
+        #[cfg(not(windows))]
+        self.settle_provisional_session(browser_id, &session, None).await;
 
         // The per-session lifecycle gate serializes competing starts and
         // commands for this session. A manager-wide gate would make starts
@@ -4917,9 +4936,12 @@ impl AgentBrowserManager {
                 }
             }
             if let Some(pid) = ready_pid {
-                let owned = owned_browser_pid(&session, pid);
+                let lookup_session = session.clone();
+                let (owned, ownership) = inspect_existing_stream_identity_with(move || {
+                    (owned_browser_pid(&lookup_session, pid), listener_ownership(port, pid))
+                }).await?;
                 let record = self.reconcile_existing_stream_process(
-                    browser_id, &session, port, pid, owned, listener_ownership(port, pid),
+                    browser_id, &session, port, pid, owned, ownership,
                 ).await?;
                 if self.reconcile_existing_stream_attachment(
                     browser_id,
@@ -5295,6 +5317,24 @@ mod tests {
             assert!(task.await.unwrap().is_err());
         }
         std::fs::remove_file(socket_path).unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn slow_stream_identity_lookup_keeps_executor_available() {
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let started = Instant::now();
+        let lookup = tokio::spawn(async move {
+            inspect_existing_stream_identity_with(move || {
+                let _ = entered_tx.send(());
+                std::thread::sleep(Duration::from_millis(600));
+                (None, None)
+            }).await
+        });
+        entered_rx.await.unwrap();
+        assert!(started.elapsed() < Duration::from_millis(300), "stream identity lookup blocked the async executor");
+        tokio::time::timeout(Duration::from_millis(300), tokio::time::sleep(Duration::from_millis(10)))
+            .await.unwrap();
+        assert!(matches!(lookup.await.unwrap(), Ok((None, None))));
     }
 
     fn test_browser_record(pid: u32, start_time: u64, token: String) -> BrowserPidRecord {
@@ -6270,9 +6310,20 @@ mod tests {
         std::fs::write(&pid_path, "still writing").unwrap();
 
         let result = Err(BrowserActionFailure::after_launch("launcher failed".into()));
-        manager.settle_provisional_action(&session, &session, "open", &result).await;
+        manager.settle_provisional_session(&session, &session, Some(("open", &result))).await;
         assert!(manager.sessions.lock().await.get(&session).unwrap().running);
         std::fs::remove_file(pid_path).unwrap();
+
+        let record_path = session_pid_path(&session).unwrap();
+        std::fs::write(&record_path, "still writing").unwrap();
+        manager.settle_provisional_session(&session, &session, None).await;
+        assert!(manager.sessions.lock().await.get(&session).unwrap().running);
+        std::fs::remove_file(record_path).unwrap();
+
+        manager.settle_provisional_session(&session, &session, None).await;
+        assert!(manager.sessions.lock().await.get(&session).is_none());
+        manager.allocate_port(&session).await.unwrap();
+        assert!(!manager.note_action_start(&session, "open").await);
     }
 
     #[cfg(unix)]
