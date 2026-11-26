@@ -282,8 +282,8 @@ pub enum ConnectCommand {
 pub enum RemoteCommand {
     /// Request a one-time pairing code for the web remote server. Standalone
     /// CLI callers currently lack owner authentication and are refused; use
-    /// desktop Settings. With a LAN listener, headless `serve` prints an
-    /// initial link at startup.
+    /// desktop Settings. With a LAN listener, foreground `serve` prints an
+    /// initial link at startup; the managed service discards stdout.
     Pair {
         /// Optional label for the paired device. Used as a fallback name if
         /// the connecting browser doesn't provide one of its own.

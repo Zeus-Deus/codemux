@@ -400,7 +400,7 @@ fn print_footer(relay_only: bool, connector_enabled: bool) {
     if relay_only {
         println!("Remote Access is using the saved relay setting; stop serve to change its network scope in desktop Settings.");
     } else {
-        println!("Restart serve to print a fresh startup pairing link; this disconnects active sessions.");
+        println!("Foreground serve prints a fresh pairing link when restarted; this disconnects active sessions.");
         println!("Stop serve to manage pairing and Remote Access in desktop Settings.");
     }
     if !connector_enabled {

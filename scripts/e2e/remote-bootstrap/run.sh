@@ -449,6 +449,7 @@ run_distro() {
     assert_contains "unit file written" "$unit_body" "ExecStart="
     assert_contains "unit runs \`serve\`" "$unit_body" " serve"
     assert_contains "unit carries CODEMUX_API_URL" "$unit_body" "Environment=CODEMUX_API_URL=${MOCK_API}"
+    assert_contains "unit hides startup pairing credentials" "$unit_body" "StandardOutput=null"
     info "unit file:"; printf '%s\n' "$unit_body" | sed 's/^/      /'
 
     local is_active is_enabled linger
@@ -494,33 +495,19 @@ run_distro() {
     assert_contains "GET / serves the embedded web UI (HTML)" "$root_html" "<!doctype html"
     assert_contains "embedded UI references a built asset bundle" "$root_html" "/assets/"
 
-    # ── (d) startup pairing URL and read-only SSH control ────────────────
+    # ── (d) managed pairing credentials stay private ─────────────────────
     #
-    # `serve` mints the initial code in-process. A later SSH CLI has no owner
-    # proof and must not mint another code over the control socket.
-    banner "${distro} · step d — startup pairing URL"
+    # The managed unit discards stdout so its startup pairing code never lands
+    # in a durable journal. A later SSH CLI has no owner proof and cannot mint
+    # another code over the control socket.
+    banner "${distro} · step d — managed pairing stays private"
 
-    local pair_out pair_url serve_log
+    local pair_out serve_log
     pair_out=$(uexec "$distro" "codemux remote pair; echo RC=\$?")
     assert_not_contains "standalone SSH cannot mint another pairing code" "$pair_out" "RC=0"
     assert_contains "standalone pairing reports owner access required" "$pair_out" "needs verified owner access"
-    pair_url=""
-    for _ in $(seq 1 10); do
-        serve_log=$(rexec "$distro" journalctl "_UID=${uid}" --no-pager -o cat 2>&1)
-        pair_url=$(printf '%s' "$serve_log" | sed -n 's/^Pairing link:[[:space:]]*//p' | head -1 | tr -d '\r')
-        [ -n "$pair_url" ] && break
-        sleep 1
-    done
-
-    if [ -z "$pair_url" ]; then
-        fail "serve printed an initial pairing link" "no 'Pairing link:' line in the service journal"
-    else
-        pass "serve printed an initial pairing link"
-        assert_contains "pairing URL host is the container IP (${ip})" "$pair_url" "//${ip}:${CODEMUX_PORT}"
-        assert_not_contains "pairing URL is NOT loopback" "$pair_url" "127.0.0.1"
-        assert_not_contains "pairing URL is NOT localhost" "$pair_url" "localhost"
-        assert_contains "serve reports a non-loopback endpoint" "$serve_log" "Endpoint:      ${ip}"
-    fi
+    serve_log=$(rexec "$distro" journalctl "_UID=${uid}" --no-pager -o cat 2>&1)
+    assert_not_contains "managed service journal has no pairing link" "$serve_log" "Pairing link:"
 
     # ── (d2) a second `serve` refuses cleanly ────────────────────────────
     #

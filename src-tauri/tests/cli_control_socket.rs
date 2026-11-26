@@ -1207,7 +1207,7 @@ fn serve_banner_names_desktop_settings_for_connector_administration() {
     let serve = Serve::start();
     let banner = serve.log();
     assert!(banner.contains("agent connector is off; enable it in desktop Settings"), "{banner}");
-    assert!(banner.contains("Restart serve to print a fresh startup pairing link"), "{banner}");
+    assert!(banner.contains("Foreground serve prints a fresh pairing link when restarted"), "{banner}");
     assert!(!banner.contains("Run `codemux connector enable`"), "{banner}");
     assert!(!banner.contains("Run `codemux remote pair`"), "{banner}");
 }
