@@ -1878,8 +1878,16 @@ fn browser_process_matches(record: &BrowserPidRecord, session: &str) -> bool {
     record.native_start && browser_process_start(record.pid, session, &record.token) == Some(record.start_time)
 }
 
+#[cfg(all(unix, any(test, target_os = "linux", target_os = "macos")))]
+fn browser_record_matches_control_dir(record: &BrowserPidRecord, session: &str) -> bool {
+    let Some(dir) = run_dir_for_session(session) else { return false };
+    browser_pid_record_for_control_dir_in(&dir, session)
+        .as_ref().map(|(_, current)| current) == Some(record)
+        && read_daemon_pid_file(&dir.join(format!("{session}.pid"))) == Some(record.pid)
+}
+
 /// Accept exactly one well-formed listener secret from a verified daemon.
-#[cfg(all(unix, any(test, target_os = "macos")))]
+#[cfg(all(unix, any(test, target_os = "linux", target_os = "macos")))]
 fn browser_listener_token_from_environ(entries: &[std::ffi::OsString]) -> Option<String> {
     use std::os::unix::ffi::OsStrExt;
 
@@ -1897,9 +1905,9 @@ fn browser_listener_token_from_environ(entries: &[std::ffi::OsString]) -> Option
 }
 
 /// Recover a previous launch's token only while its private PID record and
-/// native process identity still agree. macOS may redact process environments;
-/// that leaves the previous daemon untouched.
-#[cfg(all(unix, any(test, target_os = "macos")))]
+/// native process identity still agree. An unreadable process environment
+/// leaves the previous daemon untouched by the authenticated close path.
+#[cfg(all(unix, any(test, target_os = "linux", target_os = "macos")))]
 fn verified_browser_listener_token_from_process(record: &BrowserPidRecord, session: &str) -> Option<String> {
     use std::os::unix::ffi::OsStrExt;
     use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System, UpdateKind};
@@ -1908,8 +1916,7 @@ fn verified_browser_listener_token_from_process(record: &BrowserPidRecord, sessi
         || validate_session_name(session).is_err()
         || record.token.len() != 32
         || !record.token.bytes().all(|byte| byte.is_ascii_hexdigit())
-        || session_pid_record(session).as_ref().map(|(_, current)| current) != Some(record)
-        || read_agent_browser_daemon_pid(session) != Some(record.pid)
+        || !browser_record_matches_control_dir(record, session)
         || process_start_time(record.pid) != Some(record.start_time)
     {
         return None;
@@ -1940,7 +1947,7 @@ fn verified_browser_listener_token_from_process(record: &BrowserPidRecord, sessi
     (process_start_time(record.pid) == Some(record.start_time)).then_some(token)
 }
 
-#[cfg(all(unix, any(test, target_os = "macos")))]
+#[cfg(all(unix, any(test, target_os = "linux", target_os = "macos")))]
 fn browser_listener_token_for_close(record: &BrowserPidRecord, session: &str) -> Option<String> {
     if !browser_process_matches(record, session) {
         return None;
@@ -2206,13 +2213,20 @@ fn stop_owned_browser_daemon(session: &str, record: &BrowserPidRecord, bin: &str
     #[cfg(target_os = "linux")]
     {
         let deadline = Instant::now() + CLOSE_TIMEOUT;
-        let result = dir.as_ref()
-            .map(|dir| dir.join(format!("{session}.sock")))
-            .ok_or_else(|| "Browser control path is unavailable".to_string())
-            .and_then(|path| close_verified_unix_browser_peer(
-                &path, record.pid, deadline, || browser_process_matches(record, session),
-                || files = dir.as_ref().and_then(|dir| capture_closed_browser_files(dir, session, record)),
-            ));
+        let result = browser_listener_token_for_close(record, session)
+            .ok_or_else(|| "Verified browser listener token is unavailable".to_string())
+            .and_then(|token| {
+                dir.as_ref()
+                    .map(|dir| dir.join(format!("{session}.sock")))
+                    .ok_or_else(|| "Browser control path is unavailable".to_string())
+                    .and_then(|path| close_verified_unix_browser_peer(
+                        &path, record.pid, deadline, &token,
+                        || browser_process_matches(record, session)
+                            && (record.token == browser_owner_token()
+                                || browser_record_matches_control_dir(record, session)),
+                        || files = dir.as_ref().and_then(|dir| capture_closed_browser_files(dir, session, record)),
+                    ))
+            });
         if let Err(error) = result {
             eprintln!("[codemux::browser] Could not gracefully close browser session {session}: {error}");
         }
@@ -2595,8 +2609,7 @@ fn close_verified_browser_pid_until(record: &BrowserPidRecord, session: &str, de
                 &path, record.pid, deadline, &token,
                 || browser_process_matches(record, session)
                     && (record.token == browser_owner_token()
-                        || (session_pid_record(session).as_ref().map(|(_, current)| current) == Some(record)
-                            && read_agent_browser_daemon_pid(session) == Some(record.pid))),
+                        || browser_record_matches_control_dir(record, session)),
                 || files = dir.as_ref().and_then(|dir| capture_closed_browser_files(dir, session, record)),
             ))
     });
