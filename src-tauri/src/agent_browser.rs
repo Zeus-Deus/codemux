@@ -351,9 +351,8 @@ fn kill_owned_browser_daemons_in(dir: &std::path::Path) {
             continue;
         }
         stop_owned_browser_daemon(session, &record, &bin);
-        if path.parent() != Some(dir) && !pid_alive(record.pid) {
-            let _ = std::fs::remove_file(path);
-        }
+        // The process can exit before its daemon files are retired. Keep the
+        // native-start record so the next launch can still prove PID reuse.
     }
 }
 
@@ -507,8 +506,9 @@ const BROWSER_DAEMON_DIR: &str = "d";
 fn verified_legacy_browser_pid_in(root: &std::path::Path, session: &str) -> bool {
     let path = root.join(format!("{session}.pid"));
     let Some(pid) = read_daemon_pid_file(&path) else { return false };
-    session_pid_record_in(root, session)
-        .is_some_and(|(_, record)| record.pid == pid && browser_process_uses_control_dir(&record, session, root))
+    unambiguous_browser_pid_record_in(root, session, |record| {
+        record.pid == pid && browser_process_uses_control_dir(record, session, root)
+    }).is_some()
 }
 
 fn browser_process_uses_control_dir(record: &BrowserPidRecord, session: &str, dir: &std::path::Path) -> bool {
@@ -571,7 +571,12 @@ fn probe_legacy_browser_control_endpoint(session: &str, root: &std::path::Path, 
     let result = classify_legacy_browser_listener(listener_pid, root_pid, current_pid, current_verified);
     if result != BrowserControlEndpointProbe::Absent
         && stale_legacy_browser_listener_is_unrelated(root, session, root_pid, listener_pid)
-        && read_daemon_pid_file(&root.join(format!("{session}.pid"))) == root_pid
+        && if let Some(pid) = root_pid {
+            read_daemon_pid_file(&root.join(format!("{session}.pid"))) == Some(pid)
+        } else {
+            matches!(std::fs::symlink_metadata(root.join(format!("{session}.pid"))),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound)
+        }
         && port_snapshot.as_ref().map_or(true, |snapshot| {
             windows_browser_port_matches(&port_path, Some(snapshot))
         })
@@ -589,16 +594,27 @@ fn stale_legacy_browser_listener_is_unrelated(
     root_pid: Option<u32>,
     listener: Option<u32>,
 ) -> bool {
-    let Some(pid) = root_pid else { return false };
+    let pid_path = root.join(format!("{session}.pid"));
+    let Some(pid) = root_pid else {
+        if !matches!(std::fs::symlink_metadata(&pid_path),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound) {
+            return false;
+        }
+        let Some((record_path, old)) = session_pid_record_in(root, session) else { return false };
+        return departed_browser_listener_is_unrelated(&old, session, Some(listener))
+            && read_browser_pid_record(&record_path).as_ref() == Some(&old);
+    };
     if process_exit_confirmed(pid) {
         return stale_browser_listener_is_unrelated(
             pid, session, Some(listener), browser_listener_is_other_session,
         );
     }
-    let Some((_, old)) = session_pid_record_in(root, session) else { return false };
-    old.pid == pid && old.native_start
-        && (old.token == browser_owner_token() || previous_app_has_exited(&old))
-        && reused_browser_listener_is_unrelated(&old, session, Some(listener))
+    let record = unambiguous_browser_pid_record_in(root, session, |old| {
+        old.pid == pid && old.native_start
+            && (old.token == browser_owner_token() || previous_app_has_exited(old))
+            && reused_browser_listener_is_unrelated(old, session, Some(listener))
+    });
+    record.is_some_and(|(path, old)| read_browser_pid_record(&path).as_ref() == Some(&old))
 }
 
 #[cfg(windows)]
@@ -844,18 +860,37 @@ fn session_pid_path_in(dir: &std::path::Path, session: &str) -> Option<PathBuf> 
     Some(browser_record_dir_in(dir)?.join(format!("agent-browser-{session}.pid")))
 }
 
+#[cfg(any(test, windows, target_os = "macos"))]
 fn session_pid_record_in(dir: &std::path::Path, session: &str) -> Option<(PathBuf, BrowserPidRecord)> {
-    if let Some(current) = session_pid_path_in(dir, session) {
-        if let Some(record) = read_browser_pid_record(&current) {
-            return Some((current, record));
-        }
-    }
-    let legacy = legacy_session_pid_path_in(dir, session)?;
-    read_browser_pid_record(&legacy).map(|record| (legacy, record))
+    browser_pid_record_candidates_in(dir, session).into_iter().next()
 }
 
-fn session_pid_record(session: &str) -> Option<(PathBuf, BrowserPidRecord)> {
-    session_pid_record_in(&browser_run_root_for_session(session)?, session)
+fn browser_pid_record_candidates_in(
+    dir: &std::path::Path,
+    session: &str,
+) -> Vec<(PathBuf, BrowserPidRecord)> {
+    [session_pid_path_in(dir, session), legacy_session_pid_path_in(dir, session)]
+        .into_iter().flatten()
+        .filter_map(|path| read_browser_pid_record(&path).map(|record| (path, record)))
+        .collect()
+}
+
+fn unambiguous_browser_pid_record_in(
+    dir: &std::path::Path,
+    session: &str,
+    matches: impl Fn(&BrowserPidRecord) -> bool,
+) -> Option<(PathBuf, BrowserPidRecord)> {
+    let mut selected: Option<(PathBuf, BrowserPidRecord)> = None;
+    for (path, record) in browser_pid_record_candidates_in(dir, session) {
+        if !matches(&record) { continue; }
+        if selected.as_ref().is_some_and(|(_, prior)| prior != &record) {
+            return None;
+        }
+        if selected.is_none() {
+            selected = Some((path, record));
+        }
+    }
+    selected
 }
 
 fn browser_pid_record_paths_in(dir: &std::path::Path) -> Vec<PathBuf> {
@@ -1061,12 +1096,10 @@ fn departed_tracked_browser_endpoint_absent(
     }
     #[cfg(windows)]
     {
-        let old = session_pid_record_in(browser_record_root_from_daemon_dir(dir), session)
-            .map(|(_, old)| old);
-        old.as_ref().is_some_and(|old| {
+        unambiguous_browser_pid_record_in(browser_record_root_from_daemon_dir(dir), session, |old| {
             old.pid == pid && Some(old.start_time) == start_time
                 && departed_browser_control_endpoint_absent(session, dir, old)
-        })
+        }).is_some()
     }
     #[cfg(not(windows))]
     {
@@ -1144,7 +1177,8 @@ fn cleanup_reused_browser_lock_files_in(dir: &std::path::Path, session: &str, ol
     }
     let pid_path = dir.join(format!("{session}.pid"));
     let root = browser_record_root_from_daemon_dir(dir);
-    let Some((record_path, _)) = session_pid_record_in(root, session) else { return false };
+    let Some((record_path, _)) = unambiguous_browser_pid_record_in(root, session, |record| record == old)
+    else { return false };
     let legacy_record = record_path.parent() == Some(root);
     #[cfg(windows)]
     let port_path = dir.join(format!("{session}.port"));
@@ -1722,8 +1756,9 @@ fn owned_browser_pid(session: &str, pid: u32) -> Option<BrowserPidRecord> {
             native_start: true,
         });
     }
-    let (_, record) = session_pid_record(session)?;
-    (record.pid == pid && browser_process_matches(&record, session)).then_some(record)
+    unambiguous_browser_pid_record_in(&browser_run_root_for_session(session)?, session, |record| {
+        record.pid == pid && browser_process_matches(record, session)
+    }).map(|(_, record)| record)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1885,9 +1920,10 @@ fn require_owned_browser_session_in(session: &str, dir: &std::path::Path) -> Res
         return Ok(());
     }
     if owned_browser_pid(session, pid).is_none() {
-        let old_record = session_pid_record_in(browser_record_root_from_daemon_dir(dir), session)
-            .map(|(_, record)| record);
-        if let Some(old_record) = old_record.filter(|record| record.pid == pid) {
+        let old_record = unambiguous_browser_pid_record_in(
+            browser_record_root_from_daemon_dir(dir), session, |record| record.pid == pid,
+        ).map(|(_, record)| record);
+        if let Some(old_record) = old_record {
             if cleanup_reused_browser_lock_files_in(dir, session, &old_record) {
                 return Ok(());
             }
@@ -2414,8 +2450,9 @@ fn capture_closed_browser_files(
         return None;
     }
     let pid_path = dir.join(format!("{session}.pid"));
-    let record_path = session_pid_record_in(browser_record_root_from_daemon_dir(dir), session)
-        .map(|(path, _)| path)
+    let record_path = unambiguous_browser_pid_record_in(
+        browser_record_root_from_daemon_dir(dir), session, |saved| saved == record,
+    ).map(|(path, _)| path)
         .or_else(|| session_pid_path_in(browser_record_root_from_daemon_dir(dir), session))?;
     if read_daemon_pid_file(&pid_path) != Some(record.pid) {
         return None;
@@ -3007,8 +3044,10 @@ fn retire_exited_provisional_browser_files(session: &str) {
         agent_browser_daemon_pid_path(session),
         run_dir_for_session(session),
     ) {
-        let recorded = session_pid_record(session).filter(|(_, record)| {
-            record.pid == pid && (record.token == browser_owner_token() || previous_app_has_exited(record))
+        let recorded = browser_run_root_for_session(session).and_then(|root| {
+            unambiguous_browser_pid_record_in(&root, session, |record| {
+                record.pid == pid && (record.token == browser_owner_token() || previous_app_has_exited(record))
+            })
         });
         let departed = || {
             process_exit_confirmed(pid) || recorded.as_ref().is_some_and(|(path, record)| {
@@ -5195,26 +5234,9 @@ impl AgentBrowserManager {
 
     /// Public name for the new behavior. `new_with_cleanup` remains an alias.
     pub fn new_with_adoption() -> Self {
-        let mgr = Self::new();
-        Self::reconcile_runtime_files();
-        mgr
-    }
-
-    /// Keep live records and discard dead records from the private namespace
-    /// on Unix. Windows retains dead records for guarded port attribution.
-    /// Legacy root records remain in place because their names can be daemon
-    /// PID files for another session. Recheck ownership before any later kill.
-    fn reconcile_runtime_files() {
-        for dir in browser_runtime_dirs() {
-            for path in browser_pid_record_paths_in(&dir) {
-                let Some(_session) = session_from_pid_path(&path) else { continue };
-                let Some(record) = read_browser_pid_record(&path) else { continue };
-                if path.parent() != Some(dir.as_path()) && process_exit_confirmed(record.pid) {
-                    #[cfg(not(windows))]
-                    let _ = std::fs::remove_file(&path);
-                }
-            }
-        }
+        // Retain dead records until the corresponding daemon files are
+        // inspected at first use; eager deletion loses PID-reuse evidence.
+        Self::new()
     }
 
     /// Allocate a unique stream port for the given session key.
@@ -5326,14 +5348,14 @@ impl AgentBrowserManager {
                 .map_or(true, |dir| {
                     #[cfg(windows)]
                     if confirmed_gone {
-                        let old = session_pid_record_in(browser_record_root_from_daemon_dir(&dir), &lookup_session)
-                            .map(|(_, old)| old);
-                        if old.as_ref().is_some_and(|old| {
-                            previous.and_then(|(pid, start)| pid.zip(start))
-                                == Some((old.pid, old.start_time))
-                                && departed_browser_control_endpoint_absent(&lookup_session, &dir, old)
-                        }) {
-                            return false;
+                        if let Some((pid, start)) = previous.and_then(|(pid, start)| pid.zip(start)) {
+                            if unambiguous_browser_pid_record_in(
+                                browser_record_root_from_daemon_dir(&dir), &lookup_session,
+                                |old| old.pid == pid && old.start_time == start
+                                    && departed_browser_control_endpoint_absent(&lookup_session, &dir, old),
+                            ).is_some() {
+                                return false;
+                            }
                         }
                     }
                     browser_control_endpoint_ready(&lookup_session, &dir)
@@ -5840,7 +5862,12 @@ impl AgentBrowserManager {
             let removed_pid = removed.pid;
             tokio::task::spawn_blocking(move || {
                 let dir = run_dir_for_session(&session)?;
-                let (_, record) = session_pid_record(&session)?;
+                let root = browser_record_root_from_daemon_dir(&dir);
+                let (_, record) = if let Some(pid) = removed_pid {
+                    unambiguous_browser_pid_record_in(root, &session, |record| record.pid == pid)?
+                } else {
+                    session_pid_record_in(root, &session)?
+                };
                 if record.token != browser_owner_token()
                     || removed_pid.is_some_and(|pid| pid != record.pid)
                 {
@@ -6050,9 +6077,10 @@ impl AgentBrowserManager {
                 let dir = run_dir_for_session(&lookup_session)
                     .ok_or_else(|| format!("Cannot inspect browser session {lookup_session}"))?;
                 if read_daemon_pid_file(&dir.join(format!("{lookup_session}.pid"))) == Some(expected_pid) {
-                    let old = session_pid_record_in(browser_record_root_from_daemon_dir(&dir), &lookup_session)
-                        .map(|(_, record)| record)
-                        .filter(|old| old.pid == expected_pid && Some(old.start_time) == expected_start)
+                    let old = unambiguous_browser_pid_record_in(
+                        browser_record_root_from_daemon_dir(&dir), &lookup_session,
+                        |old| old.pid == expected_pid && Some(old.start_time) == expected_start,
+                    ).map(|(_, record)| record)
                         .ok_or_else(|| format!("Could not retire replaced browser session {lookup_session}"))?;
                     if !cleanup_reused_browser_lock_files_in(&dir, &lookup_session, &old) {
                         return Err(format!("Could not retire replaced browser session {lookup_session}"));
@@ -8459,6 +8487,24 @@ mod tests {
     }
 
     #[test]
+    fn startup_keeps_dead_record_until_daemon_files_are_checked() {
+        let session = format!("retained-browser-{}", uuid::Uuid::new_v4().simple());
+        let dir = run_dir_for_session(&session).unwrap();
+        let old = test_browser_record(u32::MAX, 1, browser_owner_token().to_owned());
+        let record_path = session_pid_path(&session).unwrap();
+        let pid_path = dir.join(format!("{session}.pid"));
+        write_session_pid(&session, &old).unwrap();
+        std::fs::write(&pid_path, u32::MAX.to_string()).unwrap();
+
+        let _manager = AgentBrowserManager::new_with_adoption();
+        assert_eq!(read_browser_pid_record(&record_path), Some(old));
+        assert_eq!(read_daemon_pid_file(&pid_path), Some(u32::MAX));
+
+        std::fs::remove_file(pid_path).unwrap();
+        clear_session_pid(&session);
+    }
+
+    #[test]
     fn browser_record_namespace_does_not_collide_with_another_daemon_pid() {
         let temp = tempfile::tempdir().unwrap();
         let first = format!("x-{}", uuid::Uuid::new_v4().simple());
@@ -8500,6 +8546,27 @@ mod tests {
         assert_eq!(browser_daemon_dir_in(temp.path(), &second), Some(selected));
         assert_eq!(read_browser_pid_record(&old_path), Some(old_record));
         assert_eq!(read_daemon_pid_file(&new_pid), Some(23456));
+    }
+
+    #[test]
+    fn differing_records_for_one_pid_are_not_selected_by_path_order() {
+        let temp = tempfile::tempdir().unwrap();
+        let session = "ambiguous-browser-record";
+        let current_path = session_pid_path_in(temp.path(), session).unwrap();
+        let legacy_path = legacy_session_pid_path_in(temp.path(), session).unwrap();
+        let current = test_browser_record(12345, 100, "a".repeat(32));
+        let mut legacy = current.clone();
+        legacy.owner_start_time = legacy.owner_start_time.saturating_add(1);
+        write_browser_pid_record(&current_path, &current).unwrap();
+        write_browser_pid_record(&legacy_path, &legacy).unwrap();
+
+        assert!(unambiguous_browser_pid_record_in(temp.path(), session, |record| {
+            record.pid == 12345 && record.start_time == 100
+        }).is_none());
+        write_browser_pid_record(&legacy_path, &current).unwrap();
+        assert_eq!(unambiguous_browser_pid_record_in(temp.path(), session, |record| {
+            record.pid == 12345 && record.start_time == 100
+        }), Some((current_path, current)));
     }
 
     #[test]
@@ -8603,9 +8670,20 @@ mod tests {
         assert!(clack_private_fs::require_private_file(&port_path).is_err());
 
         let current = temp.path().join(BROWSER_DAEMON_DIR);
-        assert_eq!(browser_daemon_dir_in(temp.path(), &session), Some(current));
+        assert_eq!(browser_daemon_dir_in(temp.path(), &session), Some(current.clone()));
         assert_eq!(std::fs::read_to_string(pid_path).unwrap(), u32::MAX.to_string());
         assert_eq!(std::fs::read_to_string(port_path).unwrap(), port.to_string());
+        assert!(std::net::TcpStream::connect(listener.local_addr().unwrap()).is_ok());
+
+        std::fs::remove_file(temp.path().join(format!("{session}.pid"))).unwrap();
+        assert!(browser_daemon_dir_in(temp.path(), &session).is_none(),
+            "an orphaned legacy port without a record remains inconclusive");
+        let old = test_browser_record(u32::MAX, 1, browser_owner_token().to_owned());
+        let record_path = session_pid_path_in(temp.path(), &session).unwrap();
+        write_browser_pid_record(&record_path, &old).unwrap();
+        assert_eq!(browser_daemon_dir_in(temp.path(), &session), Some(current),
+            "a retained record proves the orphaned port is unrelated");
+        assert_eq!(read_browser_pid_record(&record_path), Some(old));
         assert!(std::net::TcpStream::connect(listener.local_addr().unwrap()).is_ok());
     }
 
@@ -8949,6 +9027,36 @@ mod tests {
         child.wait().unwrap();
         std::fs::remove_file(old_pid).unwrap();
         std::fs::remove_file(old_record).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dead_current_record_does_not_hide_a_live_legacy_daemon() {
+        let session = format!("legacy-record-{}", uuid::Uuid::new_v4().simple());
+        let root = browser_run_root_for_session(&session).unwrap();
+        let prior_token = uuid::Uuid::new_v4().simple().to_string();
+        let (_temp, mut child, legacy_record) = browser_identity_fixture_with_attempt_and_dir(
+            &session, &prior_token, None, Some(&root),
+        );
+        let legacy_pid_path = root.join(format!("{session}.pid"));
+        let legacy_record_path = legacy_session_pid_path_in(&root, &session).unwrap();
+        let current_record_path = session_pid_path_in(&root, &session).unwrap();
+        std::fs::write(&legacy_pid_path, child.id().to_string()).unwrap();
+        write_browser_pid_record(&legacy_record_path, &legacy_record).unwrap();
+        write_browser_pid_record(
+            &current_record_path,
+            &test_browser_record(u32::MAX, 1, browser_owner_token().to_owned()),
+        ).unwrap();
+
+        assert!(verified_legacy_browser_pid_in(&root, &session));
+        assert_eq!(run_dir_for_session(&session), Some(root));
+        assert_eq!(owned_browser_pid(&session, child.id()), Some(legacy_record));
+
+        child.kill().unwrap();
+        child.wait().unwrap();
+        std::fs::remove_file(legacy_pid_path).unwrap();
+        std::fs::remove_file(legacy_record_path).unwrap();
+        std::fs::remove_file(current_record_path).unwrap();
     }
 
     #[cfg(unix)]
