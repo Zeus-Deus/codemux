@@ -8249,14 +8249,23 @@ mod tests {
         // release the provisional state after the direct child is reaped.
         let second_was_running = manager.note_action_start(&session, "open").await;
         assert!(!second_was_running);
-        // CI installs Node before Rust tests. Its --version satisfies the
-        // secure sidecar version probe, and with null stdin it exits without
-        // publishing any browser control endpoint.
-        let available = "node.exe";
-        assert!(native_browser_version(std::path::Path::new(available), Duration::from_secs(5))
-            .is_some_and(|version| version >= semver::Version::new(0, 44, 0)));
+        // Exercise the direct-child exit path after the exact sidecar version
+        // gate, without starting a real daemon or weakening that gate.
+        let fixture = tempfile::tempdir().unwrap();
+        let source = fixture.path().join("exit_without_control.rs");
+        let available = fixture.path().join("agent-browser-exit-fixture.exe");
+        std::fs::write(&source, format!(
+            "fn main() {{\n    if std::env::args().any(|arg| arg == \"--version\") {{\n        println!(\"agent-browser {}\");\n    }}\n}}\n",
+            PATCHED_BROWSER_VERSION,
+        )).unwrap();
+        let compile = std::process::Command::new(which::which("rustc").unwrap())
+            .arg(&source).arg("-o").arg(&available).output().unwrap();
+        assert!(compile.status.success(), "failed to compile browser exit fixture: {}",
+            String::from_utf8_lossy(&compile.stderr));
+        assert!(native_browser_version(&available, Duration::from_secs(5))
+            .is_some_and(|version| version.to_string() == PATCHED_BROWSER_VERSION));
         let second_failure = run_agent_browser_native_with_status(
-            available,
+            available.to_str().unwrap(),
             &["open".into(), "about:blank".into(), "--session".into(), session.clone()],
             &session,
             port,
