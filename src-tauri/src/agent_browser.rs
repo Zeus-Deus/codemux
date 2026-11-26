@@ -1977,11 +1977,20 @@ fn live_owned_browser_record(session: &str) -> Option<BrowserPidRecord> {
 
 #[cfg(not(windows))]
 fn retire_exited_provisional_browser_files(session: &str) {
-    if let Some(pid) = read_agent_browser_daemon_pid(session) {
-        if process_exit_confirmed(pid) {
-            // This path rechecks the PID and control endpoint before each
-            // removal, and leaves an inconclusive endpoint untouched.
-            let _ = require_owned_browser_session_for_cleanup(session);
+    if let (Some(pid), Some(pid_path), Some(dir)) = (
+        read_agent_browser_daemon_pid(session),
+        agent_browser_daemon_pid_path(session),
+        run_dir_for_session(session),
+    ) {
+        // Only the stale PID marker pins provisional state. Leave port,
+        // engine, and stream files to their owner: another app instance may
+        // be publishing a new launch before its PID or listener appears.
+        if process_exit_confirmed(pid)
+            && probe_browser_control_endpoint(session, &dir) == BrowserControlEndpointProbe::Absent
+            && read_daemon_pid_file(&pid_path) == Some(pid)
+            && process_exit_confirmed(pid)
+            && probe_browser_control_endpoint(session, &dir) == BrowserControlEndpointProbe::Absent {
+            let _ = std::fs::remove_file(pid_path);
         }
     }
     let Some(record_path) = session_pid_path(session) else { return };
@@ -6369,10 +6378,14 @@ mod tests {
             daemon.kill().unwrap();
             daemon.wait().unwrap();
             assert!(process_exit_confirmed(record.pid));
+            let new_port_path = run_dir_for_session(&session).unwrap().join(format!("{session}.port"));
+            std::fs::write(&new_port_path, b"new launch metadata").unwrap();
             manager.settle_provisional_session(&session, &session, None).await;
             assert!(!pid_path.exists(), "{retry} left a dead daemon PID file");
             assert!(!session_pid_path(&session).unwrap().exists(), "{retry} left a dead ownership record");
+            assert_eq!(std::fs::read(&new_port_path).unwrap(), b"new launch metadata");
             assert!(manager.sessions.lock().await.get(&session).is_none(), "{retry} kept the provisional session");
+            std::fs::remove_file(new_port_path).unwrap();
             manager.allocate_port(&session).await.unwrap();
             assert!(!manager.note_action_start(&session, "open").await);
         }
