@@ -146,6 +146,36 @@ describe("BrowserPane start failures", () => {
     expect(mocks.browserStreamBridgeEndpoints).toHaveBeenCalledTimes(1);
   });
 
+  it("shows the next approval without reopening the stream after a confirmed action", async () => {
+    mocks.startBrowserStream
+      .mockRejectedValueOnce("Browser confirmation is pending for session browser-1")
+      .mockResolvedValue("ws://127.0.0.1:9223");
+    mocks.agentBrowserPendingConfirmation.mockResolvedValue({
+      id: "c_first",
+      description: "Approve navigation",
+      expires_at_ms: Date.now() + 60_000,
+    });
+    mocks.agentBrowserRespondConfirmation
+      .mockResolvedValueOnce({
+        id: "c_second",
+        description: "Approve plugin action",
+        expires_at_ms: Date.now() + 60_000,
+      })
+      .mockResolvedValueOnce(null);
+
+    renderPane();
+    await act(async () => {});
+    fireEvent.click(screen.getByRole("button", { name: "Approve browser action" }));
+    await vi.waitFor(() => expect(screen.getByText("Approve plugin action")).toBeInTheDocument());
+    expect(mocks.agentBrowserRespondConfirmation).toHaveBeenCalledWith("browser-1", "c_first", true);
+    expect(mocks.startBrowserStream).toHaveBeenCalledTimes(1);
+    expect(mocks.browserStreamBridgeEndpoints).not.toHaveBeenCalled();
+
+    fireEvent.click(screen.getByRole("button", { name: "Approve browser action" }));
+    await vi.waitFor(() => expect(mocks.startBrowserStream).toHaveBeenCalledTimes(2));
+    expect(mocks.agentBrowserRespondConfirmation).toHaveBeenCalledWith("browser-1", "c_second", true);
+  });
+
   it("denies a pending action without starting another browser", async () => {
     mocks.startBrowserStream.mockRejectedValue("Browser confirmation is pending for session browser-1");
     mocks.agentBrowserPendingConfirmation.mockResolvedValue({

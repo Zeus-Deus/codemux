@@ -736,7 +736,11 @@ export const BrowserPane = memo(function BrowserPane({ browserId, focused, visib
     setConfirmationBusy(true);
     setConfirmationError(null);
     try {
-      await agentBrowserRespondConfirmation(pending.sessionId, pending.details.id, approve);
+      const followUp = await agentBrowserRespondConfirmation(pending.sessionId, pending.details.id, approve);
+      if (followUp) {
+        showPendingConfirmation(pending.sessionId, followUp);
+        return;
+      }
       setPendingConfirmation(null);
       if (approve) retryNow();
       else setErrorMsg("Browser action denied");

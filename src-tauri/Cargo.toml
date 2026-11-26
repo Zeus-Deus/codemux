@@ -191,6 +191,7 @@ features = ["async-secret-service", "tokio", "crypto-rust"]
 
 [target.'cfg(unix)'.dependencies]
 tauri-plugin-dialog = { version = "2", default-features = false, features = ["xdg-portal"] }
+socket2 = "0.6"
 
 [target.'cfg(target_os = "linux")'.dependencies]
 # Used by dialog_preflight.rs to ask the XDG desktop portal whether a
