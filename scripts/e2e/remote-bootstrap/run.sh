@@ -546,12 +546,27 @@ run_distro() {
     # The mutual-exclusion guard depends on the control socket being visible
     # from another process. It must lose to `run_serve`'s own check, not to a
     # port collision deeper in the stack.
-    local second_serve
-    second_serve=$(uexec "$distro" "codemux serve; echo RC=\$?")
-    printf '%s\n' "$second_serve" | sed 's/^/      /'
-    assert_not_contains "second \`codemux serve\` exits non-zero" "$second_serve" "RC=0"
-    assert_contains "second \`serve\` reports mutual exclusion" "$second_serve" "already running on this machine"
-    assert_not_contains "second \`serve\` did NOT fail on a port collision" "$second_serve" "Address already in use"
+    local second_serve second_serve_rc
+    if second_serve=$(uexec "$distro" "timeout -k 5s 30s codemux serve"); then
+        second_serve_rc=0
+    else
+        second_serve_rc=$?
+    fi
+    if [ "$second_serve_rc" -eq 1 ]; then
+        pass "second \`codemux serve\` exits with status 1"
+    else
+        fail "second \`codemux serve\` exits with status 1" "exit status ${second_serve_rc}; output redacted"
+    fi
+    if [[ "$second_serve" == *"already running on this machine"* ]]; then
+        pass "second \`serve\` reports mutual exclusion"
+    else
+        fail "second \`serve\` reports mutual exclusion" "expected owner guard; output redacted"
+    fi
+    if [[ "$second_serve" == *"Address already in use"* ]]; then
+        fail "second \`serve\` did NOT fail on a port collision" "port collision; output redacted"
+    else
+        pass "second \`serve\` did NOT fail on a port collision"
+    fi
 
     # ── (e) device registration reached the mock ─────────────────────────
     banner "${distro} · step e — device registration"
