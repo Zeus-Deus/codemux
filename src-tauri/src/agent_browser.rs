@@ -2032,19 +2032,36 @@ fn live_owned_browser_record(session: &str) -> Option<BrowserPidRecord> {
 }
 
 #[cfg(not(windows))]
+fn provisional_browser_record_departed(record: &BrowserPidRecord) -> bool {
+    process_exit_confirmed(record.pid)
+        || (record.native_start
+            && process_start_time(record.pid).is_some_and(|start| start != record.start_time)
+            && process_looks_like_agent_browser(record.pid) == Some(false))
+}
+
+#[cfg(not(windows))]
 fn retire_exited_provisional_browser_files(session: &str) {
     if let (Some(pid), Some(pid_path), Some(dir)) = (
         read_agent_browser_daemon_pid(session),
         agent_browser_daemon_pid_path(session),
         run_dir_for_session(session),
     ) {
+        let recorded = session_pid_record(session).filter(|(_, record)| {
+            record.pid == pid && (record.token == browser_owner_token() || previous_app_has_exited(record))
+        });
+        let departed = || {
+            process_exit_confirmed(pid) || recorded.as_ref().is_some_and(|(path, record)| {
+                read_browser_pid_record(path).as_ref() == Some(record)
+                    && provisional_browser_record_departed(record)
+            })
+        };
         // Only the stale PID marker pins provisional state. Leave port,
         // engine, and stream files to their owner: another app instance may
         // be publishing a new launch before its PID or listener appears.
-        if process_exit_confirmed(pid)
+        if departed()
             && probe_browser_control_endpoint(session, &dir) == BrowserControlEndpointProbe::Absent
             && read_daemon_pid_file(&pid_path) == Some(pid)
-            && process_exit_confirmed(pid)
+            && departed()
             && probe_browser_control_endpoint(session, &dir) == BrowserControlEndpointProbe::Absent {
             let _ = std::fs::remove_file(pid_path);
         }
@@ -2052,14 +2069,15 @@ fn retire_exited_provisional_browser_files(session: &str) {
     let Some(record_path) = session_pid_path(session) else { return };
     let Some(record) = read_browser_pid_record(&record_path) else { return };
     if !(record.token == browser_owner_token() || previous_app_has_exited(&record))
-        || !process_exit_confirmed(record.pid) {
+        || !provisional_browser_record_departed(&record) {
         return;
     }
     let Some(pid_path) = agent_browser_daemon_pid_path(session) else { return };
     let Some(dir) = run_dir_for_session(session) else { return };
     if matches!(std::fs::symlink_metadata(pid_path), Err(error) if error.kind() == std::io::ErrorKind::NotFound)
         && probe_browser_control_endpoint(session, &dir) == BrowserControlEndpointProbe::Absent
-        && read_browser_pid_record(&record_path).as_ref() == Some(&record) {
+        && read_browser_pid_record(&record_path).as_ref() == Some(&record)
+        && provisional_browser_record_departed(&record) {
         let _ = std::fs::remove_file(record_path);
     }
 }
@@ -4525,9 +4543,7 @@ impl AgentBrowserManager {
                     Err(error) if error.kind() == std::io::ErrorKind::NotFound => true,
                     Ok(_) => read_browser_pid_record(&path)
                         .map_or_else(|| read_daemon_pid_file(&path).is_some(), |record| {
-                            process_exit_confirmed(record.pid)
-                                || (process_start_time(record.pid).is_some_and(|start| start != record.start_time)
-                                    && process_looks_like_agent_browser(record.pid) == Some(false))
+                            provisional_browser_record_departed(&record)
                         }),
                     Err(_) => false,
                 }
@@ -6455,6 +6471,30 @@ mod tests {
             std::fs::remove_file(new_port_path).unwrap();
             manager.allocate_port(&session).await.unwrap();
             assert!(!manager.note_action_start(&session, "open").await);
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn recycled_daemon_pid_file_allows_provisional_spawn_and_pane_retries() {
+        let pid = std::process::id();
+        let current_start = process_start_time(pid).unwrap();
+        assert_eq!(process_looks_like_agent_browser(pid), Some(false));
+        for retry in ["spawn", "pane"] {
+            let session = format!("browser-reused-pid-{retry}-{}", uuid::Uuid::new_v4().simple());
+            let record = test_browser_record(pid, current_start + 1, browser_owner_token().to_owned());
+            let daemon_pid_path = agent_browser_daemon_pid_path(&session).unwrap();
+            std::fs::write(&daemon_pid_path, pid.to_string()).unwrap();
+            write_session_pid(&session, &record).unwrap();
+            let manager = AgentBrowserManager::new();
+            manager.allocate_port(&session).await.unwrap();
+            assert!(!manager.note_action_start(&session, "open").await);
+
+            manager.settle_provisional_session(&session, &session, None).await;
+            assert!(!daemon_pid_path.exists(), "{retry} left a reused daemon PID marker");
+            assert!(!session_pid_path(&session).unwrap().exists(), "{retry} left a stale ownership record");
+            assert!(manager.sessions.lock().await.get(&session).is_none(), "{retry} kept the provisional session");
+            assert_eq!(process_start_time(pid), Some(current_start), "unrelated process was affected");
         }
     }
 
