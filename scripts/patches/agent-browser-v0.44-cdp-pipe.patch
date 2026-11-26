@@ -163,19 +163,20 @@ index aad976c..14643dc 100644
          state.active_provider_connection = true;
          let target = state
 diff --git a/cli/src/native/browser.rs b/cli/src/native/browser.rs
-index 27ef4d1..4c17ed2 100644
+index 27ef4d1..49f9dc0 100644
 --- a/cli/src/native/browser.rs
 +++ b/cli/src/native/browser.rs
-@@ -1,7 +1,7 @@
+@@ -1,7 +1,8 @@
  use serde_json::{json, Value};
  use std::collections::{HashMap, HashSet};
  use std::future::Future;
 -use std::sync::Arc;
++use std::io::Write;
 +use std::sync::{Arc, Mutex as StdMutex};
  use std::time::{Duration, Instant};
  use tokio::sync::{broadcast, Mutex};
  
-@@ -698,7 +698,7 @@ fn remaining_budget(deadline: Instant) -> Duration {
+@@ -698,7 +699,7 @@ fn remaining_budget(deadline: Instant) -> Duration {
  }
  
  pub enum BrowserProcess {
@@ -184,7 +185,7 @@ index 27ef4d1..4c17ed2 100644
      Lightpanda(LightpandaProcess),
      Obscura(ObscuraProcess),
  }
-@@ -706,7 +706,7 @@ pub enum BrowserProcess {
+@@ -706,7 +707,7 @@ pub enum BrowserProcess {
  impl BrowserProcess {
      pub fn kill(&mut self) {
          match self {
@@ -193,7 +194,7 @@ index 27ef4d1..4c17ed2 100644
              BrowserProcess::Lightpanda(p) => p.kill(),
              BrowserProcess::Obscura(p) => p.kill(),
          }
-@@ -714,7 +714,10 @@ impl BrowserProcess {
+@@ -714,7 +715,10 @@ impl BrowserProcess {
  
      pub fn wait_or_kill(&mut self, timeout: std::time::Duration) {
          match self {
@@ -205,7 +206,7 @@ index 27ef4d1..4c17ed2 100644
              BrowserProcess::Lightpanda(p) => p.kill(),
              BrowserProcess::Obscura(p) => p.kill(),
          }
-@@ -723,7 +726,7 @@ impl BrowserProcess {
+@@ -723,13 +727,85 @@ impl BrowserProcess {
      /// Non-blocking check whether the browser process has exited.
      pub fn has_exited(&mut self) -> bool {
          match self {
@@ -214,16 +215,94 @@ index 27ef4d1..4c17ed2 100644
              BrowserProcess::Lightpanda(_) => false,
              BrowserProcess::Obscura(p) => p.has_exited(),
          }
-@@ -923,7 +926,7 @@ impl BrowserManager {
+     }
+ }
+ 
++async fn launch_managed_chrome_attempt(
++    options: LaunchOptions,
++) -> Result<(BrowserProcess, Arc<CdpClient>), String> {
++    let mut chrome = tokio::task::spawn_blocking(move || launch_chrome(&options))
++        .await
++        .map_err(|error| format!("Chrome launch task failed: {error}"))??;
++    let (reader, writer) = chrome.take_pipe()?;
++    let chrome = Arc::new(StdMutex::new(chrome));
++    let weak_chrome = Arc::downgrade(&chrome);
++    let on_failure: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
++        if let Some(chrome) = weak_chrome.upgrade() {
++            chrome
++                .lock()
++                .unwrap_or_else(|error| error.into_inner())
++                .kill();
++        }
++    });
++    let client = Arc::new(CdpClient::connect_pipe(reader, writer, Some(on_failure)));
++
++    // A successful spawn does not prove Chromium accepted its private pipe.
++    let ready = tokio::time::timeout(
++        Duration::from_secs(10),
++        client.send_command_no_params("Browser.getVersion", None),
++    )
++    .await;
++    if matches!(ready, Ok(Ok(_))) {
++        return Ok((BrowserProcess::Chrome(chrome), client));
++    }
++
++    let exited = {
++        let mut process = chrome.lock().unwrap_or_else(|error| error.into_inner());
++        let exited = process.has_exited();
++        process.kill();
++        exited
++    };
++    client.close().await;
++    tokio::time::sleep(Duration::from_millis(25)).await;
++    let stderr = chrome
++        .lock()
++        .unwrap_or_else(|error| error.into_inner())
++        .stderr_tail();
++    let diagnostic = if stderr.is_empty() {
++        String::new()
++    } else {
++        format!("; Chrome stderr tail: {stderr}")
++    };
++    Err(format!(
++        "Chrome pipe did not become ready: {ready:?}; process exited: {exited}{diagnostic}"
++    ))
++}
++
++async fn launch_managed_chrome(
++    options: LaunchOptions,
++) -> Result<(BrowserProcess, Arc<CdpClient>), String> {
++    const MAX_ATTEMPTS: usize = 3;
++    let mut last_error = String::new();
++    for attempt in 1..=MAX_ATTEMPTS {
++        match launch_managed_chrome_attempt(options.clone()).await {
++            Ok(launched) => return Ok(launched),
++            Err(error) => last_error = error,
++        }
++        if attempt < MAX_ATTEMPTS {
++            let _ = writeln!(
++                std::io::stderr(),
++                "[chrome] Launch attempt {attempt}/{MAX_ATTEMPTS} failed, retrying in 500ms..."
++            );
++            tokio::time::sleep(Duration::from_millis(500)).await;
++        }
++    }
++    Err(last_error)
++}
++
+ pub struct BrowserManager {
+     pub client: Arc<CdpClient>,
+     browser_process: Option<BrowserProcess>,
+@@ -923,7 +999,7 @@ impl BrowserManager {
          let download_path = options.download_path.clone();
          let headless = options.effectively_headless();
  
 -        let (ws_url, process) = match engine {
-+        let (ws_url, process, chrome_pipe) = match engine {
++        let (ws_url, process, chrome_client) = match engine {
              "lightpanda" => {
                  let lp_options = LightpandaLaunchOptions {
                      executable_path: options.executable_path.clone(),
-@@ -932,7 +935,7 @@ impl BrowserManager {
+@@ -932,7 +1008,7 @@ impl BrowserManager {
                  };
                  let lp = launch_lightpanda(&lp_options).await?;
                  let url = lp.ws_url.clone();
@@ -232,7 +311,7 @@ index 27ef4d1..4c17ed2 100644
              }
              "obscura" => {
                  let obscura_options = ObscuraLaunchOptions {
-@@ -943,14 +946,18 @@ impl BrowserManager {
+@@ -943,14 +1019,11 @@ impl BrowserManager {
                  };
                  let ob = launch_obscura(&obscura_options).await?;
                  let url = ob.ws_url.clone();
@@ -241,69 +320,21 @@ index 27ef4d1..4c17ed2 100644
              }
              _ => {
 -                let chrome = tokio::task::spawn_blocking(move || launch_chrome(&options))
-+                let mut chrome = tokio::task::spawn_blocking(move || launch_chrome(&options))
-                     .await
-                     .map_err(|e| format!("Chrome launch task failed: {}", e))??;
+-                    .await
+-                    .map_err(|e| format!("Chrome launch task failed: {}", e))??;
 -                let url = chrome.ws_url.clone();
 -                (url, BrowserProcess::Chrome(chrome))
-+                let pipe = chrome.take_pipe()?;
-+                (
-+                    String::new(),
-+                    BrowserProcess::Chrome(Arc::new(StdMutex::new(chrome))),
-+                    Some(pipe),
-+                )
++                let (process, client) = launch_managed_chrome(options).await?;
++                (String::new(), process, Some(client))
              }
          };
  
-@@ -959,7 +966,54 @@ impl BrowserManager {
+@@ -959,7 +1032,11 @@ impl BrowserManager {
          } else if engine == "obscura" {
              initialize_obscura_manager(ws_url, process).await?
          } else {
 -            let client = Arc::new(CdpClient::connect(&ws_url).await?);
-+            let client = if let Some((reader, writer)) = chrome_pipe {
-+                let chrome = match &process {
-+                    BrowserProcess::Chrome(chrome) => chrome.clone(),
-+                    _ => unreachable!("only managed Chrome uses a debugging pipe"),
-+                };
-+                let on_failure: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
-+                    chrome.lock().unwrap_or_else(|e| e.into_inner()).kill();
-+                });
-+                let client = Arc::new(CdpClient::connect_pipe(reader, writer, Some(on_failure)));
-+                // A successful spawn does not prove Chromium accepted its
-+                // private transport. Never retry over a TCP debug port.
-+                let ready = tokio::time::timeout(
-+                    Duration::from_secs(10),
-+                    client.send_command_no_params("Browser.getVersion", None),
-+                )
-+                .await;
-+                if !matches!(ready, Ok(Ok(_))) {
-+                    client.close().await;
-+                    let (exited, stderr) = if let BrowserProcess::Chrome(chrome) = &process {
-+                        let exited = {
-+                            let mut chrome_process =
-+                                chrome.lock().unwrap_or_else(|e| e.into_inner());
-+                            let exited = chrome_process.has_exited();
-+                            chrome_process.kill();
-+                            exited
-+                        };
-+                        tokio::time::sleep(Duration::from_millis(25)).await;
-+                        let stderr = chrome
-+                            .lock()
-+                            .unwrap_or_else(|e| e.into_inner())
-+                            .stderr_tail();
-+                        (exited, stderr)
-+                    } else {
-+                        (false, String::new())
-+                    };
-+                    let diagnostic = if stderr.is_empty() {
-+                        String::new()
-+                    } else {
-+                        format!("; Chrome stderr tail: {stderr}")
-+                    };
-+                    return Err(format!(
-+                        "Chrome pipe did not become ready: {ready:?}; process exited: {exited}{diagnostic}"
-+                    ));
-+                }
++            let client = if let Some(client) = chrome_client {
 +                client
 +            } else {
 +                Arc::new(CdpClient::connect(&ws_url).await?)
@@ -311,7 +342,7 @@ index 27ef4d1..4c17ed2 100644
              let mut manager = Self {
                  client,
                  browser_process: Some(process),
-@@ -1906,6 +1960,7 @@ impl BrowserManager {
+@@ -1906,6 +1983,7 @@ impl BrowserManager {
              // Only send Browser.close when we launched the browser ourselves.
              // For external connections (--auto-connect, --cdp) we just disconnect
              // without shutting down the user's browser.
@@ -319,7 +350,7 @@ index 27ef4d1..4c17ed2 100644
              let close = self.client.send_command_no_params("Browser.close", None);
              if let Some(timeout) = browser_close_timeout {
                  let _ = tokio::time::timeout(timeout, close).await;
-@@ -4531,7 +4586,7 @@ mod tests {
+@@ -4531,7 +4609,7 @@ mod tests {
          let executable = dir.path().join("chrome");
          let port = url::Url::parse(url).unwrap().port().unwrap();
          std::fs::write(&executable, format!(
@@ -328,7 +359,19 @@ index 27ef4d1..4c17ed2 100644
              dir.path().display()
          )).unwrap();
          std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
-@@ -4570,23 +4625,24 @@ mod tests {
+@@ -4549,6 +4627,11 @@ mod tests {
+             .trim()
+             .parse()
+             .unwrap();
++        assert_process_reaped(pid);
++    }
++
++    #[cfg(unix)]
++    fn assert_process_reaped(pid: i32) {
+         assert_eq!(
+             unsafe { libc::kill(pid, 0) },
+             -1,
+@@ -4570,23 +4653,126 @@ mod tests {
  
      #[cfg(unix)]
      #[tokio::test]
@@ -341,14 +384,6 @@ index 27ef4d1..4c17ed2 100644
 -            let (url, server) = initialization_server(method, false, 1, ignore_close).await;
 -            let (dir, options) = initialization_process(&url);
 -            let error = BrowserManager::launch(options, None)
--                .await
--                .err()
--                .expect("launch should fail");
--            assert!(error.contains("injected initialization failure"), "{error}");
--            let observed = server.await.unwrap();
--            assert!(observed[0].iter().any(|method| method == "Browser.close"));
--            assert_initialization_process_reaped(dir.path());
--        }
 +    async fn test_failed_local_pipe_disconnects_and_reaps() {
 +        let (url, server) = initialization_server("Target.getTargets", false, 1, false).await;
 +        let (dir, options) = initialization_process(&url);
@@ -367,10 +402,119 @@ index 27ef4d1..4c17ed2 100644
 +        );
 +        server.abort();
 +        assert_initialization_process_reaped(dir.path());
++    }
++
++    #[cfg(unix)]
++    #[tokio::test]
++    async fn test_cancelled_managed_pipe_launch_reaps_unresponsive_chrome() {
++        use std::os::unix::fs::PermissionsExt;
++
++        let dir = tempfile::tempdir().unwrap();
++        let executable = dir.path().join("chrome");
++        std::fs::write(
++            &executable,
++            r#"#!/bin/sh
++set -eu
++root=$(dirname "$0")
++printf '%s' "$$" > "$root/pid"
++perl -e 'my $b; while (sysread(STDIN, $b, 1)) { last if $b eq "\0" }' <&3
++touch "$root/command"
++exec sleep 60
++"#,
++        )
++        .unwrap();
++        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
++        let options = LaunchOptions {
++            executable_path: Some(executable.to_string_lossy().into_owned()),
++            ..Default::default()
++        };
++        let launch = tokio::spawn(launch_managed_chrome(options));
++        tokio::time::timeout(Duration::from_secs(5), async {
++            while !dir.path().join("command").exists() {
++                tokio::time::sleep(Duration::from_millis(10)).await;
++            }
++        })
++        .await
++        .expect("fixture never received the first CDP command");
++        launch.abort();
++        assert!(matches!(launch.await, Err(error) if error.is_cancelled()));
++        assert_initialization_process_reaped(dir.path());
++    }
++
++    #[cfg(unix)]
++    #[tokio::test]
++    async fn test_managed_pipe_readiness_retries_with_fresh_child() {
++        use std::os::unix::fs::PermissionsExt;
++
++        let dir = tempfile::tempdir().unwrap();
++        let executable = dir.path().join("chrome");
++        std::fs::write(
++            &executable,
++            r#"#!/bin/sh
++set -eu
++root=$(dirname "$0")
++pipe=0
++for arg do
++    case "$arg" in
++        --remote-debugging-pipe) pipe=1 ;;
++        *remote-debugging-port*) exit 23 ;;
++    esac
++done
++[ "$pipe" -eq 1 ]
++attempt=1
++if [ -f "$root/attempt" ]; then
++    attempt=$(( $(cat "$root/attempt") + 1 ))
++fi
++printf '%s' "$attempt" > "$root/attempt"
++printf '%s' "$$" > "$root/pid-$attempt"
++if [ "$attempt" -eq 1 ]; then
++    printf 'first attempt exited before pipe readiness\n' >&2
++    exit 7
++fi
++perl -e 'my $b; while (sysread(STDIN, $b, 1)) { last if $b eq "\0" }' <&3
++printf '{"id":1,"result":{"product":"fixture"}}\000' >&4
++exec sleep 60
++"#,
++        )
++        .unwrap();
++        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
++        let options = LaunchOptions {
++            executable_path: Some(executable.to_string_lossy().into_owned()),
++            ..Default::default()
++        };
++        let (process, client) =
++            tokio::time::timeout(Duration::from_secs(6), launch_managed_chrome(options))
+                 .await
+-                .err()
+-                .expect("launch should fail");
+-            assert!(error.contains("injected initialization failure"), "{error}");
+-            let observed = server.await.unwrap();
+-            assert!(observed[0].iter().any(|method| method == "Browser.close"));
+-            assert_initialization_process_reaped(dir.path());
+-        }
++                .expect("Chrome readiness retries exceeded the deadline")
++                .unwrap();
++        assert_eq!(
++            std::fs::read_to_string(dir.path().join("attempt")).unwrap(),
++            "2"
++        );
++        let first_pid: i32 = std::fs::read_to_string(dir.path().join("pid-1"))
++            .unwrap()
++            .parse()
++            .unwrap();
++        assert_process_reaped(first_pid);
++        let second_pid: i32 = std::fs::read_to_string(dir.path().join("pid-2"))
++            .unwrap()
++            .parse()
++            .unwrap();
++        assert_eq!(unsafe { libc::kill(second_pid, 0) }, 0);
++        client.close().await;
++        drop(process);
++        assert_process_reaped(second_pid);
      }
  
      #[cfg(unix)]
-@@ -4600,7 +4656,10 @@ mod tests {
+@@ -4600,7 +4786,10 @@ mod tests {
              .unwrap();
          let mut manager = tokio::time::timeout(
              Duration::from_secs(4),
@@ -383,7 +527,7 @@ index 27ef4d1..4c17ed2 100644
          .await
          .expect("Lightpanda should release the failed connection and retry")
 diff --git a/cli/src/native/cdp/chrome.rs b/cli/src/native/cdp/chrome.rs
-index bf572f9..729e346 100644
+index bf572f9..670ca2c 100644
 --- a/cli/src/native/cdp/chrome.rs
 +++ b/cli/src/native/cdp/chrome.rs
 @@ -1,12 +1,17 @@
@@ -532,7 +676,69 @@ index bf572f9..729e346 100644
          temp_user_data_dir,
      })
  }
-@@ -909,14 +951,9 @@ pub fn launch_chrome(options: &LaunchOptions) -> Result<ChromeProcess, String> {
+@@ -842,7 +884,7 @@ pub fn launch_chrome(options: &LaunchOptions) -> Result<ChromeProcess, String> {
+ 
+     // Profile name preprocessing: if --profile is a Chrome profile name (not a
+     // path), resolve it to a directory, copy the profile to a temp dir, and
+-    // rewrite options so the retry loop uses the copied profile.
++    // rewrite options for this launch attempt.
+     let mut resolved_options: Option<LaunchOptions> = None;
+     let mut profile_temp_dir: Option<PathBuf> = None;
+ 
+@@ -867,56 +909,29 @@ pub fn launch_chrome(options: &LaunchOptions) -> Result<ChromeProcess, String> {
+ 
+     let effective_options = resolved_options.as_ref().unwrap_or(options);
+ 
+-    let max_attempts = 3;
+-    let mut last_err = String::new();
+-
+-    for attempt in 1..=max_attempts {
+-        match try_launch_chrome(&chrome_path, effective_options) {
+-            Ok(mut process) => {
+-                // Transfer profile temp dir ownership to ChromeProcess for cleanup on Drop.
+-                // The try_launch_chrome temp_user_data_dir is None here because we set profile
+-                // to the temp path (treated as a user-supplied path, no second temp dir).
+-                if let Some(ref dir) = profile_temp_dir {
+-                    process.temp_user_data_dir = Some(dir.clone());
+-                }
+-                return Ok(process);
++    match try_launch_chrome(&chrome_path, effective_options) {
++        Ok(mut process) => {
++            // The copied profile belongs to this process until it exits.
++            if let Some(dir) = profile_temp_dir {
++                process.temp_user_data_dir = Some(dir);
+             }
+-            Err(e) => {
+-                last_err = e;
+-                if attempt < max_attempts {
+-                    // Use write! instead of eprintln! to avoid panicking
+-                    // if the daemon's stderr pipe is broken (parent dropped it).
+-                    let _ = writeln!(
+-                        std::io::stderr(),
+-                        "[chrome] Launch attempt {}/{} failed, retrying in 500ms...",
+-                        attempt,
+-                        max_attempts
+-                    );
+-                    std::thread::sleep(Duration::from_millis(500));
+-                }
++            Ok(process)
++        }
++        Err(error) => {
++            if let Some(dir) = profile_temp_dir {
++                let _ = std::fs::remove_dir_all(dir);
+             }
++            Err(error)
+         }
+     }
+-
+-    // All retries failed: clean up profile temp dir if we created one
+-    if let Some(ref dir) = profile_temp_dir {
+-        let _ = std::fs::remove_dir_all(dir);
+-    }
+-
+-    Err(last_err)
+ }
+ 
  fn try_launch_chrome(chrome_path: &Path, options: &LaunchOptions) -> Result<ChromeProcess, String> {
      let ChromeArgs {
          args,
@@ -547,7 +753,7 @@ index bf572f9..729e346 100644
      let cleanup_temp_dir = |dir: &Option<PathBuf>| {
          if let Some(ref d) = dir {
              let _ = std::fs::remove_dir_all(d);
-@@ -937,6 +974,32 @@ fn try_launch_chrome(chrome_path: &Path, options: &LaunchOptions) -> Result<Chro
+@@ -937,6 +952,32 @@ fn try_launch_chrome(chrome_path: &Path, options: &LaunchOptions) -> Result<Chro
      #[cfg(target_os = "linux")]
      let xvfb = maybe_start_xvfb(options);
  
@@ -580,7 +786,7 @@ index bf572f9..729e346 100644
      #[cfg(not(windows))]
      let mut cmd = Command::new(chrome_path);
      #[cfg(not(windows))]
-@@ -969,11 +1032,21 @@ fn try_launch_chrome(chrome_path: &Path, options: &LaunchOptions) -> Result<Chro
+@@ -969,11 +1010,21 @@ fn try_launch_chrome(chrome_path: &Path, options: &LaunchOptions) -> Result<Chro
      #[cfg(unix)]
      {
          use std::os::unix::process::CommandExt;
@@ -605,7 +811,7 @@ index bf572f9..729e346 100644
                  Ok(())
              });
          }
-@@ -988,44 +1061,34 @@ fn try_launch_chrome(chrome_path: &Path, options: &LaunchOptions) -> Result<Chro
+@@ -988,44 +1039,34 @@ fn try_launch_chrome(chrome_path: &Path, options: &LaunchOptions) -> Result<Chro
          format!("Failed to launch Chrome at {:?}: {}", chrome_path, e)
      })?;
  
@@ -672,7 +878,7 @@ index bf572f9..729e346 100644
              });
      }
  
-@@ -1039,7 +1102,9 @@ fn try_launch_chrome(chrome_path: &Path, options: &LaunchOptions) -> Result<Chro
+@@ -1039,7 +1080,9 @@ fn try_launch_chrome(chrome_path: &Path, options: &LaunchOptions) -> Result<Chro
  
      Ok(ChromeProcess {
          child,
@@ -683,7 +889,7 @@ index bf572f9..729e346 100644
          temp_user_data_dir,
          temp_nss_home,
          #[cfg(unix)]
-@@ -1049,123 +1114,6 @@ fn try_launch_chrome(chrome_path: &Path, options: &LaunchOptions) -> Result<Chro
+@@ -1049,123 +1092,6 @@ fn try_launch_chrome(chrome_path: &Path, options: &LaunchOptions) -> Result<Chro
      })
  }
  
@@ -807,7 +1013,7 @@ index bf572f9..729e346 100644
  /// Finds Chrome from the install cache, macOS Applications directories, or system paths.
  pub fn find_chrome() -> Option<PathBuf> {
      // 1. Check Chrome downloaded by `agent-browser install`
-@@ -1995,9 +1943,52 @@ mod tests {
+@@ -1995,9 +1921,52 @@ mod tests {
          ]));
      }
  
@@ -861,7 +1067,7 @@ index bf572f9..729e346 100644
          use std::os::unix::fs::PermissionsExt;
  
          let fixture = tempfile::tempdir().unwrap();
-@@ -2009,11 +2000,11 @@ set -eu
+@@ -2009,11 +1978,11 @@ set -eu
  for arg do
      case "$arg" in --user-data-dir=*) profile="${arg#*=}" ;; esac
  done
@@ -874,7 +1080,7 @@ index bf572f9..729e346 100644
      touch "$profile/drained-$round"
  done
  exec sleep 60
-@@ -2027,10 +2018,7 @@ exec sleep 60
+@@ -2027,10 +1996,7 @@ exec sleep 60
          };
          let mut chrome = try_launch_chrome(&executable, &options).unwrap();
          let profile = chrome.temp_user_data_dir.clone().unwrap();
@@ -886,7 +1092,7 @@ index bf572f9..729e346 100644
          for round in 1..=2 {
              std::fs::write(profile.join(format!("request-{round}")), b"").unwrap();
              let drained = profile.join(format!("drained-{round}"));
-@@ -2048,6 +2036,16 @@ exec sleep 60
+@@ -2048,6 +2014,16 @@ exec sleep 60
              );
              assert!(!chrome.has_exited());
          }
@@ -903,7 +1109,7 @@ index bf572f9..729e346 100644
          drop(chrome);
          assert!(!profile.exists());
      }
-@@ -2182,33 +2180,6 @@ exec sleep 60
+@@ -2182,33 +2158,6 @@ exec sleep 60
          assert!(!should_disable_sandbox(&args));
      }
  
@@ -937,7 +1143,7 @@ index bf572f9..729e346 100644
      #[test]
      fn test_find_playwright_chromium_nonexistent() {
          let guard = EnvGuard::new(&["PLAYWRIGHT_BROWSERS_PATH", "HOME", "USERPROFILE"]);
-@@ -2703,7 +2674,9 @@ exec sleep 60
+@@ -2703,7 +2652,9 @@ exec sleep 60
              let child = spawn_noop_child();
              let _process = ChromeProcess {
                  child,
