@@ -191,6 +191,7 @@ features = ["async-secret-service", "tokio", "crypto-rust"]
 
 [target.'cfg(unix)'.dependencies]
 tauri-plugin-dialog = { version = "2", default-features = false, features = ["xdg-portal"] }
+socket2 = "0.6"
 
 [target.'cfg(target_os = "linux")'.dependencies]
 # Used by dialog_preflight.rs to ask the XDG desktop portal whether a
@@ -214,6 +215,7 @@ gtk = "0.18"
 
 [target.'cfg(windows)'.dependencies]
 clack-private-fs = "1"
+socket2 = "0.6"
 winx = "0.36"
 # Web Push's ECE encryption uses OpenSSL. Bundle it on Windows instead of
 # requiring users/builders to provide a system OpenSSL installation.
@@ -231,6 +233,8 @@ windows-sys = { version = "0.59", features = [
     "Wdk_Foundation",
     "Wdk_Storage_FileSystem",
     "Win32_Foundation",
+    "Win32_NetworkManagement_IpHelper",
+    "Win32_Networking_WinSock",
     "Win32_Storage_FileSystem",
     # IO_STATUS_BLOCK for confined skill writes and CancelIoEx for OpenCode shutdown.
     "Win32_System_IO",
