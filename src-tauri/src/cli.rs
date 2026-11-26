@@ -90,7 +90,8 @@ pub enum CommandSet {
         /// client's own name).
         #[arg(long, value_name = "NAME", value_parser = args::client_name)]
         client: Option<String>,
-        /// The most this client's calls may do (default: full-access).
+        /// Requested access ceiling (default: full-access). The running app
+        /// keeps unverified local socket peers read-only.
         #[arg(long, value_enum, value_name = "LEVEL")]
         access: Option<args::AccessArg>,
     },
@@ -567,7 +568,7 @@ impl CommandSet {
 /// flags first, then the root's. Commands that call the control socket fill
 /// the rest from the env (`var`); no other command reads it, so a blank or
 /// misspelled variable cannot stop the app, `serve` or a child from
-/// starting. Unnamed calls run as the owner.
+/// starting. An unnamed external socket peer remains unverified.
 fn caller_of(cli: &Cli, var: impl Fn(&str) -> Option<String>) -> Result<args::CallerArgs, String> {
     let flags = match &cli.command {
         Some(CommandSet::Mcp { client, access }) => args::CallerArgs {

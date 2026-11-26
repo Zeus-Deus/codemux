@@ -42,8 +42,8 @@ pub enum Access {
 /// Who is calling, as far as visibility and the access gate care.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CallerKind {
-    /// The person: the local socket (named local clients too; their name is
-    /// attribution, `access` governs them) and the paired web remote.
+    /// The person: verified local callers (named clients use their name for
+    /// attribution) and the paired web remote.
     Owner,
     /// An OAuth connector client.
     Client,

@@ -1189,12 +1189,12 @@ pub(crate) async fn dispatch_request<R: Runtime>(app: &AppHandle<R>, request: Co
     dispatch_request_as(app, &SocketCaller::owner(), request).await
 }
 
-/// The caller registry tools run as. The socket cannot tell which chat an
-/// agent process belongs to, so it never runs registry tools as one (and
-/// never as the owner).
-fn registry_caller(caller: &SocketCaller) -> Result<&crate::agent_control::ControlCaller, String> {
+/// The caller registry tools run as. A registered agent needs its chat's
+/// binding; an unverified socket peer has a separate read-only principal.
+fn registry_caller(caller: &SocketCaller) -> Result<crate::agent_control::ControlCaller, String> {
     match caller {
-        SocketCaller::Local(caller) => Ok(caller),
+        SocketCaller::Local(caller) => Ok(caller.clone()),
+        SocketCaller::Unverified => Ok(crate::agent_control::ControlCaller::unverified_socket()),
         SocketCaller::Agent { .. } => Err(crate::agent_control::ControlError::new(
             crate::agent_control::ErrorCode::AgentIdentityRequired,
             "This process runs under a Codemux agent; use your chat's own Codemux tools for thread control",
@@ -1304,15 +1304,15 @@ pub(crate) async fn dispatch_request_as<R: Runtime>(
         "delegation_host_info" | "delegation_grants" | "delegation_authorize" | "delegation_revoke" | "delegate_task" | "delegation_list" | "delegation_read" | "delegation_cancel" | "delegation_respond" | "delegation_deliver" => crate::delegation::app::invoke(app, &request.command, request.params).await,
         // The bare aliases keep returning raw data or `code: message`.
         name if crate::agent_control::registry::is_socket_alias(name) => match registry_caller(caller) {
-            Ok(caller) => crate::agent_control::execute(app, caller, name, request.params.clone())
+            Ok(caller) => crate::agent_control::execute(app, &caller, name, request.params.clone())
                 .await.map_err(|error| error.to_string()),
             Err(refused) => Err(refused),
         },
         "tool_call" => match registry_caller(caller) {
-            Ok(caller) => tool_call(app, caller, &request.params).await,
+            Ok(caller) => tool_call(app, &caller, &request.params).await,
             Err(refused) => Err(refused),
         },
-        "tools_list" => registry_caller(caller).and_then(|caller| tools_list(caller, &request.params)),
+        "tools_list" => registry_caller(caller).and_then(|caller| tools_list(&caller, &request.params)),
         "agent_connector_status" => {
             #[derive(Deserialize)] #[serde(deny_unknown_fields)] struct Args {}
             serde_json::from_value::<Args>(request.params.clone()).map_err(|e|e.to_string())
@@ -3020,8 +3020,30 @@ mod tests {
         assert!(listed.len() < owner["tools"].as_array().unwrap().len());
         assert!(listed.iter().all(|tool| tool["annotations"]["readOnlyHint"] == true), "read-only callers see read tools only");
 
+        let unverified = dispatch_request_as(app.handle(), &SocketCaller::Unverified, request("tools_list", Value::Null)).await;
+        assert!(unverified.ok, "{:?}", unverified.error);
+        let unverified = unverified.data.unwrap();
+        assert_eq!(unverified["tools"], catalog(&ControlCaller::unverified_socket()));
+        assert_eq!(unverified["caller"], serde_json::json!({"principal": "socket:unverified", "access": "read_only"}));
+        assert!(unverified["tools"].as_array().unwrap().iter().all(|tool| tool["annotations"]["readOnlyHint"] == true));
+
         let extra = dispatch_request(app.handle(), request("tools_list", serde_json::json!({"cursor": "x"}))).await;
         assert!(refused_with(&extra, "invalid_arguments"), "{:?}", extra.error);
+    }
+
+    #[tokio::test]
+    async fn unverified_socket_can_call_registry_reads_but_not_writes() {
+        let app = operation_app();
+        let caller = SocketCaller::Unverified;
+        let read = dispatch_request_as(app.handle(), &caller,
+            request("tool_call", serde_json::json!({"name": "workspace_list", "arguments": {}}))).await;
+        assert!(read.ok, "{:?}", read.error);
+        assert_eq!(read.data.unwrap()["isError"], false);
+
+        let write = dispatch_request_as(app.handle(), &caller,
+            request("tool_call", serde_json::json!({"name": "workspace_create", "arguments": {"path": "/tmp"}}))).await;
+        assert!(write.ok, "a registry refusal is a tool result: {:?}", write.error);
+        assert_eq!(write.data.unwrap()["structuredContent"]["error"]["code"], "access_denied");
     }
 
     /// A persisted chat with no live session. A wait with `since` set to its
