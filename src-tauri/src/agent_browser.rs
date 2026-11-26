@@ -12059,7 +12059,7 @@ mod tests {
             stream.pid = Some(pid);
             stream.pid_start_time = Some(old.start_time);
         }
-        assert!(!manager.refresh_running_session(&session, &session, BrowserActionOutcome::Failed).await.unwrap());
+        assert!(!manager.refresh_running_session(&session, &session, BrowserActionOutcome::Failed, None).await.unwrap());
         let tracked = manager.sessions.lock().await;
         let stream = tracked.get(&session).unwrap();
         assert_eq!(stream.port, stream_port);

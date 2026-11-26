@@ -34,13 +34,9 @@ import {
   mapToViewport,
   sanitizeCursor,
   remoteBrowserEndpoints,
-  buildCursorProbeScript,
-  SELECTION_SCRIPT,
-  buildInsertTextScript,
-  chunkString,
-  PASTE_CHUNK_SIZE,
+  chunkPasteText,
   probeDaemon,
-  evalOnDaemon,
+  runPaneCommand,
 } from "./stream-protocol";
 import { isRemoteClient } from "@/components/remote/is-remote-client";
 import { markPaneReady } from "@/lib/perf/interaction-trace";
@@ -202,7 +198,10 @@ export const BrowserPane = memo(function BrowserPane({ browserId, focused, visib
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
   const [pendingConfirmation, setPendingConfirmation] = useState<PendingConfirmationState | null>(null);
   const pendingConfirmationRef = useRef(false);
+  const visibleConfirmationRef = useRef<PendingConfirmationState | null>(null);
+  const initialNavigationSubmittedRef = useRef<string | null>(null);
   const [confirmationBusy, setConfirmationBusy] = useState(false);
+  const confirmationBusyRef = useRef(false);
   const [confirmationError, setConfirmationError] = useState<string | null>(null);
   // Bumping this re-runs the stream effect from the top: "Retry now".
   const [retryNonce, setRetryNonce] = useState(0);
@@ -366,9 +365,11 @@ export const BrowserPane = memo(function BrowserPane({ browserId, focused, visib
     let ws: WebSocket | null = null;
     let active = true;
     let slowRetryTimer: ReturnType<typeof setTimeout> | null = null;
+    let initialNavigationTimer: ReturnType<typeof setTimeout> | null = null;
 
     (async () => {
       pendingConfirmationRef.current = false;
+      visibleConfirmationRef.current = null;
       setStatus("starting");
       setErrorMsg(null);
       setPendingConfirmation(null);
@@ -394,7 +395,7 @@ export const BrowserPane = memo(function BrowserPane({ browserId, focused, visib
           if (!remoteClient) {
             const details = await agentBrowserPendingConfirmation(streamSessionId).catch(() => null);
             if (!active) return;
-            if (details) setPendingConfirmation({ sessionId: streamSessionId, details });
+            if (details) showPendingConfirmation(streamSessionId, details);
           }
           setStatus("error");
           setErrorMsg(remoteClient ? "Browser approval is waiting on the host device" : "Browser confirmation is pending");
@@ -543,18 +544,28 @@ export const BrowserPane = memo(function BrowserPane({ browserId, focused, visib
               }
               if (statusRef.current !== "live") {
                 setStatus("live");
-                // Skip navigation on reconnect — the agent's browser is already showing the right page.
-                const isReconnect = !!agentSessionRef.current;
-                if (!isReconnect) {
+                // A pane submits its preset URL only once per browser session.
+                // Approval and WebSocket reconnects must not replay that open.
+                if (!agentSessionRef.current && initialNavigationSubmittedRef.current !== effectiveSessionId) {
                   // Navigate to pre-set URL when browser first goes live.
                   // Delay 300ms to let browser process fully initialize for CDP commands.
                   const targetUrl = currentUrlRef.current;
                   if (targetUrl && targetUrl !== "about:blank") {
-                    setTimeout(() => {
+                    initialNavigationSubmittedRef.current = effectiveSessionId;
+                    initialNavigationTimer = setTimeout(() => {
+                      initialNavigationTimer = null;
+                      if (!active) {
+                        if (initialNavigationSubmittedRef.current === effectiveSessionId) {
+                          initialNavigationSubmittedRef.current = null;
+                        }
+                        return;
+                      }
                       agentBrowserRun(effectiveSessionId, "open", { url: targetUrl })
                         .then(async () => {
+                          if (!active) return;
                           if (!isRemoteClient()) {
                             const pending = await agentBrowserPendingConfirmation(effectiveSessionId);
+                            if (!active) return;
                             if (pending) {
                               showPendingConfirmation(effectiveSessionId, pending);
                               return;
@@ -562,7 +573,7 @@ export const BrowserPane = memo(function BrowserPane({ browserId, focused, visib
                           }
                           setCurrentUrl(targetUrl);
                         })
-                        .catch(console.error);
+                        .catch((error) => { if (active) console.error(error); });
                     }, 300);
                   }
                 }
@@ -672,6 +683,12 @@ export const BrowserPane = memo(function BrowserPane({ browserId, focused, visib
       active = false;
       clearInterval(livenessInterval);
       if (slowRetryTimer) clearTimeout(slowRetryTimer);
+      if (initialNavigationTimer) {
+        clearTimeout(initialNavigationTimer);
+        if (initialNavigationSubmittedRef.current === effectiveSessionId) {
+          initialNavigationSubmittedRef.current = null;
+        }
+      }
       // Close WebSocket on cleanup so the stream server's client count resets.
       // On StrictMode remount, the daemon is already running (*running = true),
       // so startBrowserStream returns instantly and a fresh WS connects.
@@ -688,12 +705,14 @@ export const BrowserPane = memo(function BrowserPane({ browserId, focused, visib
 
   const retryNow = () => {
     pendingConfirmationRef.current = false;
+    visibleConfirmationRef.current = null;
     startFailuresRef.current = 0;
     setRetryNonce((n) => n + 1);
   };
 
   const showPendingConfirmation = (sessionId: string, details: BrowserPendingConfirmation) => {
     pendingConfirmationRef.current = true;
+    visibleConfirmationRef.current = { sessionId, details };
     wsRef.current?.close();
     wsRef.current = null;
     httpBaseRef.current = null;
@@ -709,12 +728,22 @@ export const BrowserPane = memo(function BrowserPane({ browserId, focused, visib
     let active = true;
     let checking = false;
     const checkPending = async () => {
-      if (checking || pendingConfirmationRef.current) return;
+      if (checking) return;
       checking = true;
       try {
         const pending = await agentBrowserPendingConfirmation(effectiveSessionId);
-        if (active && pending && !pendingConfirmationRef.current) {
-          showPendingConfirmation(effectiveSessionId, pending);
+        if (!active) return;
+        const shown = visibleConfirmationRef.current;
+        if (pending) {
+          if (shown?.sessionId !== effectiveSessionId || shown.details.id !== pending.id) {
+            showPendingConfirmation(effectiveSessionId, pending);
+          }
+        } else if (shown?.sessionId === effectiveSessionId && !confirmationBusyRef.current) {
+          visibleConfirmationRef.current = null;
+          setPendingConfirmation(null);
+          setConfirmationError(null);
+          setErrorMsg("Browser confirmation is no longer pending. Retry to reconnect.");
+          setStatus("error");
         }
       } catch {
         // The stream retry path reports backend failures to the pane.
@@ -733,6 +762,7 @@ export const BrowserPane = memo(function BrowserPane({ browserId, focused, visib
   const respondToConfirmation = async (approve: boolean) => {
     const pending = pendingConfirmation;
     if (!pending?.details.id || confirmationBusy || isRemoteClient()) return;
+    confirmationBusyRef.current = true;
     setConfirmationBusy(true);
     setConfirmationError(null);
     try {
@@ -741,6 +771,7 @@ export const BrowserPane = memo(function BrowserPane({ browserId, focused, visib
         showPendingConfirmation(pending.sessionId, followUp);
         return;
       }
+      visibleConfirmationRef.current = null;
       setPendingConfirmation(null);
       if (approve) retryNow();
       else setErrorMsg("Browser action denied");
@@ -749,6 +780,7 @@ export const BrowserPane = memo(function BrowserPane({ browserId, focused, visib
       try {
         const current = await agentBrowserPendingConfirmation(pending.sessionId);
         if (!current) {
+          visibleConfirmationRef.current = null;
           setPendingConfirmation(null);
           setErrorMsg(message);
           setStatus("error");
@@ -763,20 +795,10 @@ export const BrowserPane = memo(function BrowserPane({ browserId, focused, visib
       }
       setConfirmationError(message);
     } finally {
+      confirmationBusyRef.current = false;
       setConfirmationBusy(false);
     }
   };
-
-  useEffect(() => {
-    if (!pendingConfirmation) return;
-    const timer = setTimeout(() => {
-      setPendingConfirmation(null);
-      setConfirmationError(null);
-      setErrorMsg("Browser confirmation expired. Retry to request it again.");
-      setStatus("error");
-    }, Math.max(0, pendingConfirmation.details.expires_at_ms - Date.now()) + 150);
-    return () => clearTimeout(timer);
-  }, [pendingConfirmation]);
 
   const copyErrorDetails = async () => {
     const details = [
@@ -876,7 +898,7 @@ export const BrowserPane = memo(function BrowserPane({ browserId, focused, visib
     if (cursorBusyRef.current || now - lastCursorAtRef.current < CURSOR_PROBE_INTERVAL_MS) return;
     cursorBusyRef.current = true;
     lastCursorAtRef.current = now;
-    evalOnDaemon(base, buildCursorProbeScript(x, y), 1500)
+    runPaneCommand(base, { operation: "cursor", x, y }, 1500)
       .then((result) => {
         const canvas = canvasRef.current;
         if (canvas && !inspectorActiveRef.current) {
@@ -1055,7 +1077,7 @@ export const BrowserPane = memo(function BrowserPane({ browserId, focused, visib
     const base = httpBaseRef.current;
     if (base) {
       try {
-        const sel = await evalOnDaemon(base, SELECTION_SCRIPT, 1000);
+        const sel = await runPaneCommand(base, { operation: "selection" }, 1000);
         if (typeof sel === "string" && sel.length > 0) {
           await navigator.clipboard.writeText(sel);
         }
@@ -1086,9 +1108,9 @@ export const BrowserPane = memo(function BrowserPane({ browserId, focused, visib
     }
     // Chunked so each eval request fits the daemon's single-segment
     // HTTP read (see the page-scripts note in stream-protocol.ts).
-    const chunks = chunkString(text, PASTE_CHUNK_SIZE);
+    const chunks = chunkPasteText(text);
     for (let i = 0; i < chunks.length; i++) {
-      const result = await evalOnDaemon(base, buildInsertTextScript(chunks[i]), 3000);
+      const result = await runPaneCommand(base, { operation: "insert_text", text: chunks[i] }, 3000);
       const inserted = result === true || result === "true";
       if (!inserted) {
         // Focus isn't an editable element (or the daemon hiccuped) —

@@ -176,6 +176,72 @@ describe("BrowserPane start failures", () => {
     expect(mocks.agentBrowserRespondConfirmation).toHaveBeenCalledWith("browser-1", "c_second", true);
   });
 
+  it("does not resubmit a preset navigation after approval reconnects the pane", async () => {
+    useAppStore.setState({
+      appState: {
+        schema_version: 1,
+        active_workspace_id: "ws-1",
+        workspaces: [],
+        terminal_sessions: [],
+        browser_sessions: [{
+          browser_id: "browser-1",
+          title: "Example",
+          current_url: "https://example.com",
+          history: [],
+          history_index: -1,
+          is_loading: false,
+          last_error: null,
+        }],
+        agent_browser_sessions: [],
+        notifications: [],
+        detected_ports: [],
+        pane_statuses: {},
+        persistence: {
+          schema_version: 1,
+          stores_layout_metadata: true,
+          stores_terminal_metadata: true,
+          stores_live_process_state: false,
+        },
+        config: {} as AppStateSnapshot["config"],
+      },
+    });
+    mocks.startBrowserStream.mockResolvedValue("ws://127.0.0.1:9223");
+    const firstPrompt = {
+      id: "host_first",
+      description: "Approve navigation",
+      expires_at_ms: Date.now() + 60_000,
+    };
+    let backendPending: typeof firstPrompt | null = null;
+    mocks.agentBrowserPendingConfirmation.mockImplementation(async () => backendPending);
+    mocks.agentBrowserRun.mockImplementation(async (_session: string, action: string) => {
+      if (action === "open") backendPending = firstPrompt;
+      return null;
+    });
+    mocks.agentBrowserRespondConfirmation.mockImplementation(async () => {
+      backendPending = null;
+      return null;
+    });
+    const emitFrame = () => FakeWebSocket.lastSocket?.onmessage?.({
+      data: JSON.stringify({ type: "frame", data: "", metadata: { deviceWidth: 1280, deviceHeight: 720 } }),
+    });
+    const openCalls = () => mocks.agentBrowserRun.mock.calls.filter(([, action]) => action === "open");
+
+    renderPane();
+    await vi.waitFor(() => expect(FakeWebSocket.opened).toBe(1));
+    expect(FakeWebSocket.opened).toBe(1);
+    act(emitFrame);
+    await vi.waitFor(() => expect(openCalls()).toHaveLength(1));
+    expect(openCalls()).toHaveLength(1);
+    await vi.waitFor(() => expect(screen.getByText("Approve navigation")).toBeInTheDocument());
+
+    fireEvent.click(screen.getByRole("button", { name: "Approve browser action" }));
+    await vi.waitFor(() => expect(FakeWebSocket.opened).toBe(2));
+    act(emitFrame);
+    await act(async () => { await new Promise((resolve) => setTimeout(resolve, 350)); });
+    expect(openCalls()).toHaveLength(1);
+    expect(mocks.agentBrowserRespondConfirmation).toHaveBeenCalledWith("browser-1", "host_first", true);
+  });
+
   it("shows a consumed replay failure without leaving the spent approval visible", async () => {
     mocks.startBrowserStream.mockRejectedValue("Browser confirmation is pending for session browser-1");
     let pending: { id: string; description: string; expires_at_ms: number } | null = {
@@ -217,15 +283,44 @@ describe("BrowserPane start failures", () => {
   it("expires an unanswered confirmation without silently retrying", async () => {
     vi.useFakeTimers();
     mocks.startBrowserStream.mockRejectedValue("Browser confirmation is pending for session browser-1");
-    mocks.agentBrowserPendingConfirmation.mockResolvedValue({
+    const details = {
       id: "c_expire",
       description: "navigation: expired.example",
       expires_at_ms: Date.now() + 1_000,
-    });
+    };
+    mocks.agentBrowserPendingConfirmation.mockImplementation(async () =>
+      Date.now() < details.expires_at_ms ? details : null);
     renderPane();
     await act(async () => {});
-    await act(async () => { vi.advanceTimersByTime(1_200); });
-    expect(screen.getByText("Browser confirmation expired. Retry to request it again.")).toBeInTheDocument();
+    await act(async () => { await vi.advanceTimersByTimeAsync(2_100); });
+    expect(screen.getByText("Browser confirmation is no longer pending. Retry to reconnect.")).toBeInTheDocument();
+    expect(mocks.startBrowserStream).toHaveBeenCalledTimes(1);
+    expect(mocks.agentBrowserRespondConfirmation).not.toHaveBeenCalled();
+  });
+
+  it("keeps an in-flight prompt visible past its deadline and shows the next approval", async () => {
+    vi.useFakeTimers();
+    mocks.startBrowserStream.mockRejectedValue("Browser confirmation is pending for session browser-1");
+    let backendPending = {
+      id: "host_first",
+      description: "Approve navigation",
+      expires_at_ms: Date.now() + 1_000,
+    };
+    mocks.agentBrowserPendingConfirmation.mockImplementation(async () => backendPending);
+
+    renderPane();
+    await act(async () => {});
+    expect(screen.getByText("Approve navigation")).toBeInTheDocument();
+    await act(async () => { await vi.advanceTimersByTimeAsync(1_200); });
+    expect(screen.getByText("Approve navigation")).toBeInTheDocument();
+    backendPending = {
+      id: "host_second",
+      description: "Approve plugin action",
+      expires_at_ms: Date.now() + 60_000,
+    };
+    await act(async () => { await vi.advanceTimersByTimeAsync(900); });
+    expect(screen.getByText("Approve plugin action")).toBeInTheDocument();
+    expect(screen.queryByText("Approve navigation")).not.toBeInTheDocument();
     expect(mocks.startBrowserStream).toHaveBeenCalledTimes(1);
     expect(mocks.agentBrowserRespondConfirmation).not.toHaveBeenCalled();
   });

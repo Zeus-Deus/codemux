@@ -1,4 +1,4 @@
-import { describe, it, expect } from "vitest";
+import { describe, it, expect, vi } from "vitest";
 import {
   cdpButtonFromEvent,
   heldButtonFromButtons,
@@ -11,8 +11,10 @@ import {
   remoteBrowserEndpoints,
   parseDaemonResult,
   chunkString,
+  chunkPasteText,
   buildCursorProbeScript,
   buildInsertTextScript,
+  runPaneCommand,
   SELECTION_SCRIPT,
   PASTE_CHUNK_SIZE,
 } from "./stream-protocol";
@@ -218,7 +220,7 @@ describe("remoteBrowserEndpoints (loopback → served-origin proxy mapping)", ()
     });
   });
 
-  // The HTTP base must NOT be just the origin — evalOnDaemon/probeDaemon append
+  // The HTTP base must NOT be just the origin — runPaneCommand/probeDaemon append
   // `/api/status` and `/api/command`, which have to land under the port path.
   it("keeps the port path on the HTTP base so /api/* resolves through the proxy", () => {
     const ep = remoteBrowserEndpoints("ws://127.0.0.1:9260", "http://host:4377");
@@ -314,6 +316,19 @@ function evalBodyBytes(script: string): number {
   ).length;
 }
 
+describe("chunkPasteText", () => {
+  it("preserves normal chunks and splits heavily escaped control text", () => {
+    expect(chunkPasteText("a".repeat(PASTE_CHUNK_SIZE))).toEqual(["a".repeat(PASTE_CHUNK_SIZE)]);
+    const text = "\u0000".repeat(PASTE_CHUNK_SIZE);
+    const chunks = chunkPasteText(text);
+    expect(chunks.length).toBeGreaterThan(1);
+    expect(chunks.join("")).toBe(text);
+    for (const chunk of chunks) {
+      expect(evalBodyBytes(buildInsertTextScript(chunk))).toBeLessThan(MAX_EVAL_BODY_BYTES);
+    }
+  });
+});
+
 describe("buildCursorProbeScript", () => {
   it("embeds rounded integer coordinates only", () => {
     const script = buildCursorProbeScript(12.7, 99.2);
@@ -346,5 +361,50 @@ describe("buildInsertTextScript", () => {
     // Unicode worst case: 3 UTF-8 bytes per UTF-16 code unit (CJK).
     const cjk = "漢".repeat(PASTE_CHUNK_SIZE);
     expect(evalBodyBytes(buildInsertTextScript(cjk))).toBeLessThan(MAX_EVAL_BODY_BYTES);
+  });
+});
+
+describe("runPaneCommand", () => {
+  function mockFetch() {
+    const fetch = vi.fn(async (_url: string, _init?: RequestInit) => ({
+      ok: true,
+      json: async () => ({ success: true, data: { result: "ok" } }),
+    }));
+    vi.stubGlobal("fetch", fetch);
+    return fetch;
+  }
+
+  it("sends typed pane operations to the paired proxy", async () => {
+    const fetch = mockFetch();
+    try {
+      expect(await runPaneCommand("https://remote.test/proxy/browser/9260", {
+        operation: "cursor", x: 12.7, y: 99.2,
+      })).toBe("ok");
+      expect(fetch.mock.calls[0][0]).toBe("https://remote.test/proxy/browser/9260/api/command");
+      expect(JSON.parse(String(fetch.mock.calls[0][1]?.body))).toEqual({
+        operation: "cursor", x: 13, y: 99,
+      });
+      await runPaneCommand("https://remote.test/proxy/browser/9260", { operation: "selection" });
+      expect(JSON.parse(String(fetch.mock.calls[1][1]?.body))).toEqual({ operation: "selection" });
+      await runPaneCommand("https://remote.test/proxy/browser/9260", { operation: "insert_text", text: "hello" });
+      expect(JSON.parse(String(fetch.mock.calls[2][1]?.body))).toEqual({ operation: "insert_text", text: "hello" });
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
+
+  it("keeps the desktop bridge's existing evaluate command", async () => {
+    const fetch = mockFetch();
+    try {
+      expect(await runPaneCommand("http://127.0.0.1:14300/desktop-token", {
+        operation: "cursor", x: 12.7, y: 99.2,
+      })).toBe("ok");
+      const body = JSON.parse(String(fetch.mock.calls[0][1]?.body));
+      expect(body.id).toMatch(/^pane-\d+$/);
+      expect(body.action).toBe("evaluate");
+      expect(body.script).toBe(buildCursorProbeScript(13, 99));
+    } finally {
+      vi.unstubAllGlobals();
+    }
   });
 });
