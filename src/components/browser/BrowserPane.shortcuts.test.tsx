@@ -17,6 +17,8 @@ vi.mock("@/tauri/commands", () => ({
     http_base: "http://127.0.0.1:9777/private/browser/9777",
   }),
   agentBrowserRun: vi.fn().mockResolvedValue(undefined),
+  agentBrowserPendingConfirmation: vi.fn().mockResolvedValue(null),
+  agentBrowserRespondConfirmation: vi.fn().mockResolvedValue(undefined),
   activatePane: vi.fn().mockResolvedValue(undefined),
   activateTab: vi.fn().mockResolvedValue(undefined),
   activateWorkspace: vi.fn().mockResolvedValue(undefined),

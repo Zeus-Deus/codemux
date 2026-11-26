@@ -1,4 +1,4 @@
-use crate::agent_browser::{AgentBrowserManager, BrowserAutomationResult};
+use crate::agent_browser::{AgentBrowserManager, BrowserAutomationResult, BrowserPendingConfirmation};
 use crate::browser_stream_bridge::{BrowserStreamBridge, BrowserStreamBridgeEndpoints};
 use crate::state::AppStateStore;
 use std::path::PathBuf;
@@ -210,6 +210,24 @@ pub async fn agent_browser_run(
 }
 
 #[tauri::command]
+pub async fn agent_browser_pending_confirmation(
+    manager: State<'_, AgentBrowserManager>,
+    browser_id: String,
+) -> Result<Option<BrowserPendingConfirmation>, String> {
+    manager.pending_confirmation(&browser_id).await
+}
+
+#[tauri::command]
+pub async fn agent_browser_respond_confirmation(
+    manager: State<'_, AgentBrowserManager>,
+    browser_id: String,
+    id: String,
+    approve: bool,
+) -> Result<Option<BrowserPendingConfirmation>, String> {
+    manager.respond_confirmation(&browser_id, &id, approve).await
+}
+
+#[tauri::command]
 pub async fn agent_browser_close(
     manager: State<'_, AgentBrowserManager>,
     browser_id: String,
@@ -223,6 +241,24 @@ pub async fn start_browser_stream(
     browser_id: String,
 ) -> Result<String, String> {
     manager.start_stream(&browser_id).await
+}
+
+#[tauri::command]
+pub async fn ensure_browser_preset_navigation(
+    manager: State<'_, AgentBrowserManager>,
+    browser_id: String,
+    url: String,
+    retry_failed: bool,
+) -> Result<crate::agent_browser::BrowserPresetNavigationStatus, String> {
+    manager.ensure_preset_navigation(&browser_id, url, retry_failed).await
+}
+
+#[tauri::command]
+pub async fn browser_preset_navigation_status(
+    manager: State<'_, AgentBrowserManager>,
+    browser_id: String,
+) -> Result<Option<crate::agent_browser::BrowserPresetNavigationStatus>, String> {
+    manager.preset_navigation_status(&browser_id).await
 }
 
 #[tauri::command]

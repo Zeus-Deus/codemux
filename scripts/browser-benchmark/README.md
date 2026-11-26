@@ -1,8 +1,17 @@
 # Browser performance and correctness
 
-Run with an installed `agent-browser` (tested with 0.24.0) and Chromium:
+Build the pinned, authenticated sidecar and place it beside the benchmark
+executable. The production browser manager rejects other sidecar versions.
+Chromium must also be installed:
 
 ```sh
+bash scripts/copy-agent-browser.sh
+cargo build -j 2 --manifest-path scripts/browser-benchmark/Cargo.toml
+BROWSER_HOST_TRIPLE="$(rustc -vV | awk '/^host:/ {print $2}')"
+BROWSER_BENCH_TARGET_DIR="${CARGO_TARGET_DIR:-scripts/browser-benchmark/target}"
+BROWSER_EXE_SUFFIX=""
+case "$BROWSER_HOST_TRIPLE" in *windows*) BROWSER_EXE_SUFFIX=".exe" ;; esac
+cp "src-tauri/binaries/agent-browser-$BROWSER_HOST_TRIPLE$BROWSER_EXE_SUFFIX" "$BROWSER_BENCH_TARGET_DIR/debug/agent-browser$BROWSER_EXE_SUFFIX"
 cargo run -j 2 --manifest-path scripts/browser-benchmark/Cargo.toml -- results.json
 ```
 

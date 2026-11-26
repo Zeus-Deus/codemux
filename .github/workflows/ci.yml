@@ -621,6 +621,9 @@ jobs:
           TARGET="$(rustc -vV | awk '/^host:/ {print $2}')"
           node scripts/test-agent-browser-listeners.mjs "src-tauri/binaries/agent-browser-$TARGET"
           node scripts/test-agent-browser-pipe.mjs "src-tauri/binaries/agent-browser-$TARGET"
+          cargo test -j 2 --locked --manifest-path scripts/browser-benchmark/Cargo.toml --bin browser-benchmark failed_mac_open_closes_its_late_published_daemon -- --test-threads=1
+          CODEMUX_TEST_BROWSER_SIDECAR_BIN="$PWD/src-tauri/binaries/agent-browser-$TARGET" \
+            cargo test -j 2 --locked --manifest-path scripts/browser-benchmark/Cargo.toml --bin browser-benchmark real_sidecar_prior_launch_token_recovery_and_close -- --ignored --test-threads=1
 
   ci-gate:
     name: ci-gate

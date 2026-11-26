@@ -354,6 +354,8 @@ pub(super) fn allowed(cmd: &str) -> bool {
             | "search_in_files"
             | "search_project_index"
             | "start_browser_stream"
+            | "ensure_browser_preset_navigation"
+            | "browser_preset_navigation_status"
             | "start_skills_watcher"
             | "stop_skills_watcher"
             | "terminal_foreground_jobs"
@@ -401,6 +403,20 @@ mod tests {
     fn connector_administration_is_never_on_the_remote_allowlist() {
         for cmd in CONNECTOR_ADMIN_COMMANDS {
             assert!(!allowed(cmd), "{cmd} administers the outside-assistant connector");
+        }
+    }
+
+    #[test]
+    fn browser_confirmation_and_local_bridge_stay_on_the_host() {
+        assert!(allowed("agent_browser_run"));
+        assert!(allowed("ensure_browser_preset_navigation"));
+        assert!(allowed("browser_preset_navigation_status"));
+        for cmd in [
+            "agent_browser_pending_confirmation",
+            "agent_browser_respond_confirmation",
+            "browser_stream_bridge_endpoints",
+        ] {
+            assert!(!allowed(cmd), "{cmd} grants host-only browser authority");
         }
     }
 

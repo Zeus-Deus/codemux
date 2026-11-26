@@ -1,9 +1,8 @@
-use crate::agent_browser::BrowserAutomationResult;
+use crate::agent_browser::{self, BrowserAutomationResult, BrowserStreamIdentity};
 use futures_util::{SinkExt, StreamExt};
 use rand::Rng;
 use serde_json::{json, Value};
 use tokio::time::{sleep, timeout, Duration};
-use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::Message;
 
 // ---------------------------------------------------------------------------
@@ -82,13 +81,17 @@ pub fn generate_bezier_points(start: (f64, f64), end: (f64, f64), n: usize) -> V
 // WebSocket helpers
 // ---------------------------------------------------------------------------
 
-type WsStream = tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
+type WsStream = tokio_tungstenite::WebSocketStream<tokio::net::TcpStream>;
 
-async fn connect_stream(port: u16) -> Result<WsStream, String> {
-    let url = format!("ws://127.0.0.1:{}", port);
-    let (ws, _) = connect_async(&url)
+async fn connect_stream(identity: BrowserStreamIdentity) -> Result<WsStream, String> {
+    let stream = agent_browser::connect_verified_stream_peer(identity)
         .await
-        .map_err(|e| format!("Failed to connect to stream server at {}: {}. Is a browser pane open?", url, e))?;
+        .map_err(|e| format!("Failed to verify browser stream on port {}: {e}", identity.port))?;
+    let (ws, _) = tokio_tungstenite::client_async(
+        agent_browser::authenticated_stream_request(identity), stream,
+    )
+        .await
+        .map_err(|e| format!("Failed to connect to browser stream on port {}: {e}", identity.port))?;
     Ok(ws)
 }
 
@@ -153,8 +156,8 @@ fn kb_event(event_type: &str, key: &str, code: &str, text: &str, modifiers: i32,
 // Public action functions
 // ---------------------------------------------------------------------------
 
-pub async fn click_at(port: u16, x: f64, y: f64, click_type: &str) -> Result<String, String> {
-    let mut ws = connect_stream(port).await?;
+pub(crate) async fn click_at(identity: BrowserStreamIdentity, x: f64, y: f64, click_type: &str) -> Result<String, String> {
+    let mut ws = connect_stream(identity).await?;
     // CDP processes ordered input events; simulated travel adds latency
     // without changing the target or the trusted mouse-event path.
     send_msg(&mut ws, mouse_event("mouseMoved", x, y, "none", 0, 0.0, 0.0, 0)).await?;
@@ -173,8 +176,8 @@ pub async fn click_at(port: u16, x: f64, y: f64, click_type: &str) -> Result<Str
     Ok(format!("Clicked ({click_type}) at ({x}, {y})"))
 }
 
-pub async fn type_at(port: u16, text: &str, x: Option<f64>, y: Option<f64>) -> Result<String, String> {
-    let mut ws = connect_stream(port).await?;
+pub(crate) async fn type_at(identity: BrowserStreamIdentity, text: &str, x: Option<f64>, y: Option<f64>) -> Result<String, String> {
+    let mut ws = connect_stream(identity).await?;
 
     if let (Some(cx), Some(cy)) = (x, y) {
         send_msg(&mut ws, mouse_event("mouseMoved", cx, cy, "none", 0, 0.0, 0.0, 0)).await?;
@@ -203,8 +206,8 @@ pub async fn type_at(port: u16, text: &str, x: Option<f64>, y: Option<f64>) -> R
     Ok(format!("Typed {} characters", text.len()))
 }
 
-pub async fn scroll_at(port: u16, x: f64, y: f64, direction: &str, amount: i32) -> Result<String, String> {
-    let mut ws = connect_stream(port).await?;
+pub(crate) async fn scroll_at(identity: BrowserStreamIdentity, x: f64, y: f64, direction: &str, amount: i32) -> Result<String, String> {
+    let mut ws = connect_stream(identity).await?;
     let ticks = amount.clamp(1, 10);
     let (dx, dy) = match direction {
         "up" => (0.0, -(ticks as f64) * 120.0),
@@ -218,8 +221,8 @@ pub async fn scroll_at(port: u16, x: f64, y: f64, direction: &str, amount: i32) 
     Ok(format!("Scrolled {direction} by {ticks} ticks at ({x}, {y})"))
 }
 
-pub async fn key_press(port: u16, key: &str) -> Result<String, String> {
-    let mut ws = connect_stream(port).await?;
+pub(crate) async fn key_press(identity: BrowserStreamIdentity, key: &str) -> Result<String, String> {
+    let mut ws = connect_stream(identity).await?;
     let (modifiers, base_key) = parse_key_combo(key);
 
     if let Some(info) = lookup_special_key(&base_key) {
@@ -247,7 +250,7 @@ pub async fn key_press(port: u16, key: &str) -> Result<String, String> {
     Ok(format!("Pressed key: {key}"))
 }
 
-pub async fn drag(port: u16, sx: f64, sy: f64, ex: f64, ey: f64) -> Result<String, String> {
+pub(crate) async fn drag(identity: BrowserStreamIdentity, sx: f64, sy: f64, ex: f64, ey: f64) -> Result<String, String> {
     let (points, delays) = {
         let mut rng = rand::thread_rng();
         let pts = generate_bezier_points((sx, sy), (ex, ey), 5);
@@ -255,7 +258,7 @@ pub async fn drag(port: u16, sx: f64, sy: f64, ex: f64, ey: f64) -> Result<Strin
         (pts, dls)
     };
 
-    let mut ws = connect_stream(port).await?;
+    let mut ws = connect_stream(identity).await?;
     send_msg(&mut ws, mouse_event("mouseMoved", sx, sy, "none", 0, 0.0, 0.0, 0)).await?;
     sleep(Duration::from_millis(50)).await;
     send_msg(&mut ws, mouse_event("mousePressed", sx, sy, "left", 1, 0.0, 0.0, 0)).await?;
@@ -271,8 +274,8 @@ pub async fn drag(port: u16, sx: f64, sy: f64, ex: f64, ey: f64) -> Result<Strin
     Ok(format!("Dragged from ({sx}, {sy}) to ({ex}, {ey})"))
 }
 
-pub async fn get_viewport(port: u16) -> Result<(u32, u32), String> {
-    let mut ws = connect_stream(port).await?;
+pub(crate) async fn get_viewport(identity: BrowserStreamIdentity) -> Result<(u32, u32), String> {
+    let mut ws = connect_stream(identity).await?;
     send_msg(&mut ws, json!({"type": "status"})).await?;
 
     let result = timeout(Duration::from_secs(3), async {
@@ -304,37 +307,37 @@ fn make_request_id() -> String {
     format!("req-{}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis())
 }
 
-pub async fn handle_vision_action(port: u16, action: &str, params: Value, browser_id: &str) -> Result<BrowserAutomationResult, String> {
+pub(crate) async fn handle_vision_action(identity: BrowserStreamIdentity, action: &str, params: Value, browser_id: &str) -> Result<BrowserAutomationResult, String> {
     let text = match action {
         "click_at" => {
             let x = params.get("x").and_then(Value::as_f64).unwrap_or(0.0);
             let y = params.get("y").and_then(Value::as_f64).unwrap_or(0.0);
             let ct = params.get("click_type").and_then(Value::as_str).unwrap_or("left");
-            click_at(port, x, y, ct).await?
+            click_at(identity, x, y, ct).await?
         }
         "type_at" => {
             let t = params.get("text").and_then(Value::as_str).unwrap_or("");
             let x = params.get("x").and_then(Value::as_f64);
             let y = params.get("y").and_then(Value::as_f64);
-            type_at(port, t, x, y).await?
+            type_at(identity, t, x, y).await?
         }
         "scroll_at" => {
             let x = params.get("x").and_then(Value::as_f64).unwrap_or(0.0);
             let y = params.get("y").and_then(Value::as_f64).unwrap_or(0.0);
             let dir = params.get("direction").and_then(Value::as_str).unwrap_or("down");
             let amt = params.get("amount").and_then(Value::as_i64).unwrap_or(3) as i32;
-            scroll_at(port, x, y, dir, amt).await?
+            scroll_at(identity, x, y, dir, amt).await?
         }
         "key_press" => {
             let k = params.get("key").and_then(Value::as_str).unwrap_or("Enter");
-            key_press(port, k).await?
+            key_press(identity, k).await?
         }
         "drag" => {
             let sx = params.get("start_x").and_then(Value::as_f64).unwrap_or(0.0);
             let sy = params.get("start_y").and_then(Value::as_f64).unwrap_or(0.0);
             let ex = params.get("end_x").and_then(Value::as_f64).unwrap_or(0.0);
             let ey = params.get("end_y").and_then(Value::as_f64).unwrap_or(0.0);
-            drag(port, sx, sy, ex, ey).await?
+            drag(identity, sx, sy, ex, ey).await?
         }
         _ => return Err(format!("Unknown vision action: {}", action)),
     };
@@ -355,6 +358,7 @@ mod tests {
     async fn input_waits_for_dispatch_and_ignores_unrelated_pongs() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
+        let identity = agent_browser::current_process_stream_identity(port);
         let (dispatched_tx, mut dispatched_rx) = tokio::sync::oneshot::channel();
         let server = tokio::spawn(async move {
             let (tcp, _) = listener.accept().await.unwrap();
@@ -378,7 +382,7 @@ mod tests {
                 }
             }
         });
-        type_at(port, "a\né", Some(20.0), Some(30.0)).await.unwrap();
+        type_at(identity, "a\né", Some(20.0), Some(30.0)).await.unwrap();
         let events = dispatched_rx.try_recv().expect("input returned before the server dispatched it");
         assert_eq!(events.len(), 9, "focus click and three complete keystrokes");
         assert!(events.iter().any(|e| e["eventType"] == "keyDown" && e["key"] == "Enter" && e["text"] == "\r"));
@@ -389,12 +393,41 @@ mod tests {
     async fn input_reports_disconnect_before_dispatch_completion() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
+        let identity = agent_browser::current_process_stream_identity(port);
         let server = tokio::spawn(async move {
             let (tcp, _) = listener.accept().await.unwrap();
             let mut ws = tokio_tungstenite::accept_async(tcp).await.unwrap();
             ws.close(None).await.unwrap();
         });
-        assert!(click_at(port, 20.0, 30.0, "left").await.is_err());
+        assert!(click_at(identity, 20.0, 30.0, "left").await.is_err());
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn stream_handshake_sends_token_in_header_only() {
+        use tokio_tungstenite::tungstenite::handshake::server::{Request, Response};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let identity = agent_browser::current_process_stream_identity(port);
+        let expected = identity.listener_token_header();
+        let server = tokio::spawn(async move {
+            let (tcp, _) = listener.accept().await.unwrap();
+            let mut ws = tokio_tungstenite::accept_hdr_async(
+                tcp,
+                move |request: &Request, response: Response| {
+                    assert_eq!(request.headers().get("x-codemux-browser-token").unwrap(), expected.as_str());
+                    assert_eq!(request.uri().path(), "/");
+                    assert!(request.uri().query().is_none());
+                    Ok(response)
+                },
+            )
+            .await
+            .unwrap();
+            ws.close(None).await.unwrap();
+        });
+        let mut ws = connect_stream(identity).await.unwrap();
+        let _ = ws.close(None).await;
         server.await.unwrap();
     }
 }
