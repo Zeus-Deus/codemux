@@ -3336,7 +3336,7 @@ index aad976c..cb3b897 100644
      fn test_daemon_rejects_ca_cert_outside_local_chrome() {
          let ca = LaunchOptions {
 diff --git a/cli/src/native/browser.rs b/cli/src/native/browser.rs
-index 27ef4d1..3d39a3b 100644
+index 27ef4d1..5414ed0 100644
 --- a/cli/src/native/browser.rs
 +++ b/cli/src/native/browser.rs
 @@ -1,11 +1,17 @@
@@ -3377,7 +3377,7 @@ index 27ef4d1..3d39a3b 100644
              BrowserProcess::Lightpanda(p) => p.kill(),
              BrowserProcess::Obscura(p) => p.kill(),
          }
-@@ -714,19 +720,390 @@ impl BrowserProcess {
+@@ -714,22 +720,409 @@ impl BrowserProcess {
 
      pub fn wait_or_kill(&mut self, timeout: std::time::Duration) {
          match self {
@@ -3410,13 +3410,15 @@ index 27ef4d1..3d39a3b 100644
 +            },
 +            BrowserProcess::Lightpanda(_) => Ok(false),
 +            BrowserProcess::Obscura(p) => Ok(p.has_exited()),
-+        }
-+    }
-+}
-+
-+pub(super) const CHROME_PIPE_STARTUP_BUDGET: Duration = Duration::from_secs(24);
+         }
+     }
+ }
+
++pub(super) const CHROME_PIPE_STARTUP_BUDGET: Duration = Duration::from_secs(27);
 +const CHROME_PIPE_RETRY_DELAY: Duration = Duration::from_millis(500);
 +const CHROME_PIPE_CLEANUP_MARGIN: Duration = Duration::from_secs(2);
++const CHROME_PIPE_POST_READY_MARGIN: Duration = Duration::from_secs(2);
++const CHROME_PIPE_MIN_PROBE_BUDGET: Duration = Duration::from_secs(2);
 +const CHROME_PIPE_GRACEFUL_CLOSE_TIMEOUT: Duration = Duration::from_secs(2);
 +
 +enum PipeAttemptError {
@@ -3591,18 +3593,18 @@ index 27ef4d1..3d39a3b 100644
 +                .lock()
 +                .unwrap_or_else(|error| error.into_inner())
 +                .kill();
-         }
++        }
 +    });
 +    let client = Arc::new(CdpClient::connect_pipe(reader, writer, Some(on_failure)));
 +
 +    // A successful spawn does not prove Chromium accepted its private pipe.
 +    // A live Chromium can take longer than one equal retry slice to accept
-+    // the pipe, especially on loaded Windows runners. Retry promptly when it
-+    // exits or fails; otherwise give this child most of the shared deadline.
++    // the pipe, especially on loaded Windows runners. Keep a short reserve
++    // for manager setup and cleanup, and give this child the rest. A failed
++    // probe that uses this budget leaves too little time for a useful retry.
 +    let readiness_budget = deadline
 +        .saturating_duration_since(Instant::now())
-+        .saturating_sub(CHROME_PIPE_CLEANUP_MARGIN)
-+        .min(Duration::from_secs(20));
++        .saturating_sub(CHROME_PIPE_CLEANUP_MARGIN + CHROME_PIPE_POST_READY_MARGIN);
 +    let readiness_started = Instant::now();
 +    let ready = tokio::time::timeout(
 +        readiness_budget,
@@ -3707,10 +3709,14 @@ index 27ef4d1..3d39a3b 100644
 +                return Err("Chrome pipe launch preparation exceeded its startup deadline".into());
 +            }
 +        };
-+    let mut last_error = String::new();
++    let mut attempt_errors = Vec::new();
 +    for attempt in 1..=MAX_ATTEMPTS {
 +        let remaining = deadline.saturating_duration_since(Instant::now());
-+        if remaining <= CHROME_PIPE_CLEANUP_MARGIN + Duration::from_millis(100) {
++        if remaining
++            <= CHROME_PIPE_CLEANUP_MARGIN
++                + CHROME_PIPE_POST_READY_MARGIN
++                + CHROME_PIPE_MIN_PROBE_BUDGET
++        {
 +            break;
 +        }
 +        match launch_managed_chrome_attempt(prepared.0.as_ref().unwrap().clone(), deadline).await {
@@ -3753,11 +3759,21 @@ index 27ef4d1..3d39a3b 100644
 +                let _ = tokio::time::timeout_at(deadline.into(), close_task).await;
 +                return Err("Chrome pipe closed before profile handoff".into());
 +            }
-+            Err(PipeAttemptError::Retry(error)) => last_error = error,
-+            Err(PipeAttemptError::Stop(error)) => return Err(error),
++            Err(PipeAttemptError::Retry(error)) => {
++                attempt_errors.push(format!("attempt {attempt}: {error}"));
++            }
++            Err(PipeAttemptError::Stop(error)) => {
++                attempt_errors.push(format!("attempt {attempt}: {error}"));
++                return Err(attempt_errors.join("; "));
++            }
 +        }
 +        if attempt < MAX_ATTEMPTS {
-+            if deadline.saturating_duration_since(Instant::now()) <= CHROME_PIPE_RETRY_DELAY {
++            if deadline.saturating_duration_since(Instant::now())
++                <= CHROME_PIPE_RETRY_DELAY
++                    + CHROME_PIPE_CLEANUP_MARGIN
++                    + CHROME_PIPE_POST_READY_MARGIN
++                    + CHROME_PIPE_MIN_PROBE_BUDGET
++            {
 +                break;
 +            }
 +            let _ = writeln!(
@@ -3767,14 +3783,17 @@ index 27ef4d1..3d39a3b 100644
 +            tokio::time::sleep(CHROME_PIPE_RETRY_DELAY).await;
 +        }
 +    }
-+    if last_error.is_empty() {
++    if attempt_errors.is_empty() {
 +        Err("Chrome pipe startup deadline expired before another attempt".to_string())
 +    } else {
-+        Err(last_error)
-     }
- }
-
-@@ -884,6 +1261,32 @@ impl BrowserManager {
++        Err(attempt_errors.join("; "))
++    }
++}
++
+ pub struct BrowserManager {
+     pub client: Arc<CdpClient>,
+     browser_process: Option<BrowserProcess>,
+@@ -884,6 +1277,32 @@ impl BrowserManager {
      }
 
      pub async fn launch(options: LaunchOptions, engine: Option<&str>) -> Result<Self, String> {
@@ -3807,7 +3826,7 @@ index 27ef4d1..3d39a3b 100644
          let engine = engine.unwrap_or("chrome");
 
          match engine {
-@@ -922,8 +1325,10 @@ impl BrowserManager {
+@@ -922,8 +1341,10 @@ impl BrowserManager {
          let color_scheme = options.color_scheme.clone();
          let download_path = options.download_path.clone();
          let headless = options.effectively_headless();
@@ -3819,7 +3838,7 @@ index 27ef4d1..3d39a3b 100644
              "lightpanda" => {
                  let lp_options = LightpandaLaunchOptions {
                      executable_path: options.executable_path.clone(),
-@@ -932,7 +1337,7 @@ impl BrowserManager {
+@@ -932,7 +1353,7 @@ impl BrowserManager {
                  };
                  let lp = launch_lightpanda(&lp_options).await?;
                  let url = lp.ws_url.clone();
@@ -3828,7 +3847,7 @@ index 27ef4d1..3d39a3b 100644
              }
              "obscura" => {
                  let obscura_options = ObscuraLaunchOptions {
-@@ -943,14 +1348,12 @@ impl BrowserManager {
+@@ -943,14 +1364,12 @@ impl BrowserManager {
                  };
                  let ob = launch_obscura(&obscura_options).await?;
                  let url = ob.ws_url.clone();
@@ -3847,7 +3866,7 @@ index 27ef4d1..3d39a3b 100644
              }
          };
 
-@@ -959,7 +1362,11 @@ impl BrowserManager {
+@@ -959,7 +1378,11 @@ impl BrowserManager {
          } else if engine == "obscura" {
              initialize_obscura_manager(ws_url, process).await?
          } else {
@@ -3860,7 +3879,7 @@ index 27ef4d1..3d39a3b 100644
              let mut manager = Self {
                  client,
                  browser_process: Some(process),
-@@ -980,10 +1387,15 @@ impl BrowserManager {
+@@ -980,10 +1403,15 @@ impl BrowserManager {
                  headless,
                  product_checked: false,
              };
@@ -3880,7 +3899,7 @@ index 27ef4d1..3d39a3b 100644
                  return Err(error);
              }
              manager
-@@ -992,47 +1404,66 @@ impl BrowserManager {
+@@ -992,47 +1420,66 @@ impl BrowserManager {
          let session_id = match manager.active_session_id() {
              Ok(session_id) => session_id.to_string(),
              Err(error) => {
@@ -3981,7 +4000,7 @@ index 27ef4d1..3d39a3b 100644
 
          Ok(manager)
      }
-@@ -1897,17 +2328,72 @@ impl BrowserManager {
+@@ -1897,17 +2344,72 @@ impl BrowserManager {
          self.close_with_timeout(None).await
      }
 
@@ -4056,7 +4075,7 @@ index 27ef4d1..3d39a3b 100644
                  let _ = tokio::time::timeout(timeout, close).await;
              } else {
                  let _ = close.await;
-@@ -1918,10 +2404,23 @@ impl BrowserManager {
+@@ -1918,10 +2420,23 @@ impl BrowserManager {
 
          if let Some(mut process) = self.browser_process.take() {
              let timeout = std::time::Duration::from_secs(5);
@@ -4083,7 +4102,7 @@ index 27ef4d1..3d39a3b 100644
          }
 
          Ok(())
-@@ -1952,17 +2451,23 @@ impl BrowserManager {
+@@ -1952,17 +2467,23 @@ impl BrowserManager {
          }
      }
 
@@ -4113,7 +4132,7 @@ index 27ef4d1..3d39a3b 100644
      pub fn get_cdp_url(&self) -> &str {
          &self.ws_url
      }
-@@ -1993,6 +2498,16 @@ impl BrowserManager {
+@@ -1993,6 +2514,16 @@ impl BrowserManager {
          }
      }
 
@@ -4130,7 +4149,7 @@ index 27ef4d1..3d39a3b 100644
      pub fn product_checked(&self) -> bool {
          self.product_checked
      }
-@@ -4531,7 +5046,7 @@ mod tests {
+@@ -4531,7 +5062,7 @@ mod tests {
          let executable = dir.path().join("chrome");
          let port = url::Url::parse(url).unwrap().port().unwrap();
          std::fs::write(&executable, format!(
@@ -4139,7 +4158,7 @@ index 27ef4d1..3d39a3b 100644
              dir.path().display()
          )).unwrap();
          std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
-@@ -4549,6 +5064,86 @@ mod tests {
+@@ -4549,6 +5080,86 @@ mod tests {
              .trim()
              .parse()
              .unwrap();
@@ -4226,7 +4245,7 @@ index 27ef4d1..3d39a3b 100644
          assert_eq!(
              unsafe { libc::kill(pid, 0) },
              -1,
-@@ -4570,23 +5165,509 @@ mod tests {
+@@ -4570,23 +5181,514 @@ mod tests {
 
      #[cfg(unix)]
      #[tokio::test]
@@ -4467,7 +4486,7 @@ index 27ef4d1..3d39a3b 100644
 +    my ($id) = $command =~ /"id":(\d+)/;
 +    my ($method) = $command =~ /"method":"([^"]+)"/;
 +    die "bad CDP frame: $command" unless defined $id && defined $method;
-+    sleep 16 if $method eq "Browser.getVersion";
++    sleep 22 if $method eq "Browser.getVersion";
 +    my $result = $method eq "Target.getTargets" ? q({"targetInfos":[]})
 +        : $method eq "Target.createTarget" ? q({"targetId":"fixture-target"})
 +        : $method eq "Target.attachToTarget" ? q({"sessionId":"fixture-session"})
@@ -4485,13 +4504,13 @@ index 27ef4d1..3d39a3b 100644
 +        };
 +        let start = Instant::now();
 +        let mut manager = tokio::time::timeout(
-+            Duration::from_secs(25),
++            Duration::from_secs(28),
 +            BrowserManager::launch_with_budget(options, None, CHROME_PIPE_STARTUP_BUDGET),
 +        )
 +        .await
 +        .expect("a live Chromium pipe should complete manager setup before the CLI deadline")
 +        .expect("delayed first pipe and manager setup should succeed");
-+        assert!(start.elapsed() >= Duration::from_secs(16));
++        assert!(start.elapsed() >= Duration::from_secs(22));
 +        assert!(start.elapsed() < CHROME_PIPE_STARTUP_BUDGET);
 +        assert!(!dir.path().join("restarted").exists());
 +        let pid: i32 = std::fs::read_to_string(dir.path().join("pid"))
@@ -4731,6 +4750,8 @@ index 27ef4d1..3d39a3b 100644
 +            error.contains("Chrome pipe did not become ready"),
 +            "{error}"
 +        );
++        assert!(error.contains("attempt 1:"), "{error}");
++        assert!(!error.contains("attempt 2:"), "{error}");
 +        let mut spawned = 0;
 +        for entry in std::fs::read_dir(dir.path()).unwrap() {
 +            let entry = entry.unwrap();
@@ -4746,11 +4767,14 @@ index 27ef4d1..3d39a3b 100644
 +            assert_process_reaped(pid);
 +            spawned += 1;
          }
-+        assert!(spawned >= 1, "expected a child that held the pipe open");
++        assert_eq!(
++            spawned, 1,
++            "the exhausted probe must not start a short retry"
++        );
      }
 
      #[cfg(unix)]
-@@ -4600,12 +5681,20 @@ mod tests {
+@@ -4600,12 +5702,20 @@ mod tests {
              .unwrap();
          let mut manager = tokio::time::timeout(
              Duration::from_secs(4),
@@ -4773,7 +4797,7 @@ index 27ef4d1..3d39a3b 100644
          manager.close().await.unwrap();
          let observed = server.await.unwrap();
          assert!(!observed[0].iter().any(|method| method == "Browser.close"));
-@@ -4649,7 +5738,12 @@ mod tests {
+@@ -4649,7 +5759,12 @@ mod tests {
              .expect("Obscura should disconnect before retrying")
              .unwrap();
              assert!(manager.owns_obscura_process());
@@ -6076,7 +6100,7 @@ index bf572f9..cb47cf4 100644
 
      #[cfg(target_os = "linux")]
 diff --git a/cli/src/native/cdp/client.rs b/cli/src/native/cdp/client.rs
-index f06379b..5b6a8be 100644
+index f06379b..f8f6dab 100644
 --- a/cli/src/native/cdp/client.rs
 +++ b/cli/src/native/cdp/client.rs
 @@ -1,4 +1,5 @@
@@ -6085,14 +6109,16 @@ index f06379b..5b6a8be 100644
  use std::io::Write;
  use std::net::Shutdown;
  use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-@@ -9,6 +10,7 @@ use futures_util::{SinkExt, StreamExt};
+@@ -9,7 +10,8 @@ use futures_util::{SinkExt, StreamExt};
  use serde::de::IgnoredAny;
  use serde::Deserialize;
  use serde_json::Value;
+-use tokio::sync::{broadcast, mpsc, oneshot, watch, Mutex};
 +use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
- use tokio::sync::{broadcast, mpsc, oneshot, watch, Mutex};
++use tokio::sync::{broadcast, mpsc, oneshot, watch, Mutex, OwnedMutexGuard};
  use tokio::task::JoinHandle;
  use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+ use tokio_tungstenite::tungstenite::http::Request;
 @@ -117,16 +119,171 @@ pub fn is_session_detached_error(error: &str) -> bool {
          .is_some_and(|rest| rest.is_empty() || rest == ".")
  }
@@ -6275,7 +6301,7 @@ index f06379b..5b6a8be 100644
 
  /// Sessions whose events go to one private receiver instead of the broadcast.
  type PrivateSessions = Arc<std::sync::Mutex<HashMap<String, mpsc::Sender<CdpEvent>>>>;
-@@ -336,8 +493,10 @@ async fn release_detached_session(
+@@ -336,13 +493,18 @@ async fn release_detached_session(
  }
 
  pub struct CdpClient {
@@ -6288,7 +6314,15 @@ index f06379b..5b6a8be 100644
      closed: Arc<AtomicBool>,
      close_complete: AtomicBool,
      close_lock: Mutex<()>,
-@@ -439,18 +598,55 @@ impl CdpClient {
+     cancel_tx: watch::Sender<bool>,
+     next_id: AtomicU64,
++    #[cfg(test)]
++    command_response_timeout_ms: AtomicU64,
++    disposable_target_create_gate: Arc<Mutex<()>>,
+     pending: PendingMap,
+     raw_pending: RawPendingMap,
+     event_tx: broadcast::Sender<CdpEvent>,
+@@ -439,18 +601,55 @@ impl CdpClient {
              .try_clone()
              .map_err(|error| format!("Failed to duplicate CDP socket: {}", error))?;
 
@@ -6347,7 +6381,7 @@ index f06379b..5b6a8be 100644
 
          let pending_clone = pending.clone();
          let raw_pending_clone = raw_pending.clone();
-@@ -460,42 +656,15 @@ impl CdpClient {
+@@ -460,42 +659,15 @@ impl CdpClient {
          let private_clone = private_sessions.clone();
          let taps_clone = method_taps.clone();
          let detached_clone = detached_sessions.clone();
@@ -6393,7 +6427,7 @@ index f06379b..5b6a8be 100644
                  // Broadcast raw message for inspect proxy subscribers before typed parse,
                  // so messages with negative IDs (used by the inspect proxy) are still delivered.
                  if raw_tx_clone.receiver_count() > 0 {
-@@ -630,39 +799,50 @@ impl CdpClient {
+@@ -630,55 +802,98 @@ impl CdpClient {
              // Reader loop exited (connection closed or error). Drop all pending
              // command senders so callers get an immediate channel-closed error
              // instead of waiting for the 30-second timeout.
@@ -6462,7 +6496,14 @@ index f06379b..5b6a8be 100644
              socket,
              closed,
              close_complete: AtomicBool::new(false),
-@@ -674,11 +854,11 @@ impl CdpClient {
+             close_lock: Mutex::new(()),
+             cancel_tx,
+             next_id: AtomicU64::new(1),
++            #[cfg(test)]
++            command_response_timeout_ms: AtomicU64::new(30_000),
++            disposable_target_create_gate: Arc::new(Mutex::new(())),
+             pending,
+             raw_pending,
              event_tx,
              raw_tx,
              reader_handle: Mutex::new(Some(reader_handle)),
@@ -6473,10 +6514,39 @@ index f06379b..5b6a8be 100644
              detached_sessions,
 -        })
 +        }
++    }
++
++    /// Only one disposable storage-collection target may be awaiting its
++    /// create response on this connection. Its owner can outlive a cancelled
++    /// autosave without allowing later saves to create more unknown targets.
++    pub(crate) async fn lock_disposable_target_create(&self) -> OwnedMutexGuard<()> {
++        self.disposable_target_create_gate
++            .clone()
++            .lock_owned()
++            .await
++    }
++
++    #[cfg(test)]
++    pub(crate) fn set_command_response_timeout_for_test(&self, timeout: Duration) {
++        self.command_response_timeout_ms.store(
++            u64::try_from(timeout.as_millis()).expect("test timeout fits u64 milliseconds"),
++            Ordering::Relaxed,
++        );
++    }
++
++    pub(crate) fn command_response_timeout(&self) -> Duration {
++        #[cfg(test)]
++        {
++            Duration::from_millis(self.command_response_timeout_ms.load(Ordering::Relaxed))
++        }
++        #[cfg(not(test))]
++        {
++            Duration::from_secs(30)
++        }
      }
 
      /// Refuse a command to a session Chrome already reported detached.
-@@ -716,6 +896,35 @@ impl CdpClient {
+@@ -716,6 +931,35 @@ impl CdpClient {
          }
      }
 
@@ -6512,7 +6582,7 @@ index f06379b..5b6a8be 100644
      async fn abort_task(handle: &Mutex<Option<JoinHandle<()>>>) {
          let Some(task) = handle.lock().await.take() else {
              return;
-@@ -735,12 +944,14 @@ impl CdpClient {
+@@ -735,12 +979,14 @@ impl CdpClient {
          Self::abort_task(&self.keepalive_handle).await;
 
          let _ = tokio::time::timeout(TRANSPORT_CLOSE_TIMEOUT, async {
@@ -6530,7 +6600,30 @@ index f06379b..5b6a8be 100644
          Self::abort_task(&self.reader_handle).await;
          self.pending.lock().await.clear();
          self.raw_pending.lock().await.clear();
-@@ -775,8 +986,8 @@ impl CdpClient {
+@@ -752,6 +998,22 @@ impl CdpClient {
+         method: &str,
+         params: Option<Value>,
+         session_id: Option<&str>,
++    ) -> Result<Value, String> {
++        self.send_command_with_response_timeout(
++            method,
++            params,
++            session_id,
++            Some(self.command_response_timeout()),
++        )
++        .await
++    }
++
++    async fn send_command_with_response_timeout(
++        &self,
++        method: &str,
++        params: Option<Value>,
++        session_id: Option<&str>,
++        response_timeout: Option<Duration>,
+     ) -> Result<Value, String> {
+         let id = self.next_id.fetch_add(1, Ordering::SeqCst);
+
+@@ -775,8 +1037,8 @@ impl CdpClient {
              done: false,
          };
 
@@ -6541,7 +6634,7 @@ index f06379b..5b6a8be 100644
              self.ensure_open()?;
              let mut pending = self.pending.lock().await;
              if let Err(error) = self.ensure_session_attached(method, cmd.session_id.as_deref()) {
-@@ -791,11 +1002,14 @@ impl CdpClient {
+@@ -791,14 +1053,21 @@ impl CdpClient {
                  },
              );
              drop(pending);
@@ -6560,8 +6653,16 @@ index f06379b..5b6a8be 100644
 +            return Err(format!("Failed to send CDP command: {}", error));
          }
 
-         let response = match tokio::time::timeout(std::time::Duration::from_secs(30), rx).await {
-@@ -872,7 +1086,7 @@ impl CdpClient {
+-        let response = match tokio::time::timeout(std::time::Duration::from_secs(30), rx).await {
++        let response = match response_timeout {
++            Some(timeout) => tokio::time::timeout(timeout, rx).await,
++            None => Ok(rx.await),
++        };
++        let response = match response {
+             Ok(Ok(resp)) => {
+                 guard.done = true;
+                 resp
+@@ -872,7 +1141,7 @@ impl CdpClient {
      /// Contains only what's needed to forward messages bidirectionally.
      pub fn inspect_handle(&self) -> InspectProxyHandle {
          InspectProxyHandle {
@@ -6570,7 +6671,33 @@ index f06379b..5b6a8be 100644
              raw_tx: self.raw_tx.clone(),
              closed: self.closed.clone(),
          }
-@@ -935,8 +1149,8 @@ impl CdpClient {
+@@ -893,6 +1162,25 @@ impl CdpClient {
+             .map_err(|e| format!("Failed to deserialize CDP response for {}: {}", method, e))
+     }
+
++    /// Keep this create request registered until its target ID arrives or the
++    /// transport closes. Its owned caller retains the single-flight permit.
++    pub(crate) async fn send_disposable_target_create<
++        P: serde::Serialize,
++        R: serde::de::DeserializeOwned,
++    >(
++        &self,
++        params: &P,
++    ) -> Result<R, String> {
++        let params_value = serde_json::to_value(params)
++            .map_err(|e| format!("Failed to serialize params: {}", e))?;
++        let method = "Target.createTarget";
++        let result = self
++            .send_command_with_response_timeout(method, Some(params_value), None, None)
++            .await?;
++        serde_json::from_value(result)
++            .map_err(|e| format!("Failed to deserialize CDP response for {}: {}", method, e))
++    }
++
+     pub async fn send_command_no_params(
+         &self,
+         method: &str,
+@@ -935,8 +1223,8 @@ impl CdpClient {
              done: false,
          };
 
@@ -6581,7 +6708,7 @@ index f06379b..5b6a8be 100644
              self.ensure_open()?;
              let mut raw_pending = self.raw_pending.lock().await;
              if let Err(error) = self.ensure_session_attached(method, cmd.session_id.as_deref()) {
-@@ -951,11 +1165,14 @@ impl CdpClient {
+@@ -951,11 +1239,14 @@ impl CdpClient {
                  },
              );
              drop(raw_pending);
@@ -6601,7 +6728,7 @@ index f06379b..5b6a8be 100644
          }
 
          let text = match tokio::time::timeout(std::time::Duration::from_secs(30), rx).await {
-@@ -1018,23 +1235,35 @@ impl CdpClient {
+@@ -1018,23 +1309,35 @@ impl CdpClient {
          let json = serde_json::to_string(&cmd)
              .map_err(|e| format!("Failed to serialize CDP command: {}", e))?;
 
@@ -6649,7 +6776,7 @@ index f06379b..5b6a8be 100644
      }
 
      /// Test-only: count of in-flight commands still awaiting a response, so a
-@@ -1055,19 +1284,19 @@ impl CdpClient {
+@@ -1055,19 +1358,19 @@ impl CdpClient {
  /// Lightweight handle for the inspect WebSocket proxy, holding only
  /// the cloneable parts of CdpClient needed for bidirectional message forwarding.
  pub struct InspectProxyHandle {
@@ -6673,7 +6800,7 @@ index f06379b..5b6a8be 100644
              .await
              .map_err(|e| format!("Failed to send raw CDP message: {}", e))
      }
-@@ -1123,6 +1352,315 @@ mod tests {
+@@ -1123,6 +1426,315 @@ mod tests {
      const TEST_CERT_DER: &str = "MIIBPDCB46ADAgECAgkA9xwXmIhbzQIwCgYIKoZIzj0EAwIwFDESMBAGA1UEAwwJbG9jYWxob3N0MB4XDTI2MDgzMDA1NTU0NFoXDTM2MDgyNzA1NTU0NFowFDESMBAGA1UEAwwJbG9jYWxob3N0MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEQdmPO0sXXFRmVn7+8MViXGom2rYy8aV3Oc0pNZhUmFGaPl4MRFzc1G0yaV/WRBPF/BUh2LGsXCvUsn7NqaYkFaMeMBwwGgYDVR0RBBMwEYIJbG9jYWxob3N0hwR/AAABMAoGCCqGSM49BAMCA0gAMEUCIQC32oureGNAupABEmonQPAQBD7OdJjXmUxoVQNr0UB+6AIgb23GMwxTjwHyLG4tZcJST7r3cCW8K/Y+1h618j2f+Uw=";
      const TEST_KEY_DER: &str = "MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgIVZST8Vhc5f3OW+4kF78f8o1nQCRwjW/Yo8CXQ35Y9uhRANCAARB2Y87SxdcVGZWfv7wxWJcaibatjLxpXc5zSk1mFSYUZo+XgxEXNzUbTJpX9ZEE8X8FSHYsaxcK9Syfs2ppiQV";
 
@@ -6989,7 +7116,7 @@ index f06379b..5b6a8be 100644
      #[test]
      fn repairs_only_unpaired_surrogate_escapes() {
          let msg = r#"{"id":1,"result":{"high":"\ud800","low":"\udfff","pair":"\ud83d\ude00","escaped":"\\ud800","text":"café 中文"}}"#;
-@@ -1888,7 +2426,7 @@ mod tests {
+@@ -1888,7 +2500,7 @@ mod tests {
 
          let client = Arc::new(CdpClient::connect(&url).await.unwrap());
          accepted_rx.await.unwrap();
@@ -8144,7 +8271,7 @@ index 749a5b7..5927f7b 100644
      let url_a = "data:text/html,gone-session-a";
      let url_b = "data:text/html,gone-session-b";
 diff --git a/cli/src/native/state.rs b/cli/src/native/state.rs
-index 791691f..f52f2a9 100644
+index 791691f..4ba5f99 100644
 --- a/cli/src/native/state.rs
 +++ b/cli/src/native/state.rs
 @@ -5,7 +5,11 @@ use serde_json::{json, Value};
@@ -8168,7 +8295,7 @@ index 791691f..f52f2a9 100644
  #[derive(Debug, Serialize, Deserialize)]
  #[serde(rename_all = "camelCase")]
  pub struct StorageState {
-@@ -107,36 +113,94 @@ async fn eval_origin_storage(
+@@ -107,38 +113,110 @@ async fn eval_origin_storage(
      parse_origin_storage(&data)
  }
 
@@ -8209,17 +8336,22 @@ index 791691f..f52f2a9 100644
 +/// The create request must survive cancellation until it yields a target ID.
 +/// Send the guard itself so a dropped receiver also closes a late target.
 +async fn create_disposable_target(client: &Arc<CdpClient>) -> Result<TempTargetCleanup, String> {
++    let deadline = tokio::time::Instant::now() + client.command_response_timeout();
++    let timeout_error = || "CDP command timed out: Target.createTarget".to_string();
++    let create_permit = tokio::time::timeout_at(deadline, client.lock_disposable_target_create())
++        .await
++        .map_err(|_| timeout_error())?;
++    if tokio::time::Instant::now() >= deadline {
++        return Err(timeout_error());
++    }
 +    let (created_tx, created_rx) = oneshot::channel::<Result<TempTargetCleanup, String>>();
 +    let owner = client.clone();
 +    tokio::spawn(async move {
++        let _create_permit = create_permit;
 +        let created: Result<CreateTargetResult, String> = owner
-+            .send_command_typed(
-+                "Target.createTarget",
-+                &CreateTargetParams {
-+                    url: "about:blank".to_string(),
-+                },
-+                None,
-+            )
++            .send_disposable_target_create(&CreateTargetParams {
++                url: "about:blank".to_string(),
++            })
 +            .await;
 +        let _ = created_tx.send(created.map(|created| TempTargetCleanup {
 +            client: owner,
@@ -8227,9 +8359,16 @@ index 791691f..f52f2a9 100644
 +        }));
 +    });
 +
-+    created_rx
++    tokio::time::timeout_at(deadline, created_rx)
 +        .await
++        .map_err(|_| timeout_error())?
 +        .map_err(|_| "Temporary target creation task stopped".to_string())?
++}
++
++#[derive(Debug)]
++enum TempStorageError {
++    Create(String),
++    Collect,
 +}
 +
  /// Create a temporary CDP target, navigate it to each origin to collect localStorage,
@@ -8240,7 +8379,7 @@ index 791691f..f52f2a9 100644
 +    client: &Arc<CdpClient>,
      origins: &[String],
      origin_js: &str,
- ) -> Result<Vec<OriginStorage>, String> {
+-) -> Result<Vec<OriginStorage>, String> {
 -    let create_result: CreateTargetResult = client
 -        .send_command_typed(
 -            "Target.createTarget",
@@ -8252,7 +8391,10 @@ index 791691f..f52f2a9 100644
 -        .await?;
 -
 -    let target_id = create_result.target_id;
-+    let mut cleanup = create_disposable_target(client).await?;
++) -> Result<Vec<OriginStorage>, TempStorageError> {
++    let mut cleanup = create_disposable_target(client)
++        .await
++        .map_err(TempStorageError::Create)?;
 +    let target_id = cleanup
 +        .target_id
 +        .as_ref()
@@ -8274,9 +8416,12 @@ index 791691f..f52f2a9 100644
 +        cleanup.target_id = None;
 +    }
 
-     result
+-    result
++    result.map_err(|_| TempStorageError::Collect)
  }
-@@ -246,7 +310,7 @@ async fn collect_storage_in_target(
+
+ async fn collect_storage_in_target(
+@@ -246,7 +324,7 @@ async fn collect_storage_in_target(
  }
 
  pub async fn save_state(
@@ -8285,7 +8430,22 @@ index 791691f..f52f2a9 100644
      session_id: &str,
      path: Option<&str>,
      session_name: Option<&str>,
-@@ -338,7 +402,7 @@ pub async fn save_state(
+@@ -298,10 +376,10 @@ pub async fn save_state(
+     all_origins.remove(&current_origin);
+     if !all_origins.is_empty() {
+         let remaining: Vec<String> = all_origins.into_iter().collect();
+-        if let Ok(temp_origins) =
+-            collect_storage_via_temp_target(client, &remaining, origin_js).await
+-        {
+-            origins.extend(temp_origins);
++        match collect_storage_via_temp_target(client, &remaining, origin_js).await {
++            Ok(temp_origins) => origins.extend(temp_origins),
++            Err(TempStorageError::Create(error)) => return Err(error),
++            Err(TempStorageError::Collect) => {}
+         }
+     }
+
+@@ -338,7 +416,7 @@ pub async fn save_state(
  }
 
  pub async fn save_auto_state_transactional(
@@ -8294,7 +8454,7 @@ index 791691f..f52f2a9 100644
      session_id: &str,
      session_name: &str,
      session_id_str: &str,
-@@ -422,23 +486,64 @@ pub async fn save_auto_state_transactional(
+@@ -422,23 +500,64 @@ pub async fn save_auto_state_transactional(
      Ok(final_path.to_string_lossy().to_string())
  }
 
@@ -8363,7 +8523,7 @@ index 791691f..f52f2a9 100644
                          let decrypted = decrypt_data(&data, &key)?;
                          Ok(String::from_utf8(decrypted)
                              .map_err(|de| format!("Decrypted state is not valid UTF-8: {}", de))?)
-@@ -468,10 +573,15 @@ pub async fn load_state(
+@@ -468,10 +587,15 @@ pub async fn load_state(
      session_id: &str,
      path: &str,
  ) -> Result<Vec<String>, String> {
@@ -8383,7 +8543,7 @@ index 791691f..f52f2a9 100644
 
      if !state.cookies.is_empty() {
          let cookie_values: Vec<Value> = state
-@@ -855,6 +965,199 @@ pub fn get_sessions_dir() -> PathBuf {
+@@ -855,6 +979,548 @@ pub fn get_sessions_dir() -> PathBuf {
  mod tests {
      use super::*;
 
@@ -8447,6 +8607,355 @@ index 791691f..f52f2a9 100644
 +        tokio::time::timeout(Duration::from_secs(2), server)
 +            .await
 +            .expect("late temporary target was not closed")
++            .unwrap();
++        client.close().await;
++    }
++
++    #[cfg(unix)]
++    #[tokio::test]
++    async fn pipe_disposable_create_timeout_keeps_late_reply_owned() {
++        use std::io::{BufRead, Write};
++        use std::os::fd::{FromRawFd, IntoRawFd};
++        use std::os::unix::net::UnixStream;
++
++        let (child_reader, parent_writer) = UnixStream::pair().unwrap();
++        let (parent_reader, child_writer) = UnixStream::pair().unwrap();
++        child_reader
++            .set_read_timeout(Some(Duration::from_secs(3)))
++            .unwrap();
++        let reader = unsafe { fs::File::from_raw_fd(parent_reader.into_raw_fd()) };
++        let writer = unsafe { fs::File::from_raw_fd(parent_writer.into_raw_fd()) };
++        let client = Arc::new(CdpClient::connect_pipe(reader, writer, None));
++        client.set_command_response_timeout_for_test(Duration::from_millis(100));
++        let (create_seen_tx, create_seen_rx) = oneshot::channel();
++        let (release_reply_tx, release_reply_rx) = std::sync::mpsc::channel();
++        let server = tokio::task::spawn_blocking(move || {
++            fn next_frame(reader: &mut impl BufRead) -> Value {
++                let mut frame = Vec::new();
++                reader.read_until(0, &mut frame).unwrap();
++                assert_eq!(frame.last(), Some(&0));
++                serde_json::from_slice(&frame[..frame.len() - 1]).unwrap()
++            }
++
++            let mut input = std::io::BufReader::new(child_reader);
++            let mut output = child_writer;
++            let created = next_frame(&mut input);
++            assert_eq!(created["method"], "Target.createTarget");
++            create_seen_tx.send(()).unwrap();
++            release_reply_rx
++                .recv_timeout(Duration::from_secs(3))
++                .unwrap();
++            input
++                .get_ref()
++                .set_read_timeout(Some(Duration::from_millis(50)))
++                .unwrap();
++            let mut unexpected = Vec::new();
++            match input.read_until(0, &mut unexpected) {
++                Err(error)
++                    if matches!(
++                        error.kind(),
++                        io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
++                    ) =>
++                {
++                    assert!(
++                        unexpected.is_empty(),
++                        "another create wrote a partial frame"
++                    );
++                }
++                other => panic!("second create issued before the first reply: {other:?}"),
++            }
++            input
++                .get_ref()
++                .set_read_timeout(Some(Duration::from_secs(3)))
++                .unwrap();
++
++            let response = json!({ "id": created["id"], "result": { "targetId": "late" } });
++            output.write_all(response.to_string().as_bytes()).unwrap();
++            output.write_all(&[0]).unwrap();
++            let closed = next_frame(&mut input);
++            assert_eq!(closed["method"], "Target.closeTarget");
++            assert_eq!(closed["params"]["targetId"], "late");
++            let response = json!({ "id": closed["id"], "result": {} });
++            output.write_all(response.to_string().as_bytes()).unwrap();
++            output.write_all(&[0]).unwrap();
++        });
++
++        let first_client = client.clone();
++        let first = tokio::spawn(async move { create_disposable_target(&first_client).await });
++        tokio::time::timeout(Duration::from_secs(2), create_seen_rx)
++            .await
++            .expect("target create was not requested")
++            .unwrap();
++        let started = tokio::time::Instant::now();
++        let first_error = first.await.unwrap().err().expect("caller should time out");
++        assert_eq!(first_error, "CDP command timed out: Target.createTarget");
++        let second_error = create_disposable_target(&client)
++            .await
++            .err()
++            .expect("gate waiter should time out");
++        assert_eq!(second_error, first_error);
++        assert!(started.elapsed() < Duration::from_secs(1));
++
++        release_reply_tx.send(()).unwrap();
++        tokio::time::timeout(Duration::from_secs(2), server)
++            .await
++            .expect("late target was not closed")
++            .unwrap();
++        client.close().await;
++    }
++
++    #[cfg(unix)]
++    #[tokio::test]
++    async fn pipe_save_state_create_gate_timeout_preserves_snapshot() {
++        use std::io::{BufRead, Write};
++        use std::os::fd::{FromRawFd, IntoRawFd};
++        use std::os::unix::net::UnixStream;
++
++        let env = crate::test_utils::EnvGuard::new(&["AGENT_BROWSER_ENCRYPTION_KEY"]);
++        env.remove("AGENT_BROWSER_ENCRYPTION_KEY");
++        let dir = tempfile::tempdir().unwrap();
++        let snapshot = dir.path().join("state.json");
++        let original = br#"{"cookies":[],"origins":[{"origin":"https://other.test","localStorage":[{"name":"key","value":"saved"}]}]}"#;
++        fs::write(&snapshot, original).unwrap();
++
++        let (child_reader, parent_writer) = UnixStream::pair().unwrap();
++        let (parent_reader, child_writer) = UnixStream::pair().unwrap();
++        child_reader
++            .set_read_timeout(Some(Duration::from_secs(3)))
++            .unwrap();
++        let reader = unsafe { fs::File::from_raw_fd(parent_reader.into_raw_fd()) };
++        let writer = unsafe { fs::File::from_raw_fd(parent_writer.into_raw_fd()) };
++        let client = Arc::new(CdpClient::connect_pipe(reader, writer, None));
++        client.set_command_response_timeout_for_test(Duration::from_millis(100));
++        let (create_seen_tx, create_seen_rx) = oneshot::channel();
++        let (release_reply_tx, release_reply_rx) = std::sync::mpsc::channel();
++        let server = tokio::task::spawn_blocking(move || {
++            fn next_frame(reader: &mut impl BufRead) -> Value {
++                let mut frame = Vec::new();
++                reader.read_until(0, &mut frame).unwrap();
++                assert_eq!(frame.last(), Some(&0));
++                serde_json::from_slice(&frame[..frame.len() - 1]).unwrap()
++            }
++            fn respond(writer: &mut impl Write, command: &Value, result: Value) {
++                let response = json!({ "id": command["id"], "result": result });
++                writer.write_all(response.to_string().as_bytes()).unwrap();
++                writer.write_all(&[0]).unwrap();
++            }
++
++            let mut input = std::io::BufReader::new(child_reader);
++            let mut output = child_writer;
++            let first_create = next_frame(&mut input);
++            assert_eq!(first_create["method"], "Target.createTarget");
++            create_seen_tx.send(()).unwrap();
++
++            let cookies = next_frame(&mut input);
++            assert_eq!(cookies["method"], "Network.getAllCookies");
++            respond(&mut output, &cookies, json!({ "cookies": [] }));
++            let frame_tree = next_frame(&mut input);
++            assert_eq!(frame_tree["method"], "Page.getFrameTree");
++            respond(&mut output, &frame_tree, json!({}));
++            let storage = next_frame(&mut input);
++            assert_eq!(storage["method"], "Runtime.evaluate");
++            respond(
++                &mut output,
++                &storage,
++                json!({ "result": { "type": "object", "value": {
++                    "origin": "https://current.test", "localStorage": [], "sessionStorage": []
++                } } }),
++            );
++
++            release_reply_rx
++                .recv_timeout(Duration::from_secs(3))
++                .unwrap();
++            respond(
++                &mut output,
++                &first_create,
++                json!({ "targetId": "late-target" }),
++            );
++            let close = next_frame(&mut input);
++            assert_eq!(close["method"], "Target.closeTarget");
++            assert_eq!(close["params"]["targetId"], "late-target");
++            respond(&mut output, &close, json!({}));
++        });
++
++        let first_client = client.clone();
++        let first = tokio::spawn(async move { create_disposable_target(&first_client).await });
++        tokio::time::timeout(Duration::from_secs(2), create_seen_rx)
++            .await
++            .expect("first target create was not requested")
++            .unwrap();
++        client.set_command_response_timeout_for_test(Duration::from_millis(300));
++
++        let visited = HashSet::from(["https://other.test".to_string()]);
++        let error = tokio::time::timeout(
++            Duration::from_secs(2),
++            save_state(
++                &client,
++                "page-session",
++                snapshot.to_str(),
++                None,
++                "session",
++                &visited,
++            ),
++        )
++        .await
++        .expect("save did not finish after the create gate deadline")
++        .unwrap_err();
++        assert_eq!(error, "CDP command timed out: Target.createTarget");
++        assert_eq!(fs::read(&snapshot).unwrap(), original);
++
++        let first_error = first.await.unwrap().err().expect("first create timed out");
++        assert_eq!(first_error, error);
++        release_reply_tx.send(()).unwrap();
++        tokio::time::timeout(Duration::from_secs(2), server)
++            .await
++            .expect("late target was not closed")
++            .unwrap();
++        client.close().await;
++    }
++
++    #[cfg(unix)]
++    #[tokio::test]
++    async fn pipe_disposable_target_create_waits_for_cancelled_owner() {
++        use std::io::{BufRead, Write};
++        use std::os::fd::{FromRawFd, IntoRawFd};
++        use std::os::unix::net::UnixStream;
++
++        let (child_reader, parent_writer) = UnixStream::pair().unwrap();
++        let (parent_reader, child_writer) = UnixStream::pair().unwrap();
++        child_reader
++            .set_read_timeout(Some(Duration::from_secs(3)))
++            .unwrap();
++        let reader = unsafe { fs::File::from_raw_fd(parent_reader.into_raw_fd()) };
++        let writer = unsafe { fs::File::from_raw_fd(parent_writer.into_raw_fd()) };
++        let client = Arc::new(CdpClient::connect_pipe(reader, writer, None));
++        client.set_command_response_timeout_for_test(Duration::from_millis(100));
++        let (first_seen_tx, first_seen_rx) = oneshot::channel();
++        let (second_started_tx, second_started_rx) = std::sync::mpsc::channel();
++        let (no_overlap_tx, no_overlap_rx) = oneshot::channel();
++        let (release_first_tx, release_first_rx) = std::sync::mpsc::channel();
++        let (second_seen_tx, second_seen_rx) = oneshot::channel();
++        let (release_second_tx, release_second_rx) = std::sync::mpsc::channel();
++        let server = tokio::task::spawn_blocking(move || {
++            fn next_frame(reader: &mut impl BufRead) -> Value {
++                let mut frame = Vec::new();
++                reader.read_until(0, &mut frame).unwrap();
++                assert_eq!(frame.last(), Some(&0));
++                serde_json::from_slice(&frame[..frame.len() - 1]).unwrap()
++            }
++            fn respond(writer: &mut impl Write, command: &Value, result: Value) {
++                let response = json!({ "id": command["id"], "result": result });
++                writer.write_all(response.to_string().as_bytes()).unwrap();
++                writer.write_all(&[0]).unwrap();
++            }
++
++            let mut input = std::io::BufReader::new(child_reader);
++            let mut output = child_writer;
++            let first = next_frame(&mut input);
++            assert_eq!(first["method"], "Target.createTarget");
++            first_seen_tx.send(()).unwrap();
++            second_started_rx
++                .recv_timeout(Duration::from_secs(3))
++                .unwrap();
++            input
++                .get_ref()
++                .set_read_timeout(Some(Duration::from_millis(250)))
++                .unwrap();
++            let mut unexpected = Vec::new();
++            match input.read_until(0, &mut unexpected) {
++                Err(error)
++                    if matches!(
++                        error.kind(),
++                        io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
++                    ) =>
++                {
++                    assert!(unexpected.is_empty(), "second create wrote a partial frame");
++                }
++                other => {
++                    panic!("second create ran while the cancelled owner was pending: {other:?}")
++                }
++            }
++            input
++                .get_ref()
++                .set_read_timeout(Some(Duration::from_secs(3)))
++                .unwrap();
++            no_overlap_tx.send(()).unwrap();
++
++            release_first_rx
++                .recv_timeout(Duration::from_secs(3))
++                .unwrap();
++            respond(&mut output, &first, json!({ "targetId": "first" }));
++            let mut second = None;
++            let mut second_seen_tx = Some(second_seen_tx);
++            let mut first_closed = false;
++            while second.is_none() || !first_closed {
++                let frame = next_frame(&mut input);
++                match frame["method"].as_str() {
++                    Some("Target.createTarget") => {
++                        assert!(second.replace(frame).is_none(), "duplicate second create");
++                        second_seen_tx.take().unwrap().send(()).unwrap();
++                    }
++                    Some("Target.closeTarget") => {
++                        assert!(!first_closed, "duplicate first close");
++                        assert_eq!(frame["params"]["targetId"], "first");
++                        first_closed = true;
++                        respond(&mut output, &frame, json!({}));
++                    }
++                    other => panic!("unexpected CDP command: {other:?}"),
++                }
++            }
++
++            release_second_rx
++                .recv_timeout(Duration::from_secs(3))
++                .unwrap();
++            respond(
++                &mut output,
++                second.as_ref().unwrap(),
++                json!({ "targetId": "second" }),
++            );
++            let closed = next_frame(&mut input);
++            assert_eq!(closed["method"], "Target.closeTarget");
++            assert_eq!(closed["params"]["targetId"], "second");
++            respond(&mut output, &closed, json!({}));
++        });
++
++        let first_client = client.clone();
++        let first = tokio::spawn(async move {
++            let origins = ["https://example.test".to_string()];
++            collect_storage_via_temp_target(&first_client, &origins, "").await
++        });
++        tokio::time::timeout(Duration::from_secs(2), first_seen_rx)
++            .await
++            .expect("first target was not requested")
++            .unwrap();
++        first.abort();
++        let _ = first.await;
++
++        client.set_command_response_timeout_for_test(Duration::from_secs(2));
++        let second_client = client.clone();
++        let (second_poll_tx, second_poll_rx) = oneshot::channel();
++        let second = tokio::spawn(async move {
++            let _ = second_poll_tx.send(());
++            let origins = ["https://example.test".to_string()];
++            collect_storage_via_temp_target(&second_client, &origins, "").await
++        });
++        second_poll_rx.await.unwrap();
++        second_started_tx.send(()).unwrap();
++        tokio::time::timeout(Duration::from_secs(2), no_overlap_rx)
++            .await
++            .expect("overlap check did not finish")
++            .unwrap();
++        release_first_tx.send(()).unwrap();
++        tokio::time::timeout(Duration::from_secs(2), second_seen_rx)
++            .await
++            .expect("second target was not requested after first reply")
++            .unwrap();
++        second.abort();
++        let _ = second.await;
++        release_second_tx.send(()).unwrap();
++        tokio::time::timeout(Duration::from_secs(3), server)
++            .await
++            .expect("late targets were not closed")
 +            .unwrap();
 +        client.close().await;
 +    }

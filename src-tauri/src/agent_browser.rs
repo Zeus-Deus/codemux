@@ -2865,6 +2865,10 @@ fn kill_verified_browser_pid(record: &BrowserPidRecord, session: &str) -> Browse
 fn close_verified_browser_pid_until(record: &BrowserPidRecord, session: &str, deadline: Instant) -> BrowserDaemonStopOutcome {
     let dir = run_dir_for_session(session);
     let mut files = None;
+    let mut verified_peer = false;
+    let pipe_capable = dir.as_deref().is_some_and(|dir| {
+        verified_browser_daemon_has_protected_stream(session, record, dir)
+    });
     let socket = dir.as_ref().map(|dir| dir.join(format!("{session}.sock")));
     let token = browser_listener_token_for_close(record, session)
         .ok_or_else(|| "Verified browser listener token is unavailable".to_string());
@@ -2875,13 +2879,19 @@ fn close_verified_browser_pid_until(record: &BrowserPidRecord, session: &str, de
                 || browser_process_matches(record, session)
                     && (record.token == browser_owner_token()
                         || browser_record_matches_control_dir(record, session)),
-                || files = dir.as_ref().and_then(|dir| capture_closed_browser_files(dir, session, record)),
+                || {
+                    verified_peer = true;
+                    files = dir.as_ref().and_then(|dir| capture_closed_browser_files(dir, session, record));
+                },
             ))
     });
     match result {
         Ok(VerifiedBrowserCloseOutcome::CleanupPending) => return BrowserDaemonStopOutcome::CleanupPending,
         Err(error) => {
             eprintln!("[codemux::browser] Could not gracefully close browser session {session}: {error}");
+            if (pipe_capable || verified_peer) && !macos_browser_process_exited(record) {
+                return BrowserDaemonStopOutcome::Unconfirmed;
+            }
             if let (Some(dir), Some(files)) = (dir.as_deref(), files.as_ref()) {
                 let _ = cleanup_closed_browser_files(dir, session, record, files, || {
                     macos_browser_process_exited(record)
@@ -8099,6 +8109,73 @@ pub(crate) fn orphaned_ws_sessions(
 mod tests {
     use super::*;
 
+    #[cfg(windows)]
+    struct WindowsFixtureBinary {
+        executable: PathBuf,
+        manifest: Option<PathBuf>,
+    }
+
+    #[cfg(windows)]
+    impl Drop for WindowsFixtureBinary {
+        fn drop(&mut self) {
+            if let Some(manifest) = &self.manifest {
+                let _ = std::fs::remove_file(manifest);
+            }
+            let _ = std::fs::remove_file(&self.executable);
+        }
+    }
+
+    /// Keep the renamed test executable beside its DLLs and copy its
+    /// activation manifest, which CI installs under the original EXE name.
+    #[cfg(windows)]
+    fn windows_agent_browser_fixture_binary() -> WindowsFixtureBinary {
+        let executable = std::env::current_exe().unwrap();
+        let binary = executable.parent().unwrap().join(format!(
+            "agent-browser-fixture-{}.exe", uuid::Uuid::new_v4().simple(),
+        ));
+        std::fs::hard_link(&executable, &binary)
+            .or_else(|_| std::fs::copy(&executable, &binary).map(|_| ()))
+            .unwrap();
+        let source_manifest = executable.with_extension("exe.manifest");
+        let manifest = if source_manifest.exists() {
+            let target = binary.with_extension("exe.manifest");
+            std::fs::copy(source_manifest, &target).unwrap();
+            Some(target)
+        } else {
+            None
+        };
+        WindowsFixtureBinary { executable: binary, manifest }
+    }
+
+    #[cfg(windows)]
+    fn windows_fixture_exit(child: &mut std::process::Child) -> Option<String> {
+        use std::io::Read;
+
+        let status = child.try_wait().unwrap()?;
+        let mut stderr = String::new();
+        if let Some(mut output) = child.stderr.take() {
+            let _ = output.read_to_string(&mut stderr);
+        }
+        Some(format!("status={status}, stderr={stderr}"))
+    }
+
+    #[cfg(windows)]
+    fn windows_fixture_exit_code(handle: &std::os::windows::io::OwnedHandle) -> Option<u32> {
+        use std::os::windows::io::AsRawHandle;
+        use windows_sys::Win32::System::Threading::GetExitCodeProcess;
+
+        let mut code = 0;
+        (unsafe { GetExitCodeProcess(handle.as_raw_handle(), &mut code) } != 0).then_some(code)
+    }
+
+    #[cfg(windows)]
+    fn windows_fixture_listen_timeout(child: &mut std::process::Child, binary: &std::path::Path) -> ! {
+        let _ = child.kill();
+        let _ = child.wait();
+        let exit = windows_fixture_exit(child).unwrap_or_else(|| "exit status unavailable".into());
+        panic!("Windows fixture did not listen: {exit}, binary={}", binary.display());
+    }
+
     #[cfg(target_os = "linux")]
     fn saturated_control_socket(path: &std::path::Path) -> (socket2::Socket, Vec<socket2::Socket>) {
         let address = socket2::SockAddr::unix(path).unwrap();
@@ -8926,6 +9003,7 @@ mod tests {
         let session = std::env::var("CODEMUX_TEST_WINDOWS_PRIOR_SESSION").unwrap();
         let binary = std::env::var_os("CODEMUX_TEST_WINDOWS_PRIOR_BINARY").unwrap();
         let marker = std::env::var_os("CODEMUX_TEST_WINDOWS_PRIOR_MARKER").unwrap();
+        let daemon_stderr = std::env::var_os("CODEMUX_TEST_WINDOWS_PRIOR_DAEMON_STDERR").unwrap();
         let token = std::env::var("CODEMUX_TEST_WINDOWS_PRIOR_TOKEN").unwrap();
         let dir = run_dir_for_session(&session).unwrap();
         let (owner_pid, owner_start) = current_app_process_identity().unwrap();
@@ -8938,7 +9016,8 @@ mod tests {
             .env("AGENT_BROWSER_SOCKET_DIR", dir)
             .env_remove("CODEMUX_BROWSER_SECRET")
             .env_remove("CODEMUX_TEST_WINDOWS_PENDING_NO_REPLY")
-            .stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
+            .stdin(Stdio::null()).stdout(Stdio::null())
+            .stderr(Stdio::from(std::fs::File::create(daemon_stderr).unwrap()));
         if let Some(secret) = std::env::var_os("CODEMUX_TEST_WINDOWS_PRIOR_SECRET") {
             command.env("CODEMUX_BROWSER_SECRET", secret);
         }
@@ -8995,36 +9074,37 @@ mod tests {
             let record_path = session_pid_path(&session).unwrap();
             let _runtime_files = RuntimeFiles(vec![pid_path.clone(), port_path.clone(), record_path.clone()]);
             let temp = tempfile::tempdir().unwrap();
-            let binary = temp.path().join("agent-browser.exe");
-            let executable = std::env::current_exe().unwrap();
-            std::fs::hard_link(&executable, &binary)
-                .or_else(|_| std::fs::copy(&executable, &binary).map(|_| ()))
-                .unwrap();
+            let binary = windows_agent_browser_fixture_binary();
             let identity_path = temp.path().join("identity");
             let marker = temp.path().join("close-requests");
+            let daemon_stderr = temp.path().join("daemon-stderr");
             let token = uuid::Uuid::new_v4().simple().to_string();
-            let mut owner = Command::new(&binary);
+            let mut owner = Command::new(&binary.executable);
             owner.args(["--exact", "agent_browser::tests::windows_previous_owner_fixture", "--nocapture"])
                 .env("CODEMUX_TEST_WINDOWS_PRIOR_IDENTITY", &identity_path)
                 .env("CODEMUX_TEST_WINDOWS_PRIOR_SESSION", &session)
-                .env("CODEMUX_TEST_WINDOWS_PRIOR_BINARY", &binary)
+                .env("CODEMUX_TEST_WINDOWS_PRIOR_BINARY", &binary.executable)
                 .env("CODEMUX_TEST_WINDOWS_PRIOR_MARKER", &marker)
+                .env("CODEMUX_TEST_WINDOWS_PRIOR_DAEMON_STDERR", &daemon_stderr)
                 .env("CODEMUX_TEST_WINDOWS_PRIOR_TOKEN", &token)
-                .stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
+                .stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::piped());
             if let Some(secret) = &secret {
                 owner.env("CODEMUX_TEST_WINDOWS_PRIOR_SECRET", secret);
             } else {
                 owner.env_remove("CODEMUX_TEST_WINDOWS_PRIOR_SECRET");
             }
-            let mut owner = owner.spawn().unwrap();
-            assert!(owner.wait().unwrap().success(), "previous owner fixture failed");
+            let owner = owner.spawn().unwrap();
+            let spawned_owner_pid = owner.id();
+            let owner_output = owner.wait_with_output().unwrap();
+            assert!(owner_output.status.success(), "previous owner fixture failed: status={}, stderr={}, binary={}",
+                owner_output.status, String::from_utf8_lossy(&owner_output.stderr), binary.executable.display());
             let identity = std::fs::read_to_string(&identity_path).unwrap();
             let ids: Vec<u64> = identity.split_whitespace().map(|value| value.parse().unwrap()).collect();
             assert_eq!(ids.len(), 3);
             let owner_pid = u32::try_from(ids[0]).unwrap();
             let owner_start_time = ids[1];
             let daemon_pid = u32::try_from(ids[2]).unwrap();
-            assert_eq!(owner.id(), owner_pid);
+            assert_eq!(spawned_owner_pid, owner_pid);
             let raw = unsafe {
                 OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_TERMINATE | PROCESS_SYNCHRONIZE, 0, daemon_pid)
             };
@@ -9040,8 +9120,12 @@ mod tests {
                         }
                     }
                 }
-                assert!(!verified_browser_handle_exited(&daemon.0), "previous daemon exited before listening");
-                assert!(started.elapsed() < Duration::from_secs(10), "previous daemon did not listen");
+                assert!(!verified_browser_handle_exited(&daemon.0), "previous daemon exited before listening: exit_code={:?}, stderr={}, binary={}",
+                    windows_fixture_exit_code(&daemon.0),
+                    std::fs::read_to_string(&daemon_stderr).unwrap_or_default(), binary.executable.display());
+                assert!(started.elapsed() < Duration::from_secs(20), "previous daemon did not listen: exit_code={:?}, stderr={}, binary={}",
+                    windows_fixture_exit_code(&daemon.0),
+                    std::fs::read_to_string(&daemon_stderr).unwrap_or_default(), binary.executable.display());
                 std::thread::sleep(Duration::from_millis(25));
             };
             let record = BrowserPidRecord {
@@ -9098,18 +9182,14 @@ mod tests {
         let record_path = session_pid_path(&session).unwrap();
         let _runtime_files = RuntimeFiles(vec![pid_path.clone(), port_path.clone(), record_path.clone()]);
         let temp = tempfile::tempdir().unwrap();
-        let binary = temp.path().join("agent-browser.exe");
-        let executable = std::env::current_exe().unwrap();
-        std::fs::hard_link(&executable, &binary)
-            .or_else(|_| std::fs::copy(&executable, &binary).map(|_| ()))
-            .unwrap();
+        let binary = windows_agent_browser_fixture_binary();
         let marker = temp.path().join("close-requests");
-        let mut command = Command::new(&binary);
+        let mut command = Command::new(&binary.executable);
         command.args(["--exact", "agent_browser::tests::windows_cleanup_pending_daemon_fixture", "--nocapture"])
             .env("CODEMUX_TEST_WINDOWS_PENDING_SESSION", &session)
             .env("CODEMUX_TEST_WINDOWS_PENDING_MARKER", &marker)
             .env_remove("CODEMUX_TEST_WINDOWS_PENDING_NO_REPLY")
-            .stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
+            .stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::piped());
         set_browser_owner_env(&mut command, &session).unwrap();
         let mut daemon = ChildGuard(command.spawn().unwrap());
         let started = Instant::now();
@@ -9121,8 +9201,12 @@ mod tests {
                     }
                 }
             }
-            assert!(daemon.0.try_wait().unwrap().is_none(), "pending fixture exited before listening");
-            assert!(started.elapsed() < Duration::from_secs(10), "pending fixture did not listen");
+            if let Some(exit) = windows_fixture_exit(&mut daemon.0) {
+                panic!("pending fixture exited before listening: {exit}, binary={}", binary.executable.display());
+            }
+            if started.elapsed() >= Duration::from_secs(20) {
+                windows_fixture_listen_timeout(&mut daemon.0, &binary.executable);
+            }
             std::thread::sleep(Duration::from_millis(25));
         };
         let record = test_browser_record(daemon.0.id(), start_time, browser_owner_token().to_owned());
@@ -9171,18 +9255,14 @@ mod tests {
         let record_path = session_pid_path(&session).unwrap();
         let _runtime_files = RuntimeFiles(vec![pid_path.clone(), port_path, version_path.clone(), record_path.clone()]);
         let temp = tempfile::tempdir().unwrap();
-        let binary = temp.path().join("agent-browser.exe");
-        let executable = std::env::current_exe().unwrap();
-        std::fs::hard_link(&executable, &binary)
-            .or_else(|_| std::fs::copy(&executable, &binary).map(|_| ()))
-            .unwrap();
+        let binary = windows_agent_browser_fixture_binary();
         let marker = temp.path().join("close-requests");
-        let mut command = Command::new(&binary);
+        let mut command = Command::new(&binary.executable);
         command.args(["--exact", "agent_browser::tests::windows_cleanup_pending_daemon_fixture", "--nocapture"])
             .env("CODEMUX_TEST_WINDOWS_PENDING_SESSION", &session)
             .env("CODEMUX_TEST_WINDOWS_PENDING_MARKER", &marker)
             .env("CODEMUX_TEST_WINDOWS_PENDING_NO_REPLY", "1")
-            .stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
+            .stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::piped());
         set_browser_owner_env(&mut command, &session).unwrap();
         let mut daemon = ChildGuard(command.spawn().unwrap());
         let started = Instant::now();
@@ -9194,8 +9274,12 @@ mod tests {
                     }
                 }
             }
-            assert!(daemon.0.try_wait().unwrap().is_none(), "no-reply daemon exited before listening");
-            assert!(started.elapsed() < Duration::from_secs(10), "no-reply daemon did not listen");
+            if let Some(exit) = windows_fixture_exit(&mut daemon.0) {
+                panic!("no-reply daemon exited before listening: {exit}, binary={}", binary.executable.display());
+            }
+            if started.elapsed() >= Duration::from_secs(20) {
+                windows_fixture_listen_timeout(&mut daemon.0, &binary.executable);
+            }
             std::thread::sleep(Duration::from_millis(25));
         };
         let record = test_browser_record(daemon.0.id(), start_time, browser_owner_token().to_owned());
@@ -9384,6 +9468,8 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn identifies_the_peer_of_an_established_control_connection() {
+        use std::io::Read;
+
         let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
         let port = listener.local_addr().unwrap().port();
         let script = format!(
@@ -9392,7 +9478,7 @@ mod tests {
         let mut child = std::process::Command::new("powershell.exe")
             .args(["-NoProfile", "-NonInteractive", "-Command", &script])
             .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
+            .stderr(std::process::Stdio::piped())
             .spawn()
             .unwrap();
         let child_pid = child.id();
@@ -9402,11 +9488,14 @@ mod tests {
             match listener.accept() {
                 Ok((server, _)) => break server,
                 Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                    if started.elapsed() >= Duration::from_secs(5) {
-                        let status = child.try_wait().unwrap();
+                    if started.elapsed() >= Duration::from_secs(20) {
                         let _ = child.kill();
-                        let _ = child.wait();
-                        panic!("PowerShell TCP fixture did not connect: {status:?}");
+                        let status = child.wait().unwrap();
+                        let mut stderr = String::new();
+                        if let Some(mut output) = child.stderr.take() {
+                            let _ = output.read_to_string(&mut stderr);
+                        }
+                        panic!("PowerShell TCP fixture did not connect: pid={child_pid}, status={status}, stderr={stderr}");
                     }
                     std::thread::sleep(Duration::from_millis(25));
                 }
@@ -12631,7 +12720,7 @@ mod tests {
         );
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(unix)]
     #[test]
     fn cleanup_pending_daemon_fixture() {
         use std::io::{BufRead, Write};
@@ -12810,6 +12899,83 @@ mod tests {
         std::fs::remove_file(&version_path).unwrap();
         assert_eq!(stop_owned_browser_daemon(&session, &record, ""), BrowserDaemonStopOutcome::Attempted);
         assert!(daemon.0.try_wait().unwrap().is_some(), "stale fallback did not stop daemon");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_verified_close_without_reply_keeps_live_daemon_files() {
+        use std::process::{Child, Command, Stdio};
+
+        struct ChildGuard(Child);
+        impl Drop for ChildGuard {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+        struct RuntimeFiles(Vec<PathBuf>);
+        impl Drop for RuntimeFiles {
+            fn drop(&mut self) {
+                for path in &self.0 {
+                    let _ = std::fs::remove_file(path);
+                }
+            }
+        }
+
+        let session = format!("cmx-mac-{}", &uuid::Uuid::new_v4().simple().to_string()[..8]);
+        let dir = run_dir_for_session(&session).unwrap();
+        let socket = dir.join(format!("{session}.sock"));
+        let pid_path = dir.join(format!("{session}.pid"));
+        let version_path = dir.join(format!("{session}.version"));
+        let record_path = session_pid_path(&session).unwrap();
+        let _runtime_files = RuntimeFiles(vec![socket.clone(), pid_path.clone(), version_path.clone(), record_path.clone()]);
+        let executable = std::env::current_exe().unwrap();
+        let temp = tempfile::tempdir_in(executable.parent().unwrap()).unwrap();
+        let binary = temp.path().join("agent-browser");
+        std::fs::hard_link(&executable, &binary)
+            .or_else(|_| std::fs::copy(&executable, &binary).map(|_| ()))
+            .unwrap();
+        let marker = temp.path().join("close-requests");
+        let mut command = Command::new(&binary);
+        command.args(["--exact", "agent_browser::tests::cleanup_pending_daemon_fixture", "--nocapture"])
+            .env("CODEMUX_TEST_PENDING_DAEMON_SOCKET", &socket)
+            .env("CODEMUX_TEST_PENDING_DAEMON_MARKER", &marker)
+            .env("CODEMUX_TEST_PENDING_DAEMON_NO_REPLY", "1")
+            .stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
+        set_browser_owner_env(&mut command, &session).unwrap();
+        let mut daemon = ChildGuard(command.spawn().unwrap());
+        let started = Instant::now();
+        let start_time = loop {
+            if let Some(start_time) = browser_process_start(daemon.0.id(), &session, browser_owner_token()) {
+                if std::os::unix::net::UnixStream::connect(&socket).is_ok() {
+                    break start_time;
+                }
+            }
+            assert!(daemon.0.try_wait().unwrap().is_none(), "no-reply daemon exited before listening");
+            assert!(started.elapsed() < Duration::from_secs(10), "no-reply daemon did not listen");
+            std::thread::sleep(Duration::from_millis(25));
+        };
+        let record = test_browser_record(daemon.0.id(), start_time, browser_owner_token().to_owned());
+        std::fs::write(&pid_path, daemon.0.id().to_string()).unwrap();
+        std::fs::write(&version_path, PATCHED_BROWSER_VERSION).unwrap();
+        write_session_pid(&session, &record).unwrap();
+        assert!(verified_browser_daemon_has_protected_stream(&session, &record, &dir));
+
+        assert_eq!(close_verified_browser_pid_until(&record, &session, Instant::now() + CLOSE_TIMEOUT),
+            BrowserDaemonStopOutcome::Unconfirmed);
+        assert_eq!(std::fs::read_to_string(&marker).unwrap().lines().count(), 1);
+        assert!(daemon.0.try_wait().unwrap().is_none(), "unconfirmed close terminated daemon");
+        assert_eq!(read_browser_pid_record(&record_path), Some(record.clone()));
+        assert_eq!(read_daemon_pid_file(&pid_path), Some(record.pid));
+        assert!(socket.exists(), "unconfirmed close retired live control socket");
+
+        std::fs::remove_file(&version_path).unwrap();
+        assert_eq!(close_verified_browser_pid_until(&record, &session, Instant::now() + CLOSE_TIMEOUT),
+            BrowserDaemonStopOutcome::Unconfirmed);
+        assert_eq!(std::fs::read_to_string(&marker).unwrap().lines().count(), 2);
+        assert!(daemon.0.try_wait().unwrap().is_none());
+        assert_eq!(read_browser_pid_record(&record_path), Some(record));
+        assert!(socket.exists());
     }
 
     #[cfg(unix)]
