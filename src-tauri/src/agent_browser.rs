@@ -3936,20 +3936,37 @@ fn settle_preset_confirmation(
 ) -> bool {
     let next_prompt_id = stream.pending_confirmation.as_ref().and_then(|next| next.details.id.clone());
     let Some(attempt) = stream.preset_navigation.as_mut().filter(|attempt| {
-        attempt.phase == PresetNavigationPhase::Pending
+        matches!(attempt.phase, PresetNavigationPhase::Pending | PresetNavigationPhase::FailedAmbiguous)
             && attempt.prompt_id.as_deref() == Some(prior_prompt_id)
             && attempt.identity.port == stream.port
     }) else { return false };
     let same_daemon = attempt.identity.pid == record_pid && attempt.identity.start_time == record_start;
+    let was_ambiguous = attempt.phase == PresetNavigationPhase::FailedAmbiguous;
     attempt.identity = BrowserStreamIdentity {
         port: stream.port,
         pid: record_pid,
         start_time: record_start,
         generation: stream.stream_generation,
     };
-    attempt.phase = if same_daemon { phase } else { PresetNavigationPhase::Failed };
+    attempt.phase = if same_daemon { phase } else if was_ambiguous {
+        PresetNavigationPhase::FailedAmbiguous
+    } else {
+        PresetNavigationPhase::Failed
+    };
     attempt.prompt_id = if attempt.phase == PresetNavigationPhase::Pending { next_prompt_id } else { None };
     true
+}
+
+fn mark_uncertain_preset_confirmation(stream: &mut StreamSession, prompt_id: &str) {
+    if let Some(attempt) = stream.preset_navigation.as_mut().filter(|attempt| {
+        attempt.phase == PresetNavigationPhase::Pending
+            && attempt.prompt_id.as_deref() == Some(prompt_id)
+            && attempt.identity.port == stream.port
+    }) {
+        // The approved open may already have run. Keep the prompt ID so a
+        // later explicit, known decision can settle it, but never auto-open.
+        attempt.phase = PresetNavigationPhase::FailedAmbiguous;
+    }
 }
 
 impl StreamSession {
@@ -5601,6 +5618,23 @@ enum BrowserConfirmationResponse {
     ConsumedFailure(String),
 }
 
+enum BrowserConfirmationFailure {
+    BeforeSend(String),
+    MaybeApplied(String),
+}
+
+impl BrowserConfirmationFailure {
+    fn may_have_applied(&self) -> bool {
+        matches!(self, Self::MaybeApplied(_))
+    }
+
+    fn into_message(self) -> String {
+        match self {
+            Self::BeforeSend(message) | Self::MaybeApplied(message) => message,
+        }
+    }
+}
+
 fn browser_confirmation_response(
     response: &serde_json::Value,
     approve: bool,
@@ -5653,21 +5687,24 @@ fn run_browser_confirmation_decision(
     pending: &PendingBrowserConfirmation,
     id: &str,
     approve: bool,
-) -> Result<(BrowserPidRecord, BrowserConfirmationResponse), String> {
-    require_owned_browser_session(session)?;
+) -> Result<(BrowserPidRecord, BrowserConfirmationResponse), BrowserConfirmationFailure> {
+    require_owned_browser_session(session).map_err(BrowserConfirmationFailure::BeforeSend)?;
     let current = live_owned_browser_record(session)
-        .ok_or_else(|| "Could not verify the pending browser daemon".to_string())?;
+        .ok_or_else(|| BrowserConfirmationFailure::BeforeSend(
+            "Could not verify the pending browser daemon".to_string()))?;
     if current.token != browser_owner_token()
         || pending.daemon.as_ref().is_some_and(|daemon| daemon != &current) {
-        return Err("Browser daemon changed since confirmation was requested".into());
+        return Err(BrowserConfirmationFailure::BeforeSend(
+            "Browser daemon changed since confirmation was requested".into()));
     }
-    let bin = resolve_binary()?;
+    let bin = resolve_binary().map_err(BrowserConfirmationFailure::BeforeSend)?;
     let action = if approve { "confirm" } else { "deny" };
     #[cfg(windows)]
     let output = {
         let argv = vec![action.to_owned(), id.to_owned(), "--json".into(), "--session".into(), session.to_owned()];
         run_agent_browser_native_with_record(&bin, &argv, session, port, false, ACTION_TIMEOUT, current.clone())
-            .map_err(|error| format!("Browser confirmation failed: {error}"))?
+            .map_err(|error| BrowserConfirmationFailure::MaybeApplied(
+                format!("Browser confirmation failed: {error}")))?
     };
     #[cfg(not(windows))]
     let output = {
@@ -5678,17 +5715,22 @@ fn run_browser_confirmation_decision(
         } else {
             std::process::Command::new(&bin)
         };
-        set_browser_owner_env(&mut command, session)?;
+        set_browser_owner_env(&mut command, session)
+            .map_err(BrowserConfirmationFailure::BeforeSend)?;
         command.args([action, id, "--json", "--session", session])
             .env("AGENT_BROWSER_STREAM_PORT", port.to_string());
         output_capture_with_timeout(command, ACTION_TIMEOUT)
-            .map_err(|error| format!("Browser confirmation failed: {error}"))?
+            .map_err(|error| BrowserConfirmationFailure::MaybeApplied(
+                format!("Browser confirmation failed: {error}")))?
     };
-    let decision = browser_confirmation_output(&output.stdout, output.status.success(), approve)?;
+    let decision = browser_confirmation_output(&output.stdout, output.status.success(), approve)
+        .map_err(BrowserConfirmationFailure::MaybeApplied)?;
     let after = live_owned_browser_record(session)
-        .ok_or_else(|| "Could not verify browser daemon after confirmation".to_string())?;
+        .ok_or_else(|| BrowserConfirmationFailure::MaybeApplied(
+            "Could not verify browser daemon after confirmation".to_string()))?;
     if after != current {
-        return Err("Browser daemon changed while confirmation was processed".into());
+        return Err(BrowserConfirmationFailure::MaybeApplied(
+            "Browser daemon changed while confirmation was processed".into()));
     }
     Ok((after, decision))
 }
@@ -6241,7 +6283,7 @@ impl AgentBrowserManager {
     ) -> Result<Option<BrowserPendingConfirmation>, String>
     where
         F: FnOnce(String, u16, PendingBrowserConfirmation, String, bool)
-            -> Result<(BrowserPidRecord, BrowserConfirmationResponse), String> + Send + 'static,
+            -> Result<(BrowserPidRecord, BrowserConfirmationResponse), BrowserConfirmationFailure> + Send + 'static,
     {
         let session = session_name(browser_id).to_owned();
         let (port, pending, upstream_id) = {
@@ -6260,15 +6302,29 @@ impl AgentBrowserManager {
         let session_for_command = session.clone();
         let result = tokio::task::spawn_blocking(move || {
             decide(session_for_command, port, pending_for_command, upstream_id, approve)
-        }).await.map_err(|error| format!("Browser confirmation task failed: {error}"))
+        }).await.map_err(|error| BrowserConfirmationFailure::MaybeApplied(
+            format!("Browser confirmation task failed: {error}")))
             .and_then(|result| result);
         let mut sessions = self.sessions.lock().await;
         let entry = sessions.get_mut(browser_id).ok_or("Browser session closed during confirmation")?;
         if entry.pending_confirmation.as_ref().is_none_or(|current| current.daemon != pending.daemon || current.details.id.as_deref() != Some(id)) {
+            if approve && result.as_ref().map_or_else(
+                |error| error.may_have_applied(), |_| true,
+            ) {
+                mark_uncertain_preset_confirmation(entry, id);
+            }
             return Err("Browser confirmation changed while it was processed".into());
         }
         entry.pending_confirmation.as_mut().unwrap().decision_in_flight = false;
-        let (record, decision) = result?;
+        let (record, decision) = match result {
+            Ok(known) => known,
+            Err(error) => {
+                if approve && error.may_have_applied() {
+                    mark_uncertain_preset_confirmation(entry, id);
+                }
+                return Err(error.into_message());
+            }
+        };
         let record_pid = record.pid;
         let record_start = record.start_time;
         let preset_phase = preset_phase_for_confirmation(approve, &decision);
@@ -9462,6 +9518,74 @@ mod tests {
         manager.sessions.lock().await.get_mut(&session).unwrap().browser_ready = true;
         assert_eq!(manager.ensure_preset_navigation(&session, "https://example.com".into(), false).await.unwrap(),
             BrowserPresetNavigationStatus::Completed);
+    }
+
+    #[tokio::test]
+    async fn uncertain_preset_approval_keeps_no_replay_guard_after_expiry_and_reallocation() {
+        let (manager, session, _record, prompt_id) = preset_pending_fixture().await;
+        let old_port = manager.get_port(&session).await.unwrap();
+        let error = manager.respond_confirmation_locked_with(&session, &prompt_id, true,
+            |_session, _port, _pending, _upstream_id, _approve| {
+                Err(BrowserConfirmationFailure::MaybeApplied("approval reply was lost".into()))
+            }).await.unwrap_err();
+        assert_eq!(error, "approval reply was lost");
+        {
+            let mut sessions = manager.sessions.lock().await;
+            let stream = sessions.get_mut(&session).unwrap();
+            assert_eq!(stream.preset_navigation.as_ref().unwrap().phase,
+                PresetNavigationPhase::FailedAmbiguous);
+            assert_eq!(stream.preset_navigation.as_ref().unwrap().prompt_id.as_deref(),
+                Some(prompt_id.as_str()));
+            assert!(!stream.pending_confirmation.as_ref().unwrap().decision_in_flight);
+            stream.pending_confirmation.as_mut().unwrap().expires_at = Instant::now() - Duration::from_millis(1);
+        }
+        manager.clear_expired_confirmation(&session).await;
+        assert_eq!(manager.preset_navigation_status(&session).await.unwrap(),
+            Some(BrowserPresetNavigationStatus::Failed));
+
+        // The daemon exits and the stream gets a new port. The approved open
+        // may have run before its reply was lost, so reconnect cannot repeat it.
+        manager.clear_stale_running_stream_allocation(&session, old_port).await;
+        manager.next_port.store(old_port.saturating_add(1), Ordering::Relaxed);
+        let new_port = manager.allocate_port(&session).await.unwrap();
+        assert_ne!(new_port, old_port);
+        manager.allow_test_stream_port(new_port).await;
+        let replacement = current_process_stream_identity(new_port);
+        {
+            let mut sessions = manager.sessions.lock().await;
+            let stream = sessions.get_mut(&session).unwrap();
+            stream.running = true;
+            stream.browser_ready = true;
+            stream.pid = Some(replacement.pid);
+            stream.pid_start_time = Some(replacement.start_time);
+            stream.stream_generation = replacement.generation;
+            assert_eq!(stream.preset_navigation.as_ref().unwrap().phase,
+                PresetNavigationPhase::FailedAmbiguous);
+        }
+        assert_eq!(manager.ensure_preset_navigation(&session, "https://example.com".into(), false).await.unwrap(),
+            BrowserPresetNavigationStatus::Failed);
+    }
+
+    #[tokio::test]
+    async fn preset_approval_before_send_error_stays_retryable_and_known_retry_settles() {
+        let (manager, session, record, prompt_id) = preset_pending_fixture().await;
+        let error = manager.respond_confirmation_locked_with(&session, &prompt_id, true,
+            |_session, _port, _pending, _upstream_id, _approve| {
+                Err(BrowserConfirmationFailure::BeforeSend("daemon changed before send".into()))
+            }).await.unwrap_err();
+        assert_eq!(error, "daemon changed before send");
+        assert_eq!(manager.preset_navigation_status(&session).await.unwrap(),
+            Some(BrowserPresetNavigationStatus::Pending));
+
+        let error = manager.respond_confirmation_locked_with(&session, &prompt_id, true,
+            |_session, _port, _pending, _upstream_id, _approve| {
+                Err(BrowserConfirmationFailure::MaybeApplied("reply lost".into()))
+            }).await.unwrap_err();
+        assert_eq!(error, "reply lost");
+        apply_preset_decision_for_test(&manager, &session, &prompt_id, record, true,
+            BrowserConfirmationResponse::Resolved).await.unwrap();
+        assert_eq!(manager.preset_navigation_status(&session).await.unwrap(),
+            Some(BrowserPresetNavigationStatus::Completed));
     }
 
     #[tokio::test]
