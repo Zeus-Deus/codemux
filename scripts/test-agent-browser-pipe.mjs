@@ -81,6 +81,21 @@ async function cli(session, args, options) {
   return run(binary, ['--session', session, ...args], options);
 }
 
+async function closeManaged(session, description) {
+  const deadline = Date.now() + 24_000;
+  for (;;) {
+    const remaining = deadline - Date.now();
+    assert(remaining > 0, `${description} did not finish cleanup within 24 seconds`);
+    const result = await cli(session, ['close'], { timeout: Math.min(20_000, remaining) });
+    if (result.ok) return result.stdout;
+    const output = `${result.stdout}\n${result.stderr}`.trim();
+    if (!/^(?:✗\s*)?Managed Chrome cleanup is still in progress; retry the command$/.test(output)) {
+      return requireSuccess(result, description);
+    }
+    await new Promise((done) => setTimeout(done, 200));
+  }
+}
+
 async function unixChromePid(profile) {
   if (process.platform === 'linux') {
     for (const entry of await readdir('/proc')) {
@@ -193,7 +208,7 @@ try {
     assert(!result.ok && expected.test(`${result.stdout}\n${result.stderr}`),
       `${command.join(' ')} exposed managed CDP: ${result.stdout}\n${result.stderr}`);
   }
-  requireSuccess(await cli(managed, ['close']), 'close managed Chromium');
+  await closeManaged(managed, 'close managed Chromium');
   sessions.pop();
   await waitFor(() => !alive(chromePid), 'managed Chromium exit');
 
@@ -205,10 +220,11 @@ try {
   assert(!existsSync(join(blankProfile, 'DevToolsActivePort')),
     'No-URL managed launch wrote DevToolsActivePort');
   const blankPid = process.platform === 'win32'
-    ? await checkWindowsHandlesAndListeners(blankProfile) : null;
-  requireSuccess(await cli(blank, ['close']), 'close no-URL Chromium');
+    ? await checkWindowsHandlesAndListeners(blankProfile) : await unixChromePid(blankProfile);
+  assert(blankPid, 'No-URL Chromium process was not found');
+  await closeManaged(blank, 'close no-URL Chromium');
   sessions.pop();
-  if (blankPid) await waitFor(() => !alive(blankPid), 'no-URL Chromium exit');
+  await waitFor(() => !alive(blankPid), 'no-URL Chromium exit');
 
   for (const [index, flag] of ['--remote-debugging-port=0', '-remote-debugging-port=0',
     '/remote-debugging-port=0', '--remote-debugging-pipe',
