@@ -5884,7 +5884,7 @@ mod tests {
             let manager = manager.clone();
             let session = session.clone();
             tasks.push(tokio::spawn(async move {
-                manager.refresh_running_session(&session, &session, BrowserActionOutcome::Failed).await
+                manager.refresh_running_session(&session, &session, BrowserActionOutcome::Failed, None).await
             }));
         }
         tokio::time::sleep(Duration::from_millis(10)).await;
