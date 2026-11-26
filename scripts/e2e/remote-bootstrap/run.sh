@@ -503,9 +503,16 @@ run_distro() {
     banner "${distro} · step d — managed pairing stays private"
 
     local pair_out serve_log
-    pair_out=$(uexec "$distro" "codemux remote pair; echo RC=\$?")
-    assert_not_contains "standalone SSH cannot mint another pairing code" "$pair_out" "RC=0"
-    assert_contains "standalone pairing reports owner access required" "$pair_out" "needs verified owner access"
+    if pair_out=$(uexec "$distro" "codemux remote pair"); then
+        fail "standalone SSH cannot mint another pairing code" "unexpected success; output redacted"
+    else
+        pass "standalone SSH cannot mint another pairing code"
+    fi
+    if [[ "$pair_out" == *"needs verified owner access"* ]]; then
+        pass "standalone pairing reports owner access required"
+    else
+        fail "standalone pairing reports owner access required" "expected owner refusal; output redacted"
+    fi
     if serve_log=$(rexec "$distro" journalctl "_UID=${uid}" --no-pager -o cat 2>&1); then
         pass "managed service journal is readable"
         if [[ "$serve_log" == *"Pairing link:"* ]]; then
@@ -642,9 +649,16 @@ except Exception as e:
     # ── (e3) a second SSH CLI cannot change the live listener ────────────
     banner "${distro} · step e3 — standalone Remote Access change refused"
     local enable_out
-    enable_out=$(uexec "$distro" "codemux remote enable --port 4399; echo RC=\$?")
-    assert_not_contains "standalone SSH cannot change Remote Access" "$enable_out" "RC=0"
-    assert_contains "Remote Access change reports owner access required" "$enable_out" "needs verified owner access"
+    if enable_out=$(uexec "$distro" "codemux remote enable --port 4399"); then
+        fail "standalone SSH cannot change Remote Access" "unexpected success; output redacted"
+    else
+        pass "standalone SSH cannot change Remote Access"
+    fi
+    if [[ "$enable_out" == *"needs verified owner access"* ]]; then
+        pass "Remote Access change reports owner access required"
+    else
+        fail "Remote Access change reports owner access required" "expected owner refusal; output redacted"
+    fi
     uexec "$distro" "systemctl --user restart codemux.service" >/dev/null
     wait_for_port "$distro" "$CODEMUX_PORT"
     assert_contains "refused change did not persist port 4399" "$(settings_row "$distro")" "\"port\":${CODEMUX_PORT}"
