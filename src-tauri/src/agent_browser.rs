@@ -1526,17 +1526,26 @@ fn linux_browser_close_namespaces_clear_in(session: &str, roots: &[PathBuf]) -> 
     }
     !roots.is_empty() && roots.iter().all(|root| {
         let current = root.join(BROWSER_DAEMON_DIR);
+        let owned_pid = session_pid_path_in(root, session)
+            .and_then(|path| read_browser_pid_record(&path))
+            .map(|record| record.pid);
         [root.as_path(), current.as_path()].iter().all(|dir| {
+            // This session could never have published its Unix control
+            // socket in a directory beyond the kernel path limit.
+            if !browser_socket_path_fits(dir, session) {
+                return true;
+            }
             let pid_path = dir.join(format!("{session}.pid"));
             let pid_absent = match std::fs::symlink_metadata(&pid_path) {
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => true,
                 // A prefixed session can share this legacy root filename
-                // with another session's structured Codemux record.
+                // with another session's structured or numeric record.
                 Ok(_) if *dir == root.as_path() && read_browser_pid_record(&pid_path).is_some() => true,
+                Ok(_) if *dir == root.as_path() && read_daemon_pid_file(&pid_path)
+                    .is_some_and(|pid| Some(pid) != owned_pid) => true,
                 _ => false,
             };
-            pid_absent && (!browser_socket_path_fits(dir, session)
-                || probe_browser_control_endpoint(session, dir) == BrowserControlEndpointProbe::Absent)
+            pid_absent && probe_browser_control_endpoint(session, dir) == BrowserControlEndpointProbe::Absent
         })
     })
 }
@@ -9236,6 +9245,9 @@ mod tests {
         write_browser_pid_record(&foreign_record, &record).unwrap();
         assert!(linux_browser_close_namespaces_clear_in(session, &roots));
         std::fs::write(&foreign_record, "12345").unwrap();
+        assert!(linux_browser_close_namespaces_clear_in(session, &roots));
+        let own_record = session_pid_path_in(root, session).unwrap();
+        write_browser_pid_record(&own_record, &record).unwrap();
         assert!(!linux_browser_close_namespaces_clear_in(session, &roots));
     }
 
@@ -9247,6 +9259,7 @@ mod tests {
         std::fs::create_dir(&root).unwrap();
         let session = "browser-long-control-path";
         assert!(!browser_socket_path_fits(&root, session));
+        std::fs::write(root.join(format!("{session}.pid")), "12345").unwrap();
         assert!(linux_browser_close_namespaces_clear_in(session, &[root]));
     }
 
