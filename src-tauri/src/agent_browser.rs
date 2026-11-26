@@ -4030,6 +4030,7 @@ fn matching_preset_prompt_id(
 ) -> Option<String> {
     let tracked = stream.pid.zip(stream.pid_start_time).map(|(pid, start_time)| BrowserStreamIdentity {
         port: stream.port, pid, start_time, generation: stream.stream_generation,
+        listener_token: attempted.listener_token,
     });
     // Unix CLI dispatch is not peer-bound: a prompt without both observed
     // daemon identities cannot be attributed to the pre-dispatch process.
@@ -9285,7 +9286,7 @@ mod tests {
 
     #[test]
     fn unbound_pending_preset_requires_tracked_daemon_and_prompt_record() {
-        let identity = BrowserStreamIdentity { port: 9223, pid: 41, start_time: 100, generation: 1 };
+        let identity = BrowserStreamIdentity { port: 9223, pid: 41, start_time: 100, generation: 1, listener_token: [7; 32] };
         let pending = PendingBrowserConfirmation::new(
             BrowserConfirmationDetails { id: Some("open".into()), description: "Approve open".into() },
             Some(test_browser_record(identity.pid, identity.start_time, "a".repeat(32))),
