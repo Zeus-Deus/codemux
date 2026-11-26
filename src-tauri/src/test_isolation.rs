@@ -50,7 +50,13 @@ pub(crate) fn isolated(test_path: &str) -> bool {
     // A private runtime dir: a child that dials the control socket must never
     // fall back to the developer's running app.
     let runtime = root.path().join("run");
-    std::fs::create_dir(&runtime).unwrap();
+    let mut builder = std::fs::DirBuilder::new();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        builder.mode(0o700);
+    }
+    builder.create(&runtime).unwrap();
     let mut command = Command::new(std::env::current_exe().unwrap());
     command
         .current_dir(root.path())

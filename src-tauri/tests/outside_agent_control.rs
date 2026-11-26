@@ -25,6 +25,7 @@ use codemux_lib::mcp_connector;
 use serde_json::{json, Value};
 use std::collections::{BTreeSet, HashMap};
 use std::io::{BufRead, BufReader, Write};
+use std::os::unix::fs::{FileTypeExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, ExitStatus, Output, Stdio};
 use std::sync::mpsc;
@@ -142,6 +143,8 @@ fn boot() -> World {
         .unwrap();
     // The socket path must fit `sun_path`, so it gets a short dir of its own.
     let runtime = tempfile::Builder::new().prefix("oac-").tempdir().unwrap().keep();
+    std::fs::set_permissions(&runtime, std::fs::Permissions::from_mode(0o700)).unwrap();
+    assert_eq!(std::fs::metadata(&runtime).unwrap().permissions().mode() & 0o777, 0o700);
     let bin = root.join("bin");
     let home = root.join("home");
     let logs = root.join("logs");
@@ -220,6 +223,12 @@ fn boot() -> World {
     Box::leak(Box::new(app));
 
     eventually("the control socket answers", Duration::from_secs(30), || env.cli(&["json", "status", "{}"], &[]).status.success());
+    let socket_name = if cfg!(debug_assertions) { "codemux-dev.sock" } else { "codemux.sock" };
+    let socket = runtime.join(socket_name);
+    assert!(
+        std::fs::symlink_metadata(&socket).is_ok_and(|meta| meta.file_type().is_socket()),
+        "the fixture must bind its own control socket: {socket:?}"
+    );
     // Setup bound the saved port. Something may have taken it since it was
     // probed; then move the connector to another free port (the bind is
     // synchronous, so the status says at once whether it listens).

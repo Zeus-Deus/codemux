@@ -216,14 +216,122 @@ mod unix_transport {
 
 #[cfg(windows)]
 mod windows_transport {
+    use std::io;
+    use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
     use std::path::Path;
     use tokio::net::windows::named_pipe::{
         ClientOptions, NamedPipeClient, NamedPipeServer, ServerOptions,
     };
     use tokio::sync::Mutex;
+    use windows_sys::Win32::{
+        Foundation::HANDLE,
+        Security::{EqualSid, GetTokenInformation, TokenUser, TOKEN_QUERY, TOKEN_USER},
+        System::{
+            Pipes::{GetNamedPipeClientProcessId, GetNamedPipeServerProcessId},
+            Threading::{
+                GetCurrentProcess, OpenProcess, OpenProcessToken,
+                PROCESS_QUERY_LIMITED_INFORMATION,
+            },
+        },
+    };
 
     pub type ServerStream = NamedPipeServer;
     pub type ClientStream = NamedPipeClient;
+
+    fn invalid_peer(message: &'static str) -> io::Error {
+        io::Error::new(io::ErrorKind::PermissionDenied, message)
+    }
+
+    fn process_token(process: HANDLE) -> io::Result<OwnedHandle> {
+        let mut token = std::ptr::null_mut();
+        if unsafe { OpenProcessToken(process, TOKEN_QUERY, &mut token) } == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        if token.is_null() {
+            return Err(invalid_peer("control pipe process has no token"));
+        }
+        // SAFETY: OpenProcessToken returned an owned, non-null handle.
+        Ok(unsafe { OwnedHandle::from_raw_handle(token) })
+    }
+
+    fn token_user(token: &OwnedHandle) -> io::Result<Vec<usize>> {
+        let mut required = 0u32;
+        unsafe {
+            GetTokenInformation(
+                token.as_raw_handle(),
+                TokenUser,
+                std::ptr::null_mut(),
+                0,
+                &mut required,
+            );
+        }
+        if required < std::mem::size_of::<TOKEN_USER>() as u32 || required > 65_536 {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "invalid token user size"));
+        }
+        // Vec<usize> provides the alignment required by TOKEN_USER. Windows
+        // writes the SID into this same buffer and sets User.Sid to point at it.
+        let words = (required as usize).div_ceil(std::mem::size_of::<usize>());
+        let mut buffer = vec![0usize; words];
+        if unsafe {
+            GetTokenInformation(
+                token.as_raw_handle(),
+                TokenUser,
+                buffer.as_mut_ptr().cast(),
+                (words * std::mem::size_of::<usize>()) as u32,
+                &mut required,
+            )
+        } == 0
+        {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(buffer)
+    }
+
+    fn same_user_process(pid: u32) -> io::Result<()> {
+        if pid == 0 {
+            return Err(invalid_peer("control pipe peer has no process id"));
+        }
+        let process = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
+        if process.is_null() {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: OpenProcess returned an owned, non-null handle.
+        let process = unsafe { OwnedHandle::from_raw_handle(process) };
+        let peer_token = process_token(process.as_raw_handle())?;
+        let owner_token = process_token(unsafe { GetCurrentProcess() })?;
+        let peer_user = token_user(&peer_token)?;
+        let owner_user = token_user(&owner_token)?;
+        // SAFETY: both aligned buffers contain TOKEN_USER values returned by
+        // GetTokenInformation, and remain alive through the SID comparison.
+        let peer_sid = unsafe { (*(peer_user.as_ptr().cast::<TOKEN_USER>())).User.Sid };
+        let owner_sid = unsafe { (*(owner_user.as_ptr().cast::<TOKEN_USER>())).User.Sid };
+        if peer_sid.is_null() || owner_sid.is_null() || unsafe { EqualSid(peer_sid, owner_sid) } == 0 {
+            return Err(invalid_peer("control pipe peer is not this OS user"));
+        }
+        Ok(())
+    }
+
+    fn client_pid(server: &NamedPipeServer) -> io::Result<u32> {
+        let mut pid = 0;
+        if unsafe { GetNamedPipeClientProcessId(server.as_raw_handle(), &mut pid) } == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        if pid == 0 {
+            return Err(invalid_peer("control pipe client has no process id"));
+        }
+        Ok(pid)
+    }
+
+    fn authenticate_server(handle: HANDLE) -> io::Result<()> {
+        let mut pid = 0;
+        if unsafe { GetNamedPipeServerProcessId(handle, &mut pid) } == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        if pid == 0 {
+            return Err(invalid_peer("control pipe server has no process id"));
+        }
+        same_user_process(pid)
+    }
 
     /// Wraps the "current waiting server instance" for a named pipe. Windows
     /// named pipes consume a server instance on every client connect, so we
@@ -249,23 +357,30 @@ mod windows_transport {
     }
 
     impl Listener {
-        /// The stream and the peer's pid. Named pipes report none here, so
-        /// only the env marker identifies agent processes on Windows.
+        /// The stream and the connecting process's kernel-reported pid. A
+        /// foreign account cannot acquire the owner's control authority even
+        /// if the process default pipe ACL is wider than expected.
         pub async fn accept(&self) -> std::io::Result<(ServerStream, Option<u32>)> {
             let mut guard = self.pending.lock().await;
-            let server = guard.take().ok_or_else(|| {
-                std::io::Error::new(
-                    std::io::ErrorKind::Other,
-                    "named pipe listener has no pending server instance",
-                )
-            })?;
-            server.connect().await?;
-            // Eagerly create the next server instance so the listener is
-            // ready to accept another client as soon as this one is handed
-            // to its handler task.
-            let next = ServerOptions::new().create(&self.pipe_name)?;
-            *guard = Some(next);
-            Ok((server, None))
+            loop {
+                let pending = guard.as_ref().ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::Other, "named pipe listener has no pending server instance")
+                })?;
+                let connected = pending.connect().await;
+                let server = guard.take().expect("pending server exists");
+                // Re-arm before examining the connected process. Rejected
+                // clients and aborted connects must not disable the listener.
+                *guard = Some(ServerOptions::new().create(&self.pipe_name)?);
+                if connected.is_err() {
+                    continue;
+                }
+                match client_pid(&server).and_then(|pid| same_user_process(pid).map(|()| pid)) {
+                    Ok(pid) => return Ok((server, Some(pid))),
+                    Err(error) => {
+                        crate::diagnostics::stderr_line(&format!("[codemux::control] Refused named pipe client: {error}"));
+                    }
+                }
+            }
         }
     }
 
@@ -295,7 +410,10 @@ mod windows_transport {
                 tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
             }
             match ClientOptions::new().open(&pipe_name) {
-                Ok(stream) => return Ok(stream),
+                Ok(stream) => {
+                    authenticate_server(stream.as_raw_handle())?;
+                    return Ok(stream);
+                }
                 Err(err) if err.raw_os_error() == Some(ERROR_PIPE_BUSY) => {
                     last_err = Some(err);
                     continue;
@@ -311,16 +429,36 @@ mod windows_transport {
         }))
     }
 
-    /// Blocking probe: does a server respond on this pipe right now?
-    /// Opens the pipe via the std sync API so this is callable before the
-    /// tokio runtime exists.
+    /// Blocking probe: an owned server must be listening, not merely any
+    /// process that claimed the predictable name before the app started.
     pub fn sync_liveness_probe(path: &Path) -> bool {
         let pipe_name = path.to_string_lossy().into_owned();
-        std::fs::OpenOptions::new()
+        let Ok(stream) = std::fs::OpenOptions::new()
             .read(true)
             .write(true)
             .open(&pipe_name)
-            .is_ok()
+        else {
+            return false;
+        };
+        match authenticate_server(stream.as_raw_handle()) {
+            Ok(()) => true,
+            Err(error) => {
+                crate::diagnostics::stderr_line(&format!("[codemux::control] Ignoring untrusted named pipe server: {error}"));
+                false
+            }
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::same_user_process;
+
+        #[test]
+        fn process_user_must_be_attested() {
+            same_user_process(std::process::id()).expect("current process has its own user SID");
+            assert!(same_user_process(0).is_err());
+            assert!(same_user_process(u32::MAX).is_err());
+        }
     }
 }
 
@@ -371,14 +509,20 @@ const SOCKET_BASENAME: &str = "codemux";
 #[cfg(unix)]
 pub fn control_socket_path() -> Option<PathBuf> {
     let socket_file = format!("{SOCKET_BASENAME}.sock");
+    let uid = unsafe { libc::geteuid() };
     if let Some(runtime_dir) = std::env::var_os("XDG_RUNTIME_DIR").map(PathBuf::from) {
-        return Some(runtime_dir.join(&socket_file));
+        if private_runtime_dir(&runtime_dir, uid) {
+            return Some(runtime_dir.join(&socket_file));
+        }
+        crate::diagnostics::stderr_line(&format!(
+            "[codemux::control] XDG_RUNTIME_DIR {} is not an owned private directory; using the fallback",
+            runtime_dir.display()
+        ));
     }
 
     // Create the fallback privately in one operation. An existing entry
     // must already be a private directory owned by this account.
     use std::os::unix::fs::{DirBuilderExt, MetadataExt};
-    let uid = unsafe { libc::geteuid() };
     let fallback_dir = fallback_runtime_dir(uid);
     if let Err(error) = fs::DirBuilder::new().mode(0o700).create(&fallback_dir) {
         let private = error.kind() == std::io::ErrorKind::AlreadyExists
@@ -393,10 +537,18 @@ pub fn control_socket_path() -> Option<PathBuf> {
         }
     }
     crate::diagnostics::stderr_line(&format!(
-        "[codemux::control] XDG_RUNTIME_DIR unset, using fallback: {}",
+        "[codemux::control] Using fallback runtime dir: {}",
         fallback_dir.display()
     ));
     Some(fallback_dir.join(&socket_file))
+}
+
+#[cfg(unix)]
+fn private_runtime_dir(path: &std::path::Path, uid: u32) -> bool {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    path.is_absolute() && fs::symlink_metadata(path).is_ok_and(|meta| {
+        meta.is_dir() && meta.uid() == uid && meta.permissions().mode() & 0o777 == 0o700
+    })
 }
 
 /// The runtime dir the server falls back to without `XDG_RUNTIME_DIR`.
@@ -415,7 +567,7 @@ fn fallback_runtime_dir(uid: u32) -> PathBuf {
 pub(crate) fn control_socket_candidates() -> Vec<PathBuf> {
     let uid = unsafe { libc::geteuid() };
     socket_candidates(
-        std::env::var_os("XDG_RUNTIME_DIR").map(PathBuf::from),
+        std::env::var_os("XDG_RUNTIME_DIR").map(PathBuf::from).filter(|dir| private_runtime_dir(dir, uid)),
         std::path::Path::new("/run/user"),
         uid,
         || client_fallback_socket(fallback_runtime_dir(uid), uid),
@@ -454,14 +606,13 @@ fn socket_candidates(
     uid: u32,
     fallback: impl FnOnce() -> Option<PathBuf>,
 ) -> Vec<PathBuf> {
-    use std::os::unix::fs::MetadataExt;
     let socket_file = format!("{SOCKET_BASENAME}.sock");
     if let Some(runtime_dir) = xdg_runtime_dir {
         return vec![runtime_dir.join(socket_file)];
     }
     let runtime_dir = run_user.join(uid.to_string());
     let mut candidates = Vec::new();
-    if fs::metadata(&runtime_dir).is_ok_and(|meta| meta.is_dir() && meta.uid() == uid) {
+    if private_runtime_dir(&runtime_dir, uid) {
         candidates.push(runtime_dir.join(&socket_file));
     }
     candidates.extend(fallback());
@@ -2538,13 +2689,10 @@ fn resolve_control_repo_path<R: Runtime>(
 }
 
 // ---------------------------------------------------------------------------
-// Transport-layer tests
+// Control and transport tests
 //
-// These exercise the platform abstraction in `transport` without involving
-// the Tauri runtime or any command handlers — the point is to prove that
-// bind / connect / accept / liveness-probe all work on every supported
-// platform. Higher-level control-command tests would require a real
-// AppHandle, which is out of scope for a unit test.
+// The Windows external-peer test crosses a real named pipe from a separate
+// process into request dispatch with a mock AppHandle.
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
@@ -2901,7 +3049,9 @@ mod tests {
         tokio::io::WriteHalf<tokio::io::DuplexStream>,
     ) {
         let (client, server) = tokio::io::duplex(1 << 16);
-        let served = tokio::spawn(handle_client(app.handle().clone(), server, None));
+        // A duplex stream has no kernel peer credentials. Supply this test
+        // process as the verified peer so wait behavior reaches the handler.
+        let served = tokio::spawn(handle_client(app.handle().clone(), server, Some(std::process::id())));
         let (reader, writer) = tokio::io::split(client);
         (served, BufReader::new(reader).lines(), writer)
     }
@@ -3108,11 +3258,15 @@ mod tests {
         assert_eq!(socket_candidates(None, run_user.path(), uid, tmp), vec![fallback.clone()], "no runtime dir yet");
         let own = run_user.path().join(uid.to_string());
         fs::create_dir(&own).unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&own, fs::Permissions::from_mode(0o700)).unwrap();
         assert_eq!(
             socket_candidates(None, run_user.path(), uid, tmp),
             vec![own.join(&socket_file), fallback.clone()],
             "the systemd runtime dir comes before the /tmp fallback"
         );
+        fs::set_permissions(&own, fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(socket_candidates(None, run_user.path(), uid, tmp), vec![fallback.clone()], "a shared runtime dir is not used");
         let foreign = run_user.path().join((uid + 1).to_string());
         fs::create_dir(&foreign).unwrap();
         assert_eq!(
@@ -3137,6 +3291,24 @@ mod tests {
         let own = root.path().to_path_buf();
         assert_eq!(client_fallback_socket(own.clone(), uid), Some(own.join(&socket_file)));
         assert_eq!(client_fallback_socket(own, uid + 1), None, "a dir another uid owns is never used");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn private_runtime_directory_rejects_symlinks_and_shared_modes() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let root = tempfile::tempdir().unwrap();
+        let uid = fs::metadata(root.path()).unwrap().uid();
+        let private = root.path().join("private");
+        fs::create_dir(&private).unwrap();
+        fs::set_permissions(&private, fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(private_runtime_dir(&private, uid));
+        assert!(!private_runtime_dir(&private, uid.wrapping_add(1)));
+        let link = root.path().join("link");
+        std::os::unix::fs::symlink(&private, &link).unwrap();
+        assert!(!private_runtime_dir(&link, uid));
+        fs::set_permissions(&private, fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(!private_runtime_dir(&private, uid));
     }
 
     /// A one-connection-at-a-time line server: answers every line with
@@ -4186,6 +4358,63 @@ mod tests {
         assert_eq!(response.as_deref(), Some("hello"));
 
         server.abort();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "only run as a child of test_named_pipe_external_owner_claim_is_read_only"]
+    fn named_pipe_external_owner_claim_worker() {
+        let path = PathBuf::from(std::env::var_os("CODEMUX_TEST_CONTROL_PIPE").expect("test pipe path"));
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        runtime.block_on(async {
+            let mut connection = Connection::open(&[path]).await.expect("connect to test pipe");
+            let client = Some(ControlClient {
+                name: Some("owner".into()),
+                access: Some(crate::agent_control::ControlAccess::FullAccess),
+                agent: None,
+            });
+            let read = connection.exchange(&ControlEnvelope {
+                request: request("status", serde_json::json!({})), client: client.clone(),
+            }).await.unwrap();
+            assert!(read.ok, "an unverified peer can read: {:?}", read.error);
+            let write = connection.exchange(&ControlEnvelope {
+                request: request("notify", serde_json::json!({"message":"must not appear"})), client: client.clone(),
+            }).await.unwrap();
+            assert!(refused_with(&write, "access_denied"), "owner claim cannot write: {:?}", write.error);
+            assert!(write.error.as_deref().is_some_and(|error| error.contains("cannot prove owner authority")), "write refusal should explain the limit: {:?}", write.error);
+            let admin = connection.exchange(&ControlEnvelope {
+                request: request("web_remote_enable", serde_json::json!({})), client,
+            }).await.unwrap();
+            assert!(refused_with(&admin, "admin_refused"), "owner claim cannot administer: {:?}", admin.error);
+        });
+    }
+
+    #[cfg(windows)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_named_pipe_external_owner_claim_is_read_only() {
+        let path = random_pipe_path();
+        let listener = transport::bind(&path).expect("bind named pipe");
+        let child = tokio::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "control::tests::named_pipe_external_owner_claim_worker", "--ignored", "--nocapture"])
+            .env("CODEMUX_TEST_CONTROL_PIPE", &path)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .expect("launch separate pipe client");
+        let child_pid = child.id().expect("client pid");
+        let (stream, peer_pid) = tokio::time::timeout(std::time::Duration::from_secs(10), listener.accept())
+            .await.expect("client connected in time").expect("accept named-pipe client");
+        assert_eq!(peer_pid, Some(child_pid), "the pipe must report the external client's kernel PID");
+
+        let app = operation_app();
+        let served = tokio::spawn(handle_client(app.handle().clone(), stream, peer_pid));
+        let output = tokio::time::timeout(std::time::Duration::from_secs(10), child.wait_with_output())
+            .await.expect("client finished in time").expect("wait for pipe client");
+        assert!(output.status.success(), "client failed:\n{}\n{}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
+        assert_eq!(tokio::time::timeout(std::time::Duration::from_secs(5), served).await.unwrap().unwrap(), Ok(()));
+        assert!(app.state::<AppStateStore>().snapshot().notifications.is_empty(), "denied write changed app state");
     }
 
     #[cfg(windows)]
