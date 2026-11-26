@@ -1310,22 +1310,37 @@ fn stop_owned_browser_daemon(session: &str, record: &BrowserPidRecord, bin: &str
     if !browser_process_matches(record, session) {
         return;
     }
+    #[cfg(target_os = "linux")]
+    let pidfd = verified_browser_pidfd(record, session);
     // Capture the verified directory while its daemon is still alive. After
     // exit, namespace selection can switch from the legacy root to d/.
     #[cfg(windows)]
     let control_dir = verified_browser_control_dir(session, record);
-    // Windows stops through a retained, identity-checked process handle. A
-    // missing or replaced PID file must not prevent cleanup of that process.
-    #[cfg(not(windows))]
+    // Windows and Linux retain identity-checked process handles. A missing or
+    // replaced PID file must not prevent cleanup of that process.
+    #[cfg(all(not(windows), not(target_os = "linux")))]
     if read_agent_browser_daemon_pid(session) != Some(record.pid) {
         return;
     }
-    // Windows retains a verified process handle. macOS closes through a
-    // verified connected peer below; a CLI path lookup could reach a
+    // Windows retains a verified process handle. Linux and macOS close
+    // through a verified connected peer; a CLI path lookup could reach a
     // replacement daemon after this PID check.
-    #[cfg(any(windows, target_os = "macos"))]
+    #[cfg(any(windows, target_os = "linux", target_os = "macos"))]
     let _ = bin;
-    #[cfg(all(not(windows), not(target_os = "macos")))]
+    #[cfg(target_os = "linux")]
+    {
+        let deadline = Instant::now() + CLOSE_TIMEOUT;
+        let result = run_dir_for_session(session)
+            .map(|dir| dir.join(format!("{session}.sock")))
+            .ok_or_else(|| "Browser control path is unavailable".to_string())
+            .and_then(|path| close_verified_unix_browser_peer(
+                &path, record.pid, deadline, || browser_process_matches(record, session), || {},
+            ));
+        if let Err(error) = result {
+            eprintln!("[codemux::browser] Could not gracefully close browser session {session}: {error}");
+        }
+    }
+    #[cfg(all(not(windows), not(target_os = "linux"), not(target_os = "macos")))]
     {
         let mut cmd = std::process::Command::new("sh");
         if set_browser_owner_env(&mut cmd, session).is_ok() {
@@ -1343,7 +1358,15 @@ fn stop_owned_browser_daemon(session: &str, record: &BrowserPidRecord, bin: &str
             cleanup_owned_browser_lock_files_in(dir, session, record.pid);
         }
     }
-    #[cfg(not(windows))]
+    #[cfg(target_os = "linux")]
+    if browser_process_matches(record, session) {
+        if let Some(pidfd) = pidfd.as_ref() {
+            stop_verified_browser_pidfd(pidfd, record, session);
+        } else {
+            eprintln!("[codemux::browser] Cannot safely signal browser session {session}: pidfd or process identity unavailable");
+        }
+    }
+    #[cfg(all(not(windows), not(target_os = "linux")))]
     if browser_process_matches(record, session) {
         kill_verified_browser_pid(record, session);
     }
@@ -1415,7 +1438,7 @@ fn connect_unix_browser_control_until(
 /// Send close on the connection whose kernel-reported peer is the verified
 /// daemon. Resolving the socket again through the CLI could reach a process
 /// that replaced the listener after the ownership check.
-#[cfg(all(unix, any(test, target_os = "macos")))]
+#[cfg(all(unix, any(test, target_os = "linux", target_os = "macos")))]
 fn close_verified_unix_browser_peer(
     socket_path: &std::path::Path,
     expected_pid: u32,
@@ -1474,7 +1497,7 @@ fn close_verified_unix_browser_peer(
     Ok(())
 }
 
-#[cfg(all(unix, any(test, target_os = "macos")))]
+#[cfg(all(unix, any(test, target_os = "linux", target_os = "macos")))]
 fn unix_browser_control_peer_pid(stream: &std::os::unix::net::UnixStream) -> std::io::Result<u32> {
     use std::os::fd::AsRawFd;
 
@@ -1603,6 +1626,19 @@ fn signal_browser_pidfd(pidfd: &std::os::fd::OwnedFd, signal: libc::c_int) -> st
     if result < 0 { Err(std::io::Error::last_os_error()) } else { Ok(()) }
 }
 
+#[cfg(target_os = "linux")]
+fn stop_verified_browser_pidfd(pidfd: &std::os::fd::OwnedFd, record: &BrowserPidRecord, session: &str) {
+    let _ = signal_browser_pidfd(pidfd, libc::SIGTERM);
+    std::thread::sleep(Duration::from_millis(200));
+    if browser_process_matches(record, session) {
+        let _ = signal_browser_pidfd(pidfd, libc::SIGKILL);
+    }
+    let started = Instant::now();
+    while browser_process_matches(record, session) && started.elapsed() < Duration::from_secs(1) {
+        std::thread::sleep(Duration::from_millis(25));
+    }
+}
+
 #[cfg(not(windows))]
 fn kill_verified_browser_pid(record: &BrowserPidRecord, session: &str) {
     #[cfg(target_os = "linux")]
@@ -1611,15 +1647,7 @@ fn kill_verified_browser_pid(record: &BrowserPidRecord, session: &str) {
             eprintln!("[codemux::browser] Cannot safely signal browser session {session}: pidfd or process identity unavailable");
             return;
         };
-        let _ = signal_browser_pidfd(&pidfd, libc::SIGTERM);
-        std::thread::sleep(Duration::from_millis(200));
-        if browser_process_matches(record, session) {
-            let _ = signal_browser_pidfd(&pidfd, libc::SIGKILL);
-        }
-        let started = Instant::now();
-        while browser_process_matches(record, session) && started.elapsed() < Duration::from_secs(1) {
-            std::thread::sleep(Duration::from_millis(25));
-        }
+        stop_verified_browser_pidfd(&pidfd, record, session);
     }
     #[cfg(target_os = "macos")]
     close_verified_browser_pid_until(record, session, Instant::now() + CLOSE_TIMEOUT);
@@ -8608,6 +8636,74 @@ mod tests {
         assert!(!session_pid_path(&session).unwrap().exists(), "close left the old Codemux record");
         assert!(!failed_stream_attempts().lock().unwrap().get(&session)
             .is_some_and(|attempts| attempts.contains(&attempt)));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_shutdown_rejects_a_replaced_control_endpoint() {
+        use std::io::Read;
+        use std::os::unix::fs::PermissionsExt;
+        use std::os::unix::net::UnixListener;
+
+        struct ChildGuard(std::process::Child);
+        impl Drop for ChildGuard {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+        struct RuntimeFiles([PathBuf; 2]);
+        impl Drop for RuntimeFiles {
+            fn drop(&mut self) {
+                for path in &self.0 {
+                    let _ = std::fs::remove_file(path);
+                }
+            }
+        }
+
+        let session = format!("browser-replaced-close-{}", uuid::Uuid::new_v4().simple());
+        let (temp, daemon, record) = browser_identity_fixture(&session, browser_owner_token());
+        let mut daemon = ChildGuard(daemon);
+        let dir = run_dir_for_session(&session).unwrap();
+        let pid_path = dir.join(format!("{session}.pid"));
+        let socket_path = dir.join(format!("{session}.sock"));
+        let _runtime_files = RuntimeFiles([pid_path.clone(), socket_path.clone()]);
+        std::fs::write(&pid_path, record.pid.to_string()).unwrap();
+        let replacement = UnixListener::bind(&socket_path).unwrap();
+
+        // The old CLI would resolve the replaced socket after validating the
+        // daemon. A marker also catches attempts to invoke that CLI at all.
+        let marker = temp.path().join("close-called");
+        let cli = temp.path().join("agent-browser-close-marker");
+        std::fs::write(&cli, format!("#!/bin/sh\nprintf called > {}\n", shell_quote(marker.to_str().unwrap()))).unwrap();
+        std::fs::set_permissions(&cli, std::fs::Permissions::from_mode(0o700)).unwrap();
+        stop_owned_browser_daemon(&session, &record, cli.to_str().unwrap());
+
+        assert!(!marker.exists(), "shutdown must not resolve the endpoint through the CLI");
+        replacement.set_nonblocking(true).unwrap();
+        let started = Instant::now();
+        let mut connections = 0;
+        loop {
+            match replacement.accept() {
+                Ok((mut connection, _)) => {
+                    connection.set_nonblocking(false).unwrap();
+                    connection.set_read_timeout(Some(Duration::from_secs(1))).unwrap();
+                    let mut request = Vec::new();
+                    connection.read_to_end(&mut request).unwrap();
+                    assert!(request.is_empty(), "replacement peer must not receive close");
+                    connections += 1;
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock
+                    && connections == 0 && started.elapsed() < Duration::from_secs(2) =>
+                {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
+                Err(error) => panic!("verified close did not inspect the replacement endpoint: {error}"),
+            }
+        }
+        assert!(connections > 0, "shutdown must inspect the connected peer");
+        assert!(daemon.0.try_wait().unwrap().is_some(), "verified daemon must stop through its pidfd");
     }
 
     #[cfg(target_os = "linux")]
