@@ -923,11 +923,12 @@ fn cleanup_stale_browser_lock_files_in(dir: &std::path::Path, session: &str, pid
         } else {
             // The daemon may have removed .port before exiting. A listener on
             // the hash port is harmless only when the OS identifies a
-            // different, non-browser owner. Failed lookups remain ambiguous.
+            // different process that is not this browser session. Failed
+            // lookups remain ambiguous.
             !windows_browser_port_matches(&port_path, None)
                 || !stale_browser_hash_listener_is_unrelated(
-                    pid, windows_loopback_listener_pid(browser_control_fallback_port(session)),
-                    process_looks_like_agent_browser,
+                    pid, session, windows_loopback_listener_pid(browser_control_fallback_port(session)),
+                    browser_hash_listener_is_other_session,
                 )
         };
         #[cfg(not(windows))]
@@ -951,14 +952,61 @@ fn cleanup_stale_browser_lock_files_in(dir: &std::path::Path, session: &str, pid
 #[cfg(windows)]
 fn stale_browser_hash_listener_is_unrelated(
     stale_pid: u32,
+    session: &str,
     listener: Option<Option<u32>>,
-    looks_like_browser: impl Fn(u32) -> Option<bool>,
+    inspect_owner: impl Fn(u32, &str) -> Option<bool>,
 ) -> bool {
     match listener {
         Some(None) => true,
-        Some(Some(owner)) if owner != stale_pid => looks_like_browser(owner) == Some(false),
+        Some(Some(owner)) if owner != stale_pid => inspect_owner(owner, session) == Some(true),
         Some(Some(_)) | None => false,
     }
+}
+
+/// A listener on another session's hash port can outlive this session's
+/// metadata. Inspect the OS process rather than trusting the port or a PID
+/// filename: a browser must have one valid session and owner marker, and its
+/// native creation time must remain stable through identity verification.
+#[cfg(windows)]
+fn browser_hash_listener_is_other_session(pid: u32, session: &str) -> Option<bool> {
+    use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System, UpdateKind};
+
+    let start_before = process_start_time(pid).filter(|start| *start > 0)?;
+    let process_id = Pid::from_u32(pid);
+    let mut system = System::new();
+    system.refresh_processes_specifics(
+        ProcessesToUpdate::Some(&[process_id]), true,
+        ProcessRefreshKind::nothing()
+            .with_exe(UpdateKind::Always)
+            .with_environ(UpdateKind::Always),
+    );
+    let process = system.process(process_id)?;
+    let executable = process.exe()?.file_name()?.to_string_lossy().to_ascii_lowercase();
+    let unrelated = if executable.starts_with("agent-browser") {
+        let single_env = |key: &str| {
+            let mut values = process.environ().iter().filter_map(|entry| {
+                let entry = entry.to_string_lossy();
+                let (name, value) = entry.split_once('=')?;
+                name.eq_ignore_ascii_case(key).then(|| value.to_owned())
+            });
+            let value = values.next()?;
+            values.next().is_none().then_some(value)
+        };
+        let other_session = single_env("CODEMUX_BROWSER_SESSION")?;
+        let owner_token = single_env("CODEMUX_BROWSER_OWNER")?;
+        let control_dir = single_env("AGENT_BROWSER_SOCKET_DIR")?;
+        if validate_session_name(&other_session).is_err()
+            || owner_token.len() != 32 || !owner_token.bytes().all(|byte| byte.is_ascii_hexdigit())
+            || control_dir.is_empty()
+            || browser_process_start(pid, &other_session, &owner_token) != Some(start_before)
+        {
+            return None;
+        }
+        other_session != session
+    } else {
+        true
+    };
+    (process_start_time(pid) == Some(start_before)).then_some(unrelated)
 }
 
 fn browser_control_endpoint_ready_in_namespace(session: &str, dir: &std::path::Path) -> bool {
@@ -8458,12 +8506,68 @@ mod tests {
     fn failed_hash_listener_or_process_lookup_keeps_stale_cleanup_inconclusive() {
         let stale = u32::MAX;
         let foreign = std::process::id();
-        assert!(stale_browser_hash_listener_is_unrelated(stale, Some(None), |_| None));
-        assert!(stale_browser_hash_listener_is_unrelated(stale, Some(Some(foreign)), |_| Some(false)));
-        assert!(!stale_browser_hash_listener_is_unrelated(stale, None, |_| Some(false)));
-        assert!(!stale_browser_hash_listener_is_unrelated(stale, Some(Some(stale)), |_| Some(false)));
-        assert!(!stale_browser_hash_listener_is_unrelated(stale, Some(Some(foreign)), |_| None));
-        assert!(!stale_browser_hash_listener_is_unrelated(stale, Some(Some(foreign)), |_| Some(true)));
+        let session = "stale-browser";
+        assert!(stale_browser_hash_listener_is_unrelated(stale, session, Some(None), |_, _| None));
+        assert!(stale_browser_hash_listener_is_unrelated(stale, session, Some(Some(foreign)), |_, _| Some(true)));
+        assert!(!stale_browser_hash_listener_is_unrelated(stale, session, None, |_, _| Some(true)));
+        assert!(!stale_browser_hash_listener_is_unrelated(stale, session, Some(Some(stale)), |_, _| Some(true)));
+        assert!(!stale_browser_hash_listener_is_unrelated(stale, session, Some(Some(foreign)), |_, _| None));
+        assert!(!stale_browser_hash_listener_is_unrelated(stale, session, Some(Some(foreign)), |_, _| Some(false)));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_partial_shutdown_ignores_another_browser_sessions_hash_listener() {
+        struct ChildGuard(std::process::Child);
+        impl Drop for ChildGuard {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+
+        let temp = tempfile::tempdir().unwrap();
+        let binary = temp.path().join("agent-browser.exe");
+        std::fs::copy(which::which("node").unwrap(), &binary).unwrap();
+        let (stale_session, port) = (0..32).find_map(|_| {
+            let session = format!("stale-other-browser-{}", uuid::Uuid::new_v4().simple());
+            let port = browser_control_fallback_port(&session);
+            std::net::TcpListener::bind(("127.0.0.1", port)).ok().map(|listener| {
+                drop(listener);
+                (session, port)
+            })
+        }).expect("a free hash-derived browser port");
+        let other_session = format!("other-browser-{}", uuid::Uuid::new_v4().simple());
+        let current = temp.path().join(BROWSER_DAEMON_DIR);
+        prepare_browser_directory(&current, true).unwrap();
+        let script = "require('net').createServer(() => {}).listen(Number(process.argv[1]), '127.0.0.1')";
+        let child = std::process::Command::new(&binary)
+            .args(["-e", script, &port.to_string()])
+            .env("CODEMUX_BROWSER_OWNER", browser_owner_token())
+            .env("CODEMUX_BROWSER_SESSION", &other_session)
+            .env("AGENT_BROWSER_SOCKET_DIR", &current)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn().unwrap();
+        let mut child = ChildGuard(child);
+        let started = Instant::now();
+        while windows_loopback_listener_pid(port) != Some(Some(child.0.id())) {
+            assert!(child.0.try_wait().unwrap().is_none(), "other browser fixture exited before binding");
+            assert!(started.elapsed() < Duration::from_secs(5), "other browser fixture did not bind");
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        assert_eq!(browser_hash_listener_is_other_session(child.0.id(), &stale_session), Some(true));
+        assert_eq!(browser_hash_listener_is_other_session(child.0.id(), &other_session), Some(false));
+
+        let stale_pid = u32::MAX;
+        let pid_path = current.join(format!("{stale_session}.pid"));
+        std::fs::write(&pid_path, stale_pid.to_string()).unwrap();
+        assert!(browser_control_endpoint_ready_in_namespace(&stale_session, &current));
+        cleanup_owned_browser_lock_files_in(&current, &stale_session, stale_pid);
+        assert!(!pid_path.exists(), "stale metadata must not pin this browser session");
+        assert_eq!(windows_loopback_listener_pid(port), Some(Some(child.0.id())),
+            "cleanup must not stop the other session");
+        assert!(require_owned_browser_session_in(&stale_session, &current).is_ok());
     }
 
     #[test]
