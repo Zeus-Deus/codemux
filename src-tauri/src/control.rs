@@ -1863,22 +1863,11 @@ pub(crate) async fn dispatch_request_as<R: Runtime>(
                 resolve_browser_id(&app, "default")
             };
 
-            // Get the port for this session (already allocated above or in start_stream).
-            // The manager no longer registers a `workspace_id` alias, so
-            // `cli_session_name` is the only key the manager knows.
-            let vision_port = agent_browser.get_port(&cli_session_name).await
-                .unwrap_or(crate::agent_browser::DEFAULT_STREAM_PORT);
-
             let result = match action_kind.as_str() {
-                // Tier 2: coordinate-based CDP tools via stream WebSocket
-                "click_at" | "type_at" | "scroll_at" | "key_press" | "drag" => {
-                    crate::stream_input::handle_vision_action(vision_port, &action_kind, params, &cli_session_name)
-                        .await
-                        .and_then(|result| serde_json::to_value(result).map_err(|error| error.to_string()))
-                }
-                // Tier 3: OS-level kernel input via ydotool
-                "click_os" | "type_os" => {
-                    crate::os_input::handle_os_action(&action_kind, params, &cli_session_name)
+                // Direct stream and OS input share the browser confirmation
+                // lifecycle gate before resolving a port or sending input.
+                "click_at" | "type_at" | "scroll_at" | "key_press" | "drag" | "click_os" | "type_os" => {
+                    agent_browser.run_direct_input_action(&cli_session_name, &action_kind, params)
                         .await
                         .and_then(|result| serde_json::to_value(result).map_err(|error| error.to_string()))
                 }
