@@ -3336,7 +3336,7 @@ index aad976c..cb3b897 100644
      fn test_daemon_rejects_ca_cert_outside_local_chrome() {
          let ca = LaunchOptions {
 diff --git a/cli/src/native/browser.rs b/cli/src/native/browser.rs
-index 27ef4d1..2926c2b 100644
+index 27ef4d1..3d39a3b 100644
 --- a/cli/src/native/browser.rs
 +++ b/cli/src/native/browser.rs
 @@ -1,11 +1,17 @@
@@ -3377,7 +3377,7 @@ index 27ef4d1..2926c2b 100644
              BrowserProcess::Lightpanda(p) => p.kill(),
              BrowserProcess::Obscura(p) => p.kill(),
          }
-@@ -714,22 +720,388 @@ impl BrowserProcess {
+@@ -714,19 +720,390 @@ impl BrowserProcess {
 
      pub fn wait_or_kill(&mut self, timeout: std::time::Duration) {
          match self {
@@ -3414,7 +3414,7 @@ index 27ef4d1..2926c2b 100644
 +    }
 +}
 +
-+pub(super) const CHROME_PIPE_STARTUP_BUDGET: Duration = Duration::from_secs(20);
++pub(super) const CHROME_PIPE_STARTUP_BUDGET: Duration = Duration::from_secs(24);
 +const CHROME_PIPE_RETRY_DELAY: Duration = Duration::from_millis(500);
 +const CHROME_PIPE_CLEANUP_MARGIN: Duration = Duration::from_secs(2);
 +const CHROME_PIPE_GRACEFUL_CLOSE_TIMEOUT: Duration = Duration::from_secs(2);
@@ -3502,10 +3502,10 @@ index 27ef4d1..2926c2b 100644
 +            // Cancellation can drop the launch future between any two awaits.
 +            // The reaper must retain the child and copied profile in that case.
 +            let _ = self.start_reaper();
-         }
-     }
- }
-
++        }
++    }
++}
++
 +struct CancelPendingChromeSpawn(Arc<AtomicBool>);
 +
 +impl Drop for CancelPendingChromeSpawn {
@@ -3518,6 +3518,7 @@ index 27ef4d1..2926c2b 100644
 +    prepared: Arc<PreparedChromeLaunch>,
 +    deadline: Instant,
 +) -> Result<(BrowserProcess, Arc<CdpClient>), PipeAttemptError> {
++    let attempt_started = Instant::now();
 +    let spawn_deadline = deadline - CHROME_PIPE_CLEANUP_MARGIN;
 +    let cancel = Arc::new(AtomicBool::new(false));
 +    let _cancel_on_drop = CancelPendingChromeSpawn(cancel.clone());
@@ -3590,7 +3591,7 @@ index 27ef4d1..2926c2b 100644
 +                .lock()
 +                .unwrap_or_else(|error| error.into_inner())
 +                .kill();
-+        }
+         }
 +    });
 +    let client = Arc::new(CdpClient::connect_pipe(reader, writer, Some(on_failure)));
 +
@@ -3601,7 +3602,8 @@ index 27ef4d1..2926c2b 100644
 +    let readiness_budget = deadline
 +        .saturating_duration_since(Instant::now())
 +        .saturating_sub(CHROME_PIPE_CLEANUP_MARGIN)
-+        .min(Duration::from_secs(15));
++        .min(Duration::from_secs(20));
++    let readiness_started = Instant::now();
 +    let ready = tokio::time::timeout(
 +        readiness_budget,
 +        client.send_command_no_params("Browser.getVersion", None),
@@ -3629,7 +3631,10 @@ index 27ef4d1..2926c2b 100644
 +        tokio::time::timeout_at(deadline.into(), &mut close_task),
 +    );
 +    let error = format!(
-+        "Chrome pipe did not become ready: {ready:?}; process exited: {exited}{diagnostic}"
++        "Chrome pipe did not become ready after {} ms (attempt {} ms, probe budget {} ms): {ready:?}; process exited: {exited}{diagnostic}",
++        readiness_started.elapsed().as_millis(),
++        attempt_started.elapsed().as_millis(),
++        readiness_budget.as_millis(),
 +    );
 +    if matches!(reaped, Ok(Ok(()))) && matches!(closed, Ok(Ok(()))) {
 +        Err(PipeAttemptError::Retry(error))
@@ -3766,13 +3771,10 @@ index 27ef4d1..2926c2b 100644
 +        Err("Chrome pipe startup deadline expired before another attempt".to_string())
 +    } else {
 +        Err(last_error)
-+    }
-+}
-+
- pub struct BrowserManager {
-     pub client: Arc<CdpClient>,
-     browser_process: Option<BrowserProcess>,
-@@ -884,6 +1256,32 @@ impl BrowserManager {
+     }
+ }
+
+@@ -884,6 +1261,32 @@ impl BrowserManager {
      }
 
      pub async fn launch(options: LaunchOptions, engine: Option<&str>) -> Result<Self, String> {
@@ -3805,7 +3807,7 @@ index 27ef4d1..2926c2b 100644
          let engine = engine.unwrap_or("chrome");
 
          match engine {
-@@ -922,8 +1320,10 @@ impl BrowserManager {
+@@ -922,8 +1325,10 @@ impl BrowserManager {
          let color_scheme = options.color_scheme.clone();
          let download_path = options.download_path.clone();
          let headless = options.effectively_headless();
@@ -3817,7 +3819,7 @@ index 27ef4d1..2926c2b 100644
              "lightpanda" => {
                  let lp_options = LightpandaLaunchOptions {
                      executable_path: options.executable_path.clone(),
-@@ -932,7 +1332,7 @@ impl BrowserManager {
+@@ -932,7 +1337,7 @@ impl BrowserManager {
                  };
                  let lp = launch_lightpanda(&lp_options).await?;
                  let url = lp.ws_url.clone();
@@ -3826,7 +3828,7 @@ index 27ef4d1..2926c2b 100644
              }
              "obscura" => {
                  let obscura_options = ObscuraLaunchOptions {
-@@ -943,14 +1343,12 @@ impl BrowserManager {
+@@ -943,14 +1348,12 @@ impl BrowserManager {
                  };
                  let ob = launch_obscura(&obscura_options).await?;
                  let url = ob.ws_url.clone();
@@ -3845,7 +3847,7 @@ index 27ef4d1..2926c2b 100644
              }
          };
 
-@@ -959,7 +1357,11 @@ impl BrowserManager {
+@@ -959,7 +1362,11 @@ impl BrowserManager {
          } else if engine == "obscura" {
              initialize_obscura_manager(ws_url, process).await?
          } else {
@@ -3858,7 +3860,7 @@ index 27ef4d1..2926c2b 100644
              let mut manager = Self {
                  client,
                  browser_process: Some(process),
-@@ -980,10 +1382,15 @@ impl BrowserManager {
+@@ -980,10 +1387,15 @@ impl BrowserManager {
                  headless,
                  product_checked: false,
              };
@@ -3878,7 +3880,7 @@ index 27ef4d1..2926c2b 100644
                  return Err(error);
              }
              manager
-@@ -992,47 +1399,66 @@ impl BrowserManager {
+@@ -992,47 +1404,66 @@ impl BrowserManager {
          let session_id = match manager.active_session_id() {
              Ok(session_id) => session_id.to_string(),
              Err(error) => {
@@ -3979,7 +3981,7 @@ index 27ef4d1..2926c2b 100644
 
          Ok(manager)
      }
-@@ -1897,17 +2323,72 @@ impl BrowserManager {
+@@ -1897,17 +2328,72 @@ impl BrowserManager {
          self.close_with_timeout(None).await
      }
 
@@ -4054,7 +4056,7 @@ index 27ef4d1..2926c2b 100644
                  let _ = tokio::time::timeout(timeout, close).await;
              } else {
                  let _ = close.await;
-@@ -1918,10 +2399,23 @@ impl BrowserManager {
+@@ -1918,10 +2404,23 @@ impl BrowserManager {
 
          if let Some(mut process) = self.browser_process.take() {
              let timeout = std::time::Duration::from_secs(5);
@@ -4081,7 +4083,7 @@ index 27ef4d1..2926c2b 100644
          }
 
          Ok(())
-@@ -1952,17 +2446,23 @@ impl BrowserManager {
+@@ -1952,17 +2451,23 @@ impl BrowserManager {
          }
      }
 
@@ -4111,7 +4113,7 @@ index 27ef4d1..2926c2b 100644
      pub fn get_cdp_url(&self) -> &str {
          &self.ws_url
      }
-@@ -1993,6 +2493,16 @@ impl BrowserManager {
+@@ -1993,6 +2498,16 @@ impl BrowserManager {
          }
      }
 
@@ -4128,7 +4130,7 @@ index 27ef4d1..2926c2b 100644
      pub fn product_checked(&self) -> bool {
          self.product_checked
      }
-@@ -4531,7 +5041,7 @@ mod tests {
+@@ -4531,7 +5046,7 @@ mod tests {
          let executable = dir.path().join("chrome");
          let port = url::Url::parse(url).unwrap().port().unwrap();
          std::fs::write(&executable, format!(
@@ -4137,7 +4139,7 @@ index 27ef4d1..2926c2b 100644
              dir.path().display()
          )).unwrap();
          std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
-@@ -4549,6 +5059,86 @@ mod tests {
+@@ -4549,6 +5064,86 @@ mod tests {
              .trim()
              .parse()
              .unwrap();
@@ -4224,7 +4226,7 @@ index 27ef4d1..2926c2b 100644
          assert_eq!(
              unsafe { libc::kill(pid, 0) },
              -1,
-@@ -4570,23 +5160,492 @@ mod tests {
+@@ -4570,23 +5165,509 @@ mod tests {
 
      #[cfg(unix)]
      #[tokio::test]
@@ -4455,10 +4457,24 @@ index 27ef4d1..2926c2b 100644
 +    touch "$root/restarted"
 +fi
 +printf '%s' "$$" > "$root/pid"
-+perl -e 'my $byte; while (sysread(STDIN, $byte, 1)) { last if $byte eq "\0" }' <&3
-+sleep 9
-+printf '{"id":1,"result":{"product":"fixture"}}\000' >&4
-+exec sleep 60
++exec perl -e '
++my $byte;
++open my $out, ">&=4" or die $!;
++while (1) {
++    my $command = "";
++    while (sysread(STDIN, $byte, 1)) { last if $byte eq "\0"; $command .= $byte }
++    last if $command eq "";
++    my ($id) = $command =~ /"id":(\d+)/;
++    my ($method) = $command =~ /"method":"([^"]+)"/;
++    die "bad CDP frame: $command" unless defined $id && defined $method;
++    sleep 16 if $method eq "Browser.getVersion";
++    my $result = $method eq "Target.getTargets" ? q({"targetInfos":[]})
++        : $method eq "Target.createTarget" ? q({"targetId":"fixture-target"})
++        : $method eq "Target.attachToTarget" ? q({"sessionId":"fixture-session"})
++        : q({});
++    syswrite($out, "{\"id\":$id,\"result\":$result}\0") or die $!;
++}
++' <&3
 +"#,
 +        )
 +        .unwrap();
@@ -4468,19 +4484,22 @@ index 27ef4d1..2926c2b 100644
 +            ..Default::default()
 +        };
 +        let start = Instant::now();
-+        let (process, client) =
-+            tokio::time::timeout(Duration::from_secs(17), launch_managed_chrome(options))
-+                .await
-+                .expect("a live Chromium pipe should have time to become ready")
-+                .expect("delayed first pipe should succeed");
-+        assert!(start.elapsed() >= Duration::from_secs(9));
++        let mut manager = tokio::time::timeout(
++            Duration::from_secs(25),
++            BrowserManager::launch_with_budget(options, None, CHROME_PIPE_STARTUP_BUDGET),
++        )
++        .await
++        .expect("a live Chromium pipe should complete manager setup before the CLI deadline")
++        .expect("delayed first pipe and manager setup should succeed");
++        assert!(start.elapsed() >= Duration::from_secs(16));
++        assert!(start.elapsed() < CHROME_PIPE_STARTUP_BUDGET);
 +        assert!(!dir.path().join("restarted").exists());
 +        let pid: i32 = std::fs::read_to_string(dir.path().join("pid"))
 +            .unwrap()
 +            .parse()
 +            .unwrap();
-+        client.close().await;
-+        drop(process);
++        assert!(manager.abort_failed_managed_launch().await);
++        drop(manager);
 +        assert_process_reaped(pid);
 +    }
 +
@@ -4731,7 +4750,7 @@ index 27ef4d1..2926c2b 100644
      }
 
      #[cfg(unix)]
-@@ -4600,12 +5659,20 @@ mod tests {
+@@ -4600,12 +5681,20 @@ mod tests {
              .unwrap();
          let mut manager = tokio::time::timeout(
              Duration::from_secs(4),
@@ -4754,7 +4773,7 @@ index 27ef4d1..2926c2b 100644
          manager.close().await.unwrap();
          let observed = server.await.unwrap();
          assert!(!observed[0].iter().any(|method| method == "Browser.close"));
-@@ -4649,7 +5716,12 @@ mod tests {
+@@ -4649,7 +5738,12 @@ mod tests {
              .expect("Obscura should disconnect before retrying")
              .unwrap();
              assert!(manager.owns_obscura_process());
@@ -7137,7 +7156,7 @@ index 6838149..f8eb660 100644
 +    }
  }
 diff --git a/cli/src/native/daemon.rs b/cli/src/native/daemon.rs
-index f2737f1..0846b9e 100644
+index f2737f1..01e326a 100644
 --- a/cli/src/native/daemon.rs
 +++ b/cli/src/native/daemon.rs
 @@ -9,16 +9,16 @@ use std::time::Duration;
@@ -7228,28 +7247,46 @@ index f2737f1..0846b9e 100644
                  break;
              }
              _ = idle_activity.notified() => {
-@@ -430,8 +456,19 @@ async fn run_socket_server(
-                     Some(idle_lock) => idle_lock.await,
-                     None => state.clone().lock_owned().await,
-                 };
+@@ -424,20 +450,29 @@ async fn run_socket_server(
+                 break;
+             }
+             _ = shutdown_signal() => {
+-                // An armed idle lock already holds a place in the lock queue;
+-                // await it rather than queueing behind it.
+-                let mut s = match idle_lock.take() {
+-                    Some(idle_lock) => idle_lock.await,
+-                    None => state.clone().lock_owned().await,
+-                };
 -                let _ = auto_save_restore_state(&mut s).await;
-+                if s.managed_chrome_cleanup_pending()
-+                    || s.browser.as_ref().is_some_and(super::browser::BrowserManager::owns_managed_chrome_process)
-+                {
-+                    signal_shutdown_tx.send_replace(true);
-+                }
-+                let _ = auto_save_restore_state_before_managed_close(&mut s).await;
-                 let _ = close_all_browser_backends(&mut s).await;
-+                // Hold the daemon state lock while the detached worker
-+                // finishes. The listener stays bound, but no request can
-+                // launch a replacement just before shutdown exits.
-+                while s.managed_chrome_cleanup_pending() {
-+                    tokio::time::sleep(Duration::from_millis(100)).await;
-+                }
+-                let _ = close_all_browser_backends(&mut s).await;
++                // Reject requests immediately, including ones queued behind
++                // the state lock. Keep accepting fresh authenticated clients
++                // until owned Chrome cleanup finishes and the listener closes.
++                signal_shutdown_tx.send_replace(true);
++                let mut shutdown = tokio::spawn(finish_signal_shutdown(state.clone(), idle_lock.take()));
++                accept_unix_during_signal_shutdown(
++                    &listener,
++                    &mut shutdown,
++                    &state,
++                    &idle_activity,
++                    &close,
++                    &signal_shutdown_rx,
++                    crate::codemux_auth::token_matches,
++                ).await?;
                  break;
              }
          }
-@@ -484,6 +521,7 @@ async fn run_socket_server(
+     }
+
+-    if closed_by_command {
++    if closed_by_command || *signal_shutdown_rx.borrow() {
++        // A successful close can race an OS shutdown signal after it notifies
++        // the loop. In either case, release its reply handshake after the
++        // listener stops accepting requests.
+         close.finish(listener).await;
+     }
+
+@@ -484,6 +519,7 @@ async fn run_socket_server(
 
      let close = Arc::new(CloseHandshake::default());
      let mut closed_by_command = false;
@@ -7257,7 +7294,7 @@ index f2737f1..0846b9e 100644
 
      let idle_sleep = idle_timeout_ms.map(|ms| tokio::time::sleep(Duration::from_millis(ms)));
      let mut idle_sleep_pin = idle_sleep.map(Box::pin);
-@@ -505,8 +543,10 @@ async fn run_socket_server(
+@@ -505,8 +541,10 @@ async fn run_socket_server(
                          let state = state.clone();
                          let idle_activity = idle_activity.clone();
                          let close = close.clone();
@@ -7269,7 +7306,7 @@ index f2737f1..0846b9e 100644
                          });
                      }
                      Err(e) => {
-@@ -551,6 +591,9 @@ async fn run_socket_server(
+@@ -551,6 +589,9 @@ async fn run_socket_server(
                          Some(Box::pin(tokio::time::sleep(Duration::from_millis(timeout_ms))));
                      continue;
                  }
@@ -7279,7 +7316,7 @@ index f2737f1..0846b9e 100644
                  if idle_timeout.is_some_and(|t| t.is_default) {
                      let _ = writeln!(
                          std::io::stderr(),
-@@ -558,8 +601,11 @@ async fn run_socket_server(
+@@ -558,8 +599,11 @@ async fn run_socket_server(
                          DEFAULT_IDLE_TIMEOUT_MS / 60_000
                      );
                  }
@@ -7292,25 +7329,140 @@ index f2737f1..0846b9e 100644
                  break;
              }
              _ = idle_activity.notified() => {
-@@ -577,8 +623,16 @@ async fn run_socket_server(
-                     Some(idle_lock) => idle_lock.await,
-                     None => state.clone().lock_owned().await,
-                 };
+@@ -571,20 +615,23 @@ async fn run_socket_server(
+                 break;
+             }
+             _ = shutdown_signal() => {
+-                // An armed idle lock already holds a place in the lock queue;
+-                // await it rather than queueing behind it.
+-                let mut s = match idle_lock.take() {
+-                    Some(idle_lock) => idle_lock.await,
+-                    None => state.clone().lock_owned().await,
+-                };
 -                let _ = auto_save_restore_state(&mut s).await;
-+                if s.managed_chrome_cleanup_pending()
-+                    || s.browser.as_ref().is_some_and(super::browser::BrowserManager::owns_managed_chrome_process)
-+                {
-+                    signal_shutdown_tx.send_replace(true);
-+                }
-+                let _ = auto_save_restore_state_before_managed_close(&mut s).await;
-                 let _ = close_all_browser_backends(&mut s).await;
-+                while s.managed_chrome_cleanup_pending() {
-+                    tokio::time::sleep(Duration::from_millis(100)).await;
-+                }
+-                let _ = close_all_browser_backends(&mut s).await;
++                signal_shutdown_tx.send_replace(true);
++                let mut shutdown = tokio::spawn(finish_signal_shutdown(state.clone(), idle_lock.take()));
++                accept_tcp_during_signal_shutdown(
++                    &listener,
++                    &mut shutdown,
++                    &state,
++                    &idle_activity,
++                    &close,
++                    &signal_shutdown_rx,
++                    crate::codemux_auth::token_matches,
++                ).await?;
                  break;
              }
          }
-@@ -609,8 +663,13 @@ fn spawn_background_tick_if_idle(
+     }
+
+-    if closed_by_command {
++    if closed_by_command || *signal_shutdown_rx.borrow() {
+         close.finish(listener).await;
+     }
+
+@@ -595,6 +642,99 @@ type IdleLock = std::pin::Pin<
+     Box<dyn std::future::Future<Output = tokio::sync::OwnedMutexGuard<DaemonState>> + Send>,
+ >;
+
++async fn finish_signal_shutdown(
++    shared_state: Arc<tokio::sync::Mutex<DaemonState>>,
++    idle_lock: Option<IdleLock>,
++) {
++    // An armed idle lock already holds a place in the lock queue; await it
++    // rather than queueing behind it. The shutdown watch rejects requests
++    // while the old child and its disposable profile finish cleanup.
++    let mut state = match idle_lock {
++        Some(idle_lock) => idle_lock.await,
++        None => shared_state.clone().lock_owned().await,
++    };
++    let _ = auto_save_restore_state_before_managed_close(&mut state).await;
++    let _ = close_all_browser_backends(&mut state).await;
++    drop(state);
++    while shared_state.lock().await.managed_chrome_cleanup_pending() {
++        tokio::time::sleep(Duration::from_millis(100)).await;
++    }
++}
++
++type Authenticator = fn(Option<&str>) -> bool;
++
++#[cfg(unix)]
++async fn accept_unix_during_signal_shutdown(
++    listener: &tokio::net::UnixListener,
++    shutdown: &mut tokio::task::JoinHandle<()>,
++    state: &Arc<tokio::sync::Mutex<DaemonState>>,
++    idle_activity: &Arc<IdleActivity>,
++    close: &Arc<CloseHandshake>,
++    signal_shutdown: &watch::Receiver<bool>,
++    authenticate: Authenticator,
++) -> Result<(), String> {
++    loop {
++        tokio::select! {
++            biased;
++            result = &mut *shutdown => {
++                return result.map_err(|error| format!("Shutdown cleanup task failed: {error}"));
++            }
++            accepted = listener.accept() => match accepted {
++                Ok((stream, _)) => {
++                    let state = state.clone();
++                    let idle_activity = idle_activity.clone();
++                    let close = close.clone();
++                    let signal_shutdown = signal_shutdown.clone();
++                    tokio::spawn(async move {
++                        handle_connection_with_auth(
++                            stream, state, idle_activity, close, signal_shutdown, authenticate,
++                        ).await;
++                    });
++                }
++                Err(error) => {
++                    let _ = writeln!(std::io::stderr(), "Accept error: {error}");
++                }
++            }
++        }
++    }
++}
++
++#[cfg(windows)]
++async fn accept_tcp_during_signal_shutdown(
++    listener: &tokio::net::TcpListener,
++    shutdown: &mut tokio::task::JoinHandle<()>,
++    state: &Arc<tokio::sync::Mutex<DaemonState>>,
++    idle_activity: &Arc<IdleActivity>,
++    close: &Arc<CloseHandshake>,
++    signal_shutdown: &watch::Receiver<bool>,
++    authenticate: Authenticator,
++) -> Result<(), String> {
++    loop {
++        tokio::select! {
++            biased;
++            result = &mut *shutdown => {
++                return result.map_err(|error| format!("Shutdown cleanup task failed: {error}"));
++            }
++            accepted = listener.accept() => match accepted {
++                Ok((stream, _)) => {
++                    let state = state.clone();
++                    let idle_activity = idle_activity.clone();
++                    let close = close.clone();
++                    let signal_shutdown = signal_shutdown.clone();
++                    tokio::spawn(async move {
++                        handle_connection_with_auth(
++                            stream, state, idle_activity, close, signal_shutdown, authenticate,
++                        ).await;
++                    });
++                }
++                Err(error) => {
++                    let _ = writeln!(std::io::stderr(), "Accept error: {error}");
++                }
++            }
++        }
++    }
++}
++
+ /// Run the periodic browser maintenance tick in the background, skipping it
+ /// when a command holds the state lock. A skipped tick loses nothing: CDP
+ /// events stay buffered and autosave is rechecked on the next tick.
+@@ -609,8 +749,13 @@ fn spawn_background_tick_if_idle(
          let process_exited = state
              .browser
              .as_mut()
@@ -7326,15 +7478,47 @@ index f2737f1..0846b9e 100644
          if process_exited {
              let _ = close_current_browser(&mut state).await;
          } else if state.browser.is_some() {
-@@ -652,6 +711,7 @@ async fn handle_connection<S>(
+@@ -652,6 +797,28 @@ async fn handle_connection<S>(
      state: std::sync::Arc<tokio::sync::Mutex<DaemonState>>,
      idle_activity: Arc<IdleActivity>,
      close: Arc<CloseHandshake>,
++    signal_shutdown: watch::Receiver<bool>,
++) where
++    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
++{
++    handle_connection_with_auth(
++        stream,
++        state,
++        idle_activity,
++        close,
++        signal_shutdown,
++        crate::codemux_auth::token_matches,
++    )
++    .await;
++}
++
++async fn handle_connection_with_auth<S>(
++    stream: S,
++    state: std::sync::Arc<tokio::sync::Mutex<DaemonState>>,
++    idle_activity: Arc<IdleActivity>,
++    close: Arc<CloseHandshake>,
 +    mut signal_shutdown: watch::Receiver<bool>,
++    authenticate: Authenticator,
  ) where
      S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
  {
-@@ -707,15 +767,14 @@ async fn handle_connection<S>(
+@@ -687,9 +854,7 @@ async fn handle_connection<S>(
+                     }
+                 };
+
+-                if !crate::codemux_auth::token_matches(
+-                    cmd.get(crate::codemux_auth::FIELD).and_then(Value::as_str),
+-                ) {
++                if !authenticate(cmd.get(crate::codemux_auth::FIELD).and_then(Value::as_str)) {
+                     let _ = writer
+                         .write_all(b"{\"success\":false,\"error\":\"Unauthorized\"}\n")
+                         .await;
+@@ -707,15 +872,14 @@ async fn handle_connection<S>(
                      .unwrap_or_default()
                      .to_string();
 
@@ -7358,7 +7542,7 @@ index f2737f1..0846b9e 100644
 
                  let closing = close_completed_response(&action, &response);
                  if closing {
-@@ -745,6 +804,51 @@ async fn handle_connection<S>(
+@@ -745,6 +909,44 @@ async fn handle_connection<S>(
      }
  }
 
@@ -7371,46 +7555,39 @@ index f2737f1..0846b9e 100644
 +    })
 +}
 +
-+/// Signal shutdown keeps the state lock until its child reaper finishes. An
-+/// authenticated close or restart must get a retryable answer without waiting
-+/// on that lock or causing its caller to force-kill the daemon.
++/// During signal shutdown, every authenticated command gets a retryable
++/// response without waiting for the state lock held by the child reaper.
 +async fn execute_authenticated_command(
 +    cmd: &Value,
-+    action: &str,
++    _action: &str,
 +    state: &tokio::sync::Mutex<DaemonState>,
 +    idle_activity: &IdleActivity,
 +    signal_shutdown: &mut watch::Receiver<bool>,
 +) -> Value {
-+    if action == "close" || action == INTERNAL_DAEMON_SHUTDOWN_ACTION {
-+        if *signal_shutdown.borrow() {
-+            return signal_shutdown_pending_response(cmd);
-+        }
-+        return tokio::select! {
-+            biased;
-+            _ = signal_shutdown.changed() => signal_shutdown_pending_response(cmd),
-+            mut s = state.lock() => {
-+                if *signal_shutdown.borrow() {
-+                    signal_shutdown_pending_response(cmd)
-+                } else {
-+                    let response = execute_command(cmd, &mut s).await;
-+                    idle_activity.mark();
-+                    response
-+                }
-+            }
-+        };
++    if *signal_shutdown.borrow() {
++        return signal_shutdown_pending_response(cmd);
 +    }
-+    let mut s = state.lock().await;
-+    let response = execute_command(cmd, &mut s).await;
-+    // Refresh while the state lock is still held. An idle timer waiting on
-+    // this command observes the updated clock when it acquires the lock.
-+    idle_activity.mark();
-+    response
++    tokio::select! {
++        biased;
++        _ = signal_shutdown.changed() => signal_shutdown_pending_response(cmd),
++        mut s = state.lock() => {
++            if *signal_shutdown.borrow() {
++                signal_shutdown_pending_response(cmd)
++            } else {
++                let response = execute_command(cmd, &mut s).await;
++                // Refresh while the state lock is still held. An idle timer
++                // waiting on this command observes the updated clock.
++                idle_activity.mark();
++                response
++            }
++        }
++    }
 +}
 +
  fn looks_like_http(line: &str) -> bool {
      let prefixes = [
          "GET ", "POST ", "PUT ", "DELETE ", "PATCH ", "HEAD ", "OPTIONS ", "CONNECT ", "TRACE ",
-@@ -841,6 +945,41 @@ mod tests {
+@@ -841,6 +1043,129 @@ mod tests {
      use super::*;
      use crate::session_settings::{resolve_idle_timeout, IdleTimeout, MemStore};
 
@@ -7449,10 +7626,98 @@ index f2737f1..0846b9e 100644
 +        drop(held);
 +    }
 +
++    #[cfg(unix)]
++    #[tokio::test]
++    async fn pipe_signal_shutdown_accepts_fresh_authenticated_connection_during_reap() {
++        // The patched-source build may set TMPDIR to a long Cargo path.
++        // Unix socket paths must fit SUN_LEN on every CI runner.
++        let dir = tempfile::Builder::new()
++            .prefix("cmx-sig-")
++            .tempdir_in("/tmp")
++            .unwrap();
++        let socket_path = dir.path().join("shutdown.sock");
++        let listener = Arc::new(
++            bind_listener(dir.path(), &socket_path, "shutdown")
++                .await
++                .unwrap(),
++        );
++        publish_listener(&socket_path).unwrap();
++        let state = Arc::new(tokio::sync::Mutex::new(DaemonState::new()));
++        state
++            .lock()
++            .await
++            .set_managed_chrome_cleanup_count_for_test(1);
++        let activity = Arc::new(IdleActivity::new());
++        let close = Arc::new(CloseHandshake::default());
++        let (_shutdown_tx, shutdown_rx) = watch::channel(true);
++        let server = tokio::spawn({
++            let listener = listener.clone();
++            let state = state.clone();
++            let activity = activity.clone();
++            let close = close.clone();
++            async move {
++                let mut shutdown = tokio::spawn(finish_signal_shutdown(state.clone(), None));
++                accept_unix_during_signal_shutdown(
++                    &listener,
++                    &mut shutdown,
++                    &state,
++                    &activity,
++                    &close,
++                    &shutdown_rx,
++                    |candidate| candidate == Some("test-token"),
++                )
++                .await
++            }
++        });
++
++        let stream = tokio::net::UnixStream::connect(&socket_path).await.unwrap();
++        let (reader, mut writer) = tokio::io::split(stream);
++        let mut reader = BufReader::new(reader);
++        writer
++            .write_all(b"{\"id\":\"bad\",\"action\":\"launch\",\"codemuxToken\":\"wrong\"}\n")
++            .await
++            .unwrap();
++        let mut line = String::new();
++        tokio::time::timeout(Duration::from_secs(2), reader.read_line(&mut line))
++            .await
++            .expect("fresh connection was not accepted")
++            .unwrap();
++        let response: Value = serde_json::from_str(&line).unwrap();
++        assert_eq!(response["error"], "Unauthorized");
++
++        line.clear();
++        writer
++            .write_all(b"{\"id\":\"pending-launch\",\"action\":\"launch\",\"codemuxToken\":\"test-token\"}\n")
++            .await
++            .unwrap();
++        tokio::time::timeout(Duration::from_secs(2), reader.read_line(&mut line))
++            .await
++            .expect("authenticated request waited for cleanup")
++            .unwrap();
++        let response: Value = serde_json::from_str(&line).unwrap();
++        assert_eq!(response["id"], "pending-launch");
++        assert_eq!(response["success"], false);
++        assert_eq!(response["code"], MANAGED_CHROME_CLEANUP_PENDING_CODE);
++        assert!(
++            !server.is_finished(),
++            "listener stopped before cleanup settled"
++        );
++
++        state
++            .lock()
++            .await
++            .set_managed_chrome_cleanup_count_for_test(0);
++        tokio::time::timeout(Duration::from_secs(2), server)
++            .await
++            .expect("shutdown listener outlived cleanup")
++            .unwrap()
++            .unwrap();
++    }
++
      #[cfg(unix)]
      #[tokio::test]
      async fn test_socket_is_unreachable_until_published() {
-@@ -976,6 +1115,32 @@ mod tests {
+@@ -976,6 +1301,32 @@ mod tests {
          assert!(arm_idle_sleep(&activity).is_none(), "disabled live");
      }
 
@@ -7485,7 +7750,7 @@ index f2737f1..0846b9e 100644
      #[tokio::test]
      async fn test_command_completion_rearms_expired_idle_timeout() {
          let activity = IdleActivity::new();
-@@ -1090,12 +1255,12 @@ mod tests {
+@@ -1090,12 +1441,12 @@ mod tests {
      /// added in v0.22.3 to reap zombie Chrome processes. This races with
      /// Rust's `Child::try_wait()` / `Child::wait()` because `waitpid(-1)`
      /// reaps *any* child, stealing the exit status before Rust can collect
@@ -7500,7 +7765,7 @@ index f2737f1..0846b9e 100644
      /// for targeted, race-free zombie detection.
      #[test]
      fn test_no_waitpid_minus_one_in_daemon() {
-@@ -1105,14 +1270,14 @@ mod tests {
+@@ -1105,14 +1456,14 @@ mod tests {
          assert!(
              !production_code.contains("waitpid(-1"),
              "daemon.rs production code must not call waitpid(-1, ...). \
@@ -7879,10 +8144,10 @@ index 749a5b7..5927f7b 100644
      let url_a = "data:text/html,gone-session-a";
      let url_b = "data:text/html,gone-session-b";
 diff --git a/cli/src/native/state.rs b/cli/src/native/state.rs
-index 791691f..258fabd 100644
+index 791691f..f52f2a9 100644
 --- a/cli/src/native/state.rs
 +++ b/cli/src/native/state.rs
-@@ -5,7 +5,10 @@ use serde_json::{json, Value};
+@@ -5,7 +5,11 @@ use serde_json::{json, Value};
  use sha2::{Digest, Sha256};
  use std::collections::HashSet;
  use std::fs;
@@ -7890,10 +8155,11 @@ index 791691f..258fabd 100644
  use std::path::PathBuf;
 +use std::sync::Arc;
 +use std::time::Duration;
++use tokio::sync::oneshot;
 
  use super::cdp::client::CdpClient;
  use super::cdp::types::{
-@@ -15,6 +18,8 @@ use super::cdp::types::{
+@@ -15,6 +19,8 @@ use super::cdp::types::{
  use super::cookies::{self, Cookie};
  use crate::validation::{is_valid_session_name, sanitize_session_component, session_name_error};
 
@@ -7902,7 +8168,7 @@ index 791691f..258fabd 100644
  #[derive(Debug, Serialize, Deserialize)]
  #[serde(rename_all = "camelCase")]
  pub struct StorageState {
-@@ -107,11 +112,41 @@ async fn eval_origin_storage(
+@@ -107,36 +113,94 @@ async fn eval_origin_storage(
      parse_origin_storage(&data)
  }
 
@@ -7910,6 +8176,18 @@ index 791691f..258fabd 100644
 +struct TempTargetCleanup {
 +    client: Arc<CdpClient>,
 +    target_id: Option<String>,
++}
++
++async fn close_cancelled_temp_target(client: &CdpClient, target_id: String) {
++    let _ = tokio::time::timeout(
++        Duration::from_secs(1),
++        client.send_command_typed::<_, Value>(
++            "Target.closeTarget",
++            &CloseTargetParams { target_id },
++            None,
++        ),
++    )
++    .await;
 +}
 +
 +impl Drop for TempTargetCleanup {
@@ -7922,18 +8200,36 @@ index 791691f..258fabd 100644
 +        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
 +            let client = self.client.clone();
 +            runtime.spawn(async move {
-+                let _ = tokio::time::timeout(
-+                    Duration::from_secs(1),
-+                    client.send_command_typed::<_, Value>(
-+                        "Target.closeTarget",
-+                        &CloseTargetParams { target_id },
-+                        None,
-+                    ),
-+                )
-+                .await;
++                close_cancelled_temp_target(&client, target_id).await;
 +            });
 +        }
 +    }
++}
++
++/// The create request must survive cancellation until it yields a target ID.
++/// Send the guard itself so a dropped receiver also closes a late target.
++async fn create_disposable_target(client: &Arc<CdpClient>) -> Result<TempTargetCleanup, String> {
++    let (created_tx, created_rx) = oneshot::channel::<Result<TempTargetCleanup, String>>();
++    let owner = client.clone();
++    tokio::spawn(async move {
++        let created: Result<CreateTargetResult, String> = owner
++            .send_command_typed(
++                "Target.createTarget",
++                &CreateTargetParams {
++                    url: "about:blank".to_string(),
++                },
++                None,
++            )
++            .await;
++        let _ = created_tx.send(created.map(|created| TempTargetCleanup {
++            client: owner,
++            target_id: Some(created.target_id),
++        }));
++    });
++
++    created_rx
++        .await
++        .map_err(|_| "Temporary target creation task stopped".to_string())?
 +}
 +
  /// Create a temporary CDP target, navigate it to each origin to collect localStorage,
@@ -7945,14 +8241,23 @@ index 791691f..258fabd 100644
      origins: &[String],
      origin_js: &str,
  ) -> Result<Vec<OriginStorage>, String> {
-@@ -126,17 +161,24 @@ async fn collect_storage_via_temp_target(
-         .await?;
-
-     let target_id = create_result.target_id;
-+    let mut cleanup = TempTargetCleanup {
-+        client: client.clone(),
-+        target_id: Some(target_id.clone()),
-+    };
+-    let create_result: CreateTargetResult = client
+-        .send_command_typed(
+-            "Target.createTarget",
+-            &CreateTargetParams {
+-                url: "about:blank".to_string(),
+-            },
+-            None,
+-        )
+-        .await?;
+-
+-    let target_id = create_result.target_id;
++    let mut cleanup = create_disposable_target(client).await?;
++    let target_id = cleanup
++        .target_id
++        .as_ref()
++        .expect("created target has an ID")
++        .clone();
 
      // Ensure the target is closed even if attach or later steps fail
      let result = collect_storage_in_target(client, &target_id, origins, origin_js).await;
@@ -7971,7 +8276,7 @@ index 791691f..258fabd 100644
 
      result
  }
-@@ -246,7 +288,7 @@ async fn collect_storage_in_target(
+@@ -246,7 +310,7 @@ async fn collect_storage_in_target(
  }
 
  pub async fn save_state(
@@ -7980,7 +8285,7 @@ index 791691f..258fabd 100644
      session_id: &str,
      path: Option<&str>,
      session_name: Option<&str>,
-@@ -338,7 +380,7 @@ pub async fn save_state(
+@@ -338,7 +402,7 @@ pub async fn save_state(
  }
 
  pub async fn save_auto_state_transactional(
@@ -7989,7 +8294,7 @@ index 791691f..258fabd 100644
      session_id: &str,
      session_name: &str,
      session_id_str: &str,
-@@ -422,23 +464,64 @@ pub async fn save_auto_state_transactional(
+@@ -422,23 +486,64 @@ pub async fn save_auto_state_transactional(
      Ok(final_path.to_string_lossy().to_string())
  }
 
@@ -8058,7 +8363,7 @@ index 791691f..258fabd 100644
                          let decrypted = decrypt_data(&data, &key)?;
                          Ok(String::from_utf8(decrypted)
                              .map_err(|de| format!("Decrypted state is not valid UTF-8: {}", de))?)
-@@ -468,10 +551,15 @@ pub async fn load_state(
+@@ -468,10 +573,15 @@ pub async fn load_state(
      session_id: &str,
      path: &str,
  ) -> Result<Vec<String>, String> {
@@ -8078,10 +8383,74 @@ index 791691f..258fabd 100644
 
      if !state.cookies.is_empty() {
          let cookie_values: Vec<Value> = state
-@@ -855,6 +943,122 @@ pub fn get_sessions_dir() -> PathBuf {
+@@ -855,6 +965,199 @@ pub fn get_sessions_dir() -> PathBuf {
  mod tests {
      use super::*;
 
++    #[cfg(unix)]
++    #[tokio::test]
++    async fn pipe_cancelled_target_creation_closes_late_target() {
++        use std::io::{BufRead, Write};
++        use std::os::fd::{FromRawFd, IntoRawFd};
++        use std::os::unix::net::UnixStream;
++
++        let (child_reader, parent_writer) = UnixStream::pair().unwrap();
++        let (parent_reader, child_writer) = UnixStream::pair().unwrap();
++        child_reader
++            .set_read_timeout(Some(Duration::from_secs(3)))
++            .unwrap();
++        let reader = unsafe { fs::File::from_raw_fd(parent_reader.into_raw_fd()) };
++        let writer = unsafe { fs::File::from_raw_fd(parent_writer.into_raw_fd()) };
++        let client = Arc::new(CdpClient::connect_pipe(reader, writer, None));
++        let (create_seen_tx, create_seen_rx) = oneshot::channel();
++        let (release_reply_tx, release_reply_rx) = std::sync::mpsc::channel();
++        let server = tokio::task::spawn_blocking(move || {
++            fn next_frame(reader: &mut impl BufRead) -> Value {
++                let mut frame = Vec::new();
++                reader.read_until(0, &mut frame).unwrap();
++                assert_eq!(frame.last(), Some(&0));
++                serde_json::from_slice(&frame[..frame.len() - 1]).unwrap()
++            }
++
++            let mut input = std::io::BufReader::new(child_reader);
++            let mut output = child_writer;
++            let created = next_frame(&mut input);
++            assert_eq!(created["method"], "Target.createTarget");
++            create_seen_tx.send(()).unwrap();
++            release_reply_rx
++                .recv_timeout(Duration::from_secs(3))
++                .unwrap();
++            let response = json!({ "id": created["id"], "result": { "targetId": "late-target" } });
++            output.write_all(response.to_string().as_bytes()).unwrap();
++            output.write_all(&[0]).unwrap();
++
++            let closed = next_frame(&mut input);
++            assert_eq!(closed["method"], "Target.closeTarget");
++            assert_eq!(closed["params"]["targetId"], "late-target");
++            let response = json!({ "id": closed["id"], "result": {} });
++            output.write_all(response.to_string().as_bytes()).unwrap();
++            output.write_all(&[0]).unwrap();
++        });
++
++        let origins = ["https://example.test".to_string()];
++        let mut collection = Box::pin(collect_storage_via_temp_target(&client, &origins, ""));
++        tokio::time::timeout(Duration::from_secs(2), async {
++            tokio::select! {
++                _ = create_seen_rx => {},
++                result = &mut collection => panic!("collection finished before cancellation: {result:?}"),
++            }
++        })
++        .await
++        .expect("temporary target was not requested");
++        drop(collection);
++        release_reply_tx.send(()).unwrap();
++        tokio::time::timeout(Duration::from_secs(2), server)
++            .await
++            .expect("late temporary target was not closed")
++            .unwrap();
++        client.close().await;
++    }
++
 +    #[cfg(unix)]
 +    #[tokio::test]
 +    async fn pipe_cancelled_state_collection_closes_disposable_target() {
@@ -8091,6 +8460,9 @@ index 791691f..258fabd 100644
 +
 +        let (child_reader, parent_writer) = UnixStream::pair().unwrap();
 +        let (parent_reader, child_writer) = UnixStream::pair().unwrap();
++        child_reader
++            .set_read_timeout(Some(Duration::from_secs(6)))
++            .unwrap();
 +        let reader = unsafe { fs::File::from_raw_fd(parent_reader.into_raw_fd()) };
 +        let writer = unsafe { fs::File::from_raw_fd(parent_writer.into_raw_fd()) };
 +        let client = Arc::new(CdpClient::connect_pipe(reader, writer, None));
@@ -8125,21 +8497,31 @@ index 791691f..258fabd 100644
 +            output.write_all(&[0]).unwrap();
 +        });
 +
-+        let origins = ["https://example.test".to_string()];
-+        let mut collection = Box::pin(collect_storage_via_temp_target(&client, &origins, ""));
-+        tokio::time::timeout(Duration::from_secs(2), async {
-+            tokio::select! {
-+                _ = attach_seen_rx => {},
-+                result = &mut collection => panic!("collection finished before cancellation: {result:?}"),
-+            }
-+        })
++        let collection_client = client.clone();
++        let collection = tokio::spawn(async move {
++            let origins = ["https://example.test".to_string()];
++            collect_storage_via_temp_target(&collection_client, &origins, "").await
++        });
++        tokio::time::timeout(Duration::from_secs(2), attach_seen_rx)
++            .await
++            .expect("temporary target was not attached")
++            .unwrap();
++        // Keep the collection task polled while this second command waits for
++        // its attach write to release the transport lock.
++        tokio::time::timeout(
++            Duration::from_secs(5),
++            client.send_command_no_wait("Test.barrier", None, None),
++        )
 +        .await
-+        .expect("temporary target was not attached");
-+        // Reading the attach frame can precede the writer's flush completing.
-+        // Take the same transport lock once more before cancelling the save.
-+        client.send_command_no_wait("Test.barrier", None, None).await.unwrap();
-+        drop(collection);
-+        tokio::time::timeout(Duration::from_secs(2), server)
++        .expect("test transport barrier did not complete")
++        .unwrap();
++        assert!(
++            !collection.is_finished(),
++            "collection finished before cancellation"
++        );
++        collection.abort();
++        let _ = collection.await;
++        tokio::time::timeout(Duration::from_secs(5), server)
 +            .await
 +            .expect("cancelled collection did not close its target")
 +            .unwrap();
