@@ -11794,6 +11794,7 @@ mod tests {
         #[cfg(target_os = "macos")]
         let temp_root = "/tmp";
         let temp = tempfile::Builder::new().prefix("cmxbr-").tempdir_in(temp_root).unwrap();
+        std::fs::set_permissions(temp.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
         assert_eq!(std::fs::metadata(temp.path()).unwrap().permissions().mode() & 0o777, 0o700);
         let long_home = temp.path().join("h".repeat(120));
         std::fs::create_dir(&long_home).unwrap();
