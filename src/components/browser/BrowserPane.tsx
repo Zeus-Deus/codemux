@@ -168,6 +168,7 @@ const SLOW_RETRY_MS = 10000;
 // cheap WebSocket reconnect, so only a few starts retry on their own.
 // After that the pane waits for "Retry now".
 export const MAX_AUTO_START_RETRIES = 3;
+const PRESET_NAVIGATION_UNCONFIRMED_MESSAGE = "Preset navigation could not be confirmed. Check the page before retrying.";
 
 interface PendingMove {
   x: number;
@@ -432,6 +433,23 @@ export const BrowserPane = memo(function BrowserPane({ browserId, focused, visib
           const revision = confirmationRevisionRef.current;
           const presetState = await browserPresetNavigationStatus(streamSessionId).catch(() => null);
           if (!active || !paneIsCurrent() || confirmationBusyRef.current || revision !== confirmationRevisionRef.current) return;
+          if (presetState === "completed") {
+            pendingConfirmationRef.current = false;
+            setPendingPreset(null);
+            setStatus("connecting");
+            slowRetryTimer = setTimeout(() => {
+              if (active && paneIsCurrent() && !pendingConfirmationRef.current) setRetryNonce((nonce) => nonce + 1);
+            }, 1500);
+            return;
+          }
+          if (presetState === "failed") {
+            pendingConfirmationRef.current = false;
+            presetErrorRef.current = true;
+            setPendingPreset(null);
+            setStatus("error");
+            setErrorMsg(PRESET_NAVIGATION_UNCONFIRMED_MESSAGE);
+            return;
+          }
           if (presetState === "pending") setPendingPreset({ sessionId: streamSessionId, paneEpoch });
           if (!remoteClient) {
             const details = await agentBrowserPendingConfirmation(streamSessionId).catch(() => null);
@@ -635,7 +653,7 @@ export const BrowserPane = memo(function BrowserPane({ browserId, focused, visib
                         } else {
                           presetErrorRef.current = true;
                           setStatus("error");
-                          setErrorMsg("Preset navigation did not complete. Check the page, then retry if needed.");
+                          setErrorMsg(PRESET_NAVIGATION_UNCONFIRMED_MESSAGE);
                         }
                       })
                       .catch((error) => {
@@ -879,7 +897,7 @@ export const BrowserPane = memo(function BrowserPane({ browserId, focused, visib
           if (state === "failed") {
             presetErrorRef.current = true;
             setStatus("error");
-            setErrorMsg("Preset navigation did not complete. Check the page, then retry if needed.");
+            setErrorMsg(PRESET_NAVIGATION_UNCONFIRMED_MESSAGE);
           } else {
             presetErrorRef.current = false;
             setRetryNonce((nonce) => nonce + 1);
@@ -902,13 +920,13 @@ export const BrowserPane = memo(function BrowserPane({ browserId, focused, visib
   const respondToConfirmation = async (approve: boolean) => {
     const pending = pendingConfirmation;
     if (!pending?.details.id || pending.paneEpoch !== paneEpoch || !paneIsCurrent() || confirmationBusy || isRemoteClient()) return;
-    confirmationRevisionRef.current++;
+    const decisionRevision = ++confirmationRevisionRef.current;
     confirmationBusyRef.current = true;
     setConfirmationBusy(true);
     setConfirmationError(null);
     try {
       const followUp = await agentBrowserRespondConfirmation(pending.sessionId, pending.details.id, approve);
-      if (!paneIsCurrent()) return;
+      if (!paneIsCurrent() || decisionRevision !== confirmationRevisionRef.current) return;
       if (followUp) {
         showPendingConfirmation(pending.sessionId, followUp);
         return;
@@ -919,12 +937,29 @@ export const BrowserPane = memo(function BrowserPane({ browserId, focused, visib
       if (approve) retryNow();
       else setErrorMsg("Browser action denied");
     } catch (err) {
-      if (!paneIsCurrent()) return;
+      if (!paneIsCurrent() || decisionRevision !== confirmationRevisionRef.current) return;
       const message = String(err);
       try {
         const current = await agentBrowserPendingConfirmation(pending.sessionId);
-        if (!paneIsCurrent()) return;
+        if (!paneIsCurrent() || decisionRevision !== confirmationRevisionRef.current) return;
         if (!current) {
+          const presetState = await browserPresetNavigationStatus(pending.sessionId).catch(() => undefined);
+          if (!paneIsCurrent() || decisionRevision !== confirmationRevisionRef.current) return;
+          if (presetState) {
+            confirmationRevisionRef.current++;
+            visibleConfirmationRef.current = null;
+            setPendingConfirmation(null);
+            setConfirmationError(null);
+            setPendingPreset({ sessionId: pending.sessionId, paneEpoch });
+            pendingConfirmationRef.current = true;
+            setStatus("error");
+            setErrorMsg("Waiting for browser approval to finish.");
+            return;
+          }
+          if (presetState === undefined) {
+            setConfirmationError(message);
+            return;
+          }
           setPendingPreset(null);
           presetErrorRef.current = true;
           visibleConfirmationRef.current = null;
