@@ -546,8 +546,13 @@ impl SocketCaller {
                 ErrorCode::AdminRefused,
                 format!(
                     "`{command}` changes who can reach or control Codemux, or what runs without you. \
-                     Agent processes cannot run it; ask the person to run it in their own terminal or in Settings."
+                     Agent and unverified external processes cannot run it over the control socket. \
+                     Use an in-app control in Codemux where available."
                 ),
+            )),
+            Self::Agent { kind, access: ControlAccess::ReadOnly } if kind == "unverified" && required != Access::Read => Err(ControlError::new(
+                ErrorCode::AccessDenied,
+                "This control connection cannot prove owner authority, so it can only read. Use an in-app control in Codemux where available.",
             )),
             // Machine-class legacy commands stay open to agents at their own
             // access: full-access chats reach them through codemux-self.
@@ -893,7 +898,9 @@ mod tests {
             let caller = resolve_socket_caller(client(Some("owner"), Some(FullAccess), None), peer_pid);
             assert!(matches!(&caller, SocketCaller::Agent { kind, access: ReadOnly } if kind == "unverified"), "{caller:?}");
             assert!(caller.permits("status", Access::Read).is_ok());
-            assert!(caller.permits("notify", Access::Write).is_err());
+            let refused = caller.permits("notify", Access::Write).unwrap_err();
+            assert_eq!(refused.code, ErrorCode::AccessDenied);
+            assert!(refused.to_string().contains("cannot prove owner authority"), "{refused}");
             assert_eq!(caller.permits("web_remote_enable", Access::Admin).unwrap_err().code, ErrorCode::AdminRefused);
         }
     }
