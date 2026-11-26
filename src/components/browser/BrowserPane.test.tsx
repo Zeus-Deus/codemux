@@ -176,6 +176,27 @@ describe("BrowserPane start failures", () => {
     expect(mocks.agentBrowserRespondConfirmation).toHaveBeenCalledWith("browser-1", "c_second", true);
   });
 
+  it("shows a consumed replay failure without leaving the spent approval visible", async () => {
+    mocks.startBrowserStream.mockRejectedValue("Browser confirmation is pending for session browser-1");
+    let pending: { id: string; description: string; expires_at_ms: number } | null = {
+      id: "host_first",
+      description: "Approve navigation",
+      expires_at_ms: Date.now() + 60_000,
+    };
+    mocks.agentBrowserPendingConfirmation.mockImplementation(async () => pending);
+    mocks.agentBrowserRespondConfirmation.mockImplementation(async () => {
+      pending = null;
+      throw new Error("Browser action failed after confirmation: navigation failed");
+    });
+
+    renderPane();
+    await vi.waitFor(() => expect(screen.getByText("Approve navigation")).toBeInTheDocument());
+    fireEvent.click(screen.getByRole("button", { name: "Approve browser action" }));
+    await vi.waitFor(() => expect(screen.getByText(/navigation failed/)).toBeInTheDocument());
+    expect(screen.queryByText("Approve navigation")).not.toBeInTheDocument();
+    expect(mocks.startBrowserStream).toHaveBeenCalledTimes(1);
+  });
+
   it("denies a pending action without starting another browser", async () => {
     mocks.startBrowserStream.mockRejectedValue("Browser confirmation is pending for session browser-1");
     mocks.agentBrowserPendingConfirmation.mockResolvedValue({

@@ -119,11 +119,15 @@ pub(super) async fn ws_proxy<R: Runtime>(
             && app.state::<AgentBrowserManager>()
                 .verified_stream_identity_for_port(port).await == Some(identity)
         {
-            tokio::select! {
-                biased;
-                _ = closed.changed() => {}
-                _ = life.stopped() => {}
-                _ = bridge_ws(socket, identity) => {}
+            if let Some(mut authorization) = app.state::<AgentBrowserManager>()
+                .subscribe_active_stream(identity).await {
+                tokio::select! {
+                    biased;
+                    _ = authorization.changed() => {}
+                    _ = closed.changed() => {}
+                    _ = life.stopped() => {}
+                    _ = bridge_ws(socket, identity) => {}
+                }
             }
         }
         shared.connections.unregister(connection);
@@ -818,6 +822,54 @@ mod tests {
         })
         .await
         .expect("loopback bridges must respond to revocation and listener shutdown");
+    }
+
+    #[tokio::test]
+    async fn active_browser_bridge_closes_when_approval_becomes_pending() {
+        use tungstenite::client::IntoClientRequest;
+
+        tokio::time::timeout(Duration::from_secs(10), async {
+            let app = tauri::test::mock_app();
+            let db = crate::database::DatabaseStore::new_in_memory();
+            db.web_remote_insert_session("phone", None, None, &auth::sha256_hex("phone"), true)
+                .unwrap();
+            app.manage(db);
+            app.manage(WebRemoteState::default());
+            let manager = crate::agent_browser::AgentBrowserManager::new();
+            app.manage(manager.clone());
+
+            let daemon = bind_test_daemon().await;
+            let port = daemon.local_addr().unwrap().port();
+            manager.allow_test_stream_session("browser-pending", port).await;
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let proxy = listener.local_addr().unwrap();
+            let (shutdown, rx) = watch::channel(false);
+            let mut life = ListenerLife(rx);
+            let router = server::router(app.handle().clone()).layer(Extension(life.clone()));
+            let server = tokio::spawn(async move {
+                axum::serve(listener, router)
+                    .with_graceful_shutdown(async move { life.stopped().await })
+                    .await
+                    .unwrap();
+            });
+
+            let (mut client, mut upstream) = open_bridge(proxy, &daemon, "phone").await;
+            forward_frame(&mut client, &mut upstream, "before approval").await;
+            manager.park_test_stream_confirmation("browser-pending").await;
+            assert_peer_closed(&mut client).await;
+            assert_peer_closed(&mut upstream).await;
+
+            let mut request = format!("ws://{proxy}/proxy/browser/{port}/ws")
+                .into_client_request().unwrap();
+            request.headers_mut().insert(header::COOKIE,
+                format!("{}=phone", server::SESSION_COOKIE).parse().unwrap());
+            let denied = tokio_tungstenite::client_async(request, TcpStream::connect(proxy).await.unwrap())
+                .await.unwrap_err();
+            assert!(matches!(denied, tungstenite::Error::Http(response) if response.status() == StatusCode::FORBIDDEN));
+
+            shutdown.send(true).unwrap();
+            server.await.unwrap();
+        }).await.expect("approval must revoke existing and new browser bridges");
     }
 
     #[tokio::test]
