@@ -654,6 +654,15 @@ pub fn apply_disconnect_request(cfg: &mut WebRemoteConfig) {
     cfg.relay_mode_enabled = false;
 }
 
+/// A managed unit runs a bare `serve` and may remain installed if removal
+/// fails. Save an explicit LAN-off choice so that restart cannot restore a
+/// listener that was on before `connect off`.
+pub fn apply_managed_disconnect_request(cfg: &mut WebRemoteConfig) {
+    apply_disconnect_request(cfg);
+    cfg.lan_enabled = false;
+    cfg.lan_explicitly_disabled = true;
+}
+
 // ── Reports (pure formatting) ────────────────────────────────────────
 
 /// How step 3 was satisfied.
@@ -1157,7 +1166,11 @@ fn disconnect_with_host<G>(
 
     let relay_turned_off = super::load_config_from_db(db).relay_mode_enabled;
     super::update_config_headless(db, |cfg| {
-        apply_disconnect_request(cfg);
+        if unit_installed {
+            apply_managed_disconnect_request(cfg);
+        } else {
+            apply_disconnect_request(cfg);
+        }
         Ok(())
     })?;
     let service_removed = match (service_supported, host, unit_installed) {
@@ -1399,6 +1412,7 @@ mod tests {
         active_sequence: RefCell<Vec<String>>,
         unit: RefCell<Option<String>>,
         write_fails: bool,
+        remove_fails: bool,
     }
 
     fn ok(stdout: &str) -> CmdOutcome {
@@ -1425,6 +1439,7 @@ mod tests {
                 active_sequence: RefCell::new(vec!["active".to_string()]),
                 unit: RefCell::new(None),
                 write_fails: false,
+                remove_fails: false,
             }
         }
 
@@ -1473,6 +1488,9 @@ mod tests {
 
         fn remove_unit(&self) -> Result<(), String> {
             self.calls.borrow_mut().push("remove_unit".to_string());
+            if self.remove_fails {
+                return Err("permission denied".to_string());
+            }
             *self.unit.borrow_mut() = None;
             Ok(())
         }
@@ -1742,6 +1760,59 @@ mod tests {
         assert!(!host.ran("is-active"), "an unavailable user bus cannot report service state");
         assert!(!host.ran("stop codemux.service"));
         assert!(!host.ran("disable --now codemux.service"));
+    }
+
+    #[test]
+    fn connect_off_keeps_a_retained_managed_unit_from_reopening_lan() {
+        let db = crate::database::init_test_database();
+        let mut config = WebRemoteConfig::default();
+        config.enabled = true;
+        config.relay_mode_enabled = true;
+        config.lan_enabled = true;
+        super::super::save_config_to_db(&db, &config).unwrap();
+        let mut host = FakeHost::new()
+            .with_unit_installed()
+            .active_after(&["active", "deactivating", "inactive"]);
+        host.remove_fails = true;
+
+        let error = disconnect_with_host(&db, Some(&host), || false, || {
+            let before = super::super::load_config_from_db(&db);
+            assert!(before.relay_mode_enabled && before.lan_enabled);
+            assert!(host.unit_exists(), "the unit remains while ownership is checked");
+            Ok(())
+        })
+        .expect_err("unit removal is reported after access is disabled");
+
+        assert!(error.contains("From-anywhere access is off") && error.contains("could not be removed"), "{error}");
+        assert!(host.unit_exists(), "failed removal retains the unit");
+        assert!(host.ran("stop codemux.service"));
+        assert!(host.ran("remove_unit"));
+        let persisted = super::super::load_config_from_db(&db);
+        assert!(!persisted.relay_mode_enabled && !persisted.lan_enabled);
+        assert!(persisted.lan_explicitly_disabled);
+        assert!(super::super::keeps_lan_disabled(
+            persisted.relay_mode_enabled,
+            persisted.lan_enabled,
+            persisted.lan_explicitly_disabled,
+            false,
+        ));
+    }
+
+    #[test]
+    fn connect_off_without_a_managed_unit_preserves_lan() {
+        let db = crate::database::init_test_database();
+        let mut config = WebRemoteConfig::default();
+        config.enabled = true;
+        config.relay_mode_enabled = true;
+        config.lan_enabled = true;
+        super::super::save_config_to_db(&db, &config).unwrap();
+        let host = FakeHost::new();
+
+        disconnect_with_host(&db, Some(&host), || false, || Ok(())).unwrap();
+        let persisted = super::super::load_config_from_db(&db);
+        assert!(!persisted.relay_mode_enabled);
+        assert!(persisted.lan_enabled);
+        assert!(!persisted.lan_explicitly_disabled);
     }
 
     // ── Availability probe ───────────────────────────────────────

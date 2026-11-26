@@ -1,6 +1,6 @@
-//! A retained headless unit must not open a LAN listener after `connect off`.
-//! The unit runs a bare `serve`, so this exercises the same restart path with
-//! a persisted relay-only config after the relay has been disabled locally.
+//! A retained headless unit must not reopen a LAN listener after `connect off`.
+//! The unit runs a bare `serve`, so this exercises restart from a managed
+//! deployment that had both relay and LAN access on before disconnect.
 
 #![cfg(unix)]
 
@@ -10,7 +10,7 @@ use codemux_lib::web_remote;
 use codemux_lib::web_remote::serve::{serve_startup, ServeOptions};
 
 #[test]
-fn bare_serve_preserves_lan_off_after_relay_disconnect() {
+fn bare_serve_keeps_managed_lan_off_after_relay_disconnect() {
     let tmp = tempfile::tempdir().expect("tempdir");
     for (key, sub) in [
         ("HOME", ""),
@@ -42,22 +42,22 @@ fn bare_serve_preserves_lan_off_after_relay_disconnect() {
         let db = codemux_lib::database::init_database().expect("open isolated db");
         web_remote::update_config_headless(&db, |cfg| {
             cfg.enabled = true;
-            cfg.lan_enabled = false;
+            cfg.lan_enabled = true;
             cfg.relay_mode_enabled = true;
             cfg.port = port;
             cfg.bind_scope = web_remote::BIND_SCOPE_LOOPBACK.to_string();
             assert!(
                 !cfg.lan_explicitly_disabled,
-                "legacy relay-only config has no intent bit"
+                "the managed service initially had its LAN listener on"
             );
             Ok(())
         })
-        .expect("seed relay-only config");
+        .expect("seed relay and LAN config");
         web_remote::update_config_headless(&db, |cfg| {
-            web_remote::connect::apply_disconnect_request(cfg);
+            web_remote::connect::apply_managed_disconnect_request(cfg);
             Ok(())
         })
-        .expect("persist local disconnect");
+        .expect("persist managed disconnect");
         let cfg = web_remote::load_config_from_db(&db);
         assert!(!cfg.relay_mode_enabled && !cfg.lan_enabled);
         assert!(cfg.lan_explicitly_disabled);
