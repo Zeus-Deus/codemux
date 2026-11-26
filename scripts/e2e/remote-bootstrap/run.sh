@@ -506,8 +506,12 @@ run_distro() {
     pair_out=$(uexec "$distro" "codemux remote pair; echo RC=\$?")
     assert_not_contains "standalone SSH cannot mint another pairing code" "$pair_out" "RC=0"
     assert_contains "standalone pairing reports owner access required" "$pair_out" "needs verified owner access"
-    serve_log=$(rexec "$distro" journalctl "_UID=${uid}" --no-pager -o cat 2>&1)
-    assert_not_contains "managed service journal has no pairing link" "$serve_log" "Pairing link:"
+    if serve_log=$(rexec "$distro" journalctl "_UID=${uid}" --no-pager -o cat 2>&1); then
+        pass "managed service journal is readable"
+        assert_not_contains "managed service journal has no pairing link" "$serve_log" "Pairing link:"
+    else
+        fail "managed service journal is readable" "$serve_log"
+    fi
 
     # ── (d2) a second `serve` refuses cleanly ────────────────────────────
     #
