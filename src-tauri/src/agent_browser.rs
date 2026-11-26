@@ -4,7 +4,7 @@ use std::collections::HashMap;
 use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU16, Ordering};
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex as StdMutex, OnceLock};
 use hmac::{Hmac, Mac};
 use rand::RngCore;
 use std::time::{Duration, Instant};
@@ -4124,6 +4124,9 @@ pub struct AgentBrowserManager {
     next_port: Arc<AtomicU16>,
     /// Per-session state keyed by session identifier (workspace_id or cli_session_name).
     sessions: Arc<Mutex<HashMap<String, StreamSession>>>,
+    /// An ambiguous preset open belongs to the logical session, even after
+    /// its dead daemon's stream port is released for a replacement.
+    ambiguous_presets: Arc<StdMutex<HashMap<String, PresetNavigationAttempt>>>,
     #[cfg(test)]
     test_stream_ports: Arc<Mutex<HashMap<u16, (BrowserStreamIdentity, watch::Sender<u64>)>>>,
 }
@@ -6113,8 +6116,22 @@ impl AgentBrowserManager {
         Self {
             next_port: Arc::new(AtomicU16::new(DEFAULT_STREAM_PORT)),
             sessions: Arc::new(Mutex::new(HashMap::new())),
+            ambiguous_presets: Arc::new(StdMutex::new(HashMap::new())),
             #[cfg(test)]
             test_stream_ports: Arc::new(Mutex::new(HashMap::new())),
+        }
+    }
+
+    fn retire_stream_allocation(
+        &self, sessions: &mut HashMap<String, StreamSession>, session_key: &str,
+    ) {
+        if let Some(stream) = sessions.remove(session_key) {
+            if let Some(attempt) = stream.preset_navigation
+                .filter(|attempt| attempt.phase == PresetNavigationPhase::FailedAmbiguous)
+            {
+                self.ambiguous_presets.lock().unwrap()
+                    .insert(session_key.to_owned(), attempt);
+            }
         }
     }
 
@@ -6195,7 +6212,7 @@ impl AgentBrowserManager {
                     pid: None,
                     pid_start_time: None,
                     stream_generation: 0,
-                    preset_navigation: None,
+                    preset_navigation: self.ambiguous_presets.lock().unwrap().remove(session_key),
                     stream_revocation: watch::channel(0).0,
                     last_seen_at: None,
                 },
@@ -6213,7 +6230,7 @@ impl AgentBrowserManager {
     async fn clear_failed_stream_allocation(&self, session_key: &str, port: u16) {
         let mut sessions = self.sessions.lock().await;
         if sessions.get(session_key).is_some_and(|s| s.port == port && !s.running) {
-            sessions.remove(session_key);
+            self.retire_stream_allocation(&mut sessions, session_key);
         }
     }
 
@@ -6362,7 +6379,7 @@ impl AgentBrowserManager {
     async fn clear_stale_running_stream_allocation(&self, session_key: &str, port: u16) {
         let mut sessions = self.sessions.lock().await;
         if sessions.get(session_key).is_some_and(|s| s.port == port) {
-            sessions.remove(session_key);
+            self.retire_stream_allocation(&mut sessions, session_key);
         }
     }
 
@@ -6838,7 +6855,7 @@ impl AgentBrowserManager {
             if sessions.get(browser_id).is_some_and(|entry| {
                 entry.pid.is_none() && !entry.browser_ready && !entry.confirmation_pending
             }) {
-                sessions.remove(browser_id);
+                self.retire_stream_allocation(&mut sessions, browser_id);
             }
         }
     }
@@ -7202,7 +7219,12 @@ impl AgentBrowserManager {
         let session = session_name(browser_id).to_string();
 
         // Step 1: pop the session under the lock so nothing else races us.
-        let removed = self.sessions.lock().await.remove(browser_id);
+        let removed = {
+            let mut sessions = self.sessions.lock().await;
+            let removed = sessions.remove(browser_id);
+            self.ambiguous_presets.lock().unwrap().remove(browser_id);
+            removed
+        };
         #[cfg(not(target_os = "macos"))]
         let had_session = removed.is_some();
         #[cfg(target_os = "macos")]
@@ -9433,6 +9455,65 @@ mod tests {
         }
         assert_eq!(manager.ensure_preset_navigation(&session, "https://example.com".into(), false).await.unwrap(),
             BrowserPresetNavigationStatus::Failed);
+    }
+
+    #[tokio::test]
+    async fn ambiguous_preset_survives_stream_port_reallocation_until_explicit_retry_or_close() {
+        let manager = AgentBrowserManager::new();
+        let session = format!("preset-reallocated-{}", uuid::Uuid::new_v4().simple());
+        let old_port = manager.allocate_port(&session).await.unwrap();
+        manager.allow_test_stream_session(&session, old_port).await;
+        let original = manager.verified_stream_identity(&session).await.unwrap();
+
+        // An unbound Unix open may have reached a daemon before its reply was
+        // lost. The old daemon then exits, so startup retires its port.
+        let (phase, response) = classify_completed_preset_verification(
+            original, Err("lost preset reply".into()), false,
+        );
+        assert_eq!(phase, PresetNavigationPhase::FailedAmbiguous);
+        assert!(response.is_err());
+        {
+            let mut sessions = manager.sessions.lock().await;
+            let stream = sessions.get_mut(&session).unwrap();
+            assert_eq!(begin_preset_navigation(stream, original, false), None);
+            assert!(settle_preset_navigation(stream, original, None, phase, None));
+        }
+        manager.clear_stale_running_stream_allocation(&session, old_port).await;
+        assert_eq!(manager.get_port(&session).await, None);
+
+        let new_port = manager.allocate_port(&session).await.unwrap();
+        assert_ne!(new_port, old_port);
+        manager.allow_test_stream_port(new_port).await;
+        let replacement = current_process_stream_identity(new_port);
+        {
+            let mut sessions = manager.sessions.lock().await;
+            let stream = sessions.get_mut(&session).unwrap();
+            stream.running = true;
+            stream.browser_ready = true;
+            stream.pid = Some(replacement.pid);
+            stream.pid_start_time = Some(replacement.start_time);
+            stream.stream_generation = replacement.generation;
+            assert_eq!(stream.preset_navigation.as_ref().unwrap().phase,
+                PresetNavigationPhase::FailedAmbiguous);
+        }
+        assert_eq!(manager.preset_navigation_status(&session).await.unwrap(),
+            Some(BrowserPresetNavigationStatus::Failed));
+        // This returns the guarded result before invoking the CLI a second time.
+        assert_eq!(manager.ensure_preset_navigation(&session, "https://example.com".into(), false).await.unwrap(),
+            BrowserPresetNavigationStatus::Failed);
+
+        {
+            let mut sessions = manager.sessions.lock().await;
+            let stream = sessions.get_mut(&session).unwrap();
+            assert_eq!(begin_preset_navigation(stream, replacement, true), None);
+            assert_eq!(stream.preset_navigation.as_ref().unwrap().phase,
+                PresetNavigationPhase::Running);
+            stream.preset_navigation.as_mut().unwrap().phase = PresetNavigationPhase::FailedAmbiguous;
+        }
+        manager.clear_stale_running_stream_allocation(&session, new_port).await;
+        assert!(manager.ambiguous_presets.lock().unwrap().contains_key(&session));
+        manager.close(&session).await.unwrap();
+        assert!(!manager.ambiguous_presets.lock().unwrap().contains_key(&session));
     }
 
     #[tokio::test]
