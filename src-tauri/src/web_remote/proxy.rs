@@ -249,6 +249,10 @@ pub async fn http_forward<R: Runtime>(
         .verified_stream_identity_for_port(port).await else {
         return StatusCode::FORBIDDEN.into_response();
     };
+    let Some(authorization) = app.state::<AgentBrowserManager>()
+        .subscribe_active_stream(identity).await else {
+        return StatusCode::FORBIDDEN.into_response();
+    };
     // Reject a percent-decoded CR/LF (or other control char) in the path before
     // it reaches the raw request line — no header/request smuggling to the
     // daemon. (`uri.query()` stays percent-encoded, so it needs no such guard.)
@@ -258,7 +262,7 @@ pub async fn http_forward<R: Runtime>(
     if !allowed_browser_api(&method, &rest) {
         return StatusCode::NOT_FOUND.into_response();
     }
-    match forward(identity, &method, &rest, uri.query(), &headers, &body).await {
+    match forward(identity, authorization, &method, &rest, uri.query(), &headers, &body).await {
         Ok(resp) => resp,
         Err(()) => (StatusCode::BAD_GATEWAY, "daemon unreachable").into_response(),
     }
@@ -268,6 +272,7 @@ pub async fn http_forward<R: Runtime>(
 /// request, and translate the response back into an axum `Response`.
 pub(crate) async fn forward(
     identity: BrowserStreamIdentity,
+    mut authorization: watch::Receiver<u64>,
     method: &Method,
     rest: &str,
     query: Option<&str>,
@@ -303,19 +308,27 @@ pub(crate) async fn forward(
     let mut wire = head.into_bytes();
     wire.extend_from_slice(body);
 
-    let mut stream = crate::agent_browser::connect_verified_stream_peer(identity)
-        .await
-        .map_err(|_| ())?;
+    let mut stream = tokio::select! {
+        biased;
+        _ = authorization.changed() => return Err(()),
+        result = crate::agent_browser::connect_verified_stream_peer(identity) => result.map_err(|_| ())?,
+    };
 
     // One write_all → the whole request lands in a single loopback segment,
     // satisfying the daemon's single-peek read.
-    stream.write_all(&wire).await.map_err(|_| ())?;
+    tokio::select! {
+        biased;
+        _ = authorization.changed() => return Err(()),
+        result = stream.write_all(&wire) => result.map_err(|_| ())?,
+    }
     let _ = stream.flush().await;
 
-    let raw = tokio::time::timeout(Duration::from_secs(30), read_response(&mut stream, method))
-        .await
-        .map_err(|_| ())?
-        .map_err(|_| ())?;
+    let raw = tokio::select! {
+        biased;
+        _ = authorization.changed() => return Err(()),
+        result = tokio::time::timeout(Duration::from_secs(30), read_response(&mut stream, method)) =>
+            result.map_err(|_| ())?.map_err(|_| ())?,
+    };
 
     let parsed = parse_http_response(&raw, method).ok_or(())?;
     let mut builder = axum::response::Response::builder().status(parsed.status);
@@ -597,8 +610,10 @@ mod tests {
         headers.insert(header::CONTENT_TYPE, "application/json".parse().unwrap());
         headers.insert(header::COOKIE, "session=private".parse().unwrap());
         headers.insert(header::AUTHORIZATION, "Bearer private".parse().unwrap());
+        let (_authorization_sender, authorization) = watch::channel(0);
         let response = forward(
             crate::agent_browser::current_process_stream_identity(port),
+            authorization,
             &Method::POST,
             "command",
             None,
@@ -617,6 +632,47 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn pending_approval_cancels_paired_http_during_peer_verification() {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            let app = tauri::test::mock_app();
+            let db = crate::database::DatabaseStore::new_in_memory();
+            db.web_remote_insert_session("phone", None, None, &auth::sha256_hex("phone"), true)
+                .unwrap();
+            app.manage(db);
+            let manager = crate::agent_browser::AgentBrowserManager::new();
+            app.manage(manager.clone());
+            let daemon = bind_test_daemon().await;
+            let port = daemon.local_addr().unwrap().port();
+            manager.allow_test_stream_session("browser-http-pending", port).await;
+            let request = tokio::spawn({
+                let app = app.handle().clone();
+                async move {
+                    let mut headers = HeaderMap::new();
+                    headers.insert(header::AUTHORIZATION, "Bearer phone".parse().unwrap());
+                    http_forward(
+                        State(app),
+                        Path((port, "command".to_owned())),
+                        Method::POST,
+                        "/api/command".parse().unwrap(),
+                        headers,
+                        Bytes::from_static(br#"{"action":"stream_status"}"#),
+                    ).await
+                }
+            });
+
+            let (mut stream, _) = daemon.accept().await.unwrap();
+            // The single-thread test executor parks approval before the
+            // verifier can resume the forwarding task after accept.
+            manager.park_test_stream_confirmation("browser-http-pending").await;
+            let mut byte = [0; 1];
+            let received = tokio::time::timeout(Duration::from_secs(2), stream.read(&mut byte))
+                .await.unwrap().unwrap();
+            assert_eq!(received, 0, "revoked paired HTTP request reached the daemon");
+            assert_eq!(request.await.unwrap().status(), StatusCode::BAD_GATEWAY);
+        }).await.expect("paired HTTP must stop while its peer is being verified");
+    }
+
+    #[tokio::test]
     async fn http_proxy_does_not_send_to_a_different_established_peer() {
         let daemon = bind_test_daemon().await;
         let port = daemon.local_addr().unwrap().port();
@@ -629,8 +685,10 @@ mod tests {
                 .unwrap()
         });
         let (unrelated, identity) = unrelated_live_identity(port);
+        let (_authorization_sender, authorization) = watch::channel(0);
         let response = forward(
             identity,
+            authorization,
             &Method::POST,
             "command",
             None,
