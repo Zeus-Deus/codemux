@@ -904,14 +904,40 @@ fn cleanup_stale_browser_lock_files_in(dir: &std::path::Path, session: &str, pid
         return;
     }
     let pid_path = dir.join(format!("{session}.pid"));
+    #[cfg(windows)]
+    let port_path = dir.join(format!("{session}.port"));
+    #[cfg(windows)]
+    let Some(captured_port) = optional_windows_browser_port(&port_path) else { return };
+    #[cfg(windows)]
+    let mut remaining_port = captured_port.as_ref();
     for ext in ["port", "engine", "stream", "pid"] {
         // The daemon may have restarted under this session name. Recheck
         // before touching each entry and remove the PID file last.
-        if pid_alive(pid) || browser_control_endpoint_ready_in_namespace(session, dir)
+        #[cfg(windows)]
+        let endpoint_ready = if let Some(port) = captured_port.as_ref() {
+            // Keep probing the daemon's recorded port after removing .port.
+            // Falling back to the hash port here could attribute an unrelated
+            // listener to the dead daemon and strand its PID marker.
+            windows_loopback_listener_pid(port.port) != Some(None)
+                || !windows_browser_port_matches(&port_path, remaining_port)
+        } else {
+            browser_control_endpoint_ready_in_namespace(session, dir)
+        };
+        #[cfg(not(windows))]
+        let endpoint_ready = browser_control_endpoint_ready_in_namespace(session, dir);
+        if pid_alive(pid) || endpoint_ready
             || read_daemon_pid_file(&pid_path) != Some(pid) {
             break;
         }
-        let _ = std::fs::remove_file(dir.join(format!("{session}.{ext}")));
+        let removed = std::fs::remove_file(dir.join(format!("{session}.{ext}")));
+        #[cfg(windows)]
+        if removed.as_ref().is_err_and(|error| error.kind() != std::io::ErrorKind::NotFound) {
+            break;
+        }
+        #[cfg(not(windows))]
+        let _ = removed;
+        #[cfg(windows)]
+        if ext == "port" { remaining_port = None; }
     }
 }
 
@@ -985,6 +1011,64 @@ fn cleanup_owned_browser_lock_files_in(dir: &std::path::Path, session: &str, pid
 struct WindowsBrowserFileId(u64, u128);
 
 #[cfg(windows)]
+struct PinnedWindowsBrowserFile {
+    file: std::fs::File,
+    id: WindowsBrowserFileId,
+}
+
+/// Keep the verified legacy file open without write sharing while the old
+/// daemon exits and its metadata is retired. Another launch can rename it,
+/// but cannot rewrite its contents in place; deletion targets this handle.
+#[cfg(windows)]
+fn pin_windows_browser_file(path: &std::path::Path) -> Option<PinnedWindowsBrowserFile> {
+    use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
+    use windows_sys::Win32::Storage::FileSystem::{
+        DELETE, FILE_FLAG_OPEN_REPARSE_POINT, FILE_GENERIC_READ, FILE_SHARE_DELETE,
+        FILE_SHARE_READ,
+    };
+
+    let file = std::fs::OpenOptions::new()
+        .access_mode(FILE_GENERIC_READ | DELETE)
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_DELETE)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(path).ok()?;
+    let meta = file.metadata().ok()?;
+    if !meta.is_file() || meta.file_attributes() & 0x400 != 0 { return None; }
+    let (volume, id) = crate::windows_file_id::file_id(&file).ok()?;
+    let id = WindowsBrowserFileId(volume, id);
+    (windows_browser_file_id(path) == Some(id)).then_some(PinnedWindowsBrowserFile { file, id })
+}
+
+#[cfg(windows)]
+fn optional_pinned_windows_browser_file(path: &std::path::Path) -> Option<Option<PinnedWindowsBrowserFile>> {
+    match std::fs::symlink_metadata(path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Some(None),
+        Ok(_) => pin_windows_browser_file(path).map(Some),
+        Err(_) => None,
+    }
+}
+
+#[cfg(windows)]
+fn delete_pinned_windows_browser_file(path: &std::path::Path, pinned: PinnedWindowsBrowserFile) -> bool {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Storage::FileSystem::{
+        FileDispositionInfo, SetFileInformationByHandle, FILE_DISPOSITION_INFO,
+    };
+
+    if windows_browser_file_id(path) != Some(pinned.id) { return false; }
+    let info = FILE_DISPOSITION_INFO { DeleteFile: 1 };
+    // SAFETY: the live file handle was opened with DELETE access, and info
+    // has the size and layout required by FileDispositionInfo.
+    unsafe {
+        SetFileInformationByHandle(
+            pinned.file.as_raw_handle(), FileDispositionInfo,
+            std::ptr::addr_of!(info).cast(),
+            std::mem::size_of::<FILE_DISPOSITION_INFO>() as u32,
+        ) != 0
+    }
+}
+
+#[cfg(windows)]
 fn open_windows_browser_regular_file(path: &std::path::Path) -> Option<std::fs::File> {
     use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
     use windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT;
@@ -1003,15 +1087,7 @@ fn windows_browser_file_id(path: &std::path::Path) -> Option<WindowsBrowserFileI
 }
 
 #[cfg(windows)]
-fn optional_windows_browser_file_id(path: &std::path::Path) -> Option<Option<WindowsBrowserFileId>> {
-    match std::fs::symlink_metadata(path) {
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Some(None),
-        Ok(_) => windows_browser_file_id(path).map(Some),
-        Err(_) => None,
-    }
-}
-
-#[cfg(windows)]
+#[derive(Clone)]
 struct WindowsBrowserPortSnapshot {
     id: WindowsBrowserFileId,
     contents: Vec<u8>,
@@ -1048,10 +1124,11 @@ fn optional_windows_browser_port(path: &std::path::Path) -> Option<Option<Window
 #[cfg(windows)]
 struct CapturedLegacyWindowsBrowserFiles {
     dir: PathBuf,
-    pid: WindowsBrowserFileId,
-    port: Option<WindowsBrowserPortSnapshot>,
-    engine: Option<WindowsBrowserFileId>,
-    stream: Option<WindowsBrowserFileId>,
+    pid: PinnedWindowsBrowserFile,
+    port: Option<(PinnedWindowsBrowserFile, WindowsBrowserPortSnapshot)>,
+    captured_port: Option<u16>,
+    engine: Option<PinnedWindowsBrowserFile>,
+    stream: Option<PinnedWindowsBrowserFile>,
 }
 
 /// Legacy daemon-written files may inherit an ACL broader than Codemux's
@@ -1071,14 +1148,23 @@ fn capture_legacy_windows_browser_files(
     if read_daemon_pid_file(&pid_path) != Some(record.pid) {
         return None;
     }
-    let pid = windows_browser_file_id(&pid_path)?;
-    let port = optional_windows_browser_port(&dir.join(format!("{session}.port")))?;
-    let engine = optional_windows_browser_file_id(&dir.join(format!("{session}.engine")))?;
-    let stream = optional_windows_browser_file_id(&dir.join(format!("{session}.stream")))?;
+    let pid = pin_windows_browser_file(&pid_path)?;
+    let port_path = dir.join(format!("{session}.port"));
+    let port = match optional_pinned_windows_browser_file(&port_path)? {
+        Some(file) => {
+            let snapshot = windows_browser_port_snapshot(&port_path)?;
+            if snapshot.id != file.id { return None; }
+            Some((file, snapshot))
+        }
+        None => None,
+    };
+    let captured_port = port.as_ref().map(|(_, snapshot)| snapshot.port);
+    let engine = optional_pinned_windows_browser_file(&dir.join(format!("{session}.engine")))?;
+    let stream = optional_pinned_windows_browser_file(&dir.join(format!("{session}.stream")))?;
     (read_daemon_pid_file(&pid_path) == Some(record.pid)
-        && windows_browser_file_id(&pid_path) == Some(pid))
+        && windows_browser_file_id(&pid_path) == Some(pid.id))
         .then_some(CapturedLegacyWindowsBrowserFiles {
-            dir: dir.to_path_buf(), pid, port, engine, stream,
+            dir: dir.to_path_buf(), pid, port, captured_port, engine, stream,
         })
 }
 
@@ -1106,10 +1192,11 @@ fn windows_browser_port_matches(path: &std::path::Path, expected: Option<&Window
 fn captured_legacy_browser_endpoint_absent(
     session: &str,
     pid: u32,
-    files: &CapturedLegacyWindowsBrowserFiles,
+    dir: &std::path::Path,
+    captured_port: Option<u16>,
 ) -> bool {
-    let port = files.port.as_ref().map_or_else(|| browser_control_fallback_port(session), |port| port.port);
-    let current = files.dir.join(BROWSER_DAEMON_DIR);
+    let port = captured_port.unwrap_or_else(|| browser_control_fallback_port(session));
+    let current = dir.join(BROWSER_DAEMON_DIR);
     let current_pid = read_daemon_pid_file(&current.join(format!("{session}.pid")));
     let current_verified = current_pid.is_some_and(|current_pid| {
         owned_browser_pid(session, current_pid).is_some_and(|record| {
@@ -1120,7 +1207,7 @@ fn captured_legacy_browser_endpoint_absent(
     let Some(listener_pid) = windows_loopback_listener_pid(port) else { return false };
     let result = classify_legacy_browser_listener(listener_pid, Some(pid), current_pid, current_verified);
     result == BrowserControlEndpointProbe::Absent
-        || (files.port.is_none() && result == BrowserControlEndpointProbe::Inconclusive
+        || (captured_port.is_none() && result == BrowserControlEndpointProbe::Inconclusive
             && listener_pid.is_some_and(|listener_pid| listener_pid != pid))
 }
 
@@ -1128,42 +1215,61 @@ fn captured_legacy_browser_endpoint_absent(
 fn cleanup_captured_legacy_windows_browser_files(
     session: &str,
     record: &BrowserPidRecord,
-    files: &CapturedLegacyWindowsBrowserFiles,
+    files: CapturedLegacyWindowsBrowserFiles,
     old_exited: impl Fn() -> bool,
 ) -> bool {
-    let path = |ext: &str| files.dir.join(format!("{session}.{ext}"));
+    cleanup_captured_legacy_windows_browser_files_with_hook(session, record, files, old_exited, |_| {})
+}
+
+#[cfg(windows)]
+fn cleanup_captured_legacy_windows_browser_files_with_hook(
+    session: &str,
+    record: &BrowserPidRecord,
+    mut files: CapturedLegacyWindowsBrowserFiles,
+    old_exited: impl Fn() -> bool,
+    mut before_delete: impl FnMut(&str),
+) -> bool {
+    let dir = files.dir.clone();
+    let captured_port = files.captured_port;
+    let path = |ext: &str| dir.join(format!("{session}.{ext}"));
     let pid_path = path("pid");
     let port_path = path("port");
     let engine_path = path("engine");
     let stream_path = path("stream");
-    let mut port = files.port.as_ref();
-    let mut engine = files.engine;
-    let mut stream = files.stream;
+    let pid_id = files.pid.id;
+    let mut port = files.port.as_ref().map(|(_, snapshot)| snapshot.clone());
+    let mut engine = files.engine.as_ref().map(|file| file.id);
+    let mut stream = files.stream.as_ref().map(|file| file.id);
     let still_old = |port: Option<&WindowsBrowserPortSnapshot>, engine, stream| {
         old_exited()
             && read_daemon_pid_file(&pid_path) == Some(record.pid)
-            && windows_browser_file_id(&pid_path) == Some(files.pid)
+            && windows_browser_file_id(&pid_path) == Some(pid_id)
             && windows_browser_port_matches(&port_path, port)
             && optional_windows_browser_file_matches(&engine_path, engine)
             && optional_windows_browser_file_matches(&stream_path, stream)
-            && captured_legacy_browser_endpoint_absent(session, record.pid, files)
+            && captured_legacy_browser_endpoint_absent(session, record.pid, &dir, captured_port)
     };
-    if !still_old(port, engine, stream) { return false; }
-    if engine.is_some() {
-        if std::fs::remove_file(&engine_path).is_err() { return false; }
+    if !still_old(port.as_ref(), engine, stream) { return false; }
+    if let Some(file) = files.engine.take() {
+        before_delete("engine");
+        if !delete_pinned_windows_browser_file(&engine_path, file) { return false; }
         engine = None;
     }
-    if !still_old(port, engine, stream) { return false; }
-    if stream.is_some() {
-        if std::fs::remove_file(&stream_path).is_err() { return false; }
+    if !still_old(port.as_ref(), engine, stream) { return false; }
+    if let Some(file) = files.stream.take() {
+        before_delete("stream");
+        if !delete_pinned_windows_browser_file(&stream_path, file) { return false; }
         stream = None;
     }
-    if !still_old(port, engine, stream) { return false; }
-    if port.is_some() {
-        if std::fs::remove_file(&port_path).is_err() { return false; }
+    if !still_old(port.as_ref(), engine, stream) { return false; }
+    if let Some((file, _)) = files.port.take() {
+        before_delete("port");
+        if !delete_pinned_windows_browser_file(&port_path, file) { return false; }
         port = None;
     }
-    still_old(port, engine, stream) && std::fs::remove_file(pid_path).is_ok()
+    if !still_old(port.as_ref(), engine, stream) { return false; }
+    before_delete("pid");
+    delete_pinned_windows_browser_file(&pid_path, files.pid)
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1582,7 +1688,7 @@ fn stop_owned_browser_daemon(session: &str, record: &BrowserPidRecord, bin: &str
     #[cfg(windows)]
     if let Some(handle) = open_verified_browser_handle(record, session) {
         kill_verified_browser_handle(&handle, record.pid);
-        if let Some(files) = legacy_files.as_ref() {
+        if let Some(files) = legacy_files {
             let _ = cleanup_captured_legacy_windows_browser_files(session, record, files, || {
                 verified_browser_handle_exited(&handle)
             });
@@ -6816,7 +6922,7 @@ mod tests {
         }
         assert_eq!(browser_daemon_dir_in(root, &session), Some(current.clone()));
 
-        assert!(cleanup_captured_legacy_windows_browser_files(&session, &record, &captured, || true));
+        assert!(cleanup_captured_legacy_windows_browser_files(&session, &record, captured, || true));
         for ext in ["pid", "port", "engine", "stream"] {
             assert!(!root.join(format!("{session}.{ext}")).exists());
             assert_eq!(std::fs::read_to_string(current.join(format!("{session}.{ext}"))).unwrap(),
@@ -6841,10 +6947,45 @@ mod tests {
         std::fs::rename(&port_path, &old_port).unwrap();
         std::fs::write(&port_path, b"53001").unwrap();
 
-        assert!(!cleanup_captured_legacy_windows_browser_files(&session, &record, &captured, || true));
+        assert!(!cleanup_captured_legacy_windows_browser_files(&session, &record, captured, || true));
         assert!(pid_path.exists());
         assert!(port_path.exists());
         assert!(old_port.exists());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn captured_legacy_cleanup_blocks_in_place_writes_and_keeps_late_replacement() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let session = format!("legacy-late-replacement-{}", uuid::Uuid::new_v4().simple());
+        let old_pid = u32::MAX;
+        let pid_path = root.join(format!("{session}.pid"));
+        let port_path = root.join(format!("{session}.port"));
+        std::fs::write(&pid_path, old_pid.to_string()).unwrap();
+        let ephemeral = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        std::fs::write(&port_path, ephemeral.local_addr().unwrap().port().to_string()).unwrap();
+        drop(ephemeral);
+        let record = test_browser_record(old_pid, 1, browser_owner_token().to_owned());
+        let captured = capture_legacy_windows_browser_files(root, &session, &record).unwrap();
+        let moved = root.join("original.pid");
+        let mut reached_pid_delete = false;
+
+        assert!(!cleanup_captured_legacy_windows_browser_files_with_hook(
+            &session, &record, captured, || true, |ext| {
+                if ext == "pid" {
+                    reached_pid_delete = true;
+                    assert!(std::fs::OpenOptions::new().write(true).open(&pid_path).is_err(),
+                        "the pinned handle must prevent in-place metadata rewrites");
+                    std::fs::rename(&pid_path, &moved).unwrap();
+                    std::fs::write(&pid_path, old_pid.to_string()).unwrap();
+                }
+            },
+        ));
+        assert!(reached_pid_delete);
+        assert_eq!(std::fs::read_to_string(&pid_path).unwrap(), old_pid.to_string(),
+            "cleanup must not delete a replacement published after validation");
+        assert!(moved.exists(), "the old file remains when its path was replaced");
     }
 
     #[cfg(windows)]
@@ -8209,6 +8350,40 @@ mod tests {
         assert!(require_owned_browser_session_in(&session, &current).is_err(),
             "invalid d/ metadata must stay fail-closed");
         drop(listener);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_ephemeral_close_cleanup_allows_restart_with_hash_port_occupied() {
+        use std::io::Write;
+
+        let temp = tempfile::tempdir().unwrap();
+        let (session, hash_listener) = (0..32).find_map(|_| {
+            let session = format!("ephemeral-cleanup-{}", uuid::Uuid::new_v4().simple());
+            std::net::TcpListener::bind(("127.0.0.1", browser_control_fallback_port(&session)))
+                .ok().map(|listener| (session, listener))
+        }).expect("a free hash-derived browser port");
+        let current = temp.path().join(BROWSER_DAEMON_DIR);
+        prepare_browser_directory(&current, true).unwrap();
+        let pid = u32::MAX;
+        let pid_path = current.join(format!("{session}.pid"));
+        let port_path = current.join(format!("{session}.port"));
+        std::fs::write(&pid_path, pid.to_string()).unwrap();
+        let ephemeral = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let mut port_file = clack_private_fs::create_new_file(&port_path).unwrap();
+        write!(port_file, "{}", ephemeral.local_addr().unwrap().port()).unwrap();
+        port_file.sync_all().unwrap();
+        drop(port_file);
+        drop(ephemeral);
+        assert!(!browser_control_endpoint_ready_in_namespace(&session, &current));
+
+        cleanup_owned_browser_lock_files_in(&current, &session, pid);
+        assert!(!pid_path.exists(), "close must retire the dead daemon PID");
+        assert!(!port_path.exists());
+        assert!(std::net::TcpStream::connect(hash_listener.local_addr().unwrap()).is_ok(),
+            "unrelated hash listener must remain running");
+        assert!(require_owned_browser_session_in(&session, &current).is_ok(),
+            "the next start must be admitted while the hash port is occupied");
     }
 
     #[test]
