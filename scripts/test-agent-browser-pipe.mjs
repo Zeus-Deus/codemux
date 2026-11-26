@@ -16,6 +16,7 @@ const binary = resolve(process.argv[2]);
 const root = await mkdtemp(join(process.platform === 'linux' ? '/var/tmp' : process.platform === 'darwin' ? '/tmp' : tmpdir(), 'cmx-p-'));
 const socketDir = join(root, 's');
 const managedProfile = join(root, 'managed');
+const blankProfile = join(root, 'blank');
 const failedProfile = join(root, 'failed');
 const externalProfile = join(root, 'external');
 const sessionPrefix = `p${randomUUID().slice(0, 8)}`;
@@ -28,15 +29,20 @@ const sessions = [];
 let externalChrome;
 
 async function run(file, args, options = {}) {
+  const started = performance.now();
   try {
-    return { ...await execFile(file, args, { env, timeout: 20_000, maxBuffer: 4 << 20, ...options }), ok: true };
+    return { ...await execFile(file, args, { env, timeout: 20_000, maxBuffer: 4 << 20, ...options }),
+      ok: true, elapsedMs: Math.round(performance.now() - started) };
   } catch (error) {
-    return { stdout: error.stdout ?? '', stderr: error.stderr ?? '', ok: false, error };
+    return { stdout: error.stdout ?? '', stderr: error.stderr ?? '', ok: false, error,
+      elapsedMs: Math.round(performance.now() - started) };
   }
 }
 
 function requireSuccess(result, description) {
-  assert(result.ok, `${description} failed:\n${result.stdout}\n${result.stderr}\n${result.error}`);
+  assert(result.ok, `${description} failed after ${result.elapsedMs} ms ` +
+    `(code=${String(result.error?.code)}, signal=${String(result.error?.signal)}, ` +
+    `killed=${String(result.error?.killed)}):\nstdout:\n${result.stdout}\nstderr:\n${result.stderr}\n${result.error}`);
   return result.stdout;
 }
 
@@ -70,8 +76,8 @@ function chromePath() {
   return found;
 }
 
-async function cli(session, args) {
-  return run(binary, ['--session', session, ...args]);
+async function cli(session, args, options) {
+  return run(binary, ['--session', session, ...args], options);
 }
 
 async function unixChromePid(profile) {
@@ -137,7 +143,8 @@ async function checkUnixPipesAndListeners(pid) {
 
 async function checkWindowsHandlesAndListeners(profile) {
   const script = resolve('scripts/test-agent-browser-pipe-windows.ps1');
-  const result = await run('pwsh', ['-NoProfile', '-File', script, '-ProfilePath', profile]);
+  const result = await run('pwsh', ['-NoProfile', '-File', script, '-ProfilePath', profile],
+    { timeout: 45_000 });
   requireSuccess(result, 'inspect Chromium inherited handles and listeners');
   const pid = Number(result.stdout.trim());
   assert(Number.isInteger(pid) && pid > 0, `Invalid Chromium PID: ${result.stdout}`);
@@ -163,13 +170,14 @@ async function stopExternal() {
 }
 
 try {
-  await Promise.all([mkdir(socketDir), mkdir(managedProfile), mkdir(failedProfile), mkdir(externalProfile)]);
+  await Promise.all([mkdir(socketDir), mkdir(managedProfile), mkdir(blankProfile),
+    mkdir(failedProfile), mkdir(externalProfile)]);
   const chrome = chromePath();
   const managed = `${sessionPrefix}-managed`;
   sessions.push(managed);
   const dataUrl = `data:text/html,${encodeURIComponent('<title>Pipe smoke</title><h1>private transport</h1>')}`;
   requireSuccess(await cli(managed, ['--executable-path', chrome, '--profile', managedProfile,
-    'open', dataUrl]), 'open managed Chromium');
+    'open', dataUrl], { timeout: 28_000 }), 'open managed Chromium');
   assert.match(requireSuccess(await cli(managed, ['get', 'title']), 'round-trip CDP command'), /Pipe smoke/);
   assert(!existsSync(join(managedProfile, 'DevToolsActivePort')), 'Managed Chromium wrote DevToolsActivePort');
   const chromePid = process.platform === 'win32'
@@ -187,6 +195,16 @@ try {
   requireSuccess(await cli(managed, ['close']), 'close managed Chromium');
   sessions.pop();
   await waitFor(() => !alive(chromePid), 'managed Chromium exit');
+
+  const blank = `${sessionPrefix}-blank`;
+  sessions.push(blank);
+  requireSuccess(await cli(blank, ['--executable-path', chrome, '--profile', blankProfile,
+    'open'], { timeout: 28_000 }), 'launch managed Chromium without URL');
+  assert.match(requireSuccess(await cli(blank, ['get', 'url']), 'no-URL CDP command'), /about:blank/);
+  assert(!existsSync(join(blankProfile, 'DevToolsActivePort')),
+    'No-URL managed launch wrote DevToolsActivePort');
+  requireSuccess(await cli(blank, ['close']), 'close no-URL Chromium');
+  sessions.pop();
 
   for (const [index, flag] of ['--remote-debugging-port=0', '-remote-debugging-port=0',
     '/remote-debugging-port=0', '--remote-debugging-pipe',
@@ -207,8 +225,8 @@ try {
     '-o', fake], { timeout: 30_000 }), 'build broken pipe fixture');
   const failed = `${sessionPrefix}-failed`;
   sessions.push(failed);
-  const failedLaunch = await cli(failed, ['--executable-path', fake, '--profile', failedProfile,
-    'open', 'about:blank']);
+  const failedLaunch = await cli(failed, ['--executable-path', fake,
+    '--profile', failedProfile, 'open', 'about:blank'], { timeout: 27_000 });
   assert(!failedLaunch.ok && /pipe/i.test(`${failedLaunch.stdout}\n${failedLaunch.stderr}`),
     `Broken pipe launch did not fail closed: ${failedLaunch.stdout}\n${failedLaunch.stderr}`);
   const fakePid = Number(await readFile(join(failedProfile, 'fake-chrome.pid'), 'utf8'));

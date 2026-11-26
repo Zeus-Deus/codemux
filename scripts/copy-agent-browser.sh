@@ -37,6 +37,7 @@ mkdir -p "$ROOT/src-tauri/binaries" "$BUILD_ROOT"
 # exact bytes recorded by this build. An npm binary never satisfies the stamp.
 if [ -s "$DEST" ] && [ -f "$STAMP" ] &&
    [ "$(cat "$STAMP")" = "$SOURCE_COMMIT $AUTH_PATCH_HASH $PIPE_PATCH_HASH $(hash_file "$DEST")" ] &&
+   [ "${CODEMUX_BROWSER_RUN_PIPE_TESTS:-0}" != 1 ] &&
    [ "$("$DEST" --version)" = "agent-browser 0.44.0+codemux.2" ]; then
   exit 0
 fi
@@ -54,6 +55,17 @@ git -C "$SOURCE_DIR" apply --check "$AUTH_PATCH"
 git -C "$SOURCE_DIR" apply "$AUTH_PATCH"
 git -C "$SOURCE_DIR" apply --check "$PIPE_PATCH"
 git -C "$SOURCE_DIR" apply "$PIPE_PATCH"
+
+# The native smoke checks exercise a real browser, while these patched-source
+# tests cover cancellation, bounded startup retries, and child reaping.
+# Opting in must still run them when a stamped binary is already available.
+if [ "${CODEMUX_BROWSER_RUN_PIPE_TESTS:-0}" = 1 ]; then
+  TMPDIR="${CODEMUX_BROWSER_BUILD_TMPDIR:-${TMPDIR:-$BUILD_ROOT}}" \
+    CARGO_TARGET_DIR="$BUILD_ROOT/target" \
+    cargo test -j 2 --locked --profile ci --target "$TARGET" \
+    --manifest-path "$SOURCE_DIR/cli/Cargo.toml" \
+    --bin agent-browser pipe_ -- --test-threads=2
+fi
 
 TMPDIR="${CODEMUX_BROWSER_BUILD_TMPDIR:-${TMPDIR:-$BUILD_ROOT}}" \
   CARGO_TARGET_DIR="$BUILD_ROOT/target" \

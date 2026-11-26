@@ -1,6 +1,7 @@
 param([Parameter(Mandatory)][string]$ProfilePath)
 $ErrorActionPreference = 'Stop'
 
+[Console]::Error.WriteLine('Inspecting managed Chromium process')
 $chrome = @(Get-CimInstance Win32_Process | Where-Object {
   $_.CommandLine -and $_.CommandLine.Contains("--user-data-dir=$ProfilePath") -and
   $_.CommandLine.Contains('--remote-debugging-pipe') -and
@@ -14,6 +15,7 @@ if ($commandLine -notmatch '--remote-debugging-io-pipes=(\d+),(\d+)') {
 }
 $handles = @([long]$Matches[1], [long]$Matches[2])
 
+[Console]::Error.WriteLine('Loading native handle inspector')
 Add-Type -TypeDefinition @'
 using System;
 using System.Runtime.InteropServices;
@@ -52,6 +54,7 @@ try {
   [void][BrowserPipeHandles]::CloseHandle($source)
 }
 
+[Console]::Error.WriteLine('Inspecting managed Chromium TCP listeners')
 $listeners = @(Get-NetTCPConnection -State Listen -ErrorAction Stop | Where-Object {
   $_.OwningProcess -eq $chrome[0].ProcessId
 })

@@ -163,7 +163,7 @@ index aad976c..14643dc 100644
          state.active_provider_connection = true;
          let target = state
 diff --git a/cli/src/native/browser.rs b/cli/src/native/browser.rs
-index 27ef4d1..49f9dc0 100644
+index 27ef4d1..d8814ed 100644
 --- a/cli/src/native/browser.rs
 +++ b/cli/src/native/browser.rs
 @@ -1,7 +1,8 @@
@@ -206,7 +206,7 @@ index 27ef4d1..49f9dc0 100644
              BrowserProcess::Lightpanda(p) => p.kill(),
              BrowserProcess::Obscura(p) => p.kill(),
          }
-@@ -723,13 +727,85 @@ impl BrowserProcess {
+@@ -723,13 +727,143 @@ impl BrowserProcess {
      /// Non-blocking check whether the browser process has exited.
      pub fn has_exited(&mut self) -> bool {
          match self {
@@ -218,13 +218,42 @@ index 27ef4d1..49f9dc0 100644
      }
  }
  
++const CHROME_PIPE_STARTUP_BUDGET: Duration = Duration::from_secs(20);
++const CHROME_PIPE_RETRY_DELAY: Duration = Duration::from_millis(500);
++const CHROME_PIPE_CLEANUP_MARGIN: Duration = Duration::from_secs(2);
++
++enum PipeAttemptError {
++    Retry(String),
++    Stop(String),
++}
++
 +async fn launch_managed_chrome_attempt(
 +    options: LaunchOptions,
-+) -> Result<(BrowserProcess, Arc<CdpClient>), String> {
-+    let mut chrome = tokio::task::spawn_blocking(move || launch_chrome(&options))
-+        .await
-+        .map_err(|error| format!("Chrome launch task failed: {error}"))??;
-+    let (reader, writer) = chrome.take_pipe()?;
++    deadline: Instant,
++) -> Result<(BrowserProcess, Arc<CdpClient>), PipeAttemptError> {
++    let mut launch_task = tokio::task::spawn_blocking(move || launch_chrome(&options));
++    let mut chrome = match tokio::time::timeout_at(deadline.into(), &mut launch_task).await {
++        Ok(Ok(Ok(chrome))) => chrome,
++        Ok(Ok(Err(error))) => return Err(PipeAttemptError::Retry(error)),
++        Ok(Err(error)) => {
++            return Err(PipeAttemptError::Retry(format!(
++                "Chrome launch task failed: {error}"
++            )))
++        }
++        Err(_) => {
++            // spawn_blocking cannot be cancelled. Do not overlap a retry with
++            // this launch; reap its child if it eventually returns one.
++            tokio::spawn(async move {
++                if let Ok(Ok(chrome)) = launch_task.await {
++                    drop(chrome);
++                }
++            });
++            return Err(PipeAttemptError::Stop(
++                "Chrome pipe launch exceeded its startup deadline".to_string(),
++            ));
++        }
++    };
++    let (reader, writer) = chrome.take_pipe().map_err(PipeAttemptError::Retry)?;
 +    let chrome = Arc::new(StdMutex::new(chrome));
 +    let weak_chrome = Arc::downgrade(&chrome);
 +    let on_failure: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
@@ -238,8 +267,12 @@ index 27ef4d1..49f9dc0 100644
 +    let client = Arc::new(CdpClient::connect_pipe(reader, writer, Some(on_failure)));
 +
 +    // A successful spawn does not prove Chromium accepted its private pipe.
++    let readiness_budget = deadline
++        .saturating_duration_since(Instant::now())
++        .saturating_sub(CHROME_PIPE_CLEANUP_MARGIN)
++        .min(Duration::from_secs(10));
 +    let ready = tokio::time::timeout(
-+        Duration::from_secs(10),
++        readiness_budget,
 +        client.send_command_no_params("Browser.getVersion", None),
 +    )
 +    .await;
@@ -264,36 +297,61 @@ index 27ef4d1..49f9dc0 100644
 +    } else {
 +        format!("; Chrome stderr tail: {stderr}")
 +    };
-+    Err(format!(
++    Err(PipeAttemptError::Retry(format!(
 +        "Chrome pipe did not become ready: {ready:?}; process exited: {exited}{diagnostic}"
-+    ))
++    )))
 +}
 +
 +async fn launch_managed_chrome(
 +    options: LaunchOptions,
 +) -> Result<(BrowserProcess, Arc<CdpClient>), String> {
++    launch_managed_chrome_with_budget(options, CHROME_PIPE_STARTUP_BUDGET).await
++}
++
++async fn launch_managed_chrome_with_budget(
++    options: LaunchOptions,
++    startup_budget: Duration,
++) -> Result<(BrowserProcess, Arc<CdpClient>), String> {
 +    const MAX_ATTEMPTS: usize = 3;
++    let deadline = Instant::now() + startup_budget;
 +    let mut last_error = String::new();
 +    for attempt in 1..=MAX_ATTEMPTS {
-+        match launch_managed_chrome_attempt(options.clone()).await {
++        let remaining_attempts = MAX_ATTEMPTS - attempt + 1;
++        let remaining = deadline.saturating_duration_since(Instant::now());
++        let reserved_backoffs = CHROME_PIPE_RETRY_DELAY * (remaining_attempts - 1) as u32;
++        let attempt_budget =
++            remaining.saturating_sub(reserved_backoffs) / remaining_attempts as u32;
++        if attempt_budget < Duration::from_millis(100) {
++            break;
++        }
++        let attempt_deadline = Instant::now() + attempt_budget;
++        match launch_managed_chrome_attempt(options.clone(), attempt_deadline).await {
 +            Ok(launched) => return Ok(launched),
-+            Err(error) => last_error = error,
++            Err(PipeAttemptError::Retry(error)) => last_error = error,
++            Err(PipeAttemptError::Stop(error)) => return Err(error),
 +        }
 +        if attempt < MAX_ATTEMPTS {
++            if deadline.saturating_duration_since(Instant::now()) <= CHROME_PIPE_RETRY_DELAY {
++                break;
++            }
 +            let _ = writeln!(
 +                std::io::stderr(),
 +                "[chrome] Launch attempt {attempt}/{MAX_ATTEMPTS} failed, retrying in 500ms..."
 +            );
-+            tokio::time::sleep(Duration::from_millis(500)).await;
++            tokio::time::sleep(CHROME_PIPE_RETRY_DELAY).await;
 +        }
 +    }
-+    Err(last_error)
++    if last_error.is_empty() {
++        Err("Chrome pipe startup deadline expired before another attempt".to_string())
++    } else {
++        Err(last_error)
++    }
 +}
 +
  pub struct BrowserManager {
      pub client: Arc<CdpClient>,
      browser_process: Option<BrowserProcess>,
-@@ -923,7 +999,7 @@ impl BrowserManager {
+@@ -923,7 +1057,7 @@ impl BrowserManager {
          let download_path = options.download_path.clone();
          let headless = options.effectively_headless();
  
@@ -302,7 +360,7 @@ index 27ef4d1..49f9dc0 100644
              "lightpanda" => {
                  let lp_options = LightpandaLaunchOptions {
                      executable_path: options.executable_path.clone(),
-@@ -932,7 +1008,7 @@ impl BrowserManager {
+@@ -932,7 +1066,7 @@ impl BrowserManager {
                  };
                  let lp = launch_lightpanda(&lp_options).await?;
                  let url = lp.ws_url.clone();
@@ -311,7 +369,7 @@ index 27ef4d1..49f9dc0 100644
              }
              "obscura" => {
                  let obscura_options = ObscuraLaunchOptions {
-@@ -943,14 +1019,11 @@ impl BrowserManager {
+@@ -943,14 +1077,11 @@ impl BrowserManager {
                  };
                  let ob = launch_obscura(&obscura_options).await?;
                  let url = ob.ws_url.clone();
@@ -329,7 +387,7 @@ index 27ef4d1..49f9dc0 100644
              }
          };
  
-@@ -959,7 +1032,11 @@ impl BrowserManager {
+@@ -959,7 +1090,11 @@ impl BrowserManager {
          } else if engine == "obscura" {
              initialize_obscura_manager(ws_url, process).await?
          } else {
@@ -342,7 +400,7 @@ index 27ef4d1..49f9dc0 100644
              let mut manager = Self {
                  client,
                  browser_process: Some(process),
-@@ -1906,6 +1983,7 @@ impl BrowserManager {
+@@ -1906,6 +2041,7 @@ impl BrowserManager {
              // Only send Browser.close when we launched the browser ourselves.
              // For external connections (--auto-connect, --cdp) we just disconnect
              // without shutting down the user's browser.
@@ -350,7 +408,7 @@ index 27ef4d1..49f9dc0 100644
              let close = self.client.send_command_no_params("Browser.close", None);
              if let Some(timeout) = browser_close_timeout {
                  let _ = tokio::time::timeout(timeout, close).await;
-@@ -4531,7 +4609,7 @@ mod tests {
+@@ -4531,7 +4667,7 @@ mod tests {
          let executable = dir.path().join("chrome");
          let port = url::Url::parse(url).unwrap().port().unwrap();
          std::fs::write(&executable, format!(
@@ -359,7 +417,7 @@ index 27ef4d1..49f9dc0 100644
              dir.path().display()
          )).unwrap();
          std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
-@@ -4549,6 +4627,11 @@ mod tests {
+@@ -4549,6 +4685,11 @@ mod tests {
              .trim()
              .parse()
              .unwrap();
@@ -371,7 +429,7 @@ index 27ef4d1..49f9dc0 100644
          assert_eq!(
              unsafe { libc::kill(pid, 0) },
              -1,
-@@ -4570,23 +4653,126 @@ mod tests {
+@@ -4570,23 +4711,186 @@ mod tests {
  
      #[cfg(unix)]
      #[tokio::test]
@@ -491,7 +549,6 @@ index 27ef4d1..49f9dc0 100644
 -            let observed = server.await.unwrap();
 -            assert!(observed[0].iter().any(|method| method == "Browser.close"));
 -            assert_initialization_process_reaped(dir.path());
--        }
 +                .expect("Chrome readiness retries exceeded the deadline")
 +                .unwrap();
 +        assert_eq!(
@@ -511,10 +568,70 @@ index 27ef4d1..49f9dc0 100644
 +        client.close().await;
 +        drop(process);
 +        assert_process_reaped(second_pid);
++    }
++
++    #[cfg(unix)]
++    #[tokio::test]
++    async fn test_managed_pipe_slow_readiness_obeys_shared_deadline_and_reaps() {
++        use std::os::unix::fs::PermissionsExt;
++
++        let dir = tempfile::tempdir().unwrap();
++        let executable = dir.path().join("chrome");
++        std::fs::write(
++            &executable,
++            r#"#!/bin/sh
++set -eu
++root=$(dirname "$0")
++attempt=1
++if [ -f "$root/attempt" ]; then
++    attempt=$(( $(cat "$root/attempt") + 1 ))
++fi
++printf '%s' "$attempt" > "$root/attempt"
++printf '%s' "$$" > "$root/pid-$attempt"
++exec perl -e 'my $root = shift; my $byte; while (sysread(STDIN, $byte, 1)) { last if $byte eq "\0" } open my $f, ">", "$root/received-$$" or die $!; print $f "ok"; close $f; sleep 60' "$root" <&3
++"#,
++        )
++        .unwrap();
++        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
++        let options = LaunchOptions {
++            executable_path: Some(executable.to_string_lossy().into_owned()),
++            ..Default::default()
++        };
++        let budget = Duration::from_secs(12);
++        let start = Instant::now();
++        let error = tokio::time::timeout(
++            Duration::from_secs(14),
++            launch_managed_chrome_with_budget(options, budget),
++        )
++        .await
++        .expect("managed launch exceeded its shared deadline")
++        .err()
++        .expect("unresponsive pipes must fail closed");
++        assert!(start.elapsed() < Duration::from_secs(13), "{error}");
++        assert!(
++            error.contains("Chrome pipe did not become ready"),
++            "{error}"
++        );
++        let mut spawned = 0;
++        for entry in std::fs::read_dir(dir.path()).unwrap() {
++            let entry = entry.unwrap();
++            let name = entry.file_name();
++            if !name.to_string_lossy().starts_with("pid-") {
++                continue;
++            }
++            let pid: i32 = std::fs::read_to_string(entry.path())
++                .unwrap()
++                .parse()
++                .unwrap();
++            assert!(dir.path().join(format!("received-{pid}")).exists());
++            assert_process_reaped(pid);
++            spawned += 1;
+         }
++        assert!(spawned >= 2, "expected retries after slow readiness");
      }
  
      #[cfg(unix)]
-@@ -4600,7 +4786,10 @@ mod tests {
+@@ -4600,7 +4904,10 @@ mod tests {
              .unwrap();
          let mut manager = tokio::time::timeout(
              Duration::from_secs(4),

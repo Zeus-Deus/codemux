@@ -595,11 +595,24 @@ jobs:
           path: windows-claude-evidence/
           if-no-files-found: warn
 
-  # ---------------------------------------------------------------------------
-  # Single always-reporting status for branch protection. Path-skipped jobs
-  # conclude as "skipped" (and a skipped matrix job never expands its matrix
-  # names), so require this check rather than the individual jobs.
-  # ---------------------------------------------------------------------------
+  # Exercise patched upstream pipe lifecycle tests on a separate Linux runner.
+  # The desktop Rust job is near its timeout and native smoke does not cover
+  # cancellation and retry internals.
+  browser-sidecar-pipe-tests:
+    needs: changes
+    if: needs.changes.outputs.rust == 'true' && (github.event_name != 'workflow_dispatch' || !inputs.claude_install_only)
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+      - name: Test patched browser pipe lifecycle
+        env:
+          CODEMUX_BROWSER_RUN_PIPE_TESTS: '1'
+        run: bash scripts/copy-agent-browser.sh
+
   browser-sidecar-macos:
     needs: changes
     if: needs.changes.outputs.rust == 'true'
@@ -625,10 +638,12 @@ jobs:
           CODEMUX_TEST_BROWSER_SIDECAR_BIN="$PWD/src-tauri/binaries/agent-browser-$TARGET" \
             cargo test -j 2 --locked --manifest-path scripts/browser-benchmark/Cargo.toml --bin browser-benchmark real_sidecar_prior_launch_token_recovery_and_close -- --ignored --test-threads=1
 
+  # Single always-reporting status for branch protection. Path-skipped jobs
+  # conclude as "skipped", so require this check rather than individual jobs.
   ci-gate:
     name: ci-gate
     if: always()
-    needs: [changes, web-checks, iroh-wasm, rust, browser-sidecar-macos]
+    needs: [changes, web-checks, iroh-wasm, rust, browser-sidecar-pipe-tests, browser-sidecar-macos]
     runs-on: ubuntu-latest
     timeout-minutes: 5
 
