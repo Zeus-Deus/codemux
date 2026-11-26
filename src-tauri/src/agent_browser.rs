@@ -343,17 +343,15 @@ fn kill_untracked_browser_daemons(session_filter: Option<&str>) {
 }
 
 fn kill_owned_browser_daemons_in(dir: &std::path::Path) {
-    let Ok(entries) = std::fs::read_dir(dir) else { return };
     let bin = resolve_binary();
-    for entry in entries.flatten() {
-        let path = entry.path();
+    for path in browser_pid_record_paths_in(dir) {
         let Some(session) = session_from_pid_path(&path) else { continue };
         let Some(record) = read_browser_pid_record(&path) else { continue };
         if record.token != browser_owner_token() || !browser_process_matches(&record, session) {
             continue;
         }
         stop_owned_browser_daemon(session, &record, &bin);
-        if !pid_alive(record.pid) {
+        if path.parent() != Some(dir) && !pid_alive(record.pid) {
             let _ = std::fs::remove_file(path);
         }
     }
@@ -558,12 +556,61 @@ fn open_session_log(path: &std::path::Path) -> Option<std::fs::File> {
     }
 }
 
+const BROWSER_RECORD_DIR: &str = "codemux-records";
+
+fn browser_record_dir_in(dir: &std::path::Path) -> Option<PathBuf> {
+    let records = dir.join(BROWSER_RECORD_DIR);
+    prepare_browser_directory(&records, true)?;
+    Some(records)
+}
+
+fn legacy_session_pid_path_in(dir: &std::path::Path, session: &str) -> Option<PathBuf> {
+    validate_session_name(session).ok()?;
+    Some(dir.join(format!("agent-browser-{session}.pid")))
+}
+
+fn session_pid_path_in(dir: &std::path::Path, session: &str) -> Option<PathBuf> {
+    validate_session_name(session).ok()?;
+    Some(browser_record_dir_in(dir)?.join(format!("agent-browser-{session}.pid")))
+}
+
+fn session_pid_record_in(dir: &std::path::Path, session: &str) -> Option<(PathBuf, BrowserPidRecord)> {
+    if let Some(current) = session_pid_path_in(dir, session) {
+        if let Some(record) = read_browser_pid_record(&current) {
+            return Some((current, record));
+        }
+    }
+    let legacy = legacy_session_pid_path_in(dir, session)?;
+    read_browser_pid_record(&legacy).map(|record| (legacy, record))
+}
+
+fn session_pid_record(session: &str) -> Option<(PathBuf, BrowserPidRecord)> {
+    session_pid_record_in(&run_dir_for_session(session)?, session)
+}
+
+fn browser_pid_record_paths_in(dir: &std::path::Path) -> Vec<PathBuf> {
+    // Legacy root records remain readable, but are never removed here: the
+    // same root name may be another session's daemon PID by the time cleanup
+    // runs. Only the separate current namespace is safe to retire.
+    let mut paths = Vec::new();
+    for record_dir in [browser_record_dir_in(dir), Some(dir.to_path_buf())].into_iter().flatten() {
+        if let Ok(entries) = std::fs::read_dir(record_dir) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if session_from_pid_path(&path).is_some() && read_browser_pid_record(&path).is_some() {
+                    paths.push(path);
+                }
+            }
+        }
+    }
+    paths
+}
+
 /// Path to the per-session PID file written by codemux when it spawns
 /// the agent-browser daemon. Used by `close()` for targeted PID-based
 /// teardown and by `new_with_adoption()` for safe restart adoption.
 pub fn session_pid_path(session_name: &str) -> Option<PathBuf> {
-    validate_session_name(session_name).ok()?;
-    Some(run_dir_for_session(session_name)?.join(format!("agent-browser-{session_name}.pid")))
+    session_pid_path_in(&run_dir_for_session(session_name)?, session_name)
 }
 
 /// Path to the per-session stderr log file. Captured during daemon
@@ -632,7 +679,8 @@ fn cleanup_reused_browser_lock_files_in(dir: &std::path::Path, session: &str, ol
         return false;
     }
     let pid_path = dir.join(format!("{session}.pid"));
-    let record_path = dir.join(format!("agent-browser-{session}.pid"));
+    let Some((record_path, _)) = session_pid_record_in(dir, session) else { return false };
+    let legacy_record = record_path.parent() == Some(dir);
     let stale = || {
         (old.token == browser_owner_token() || previous_app_has_exited(old))
             && process_start_time(old.pid).is_some_and(|start| start != old.start_time)
@@ -656,7 +704,7 @@ fn cleanup_reused_browser_lock_files_in(dir: &std::path::Path, session: &str, ol
         || read_browser_pid_record(&record_path).as_ref() != Some(old) {
         return false;
     }
-    std::fs::remove_file(record_path).is_ok()
+    legacy_record || std::fs::remove_file(record_path).is_ok()
 }
 
 #[cfg(windows)]
@@ -673,7 +721,7 @@ fn cleanup_owned_browser_lock_files(session: &str, pid: u32) {
     cleanup_stale_browser_lock_files(session, pid);
 }
 
-#[derive(Clone, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 struct BrowserPidRecord {
     pid: u32,
     start_time: u64,
@@ -864,8 +912,7 @@ fn owned_browser_pid(session: &str, pid: u32) -> Option<BrowserPidRecord> {
             native_start: true,
         });
     }
-    let path = session_pid_path(session)?;
-    let record = read_browser_pid_record(&path)?;
+    let (_, record) = session_pid_record(session)?;
     (record.pid == pid && browser_process_matches(&record, session)).then_some(record)
 }
 
@@ -974,7 +1021,7 @@ fn require_owned_browser_session_in(session: &str, dir: &std::path::Path) -> Res
         return Ok(());
     }
     if owned_browser_pid(session, pid).is_none() {
-        let old_record = read_browser_pid_record(&dir.join(format!("agent-browser-{session}.pid")));
+        let old_record = session_pid_record_in(dir, session).map(|(_, record)| record);
         if let Some(old_record) = old_record.filter(|record| record.pid == pid) {
             if cleanup_reused_browser_lock_files_in(dir, session, &old_record) {
                 return Ok(());
@@ -1386,6 +1433,7 @@ fn browser_file_identity(path: &std::path::Path) -> Option<BrowserFileIdentity> 
 #[cfg(all(unix, any(test, target_os = "macos")))]
 struct ClosedBrowserFiles {
     pid: BrowserFileIdentity,
+    record_path: PathBuf,
     record: Option<BrowserFileIdentity>,
     stream: Option<BrowserFileIdentity>,
     socket: Option<BrowserFileIdentity>,
@@ -1405,7 +1453,9 @@ fn capture_closed_browser_files(
         return None;
     }
     let pid_path = dir.join(format!("{session}.pid"));
-    let record_path = dir.join(format!("agent-browser-{session}.pid"));
+    let record_path = session_pid_record_in(dir, session)
+        .map(|(path, _)| path)
+        .or_else(|| session_pid_path_in(dir, session))?;
     if read_daemon_pid_file(&pid_path) != Some(record.pid) {
         return None;
     }
@@ -1435,6 +1485,7 @@ fn capture_closed_browser_files(
         .and_then(|_| browser_file_identity(&socket_path));
     Some(ClosedBrowserFiles {
         pid: browser_file_identity(&pid_path)?,
+        record_path,
         record: owned,
         stream,
         socket,
@@ -1480,8 +1531,9 @@ fn cleanup_closed_browser_files(
     if validate_session_name(session).is_err() {
         return false;
     }
+    let legacy_record = files.record_path.parent() == Some(dir);
     let pid_path = dir.join(format!("{session}.pid"));
-    let record_path = dir.join(format!("agent-browser-{session}.pid"));
+    let record_path = &files.record_path;
     let stream_path = dir.join(format!("{session}.stream"));
     let socket_path = dir.join(format!("{session}.sock"));
     let still_old = || {
@@ -1517,7 +1569,7 @@ fn cleanup_closed_browser_files(
     {
         return false;
     }
-    files.record.is_none() || std::fs::remove_file(record_path).is_ok()
+    legacy_record || files.record.is_none() || std::fs::remove_file(record_path).is_ok()
 }
 
 #[cfg(windows)]
@@ -1527,14 +1579,18 @@ fn kill_verified_browser_pid(record: &BrowserPidRecord, session: &str) {
     }
 }
 
-/// Write the tracked PID to our own per-session PID file under
-/// `~/.codemux/run/`. Callers launching a daemon must handle a write failure
+/// Write the tracked PID to our own private record directory. Callers launching
+/// a daemon must handle a write failure
 /// before sending the first command, or they could leave it untracked.
 fn write_session_pid(session_name: &str, record: &BrowserPidRecord) -> std::io::Result<()> {
-    use std::io::Write;
-
     let path = session_pid_path(session_name)
         .ok_or_else(|| std::io::Error::other("Cannot prepare private browser PID path"))?;
+    write_browser_pid_record(&path, record)
+}
+
+fn write_browser_pid_record(path: &std::path::Path, record: &BrowserPidRecord) -> std::io::Result<()> {
+    use std::io::Write;
+
     if record.owner_pid == 0 || record.owner_start_time == 0 || !record.native_start {
         return Err(std::io::Error::other("Browser owner process identity is missing"));
     }
@@ -1544,11 +1600,11 @@ fn write_session_pid(session_name: &str, record: &BrowserPidRecord) -> std::io::
     );
     #[cfg(windows)]
     let result = (|| -> std::io::Result<()> {
-        let mut file = match clack_private_fs::create_new_file(&path) {
+        let mut file = match clack_private_fs::create_new_file(path) {
             Ok(file) => file,
             Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-                clack_private_fs::require_private_file(&path)?;
-                std::fs::OpenOptions::new().write(true).truncate(true).open(&path)?
+                clack_private_fs::require_private_file(path)?;
+                std::fs::OpenOptions::new().write(true).truncate(true).open(path)?
             }
             Err(error) => return Err(error),
         };
@@ -1561,7 +1617,7 @@ fn write_session_pid(session_name: &str, record: &BrowserPidRecord) -> std::io::
         let mut staged = tempfile::NamedTempFile::new_in(parent)?;
         staged.write_all(content.as_bytes())?;
         staged.as_file().sync_all()?;
-        staged.persist(&path).map_err(|error| error.error)?;
+        staged.persist(path).map_err(|error| error.error)?;
         Ok(())
     })();
     if let Err(error) = &result {
@@ -2016,6 +2072,7 @@ fn shutdown_record_owned_by_this_app(session: &str, removed_pid: Option<u32>) ->
 
 /// Remove our PID file once the daemon is gone. Best-effort.
 fn clear_session_pid(session_name: &str) {
+    // An old root record name can be another session's daemon PID file now.
     if let Some(path) = session_pid_path(session_name) {
         let _ = std::fs::remove_file(path);
     }
@@ -4096,16 +4153,15 @@ impl AgentBrowserManager {
         mgr
     }
 
-    /// Keep live records and discard only records whose PID no longer exists.
-    /// Ownership is checked again before any later action or kill.
+    /// Keep live records and discard dead records from the private namespace.
+    /// Legacy root records remain in place because their names can be daemon
+    /// PID files for another session. Recheck ownership before any later kill.
     fn reconcile_runtime_files() {
         for dir in browser_runtime_dirs() {
-            let Ok(entries) = std::fs::read_dir(&dir) else { continue };
-            for entry in entries.flatten() {
-                let path = entry.path();
+            for path in browser_pid_record_paths_in(&dir) {
                 let Some(_session) = session_from_pid_path(&path) else { continue };
                 let Some(record) = read_browser_pid_record(&path) else { continue };
-                if !pid_alive(record.pid) {
+                if path.parent() != Some(dir.as_path()) && !pid_alive(record.pid) {
                     let _ = std::fs::remove_file(&path);
                 }
             }
@@ -4684,7 +4740,7 @@ impl AgentBrowserManager {
     ///   2. Verify the daemon's process marker, session, and start time.
     ///   3. Close the verified daemon using the platform's bound process or
     ///      control peer, with a Linux pidfd fallback when necessary.
-    ///   4. Clean up our PID file under `~/.codemux/run/`.
+    ///   4. Clean up our PID file in the private record directory.
     ///
     /// Returns Ok even if individual steps fail — close is idempotent and
     /// callers should not be blocked from retrying or moving on.
@@ -4708,7 +4764,7 @@ impl AgentBrowserManager {
         #[cfg(target_os = "macos")]
         let closing_files = removed.as_ref().and_then(|removed| {
             let dir = run_dir_for_session(&session)?;
-            let record = read_browser_pid_record(&session_pid_path(&session)?)?;
+            let (_, record) = session_pid_record(&session)?;
             if record.token != browser_owner_token()
                 || removed.pid.is_some_and(|pid| pid != record.pid)
             {
@@ -4898,7 +4954,7 @@ impl AgentBrowserManager {
                     return Err(format!("Could not verify replaced browser session {lookup_session} control endpoint"));
                 }
                 if read_daemon_pid_file(&dir.join(format!("{lookup_session}.pid"))) == Some(expected_pid) {
-                    let old = read_browser_pid_record(&dir.join(format!("agent-browser-{lookup_session}.pid")))
+                    let old = session_pid_record_in(&dir, &lookup_session).map(|(_, record)| record)
                         .filter(|old| old.pid == expected_pid && Some(old.start_time) == expected_start)
                         .ok_or_else(|| format!("Could not retire replaced browser session {lookup_session}"))?;
                     if !cleanup_reused_browser_lock_files_in(&dir, &lookup_session, &old) {
@@ -7003,7 +7059,7 @@ mod tests {
         );
     }
 
-    /// `session_pid_path` returns a path under the runtime dir when
+    /// `session_pid_path` returns a path under the private record dir when
     /// `HOME` is set. Sanity-check the layout so the safe-adoption
     /// path can find files written here.
     #[test]
@@ -7020,7 +7076,68 @@ mod tests {
             s.ends_with("agent-browser-ws-layout-test.pid"),
             "unexpected pid path filename: {s}"
         );
-        assert!(path.starts_with(run_dir_for_session("ws-layout-test").unwrap()), "PID file must live in the browser runtime directory: {s}");
+        assert_eq!(path.parent().unwrap(), run_dir_for_session("ws-layout-test").unwrap().join(BROWSER_RECORD_DIR));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(std::fs::metadata(path.parent().unwrap()).unwrap().permissions().mode() & 0o777, 0o700);
+        }
+        #[cfg(windows)]
+        clack_private_fs::require_private_directory(path.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn browser_record_namespace_does_not_collide_with_another_daemon_pid() {
+        let temp = tempfile::tempdir().unwrap();
+        let first = format!("x-{}", uuid::Uuid::new_v4().simple());
+        let second = format!("agent-browser-{first}");
+        validate_session_name(&second).unwrap();
+        let first_record = test_browser_record(12345, 100, "a".repeat(32));
+        let second_record = test_browser_record(23456, 200, "b".repeat(32));
+        let first_path = session_pid_path_in(temp.path(), &first).unwrap();
+        let second_path = session_pid_path_in(temp.path(), &second).unwrap();
+        let second_daemon_pid = temp.path().join(format!("{second}.pid"));
+        assert_eq!(second_daemon_pid, legacy_session_pid_path_in(temp.path(), &first).unwrap());
+
+        write_browser_pid_record(&first_path, &first_record).unwrap();
+        write_browser_pid_record(&second_path, &second_record).unwrap();
+        std::fs::write(&second_daemon_pid, b"23456\n").unwrap();
+        assert_eq!(session_pid_record_in(temp.path(), &first).unwrap().1, first_record);
+        assert_eq!(session_pid_record_in(temp.path(), &second).unwrap().1, second_record);
+        assert_eq!(read_daemon_pid_file(&second_daemon_pid), Some(23456));
+
+        std::fs::remove_file(&first_path).unwrap();
+        assert!(session_pid_record_in(temp.path(), &first).is_none());
+        assert_eq!(session_pid_record_in(temp.path(), &second).unwrap().1, second_record);
+        assert_eq!(read_daemon_pid_file(&second_daemon_pid), Some(23456));
+    }
+
+    #[test]
+    fn legacy_record_fallback_never_touches_daemon_pid_files() {
+        let temp = tempfile::tempdir().unwrap();
+        let session = "legacy-browser-record";
+        let legacy = legacy_session_pid_path_in(temp.path(), session).unwrap();
+        let record = test_browser_record(12345, 100, "a".repeat(32));
+        write_browser_pid_record(&legacy, &record).unwrap();
+        let current = session_pid_path_in(temp.path(), session).unwrap();
+        assert!(!current.exists());
+        assert_eq!(session_pid_record_in(temp.path(), session), Some((legacy.clone(), record.clone())));
+        assert_eq!(browser_pid_record_paths_in(temp.path()), vec![legacy.clone()]);
+        assert!(legacy.exists(), "legacy names must not be unlinked across a daemon PID race");
+        let colliding_daemon = format!("agent-browser-{session}");
+        assert!(require_owned_browser_session_in(&colliding_daemon, temp.path())
+            .unwrap_err().contains("invalid daemon PID file"));
+
+        let numeric_session = "other-daemon-pid";
+        let numeric = legacy_session_pid_path_in(temp.path(), numeric_session).unwrap();
+        std::fs::write(&numeric, b"54321\n").unwrap();
+        assert!(session_pid_record_in(temp.path(), numeric_session).is_none());
+        assert_eq!(std::fs::read(&numeric).unwrap(), b"54321\n");
+
+        std::fs::remove_dir(current.parent().unwrap()).unwrap();
+        std::fs::write(current.parent().unwrap(), b"unusable directory").unwrap();
+        assert!(session_pid_path_in(temp.path(), session).is_none());
+        assert_eq!(session_pid_record_in(temp.path(), session), Some((legacy, record)));
     }
 
     #[cfg(unix)]
@@ -7132,7 +7249,7 @@ mod tests {
     /// reconciliation path can actually use what we wrote.
     #[test]
     fn pid_file_round_trip_via_write_session_pid() {
-        // We write to ~/.codemux/run/agent-browser-{name}.pid and read
+        // We write to the private codemux-records directory and read
         // via session_pid_path (NOT the agent-browser-CLI's own PID
         // file). Use a unique name so parallel test runs don't collide.
         let name = format!("ws-roundtrip-{}", std::process::id());
@@ -7397,7 +7514,7 @@ mod tests {
         if with_record {
             let mut owned = std::fs::OpenOptions::new().write(true).create_new(true)
                 .mode(0o600)
-                .open(dir.join(format!("agent-browser-{session}.pid"))).unwrap();
+                .open(session_pid_path_in(dir, session).unwrap()).unwrap();
             writeln!(owned, "{} {} {} {} {} v2", record.pid, record.start_time,
                 record.token, record.owner_pid, record.owner_start_time).unwrap();
         }
@@ -7417,7 +7534,25 @@ mod tests {
         for suffix in ["pid", "stream", "sock"] {
             assert!(!dir.path().join(format!("{session}.{suffix}")).exists());
         }
-        assert!(!dir.path().join(format!("agent-browser-{session}.pid")).exists());
+        assert!(!session_pid_path_in(dir.path(), session).unwrap().exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn confirmed_browser_close_preserves_legacy_record_and_retires_daemon_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let session = "browser-close-legacy";
+        let record = test_browser_record(12345, 1, browser_owner_token().to_owned());
+        closed_browser_file_fixture(dir.path(), session, &record, false);
+        let legacy = legacy_session_pid_path_in(dir.path(), session).unwrap();
+        write_browser_pid_record(&legacy, &record).unwrap();
+        let files = capture_closed_browser_files(dir.path(), session, &record).unwrap();
+        assert_eq!(files.record_path, legacy);
+        assert!(cleanup_closed_browser_files(dir.path(), session, &record, &files, || true));
+        for suffix in ["pid", "stream", "sock"] {
+            assert!(!dir.path().join(format!("{session}.{suffix}")).exists());
+        }
+        assert_eq!(read_browser_pid_record(&legacy), Some(record));
     }
 
     #[cfg(unix)]
@@ -7434,19 +7569,19 @@ mod tests {
         let replacement = UnixListener::bind(&socket_path).unwrap();
         assert!(!cleanup_closed_browser_files(dir.path(), session, &record, &files, || true));
         assert!(dir.path().join(format!("{session}.pid")).exists());
-        assert!(dir.path().join(format!("agent-browser-{session}.pid")).exists());
+        assert!(session_pid_path_in(dir.path(), session).unwrap().exists());
         drop(replacement);
 
         std::fs::remove_file(&socket_path).unwrap();
         let mut changed = record.clone();
         changed.token = uuid::Uuid::new_v4().simple().to_string();
         std::fs::write(
-            dir.path().join(format!("agent-browser-{session}.pid")),
+            session_pid_path_in(dir.path(), session).unwrap(),
             format!("{} {} {} {} {} v2\n", changed.pid, changed.start_time,
                 changed.token, changed.owner_pid, changed.owner_start_time),
         ).unwrap();
         assert!(!cleanup_closed_browser_files(dir.path(), session, &record, &files, || true));
-        assert!(read_browser_pid_record(&dir.path().join(format!("agent-browser-{session}.pid"))).as_ref() == Some(&changed));
+        assert!(read_browser_pid_record(&session_pid_path_in(dir.path(), session).unwrap()).as_ref() == Some(&changed));
     }
 
     #[cfg(unix)]
@@ -7462,7 +7597,7 @@ mod tests {
         for suffix in ["pid", "stream", "sock"] {
             assert!(!dir.path().join(format!("{session}.{suffix}")).exists());
         }
-        assert!(!dir.path().join(format!("agent-browser-{session}.pid")).exists());
+        assert!(!session_pid_path_in(dir.path(), session).unwrap().exists());
     }
 
     #[cfg(unix)]
@@ -7475,7 +7610,7 @@ mod tests {
         let session = "browser-close-record-race";
         let record = test_browser_record(12345, 1, browser_owner_token().to_owned());
         let files = closed_browser_file_fixture(dir.path(), session, &record, false);
-        let path = dir.path().join(format!("agent-browser-{session}.pid"));
+        let path = session_pid_path_in(dir.path(), session).unwrap();
         let mut replacement = std::fs::OpenOptions::new().write(true).create_new(true)
             .mode(0o600).open(&path).unwrap();
         writeln!(replacement, "{} {} {} {} {} v2", record.pid, record.start_time,
@@ -7722,7 +7857,7 @@ mod tests {
         assert!(output_capture_and_track_browser_daemon(timed_out, Duration::from_millis(100), &session).is_err());
         assert_eq!(read_browser_pid_record(&tracked_path).unwrap().pid, record.pid);
 
-        let cleanup_record = temp.path().join(format!("agent-browser-{session}.pid"));
+        let cleanup_record = session_pid_path_in(temp.path(), &session).unwrap();
         std::fs::copy(&tracked_path, &cleanup_record).unwrap();
         kill_owned_browser_daemons_in(temp.path());
         let start = Instant::now();
@@ -8220,6 +8355,32 @@ mod tests {
         assert_eq!(process_start_time(pid), Some(start_time));
     }
 
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn recycled_pid_cleanup_keeps_legacy_record_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let session = "reused-legacy-record";
+        let pid = std::process::id();
+        let start_time = process_start_time(pid).unwrap();
+        let old = BrowserPidRecord {
+            pid,
+            start_time: different_native_start_in_same_second(start_time),
+            token: browser_owner_token().to_owned(),
+            owner_pid: pid,
+            owner_start_time: start_time,
+            native_start: true,
+        };
+        let daemon_pid = dir.path().join(format!("{session}.pid"));
+        let legacy = legacy_session_pid_path_in(dir.path(), session).unwrap();
+        std::fs::write(&daemon_pid, pid.to_string()).unwrap();
+        write_browser_pid_record(&legacy, &old).unwrap();
+
+        assert!(cleanup_reused_browser_lock_files_in(dir.path(), session, &old));
+        assert!(!daemon_pid.exists());
+        assert_eq!(read_browser_pid_record(&legacy), Some(old));
+        assert_eq!(process_start_time(pid), Some(start_time));
+    }
+
     #[tokio::test]
     async fn pending_stream_confirmation_survives_a_retry() {
         let manager = AgentBrowserManager::new();
@@ -8621,7 +8782,7 @@ mod tests {
             .spawn()
             .unwrap();
         let session = "unrelated-process-test";
-        let path = temp.path().join(format!("agent-browser-{session}.pid"));
+        let path = session_pid_path_in(temp.path(), session).unwrap();
         std::fs::write(&path, format!("{} 1 {}\n", child.id(), browser_owner_token())).unwrap();
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
 
