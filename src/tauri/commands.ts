@@ -1345,6 +1345,14 @@ export const agentBrowserScreenshot = (browserId: string) =>
 export const startBrowserStream = (browserId: string) =>
   invoke<string>("start_browser_stream", { browserId });
 
+export type BrowserPresetNavigationStatus = "completed" | "pending" | "failed";
+
+export const ensureBrowserPresetNavigation = (browserId: string, url: string, retryFailed = false) =>
+  invoke<BrowserPresetNavigationStatus>("ensure_browser_preset_navigation", { browserId, url, retryFailed });
+
+export const browserPresetNavigationStatus = (browserId: string) =>
+  invoke<BrowserPresetNavigationStatus | null>("browser_preset_navigation_status", { browserId });
+
 export interface BrowserStreamBridgeEndpoints {
   ws_url: string;
   http_base: string;

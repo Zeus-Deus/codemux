@@ -354,6 +354,8 @@ pub(super) fn allowed(cmd: &str) -> bool {
             | "search_in_files"
             | "search_project_index"
             | "start_browser_stream"
+            | "ensure_browser_preset_navigation"
+            | "browser_preset_navigation_status"
             | "start_skills_watcher"
             | "stop_skills_watcher"
             | "terminal_foreground_jobs"
@@ -407,6 +409,8 @@ mod tests {
     #[test]
     fn browser_confirmation_and_local_bridge_stay_on_the_host() {
         assert!(allowed("agent_browser_run"));
+        assert!(allowed("ensure_browser_preset_navigation"));
+        assert!(allowed("browser_preset_navigation_status"));
         for cmd in [
             "agent_browser_pending_confirmation",
             "agent_browser_respond_confirmation",
