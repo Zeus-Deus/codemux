@@ -317,6 +317,96 @@ describe("BrowserPane start failures", () => {
     expect(mocks.agentBrowserPendingConfirmation).not.toHaveBeenCalled();
   });
 
+  it("does not apply a former browser's preset poll or stale frame after switching panes", async () => {
+    const firstId = "browser-preset-first";
+    const secondId = "browser-preset-second";
+    setPresetBrowser(firstId, "https://first.example");
+    mocks.startBrowserStream.mockResolvedValue("ws://127.0.0.1:9223");
+    let firstPending = false;
+    mocks.ensureBrowserPresetNavigation.mockImplementation(async (sessionId: string) => {
+      if (sessionId === firstId) firstPending = true;
+      return sessionId === firstId ? "pending" : "completed";
+    });
+    const firstPrompt = {
+      id: "first_prompt",
+      description: "Approve first browser",
+      expires_at_ms: Date.now() + 60_000,
+    };
+    mocks.agentBrowserPendingConfirmation.mockImplementation(async (sessionId: string) =>
+      sessionId === firstId && firstPending ? firstPrompt : null);
+    let releaseFirstStatus: ((state: string) => void) | undefined;
+    const firstStatus = new Promise<string>((resolve) => { releaseFirstStatus = resolve; });
+    mocks.browserPresetNavigationStatus.mockImplementation((sessionId: string) =>
+      sessionId === firstId ? firstStatus : Promise.resolve(null));
+    let releaseFirstApproval: ((details: typeof firstPrompt) => void) | undefined;
+    const firstApproval = new Promise<typeof firstPrompt>((resolve) => { releaseFirstApproval = resolve; });
+    mocks.agentBrowserRespondConfirmation.mockImplementation(() => firstApproval);
+    const onStatusChange = vi.fn();
+
+    const pane = render(<BrowserPane browserId={firstId} focused={false} visible onStatusChange={onStatusChange} />);
+    await vi.waitFor(() => expect(FakeWebSocket.opened).toBe(1));
+    const firstSocket = FakeWebSocket.lastSocket;
+    act(emitFrame);
+    await vi.waitFor(() => expect(screen.getByText("Approve first browser")).toBeInTheDocument());
+    await vi.waitFor(() => expect(mocks.browserPresetNavigationStatus).toHaveBeenCalledWith(firstId));
+    fireEvent.click(screen.getByRole("button", { name: "Approve browser action" }));
+    await vi.waitFor(() => expect(mocks.agentBrowserRespondConfirmation).toHaveBeenCalledWith(firstId, "first_prompt", true));
+
+    act(() => {
+      setPresetBrowser(secondId, "https://second.example");
+      pane.rerender(<BrowserPane browserId={secondId} focused={false} visible onStatusChange={onStatusChange} />);
+    });
+    await vi.waitFor(() => expect(FakeWebSocket.opened).toBe(2));
+    expect(screen.queryByText("Approve first browser")).not.toBeInTheDocument();
+    onStatusChange.mockClear();
+    act(() => firstSocket?.onmessage?.({
+      data: JSON.stringify({ type: "frame", data: "", metadata: { deviceWidth: 1280, deviceHeight: 720 } }),
+    }));
+    expect(onStatusChange).not.toHaveBeenCalledWith("live");
+    expect(mocks.ensureBrowserPresetNavigation).not.toHaveBeenCalledWith(secondId, "https://second.example", false);
+
+    act(emitFrame);
+    await vi.waitFor(() => expect(mocks.ensureBrowserPresetNavigation).toHaveBeenCalledWith(secondId, "https://second.example", false));
+    const firstReadsBefore = mocks.agentBrowserPendingConfirmation.mock.calls
+      .filter(([sessionId]) => sessionId === firstId).length;
+    await act(async () => { releaseFirstStatus?.("pending"); });
+    await act(async () => { releaseFirstApproval?.({ ...firstPrompt, id: "old_follow_up", description: "Old follow-up" }); });
+    expect(screen.queryByText("Approve first browser")).not.toBeInTheDocument();
+    expect(screen.queryByText("Old follow-up")).not.toBeInTheDocument();
+    expect(mocks.agentBrowserPendingConfirmation.mock.calls.filter(([sessionId]) => sessionId === firstId)).toHaveLength(firstReadsBefore);
+  });
+
+  it("ignores an old pending-prompt poll after approval reveals a follow-up", async () => {
+    const firstPrompt = {
+      id: "first_prompt",
+      description: "Approve navigation",
+      expires_at_ms: Date.now() + 60_000,
+    };
+    const followUp = {
+      id: "follow_up",
+      description: "Approve plugin",
+      expires_at_ms: Date.now() + 60_000,
+    };
+    mocks.startBrowserStream.mockRejectedValue("Browser confirmation is pending for session browser-1");
+    let releaseOldPoll: ((details: typeof firstPrompt) => void) | undefined;
+    const oldPoll = new Promise<typeof firstPrompt>((resolve) => { releaseOldPoll = resolve; });
+    let holdPoll = false;
+    mocks.agentBrowserPendingConfirmation.mockImplementation(() => holdPoll ? oldPoll : Promise.resolve(firstPrompt));
+    mocks.agentBrowserRespondConfirmation.mockResolvedValue(followUp);
+
+    renderPane();
+    await vi.waitFor(() => expect(screen.getByText("Approve navigation")).toBeInTheDocument());
+    const initialReads = mocks.agentBrowserPendingConfirmation.mock.calls.length;
+    holdPoll = true;
+    await vi.waitFor(() => expect(mocks.agentBrowserPendingConfirmation.mock.calls.length).toBeGreaterThan(initialReads), { timeout: 3500 });
+
+    fireEvent.click(screen.getByRole("button", { name: "Approve browser action" }));
+    await vi.waitFor(() => expect(screen.getByText("Approve plugin")).toBeInTheDocument());
+    await act(async () => { releaseOldPoll?.(firstPrompt); });
+    expect(screen.getByText("Approve plugin")).toBeInTheDocument();
+    expect(screen.queryByText("Approve navigation")).not.toBeInTheDocument();
+  });
+
   it("shows a cached failure after a pane remounts during the first preset open", async () => {
     const browserId = "browser-preset-remount";
     setPresetBrowser(browserId);
