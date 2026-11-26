@@ -3744,6 +3744,8 @@ pub enum BrowserPresetNavigationStatus {
 enum PresetNavigationPhase {
     Running,
     Completed,
+    /// The open completed, but a later daemon identity probe was inconclusive.
+    CompletedUnverified,
     Pending,
     Failed,
 }
@@ -3783,12 +3785,17 @@ fn begin_preset_navigation(
         attempt.identity == identity
             || (attempt.phase != PresetNavigationPhase::Completed && same_stream_process(attempt.identity, identity))
     }) {
-        if attempt.phase != PresetNavigationPhase::Completed {
-            attempt.identity = identity;
-        }
         match attempt.phase {
             PresetNavigationPhase::Completed => return Some(BrowserPresetNavigationStatus::Completed),
+            PresetNavigationPhase::CompletedUnverified => {
+                if attempt.identity == identity {
+                    attempt.phase = PresetNavigationPhase::Completed;
+                    return Some(BrowserPresetNavigationStatus::Completed);
+                }
+                // A verified replacement may perform its own first open.
+            }
             PresetNavigationPhase::Pending | PresetNavigationPhase::Running | PresetNavigationPhase::Failed => {
+                attempt.identity = identity;
                 attempt.phase = PresetNavigationPhase::Failed;
                 if !retry_failed {
                     return Some(BrowserPresetNavigationStatus::Failed);
@@ -3804,6 +3811,19 @@ fn begin_preset_navigation(
     None
 }
 
+fn classify_completed_preset_verification(
+    attempted: BrowserStreamIdentity,
+    verified: Result<BrowserStreamIdentity, String>,
+) -> (PresetNavigationPhase, Result<BrowserPresetNavigationStatus, String>) {
+    match verified {
+        Ok(current) if current == attempted =>
+            (PresetNavigationPhase::Completed, Ok(BrowserPresetNavigationStatus::Completed)),
+        Ok(_) => (PresetNavigationPhase::Failed, Ok(BrowserPresetNavigationStatus::Failed)),
+        Err(error) => (PresetNavigationPhase::CompletedUnverified,
+            Err(format!("Browser preset navigation completed, but daemon identity could not be verified: {error}"))),
+    }
+}
+
 fn settle_preset_navigation(
     stream: &mut StreamSession,
     attempted: BrowserStreamIdentity,
@@ -3814,10 +3834,13 @@ fn settle_preset_navigation(
     let Some(attempt) = stream.preset_navigation.as_mut()
         .filter(|attempt| attempt.identity == attempted && attempt.phase == PresetNavigationPhase::Running)
     else { return false };
-    // A new daemon did not perform this attempt. Retain the old identity so
-    // its first preset open can run on the next frame without manual retry.
-    if let Some(current) = tracked.filter(|current| same_stream_process(*current, attempted)) {
-        attempt.identity = current;
+    // Pending and failed commands may discover the same daemon's generation
+    // later. A completed command keeps its exact identity until verification,
+    // so a replacement cannot inherit the old open.
+    if matches!(phase, PresetNavigationPhase::Pending | PresetNavigationPhase::Failed) {
+        if let Some(current) = tracked.filter(|current| same_stream_process(*current, attempted)) {
+            attempt.identity = current;
+        }
     }
     attempt.phase = phase;
     attempt.prompt_id = prompt_id;
@@ -6650,19 +6673,22 @@ impl AgentBrowserManager {
                 .flatten();
             (pending, tracked)
         });
-        let (phase, status, prompt_id) = if let Some(Some(prompt_id)) = pending_id {
-            (PresetNavigationPhase::Pending, BrowserPresetNavigationStatus::Pending, Some(prompt_id))
-        } else if result.as_ref().is_ok_and(|(_, outcome)| *outcome == BrowserActionOutcome::Completed)
-            && self.verified_stream_identity(browser_id).await.ok() == Some(identity) {
-            (PresetNavigationPhase::Completed, BrowserPresetNavigationStatus::Completed, None)
+        let (phase, response, prompt_id) = if let Some(Some(prompt_id)) = pending_id {
+            (PresetNavigationPhase::Pending, Ok(BrowserPresetNavigationStatus::Pending), Some(prompt_id))
+        } else if result.as_ref().is_ok_and(|(_, outcome)| *outcome == BrowserActionOutcome::Completed) {
+            let (phase, response) = classify_completed_preset_verification(
+                identity, self.verified_stream_identity(browser_id).await,
+            );
+            (phase, response, None)
         } else {
-            (PresetNavigationPhase::Failed, BrowserPresetNavigationStatus::Failed, None)
+            (PresetNavigationPhase::Failed, Ok(BrowserPresetNavigationStatus::Failed), None)
         };
         let mut stored = false;
         if let Some(stream) = self.sessions.lock().await.get_mut(browser_id) {
             stored = settle_preset_navigation(stream, identity, tracked_identity, phase, prompt_id);
         }
-        Ok(if stored { status } else { BrowserPresetNavigationStatus::Failed })
+        if !stored { return Ok(BrowserPresetNavigationStatus::Failed); }
+        response
     }
 
     async fn run_command_locked(
@@ -8812,6 +8838,59 @@ mod tests {
             Some(replaced_during_open), PresetNavigationPhase::Failed, None));
         assert_eq!(stream.preset_navigation.as_ref().unwrap().identity, same_process_new_generation);
         assert_eq!(begin_preset_navigation(&mut stream, replaced_during_open, false), None);
+    }
+
+    #[tokio::test]
+    async fn completed_preset_open_survives_one_failed_identity_probe_without_reopening() {
+        let manager = AgentBrowserManager::new();
+        let session = format!("preset-probe-{}", uuid::Uuid::new_v4().simple());
+        manager.allow_test_stream_session(&session, 9223).await;
+        let identity = manager.verified_stream_identity(&session).await.unwrap();
+        let (phase, response) = classify_completed_preset_verification(
+            identity, Err("transient listener lookup".into()),
+        );
+        assert_eq!(phase, PresetNavigationPhase::CompletedUnverified);
+        assert!(response.is_err());
+        {
+            let mut sessions = manager.sessions.lock().await;
+            let stream = sessions.get_mut(&session).unwrap();
+            assert_eq!(begin_preset_navigation(stream, identity, false), None);
+            assert!(settle_preset_navigation(stream, identity, Some(identity), phase, None));
+        }
+        let unresolved = manager.sessions.lock().await.get(&session).unwrap().preset_navigation.clone().unwrap();
+        // A status read cannot claim verification. Explicit retry rechecks
+        // the same daemon and caches completion for later remounts.
+        assert_eq!(manager.preset_navigation_status(&session).await.unwrap(), None);
+        assert_eq!(manager.ensure_preset_navigation(&session, "https://example.com".into(), true).await.unwrap(),
+            BrowserPresetNavigationStatus::Completed);
+        assert_eq!(manager.ensure_preset_navigation(&session, "https://example.com".into(), false).await.unwrap(),
+            BrowserPresetNavigationStatus::Completed);
+
+        let mut sessions = manager.sessions.lock().await;
+        let stream = sessions.get_mut(&session).unwrap();
+        // A newly verified daemon can perform its own first open, even if
+        // the previous completed command never passed its final probe.
+        let new_generation = BrowserStreamIdentity { generation: identity.generation.wrapping_add(1), ..identity };
+        stream.preset_navigation = Some(PresetNavigationAttempt {
+            identity,
+            phase: PresetNavigationPhase::Running,
+            prompt_id: None,
+        });
+        assert!(settle_preset_navigation(stream, identity, Some(new_generation),
+            PresetNavigationPhase::CompletedUnverified, None));
+        assert_eq!(stream.preset_navigation.as_ref().unwrap().identity, identity);
+        stream.preset_navigation = Some(unresolved.clone());
+        assert_eq!(begin_preset_navigation(stream, new_generation, false), None);
+        assert_eq!(stream.preset_navigation.as_ref().unwrap().identity, new_generation);
+        let replacement = BrowserStreamIdentity {
+            pid: identity.pid.wrapping_add(1),
+            start_time: identity.start_time.wrapping_add(1),
+            generation: new_generation.generation.wrapping_add(1),
+            ..identity
+        };
+        stream.preset_navigation = Some(unresolved);
+        assert_eq!(begin_preset_navigation(stream, replacement, false), None);
+        assert_eq!(stream.preset_navigation.as_ref().unwrap().identity, replacement);
     }
 
     #[tokio::test]
