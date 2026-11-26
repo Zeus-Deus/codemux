@@ -9078,6 +9078,7 @@ mod tests {
             let identity_path = temp.path().join("identity");
             let marker = temp.path().join("close-requests");
             let daemon_stderr = temp.path().join("daemon-stderr");
+            let owner_stderr = temp.path().join("owner-stderr");
             let token = uuid::Uuid::new_v4().simple().to_string();
             let mut owner = Command::new(&binary.executable);
             owner.args(["--exact", "agent_browser::tests::windows_previous_owner_fixture", "--nocapture"])
@@ -9087,17 +9088,19 @@ mod tests {
                 .env("CODEMUX_TEST_WINDOWS_PRIOR_MARKER", &marker)
                 .env("CODEMUX_TEST_WINDOWS_PRIOR_DAEMON_STDERR", &daemon_stderr)
                 .env("CODEMUX_TEST_WINDOWS_PRIOR_TOKEN", &token)
-                .stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::piped());
+                .stdin(Stdio::null()).stdout(Stdio::null())
+                .stderr(Stdio::from(std::fs::File::create(&owner_stderr).unwrap()));
             if let Some(secret) = &secret {
                 owner.env("CODEMUX_TEST_WINDOWS_PRIOR_SECRET", secret);
             } else {
                 owner.env_remove("CODEMUX_TEST_WINDOWS_PRIOR_SECRET");
             }
-            let owner = owner.spawn().unwrap();
+            let mut owner = owner.spawn().unwrap();
             let spawned_owner_pid = owner.id();
-            let owner_output = owner.wait_with_output().unwrap();
-            assert!(owner_output.status.success(), "previous owner fixture failed: status={}, stderr={}, binary={}",
-                owner_output.status, String::from_utf8_lossy(&owner_output.stderr), binary.executable.display());
+            let owner_status = wait_with_timeout(&mut owner, Duration::from_secs(20));
+            assert!(owner_status.as_ref().is_ok_and(std::process::ExitStatus::success),
+                "previous owner fixture failed: status={owner_status:?}, stderr={}, binary={}",
+                std::fs::read_to_string(&owner_stderr).unwrap_or_default(), binary.executable.display());
             let identity = std::fs::read_to_string(&identity_path).unwrap();
             let ids: Vec<u64> = identity.split_whitespace().map(|value| value.parse().unwrap()).collect();
             assert_eq!(ids.len(), 3);
