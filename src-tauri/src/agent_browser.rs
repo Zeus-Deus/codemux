@@ -550,22 +550,18 @@ fn probe_legacy_browser_control_endpoint(session: &str, root: &std::path::Path, 
         return BrowserControlEndpointProbe::Absent;
     }
     let port_path = root.join(format!("{session}.port"));
-    let (port, root_port_present) = match std::fs::symlink_metadata(&port_path) {
-        Ok(meta) => {
-            use std::os::windows::fs::MetadataExt;
-            if !meta.is_file() || meta.file_attributes() & 0x400 != 0
-                || clack_private_fs::require_private_file(&port_path).is_err() {
-                return BrowserControlEndpointProbe::Inconclusive;
-            }
-            match std::fs::read_to_string(&port_path).ok()
-                .and_then(|value| value.trim().parse::<u16>().ok()) {
-                Some(port) if port != 0 => (port, true),
-                _ => return BrowserControlEndpointProbe::Inconclusive,
-            }
-        }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => (browser_control_fallback_port(session), false),
+    let port_snapshot = match std::fs::symlink_metadata(&port_path) {
+        Ok(_) => match windows_browser_port_snapshot(&port_path) {
+            Some(snapshot) => Some(snapshot),
+            None => return BrowserControlEndpointProbe::Inconclusive,
+        },
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
         Err(_) => return BrowserControlEndpointProbe::Inconclusive,
     };
+    let root_port_present = port_snapshot.is_some();
+    let port = port_snapshot.as_ref().map_or_else(
+        || browser_control_fallback_port(session), |snapshot| snapshot.port,
+    );
     if !root_port_present && root_pid.is_none() {
         return BrowserControlEndpointProbe::Absent;
     }
@@ -574,7 +570,12 @@ fn probe_legacy_browser_control_endpoint(session: &str, root: &std::path::Path, 
     };
     let result = classify_legacy_browser_listener(listener_pid, root_pid, current_pid, current_verified);
     if result != BrowserControlEndpointProbe::Absent
-        && stale_legacy_browser_listener_is_unrelated(root, session, root_pid, listener_pid) {
+        && stale_legacy_browser_listener_is_unrelated(root, session, root_pid, listener_pid)
+        && read_daemon_pid_file(&root.join(format!("{session}.pid"))) == root_pid
+        && port_snapshot.as_ref().map_or(true, |snapshot| {
+            windows_browser_port_matches(&port_path, Some(snapshot))
+        })
+        && windows_loopback_listener_pid(port) == Some(listener_pid) {
         BrowserControlEndpointProbe::Absent
     } else {
         result
@@ -995,7 +996,7 @@ fn reused_browser_listener_is_unrelated(
     }
     let Some(start) = process_start_time(old.pid) else { return false };
     if start == old.start_time
-        || process_looks_like_agent_browser(old.pid) != Some(false)
+        || browser_listener_is_other_session(old.pid, session) != Some(true)
         || process_start_time(old.pid) != Some(start)
     {
         return false;
@@ -1165,7 +1166,13 @@ fn cleanup_reused_browser_lock_files_in(dir: &std::path::Path, session: &str, ol
         let endpoint_absent = !browser_control_endpoint_ready_in_namespace(session, dir);
         (old.token == browser_owner_token() || previous_app_has_exited(old))
             && process_start_time(old.pid).is_some_and(|start| start != old.start_time)
-            && process_looks_like_agent_browser(old.pid) == Some(false)
+            && {
+                #[cfg(windows)]
+                let unrelated = browser_listener_is_other_session(old.pid, session) == Some(true);
+                #[cfg(not(windows))]
+                let unrelated = process_looks_like_agent_browser(old.pid) == Some(false);
+                unrelated
+            }
             && endpoint_absent
             && read_daemon_pid_file(&pid_path) == Some(old.pid)
             && read_browser_pid_record(&record_path).as_ref() == Some(old)
@@ -8589,6 +8596,11 @@ mod tests {
         write!(port_file, "{port}").unwrap();
         port_file.sync_all().unwrap();
         drop(port_file);
+        let acl = std::process::Command::new("icacls")
+            .arg(&port_path).args(["/grant", "*S-1-5-32-545:R"])
+            .output().unwrap();
+        assert!(acl.status.success(), "could not set legacy port ACL: {acl:?}");
+        assert!(clack_private_fs::require_private_file(&port_path).is_err());
 
         let current = temp.path().join(BROWSER_DAEMON_DIR);
         assert_eq!(browser_daemon_dir_in(temp.path(), &session), Some(current));
@@ -8870,6 +8882,23 @@ mod tests {
         assert_eq!(windows_loopback_listener_pid(port), Some(Some(child.0.id())),
             "cleanup must not stop the other session");
         assert!(require_owned_browser_session_in(&stale_session, &current).is_ok());
+
+        let start = process_start_time(child.0.id()).unwrap();
+        let old = test_browser_record(
+            child.0.id(), start.saturating_add(1), browser_owner_token().to_owned(),
+        );
+        assert!(!reused_browser_listener_is_unrelated(&old, &other_session, Some(Some(child.0.id()))),
+            "a same-session browser replacement must remain blocked");
+        let record_path = session_pid_path_in(temp.path(), &stale_session).unwrap();
+        write_browser_pid_record(&record_path, &old).unwrap();
+        std::fs::write(&pid_path, child.0.id().to_string()).unwrap();
+        assert!(reused_browser_listener_is_unrelated(&old, &stale_session, Some(Some(child.0.id()))));
+        assert!(require_owned_browser_session_in(&stale_session, &current).is_ok(),
+            "a verified other-session browser must not pin the recycled PID");
+        assert!(!pid_path.exists());
+        assert!(!record_path.exists());
+        assert_eq!(windows_loopback_listener_pid(port), Some(Some(child.0.id())));
+        assert!(child.0.try_wait().unwrap().is_none());
     }
 
     #[test]
