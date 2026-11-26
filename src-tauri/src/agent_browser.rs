@@ -11935,7 +11935,7 @@ mod tests {
             let mut sessions = manager.sessions.lock().await;
             let entry = sessions.get_mut(&session).unwrap();
             entry.pending_confirmation.as_mut().unwrap().decision_in_flight = false;
-            AgentBrowserManager::finish_confirmation_decision(entry, record,
+            AgentBrowserManager::finish_confirmation_decision(entry, &session, record,
                 BrowserConfirmationResponse::FollowUp(BrowserConfirmationDetails {
                     id: Some("c_reused".into()), description: "Approve plugin action".into(),
                 })).unwrap().unwrap()
