@@ -88,10 +88,86 @@ index 719543c..740c500 100644
  pub fn expected_token() -> Option<&'static str> {
      static TOKEN: OnceLock<Option<String>> = OnceLock::new();
 diff --git a/cli/src/connection.rs b/cli/src/connection.rs
-index 40e8f4a..c00acda 100644
+index 40e8f4a..147eec7 100644
 --- a/cli/src/connection.rs
 +++ b/cli/src/connection.rs
-@@ -1438,8 +1438,8 @@ fn send_command_once(cmd: &Value, session: &str) -> Result<Response, SendError>
+@@ -23,6 +23,7 @@ use windows_sys::Win32::System::Threading::{
+ };
+
+ pub(crate) const INTERNAL_DAEMON_SHUTDOWN_ACTION: &str = "__agent_browser_internal_shutdown";
++pub(crate) const MANAGED_CHROME_CLEANUP_PENDING_CODE: &str = "managed_chrome_cleanup_pending";
+
+ #[derive(Serialize)]
+ #[allow(dead_code)]
+@@ -928,28 +929,51 @@ fn wait_for_daemon_exit(session: &str, timeout: Duration) -> bool {
+     !daemon_ready(session)
+ }
+
+-fn request_graceful_daemon_shutdown(session: &str) -> bool {
++#[derive(Debug, PartialEq, Eq)]
++enum DaemonShutdownResult {
++    Stopped,
++    CleanupPending,
++    Unavailable,
++}
++
++fn cleanup_pending_shutdown_response(response: &Response) -> bool {
++    !response.success && response.code.as_deref() == Some(MANAGED_CHROME_CLEANUP_PENDING_CODE)
++}
++
++fn request_graceful_daemon_shutdown(session: &str) -> DaemonShutdownResult {
+     let close_cmd = json!({
+         "id": "restart-close",
+         "action": INTERNAL_DAEMON_SHUTDOWN_ACTION
+     });
+
+     match send_command(close_cmd, session) {
+-        Ok(resp) if resp.success => wait_for_daemon_exit(session, Duration::from_secs(5)),
+-        _ => false,
++        Ok(resp) if resp.success && wait_for_daemon_exit(session, Duration::from_secs(5)) => {
++            DaemonShutdownResult::Stopped
++        }
++        Ok(resp) if cleanup_pending_shutdown_response(&resp) => {
++            DaemonShutdownResult::CleanupPending
++        }
++        _ => DaemonShutdownResult::Unavailable,
+     }
+ }
+
+-fn stop_existing_daemon_for_restart(session: &str) {
+-    if !request_graceful_daemon_shutdown(session) {
+-        kill_stale_daemon(session);
++fn stop_existing_daemon_for_restart(session: &str) -> Result<(), String> {
++    match request_graceful_daemon_shutdown(session) {
++        DaemonShutdownResult::Stopped => Ok(()),
++        DaemonShutdownResult::CleanupPending => {
++            Err("Managed Chrome cleanup is still in progress; retry the command".into())
++        }
++        DaemonShutdownResult::Unavailable => {
++            kill_stale_daemon(session);
++            Ok(())
++        }
+     }
+ }
+
+ /// Stops a session's daemon without a `close`, so the session's stored
+ /// settings stay, the same way a restart stops it.
+ pub fn stop_daemon(session: &str) {
+-    stop_existing_daemon_for_restart(session);
++    let _ = stop_existing_daemon_for_restart(session);
+ }
+
+ /// Marks this process's stdout and stderr non-inheritable so a detached child cannot hold a reader's pipes open.
+@@ -1070,7 +1094,7 @@ fn ensure_daemon_locked(session: &str, opts: &DaemonOptions) -> Result<DaemonRes
+             match ready_existing_daemon_result(session, opts, Duration::from_secs(1)) {
+                 Some(result) => return Ok(result),
+                 None => {
+-                    stop_existing_daemon_for_restart(session);
++                    stop_existing_daemon_for_restart(session)?;
+                     restarted = true;
+                 }
+             }
+@@ -1438,8 +1462,8 @@ fn send_command_once(cmd: &Value, session: &str) -> Result<Response, SendError>
          .ok_or_else(|| SendError::NotSent("Codemux browser token is missing".into()))?;
      let mut authenticated = cmd.clone();
      authenticated[crate::codemux_auth::FIELD] = Value::String(token.to_owned());
@@ -102,8 +178,30 @@ index 40e8f4a..c00acda 100644
      json_str.push('\n');
 
      let stream = connect(session).map_err(SendError::NotSent)?;
+@@ -1488,6 +1512,21 @@ mod tests {
+     use super::*;
+     use crate::test_utils::EnvGuard;
+
++    #[test]
++    fn pipe_cleanup_pending_shutdown_is_retryable() {
++        let pending = Response {
++            success: false,
++            code: Some(MANAGED_CHROME_CLEANUP_PENDING_CODE.into()),
++            ..Response::default()
++        };
++        assert!(cleanup_pending_shutdown_response(&pending));
++        assert!(!cleanup_pending_shutdown_response(&Response {
++            success: true,
++            ..pending
++        }));
++        assert!(!cleanup_pending_shutdown_response(&Response::default()));
++    }
++
+     #[cfg(unix)]
+     #[test]
+     fn unrelated_process_is_not_agent_browser() {
 diff --git a/cli/src/main.rs b/cli/src/main.rs
-index 2e44178..3c4fa91 100644
+index 2e44178..28a840f 100644
 --- a/cli/src/main.rs
 +++ b/cli/src/main.rs
 @@ -1,8 +1,8 @@
@@ -116,19 +214,37 @@ index 2e44178..3c4fa91 100644
  mod commands;
  mod connection;
  mod doctor;
-@@ -1927,13 +1927,18 @@ fn main() {
+@@ -590,6 +590,20 @@ fn canonical_path(path: PathBuf) -> PathBuf {
+     path.canonicalize().unwrap_or(path)
+ }
+
++fn ca_cert_request_path(path: &str, launches_browser: bool) -> Result<PathBuf, String> {
++    let path = std::path::Path::new(path);
++    if launches_browser {
++        // The daemon validates the CA under the managed launch deadline.
++        // Preserve the CLI's cwd for relative paths without walking a slow
++        // filesystem before the request has even reached that deadline.
++        std::path::absolute(path).map_err(|error| {
++            format!("Cannot resolve --ca-cert against the current directory: {error}")
++        })
++    } else {
++        Ok(path.canonicalize().unwrap_or_else(|_| path.to_path_buf()))
++    }
++}
++
+ fn git_toplevel() -> Option<PathBuf> {
+     let output = Command::new("git")
+         .args(["rev-parse", "--show-toplevel"])
+@@ -1927,17 +1941,28 @@ fn main() {
      }
 
      if let Some(ref ca_path) = flags.ca_cert {
 -        if let Err(msg) = ca_bundle::load(ca_path) {
--            if flags.json {
--                print_json_error(&msg);
--            } else {
--                eprintln!("{} {}", color::error_indicator(), msg);
 +        // Browser launches validate CA trust in the daemon before changing
 +        // session settings. Reading a certificate here would precede the
 +        // managed Chromium startup deadline.
-+        if !native::actions::command_launches_browser(&cmd) {
++        let launches_browser = native::actions::command_launches_browser(&cmd);
++        if !launches_browser {
 +            if let Err(msg) = ca_bundle::load(ca_path) {
 +                if flags.json {
 +                    print_json_error(&msg);
@@ -136,11 +252,42 @@ index 2e44178..3c4fa91 100644
 +                    eprintln!("{} {}", color::error_indicator(), msg);
 +                }
 +                exit(1);
++            }
++        }
++        let canonical = ca_cert_request_path(ca_path, launches_browser).unwrap_or_else(|message| {
+             if flags.json {
+-                print_json_error(&msg);
++                print_json_error(&message);
+             } else {
+-                eprintln!("{} {}", color::error_indicator(), msg);
++                eprintln!("{} {}", color::error_indicator(), message);
              }
--            exit(1);
-         }
-         let canonical = std::path::Path::new(ca_path)
-             .canonicalize()
+             exit(1);
+-        }
+-        let canonical = std::path::Path::new(ca_path)
+-            .canonicalize()
+-            .unwrap_or_else(|_| std::path::PathBuf::from(ca_path));
++        });
+         flags.ca_cert = Some(canonical.display().to_string());
+     }
+
+@@ -3426,6 +3451,16 @@ mod tests {
+         );
+     }
+
++    #[test]
++    fn pipe_launch_ca_path_is_absolute_without_reading_the_file() {
++        let missing = format!("missing-ca-{}", std::process::id());
++        let launch = ca_cert_request_path(&missing, true).unwrap();
++        assert!(launch.is_absolute());
++        assert!(launch.ends_with(&missing));
++        let browserless = ca_cert_request_path(&missing, false).unwrap();
++        assert_eq!(browserless, std::path::PathBuf::from(missing));
++    }
++
+     #[test]
+     fn test_incompatible_launch_mode_error_rejects_ca_cert_modes() {
+         let with_ca = |mut flags: Flags| {
 diff --git a/cli/src/mcp.rs b/cli/src/mcp.rs
 index afb567c..30e5501 100644
 --- a/cli/src/mcp.rs
@@ -164,10 +311,10 @@ index afb567c..30e5501 100644
              &[],
          ),
 diff --git a/cli/src/native/actions.rs b/cli/src/native/actions.rs
-index aad976c..70eef49 100644
+index aad976c..cc91080 100644
 --- a/cli/src/native/actions.rs
 +++ b/cli/src/native/actions.rs
-@@ -5,7 +5,7 @@ use std::fs;
+@@ -5,12 +5,14 @@ use std::fs;
  use std::hash::{DefaultHasher, Hash, Hasher};
  use std::io::Write;
  use std::path::PathBuf;
@@ -176,7 +323,15 @@ index aad976c..70eef49 100644
  use std::sync::Arc;
  use time::{format_description::well_known::Rfc3339, OffsetDateTime};
  use tokio::sync::{broadcast, oneshot, RwLock};
-@@ -19,7 +19,7 @@ use crate::session_settings::{
+
+-use crate::connection::{get_socket_dir, INTERNAL_DAEMON_SHUTDOWN_ACTION};
++use crate::connection::{
++    get_socket_dir, INTERNAL_DAEMON_SHUTDOWN_ACTION, MANAGED_CHROME_CLEANUP_PENDING_CODE,
++};
+ use crate::session_files::SessionFile;
+ use crate::session_settings::{
+     named, spec, Connection, Effect, Key, Patch, Persist, Requested, Running, Store, RESTORE_UNIT,
+@@ -19,7 +21,7 @@ use crate::session_settings::{
  use super::a11y;
  use super::auth;
  use super::browser::{should_track_target, BrowserManager, TabKeep, WaitUntil, WedgeReport};
@@ -185,7 +340,7 @@ index aad976c..70eef49 100644
  use super::cdp::client::{is_session_detached_error, CdpClient};
  use super::cdp::types::{
      session_matches, AttachToTargetParams, AttachToTargetResult, CdpEvent,
-@@ -475,6 +475,54 @@ fn resolve_effective_ca_cert(
+@@ -475,6 +477,54 @@ fn resolve_effective_ca_cert(
      }))
  }
 
@@ -240,7 +395,7 @@ index aad976c..70eef49 100644
  fn apply_effective_ca_cert(
      options: &mut LaunchOptions,
      effective_ca_cert: &Option<EffectiveCaCert>,
-@@ -647,6 +695,9 @@ impl SessionSetup {
+@@ -647,6 +697,9 @@ impl SessionSetup {
 
  pub struct DaemonState {
      pub browser: Option<BrowserManager>,
@@ -250,28 +405,41 @@ index aad976c..70eef49 100644
      pub appium: Option<AppiumManager>,
      pub local_driver: Option<DriverProcess>,
      pub webdriver_backend: Option<super::webdriver::backend::WebDriverBackend>,
-@@ -817,6 +868,20 @@ pub struct DaemonState {
+@@ -817,6 +870,33 @@ pub struct DaemonState {
      last_persisted_binding: Option<tab_binding::TabBinding>,
  }
 
++const MANAGED_CHROME_CLEANUP_PENDING_ERROR: &str =
++    "Managed Chrome cleanup is still in progress; retry the command";
++
 +fn ensure_managed_chrome_cleanup_settled(state: &DaemonState) -> Result<(), String> {
-+    let active = usize::from(
-+        state
-+            .browser
-+            .as_ref()
-+            .is_some_and(BrowserManager::owns_managed_chrome_process),
-+    );
-+    if state.managed_chrome_cleanup.load(Ordering::Acquire) > active {
-+        Err("Managed Chrome cleanup is still in progress; retry the command".into())
++    if state.managed_chrome_cleanup_pending() {
++        Err(MANAGED_CHROME_CLEANUP_PENDING_ERROR.into())
 +    } else {
 +        Ok(())
++    }
++}
++
++impl DaemonState {
++    pub(super) fn managed_chrome_cleanup_pending(&self) -> bool {
++        let active = usize::from(
++            self.browser
++                .as_ref()
++                .is_some_and(BrowserManager::owns_managed_chrome_process),
++        );
++        self.managed_chrome_cleanup.load(Ordering::Acquire) > active
++    }
++
++    #[cfg(test)]
++    pub(super) fn set_managed_chrome_cleanup_count_for_test(&self, count: usize) {
++        self.managed_chrome_cleanup.store(count, Ordering::Release);
 +    }
 +}
 +
  fn default_idle_shutdown_is_blocked(
      headed_webdriver: bool,
      provider_owned: bool,
-@@ -891,6 +956,7 @@ impl DaemonState {
+@@ -891,6 +971,7 @@ impl DaemonState {
          }
          Self {
              browser: None,
@@ -279,7 +447,7 @@ index aad976c..70eef49 100644
              appium: None,
              local_driver: None,
              webdriver_backend: None,
-@@ -3166,6 +3232,7 @@ async fn execute_command_inner(cmd: &Value, state: &mut DaemonState) -> Value {
+@@ -3166,6 +3247,7 @@ async fn execute_command_inner(cmd: &Value, state: &mut DaemonState) -> Value {
          .to_string();
 
      let cmd_start = std::time::Instant::now();
@@ -287,7 +455,7 @@ index aad976c..70eef49 100644
 
      // A retry of the request that wedged the tab must not run on its blank
      // replacement: `url` would report about:blank as a success.
-@@ -3230,11 +3297,29 @@ async fn execute_command_inner(cmd: &Value, state: &mut DaemonState) -> Value {
+@@ -3230,11 +3312,29 @@ async fn execute_command_inner(cmd: &Value, state: &mut DaemonState) -> Value {
      // the browser and these settings alone.
      let launches = command_launches_browser(cmd);
      let mut launch_patch: Option<Patch> = None;
@@ -317,7 +485,7 @@ index aad976c..70eef49 100644
      let mut settings_outcome = if action == "close" {
          SettingsOutcome::default()
      } else {
-@@ -3247,9 +3332,11 @@ async fn execute_command_inner(cmd: &Value, state: &mut DaemonState) -> Value {
+@@ -3247,9 +3347,11 @@ async fn execute_command_inner(cmd: &Value, state: &mut DaemonState) -> Value {
          };
          if launches {
              let mut patch = patch;
@@ -332,7 +500,7 @@ index aad976c..70eef49 100644
              launch_patch = Some(patch);
          }
          outcome
-@@ -3270,10 +3357,19 @@ async fn execute_command_inner(cmd: &Value, state: &mut DaemonState) -> Value {
+@@ -3270,10 +3372,19 @@ async fn execute_command_inner(cmd: &Value, state: &mut DaemonState) -> Value {
          // Check if existing connection is stale and needs re-launch.
          // This must happen before policy evaluation so plugin capability
          // actions are gated when recovery relaunches would invoke plugins.
@@ -353,7 +521,7 @@ index aad976c..70eef49 100644
          } else {
              state.webdriver_backend.is_none()
          }
-@@ -3421,7 +3517,15 @@ async fn execute_command_inner(cmd: &Value, state: &mut DaemonState) -> Value {
+@@ -3421,7 +3532,15 @@ async fn execute_command_inner(cmd: &Value, state: &mut DaemonState) -> Value {
              lifecycle_relaunched_browser |= restore_applied.relaunched_browser;
              // The launch settings take effect now.
              if let (Some(patch), Some(_)) = (launch_patch.as_ref(), launch_plan.as_ref()) {
@@ -370,7 +538,7 @@ index aad976c..70eef49 100644
                      Ok(outcome) => settings_outcome.absorb(outcome),
                      Err(e) => {
                          let cleanup = Box::pin(rollback_restore_unit(
-@@ -3445,15 +3549,16 @@ async fn execute_command_inner(cmd: &Value, state: &mut DaemonState) -> Value {
+@@ -3445,15 +3564,16 @@ async fn execute_command_inner(cmd: &Value, state: &mut DaemonState) -> Value {
              let strict_state = launch_patch
                  .as_ref()
                  .is_some_and(|patch| patch.value(Key::StorageState).is_some());
@@ -389,7 +557,7 @@ index aad976c..70eef49 100644
                  Err(e) => Err(e),
              };
              if let Err(e) = launched {
-@@ -3565,15 +3670,29 @@ async fn execute_command_inner(cmd: &Value, state: &mut DaemonState) -> Value {
+@@ -3565,15 +3685,29 @@ async fn execute_command_inner(cmd: &Value, state: &mut DaemonState) -> Value {
      let mut result = match action {
          "launch" => {
              let applied = match launch_patch.as_ref() {
@@ -423,7 +591,7 @@ index aad976c..70eef49 100644
                  Err(e) => Err(e),
              };
              match result {
-@@ -4931,9 +5050,28 @@ async fn auto_launch_with(
+@@ -4931,9 +5065,28 @@ async fn auto_launch_with(
      plugins: Vec<crate::plugins::PluginConfig>,
      cmd: &Value,
      strict_state: bool,
@@ -453,7 +621,7 @@ index aad976c..70eef49 100644
      if result.is_ok() && !resumed {
          state.attached_target = attached_target_for(&state.settings.connection());
      }
-@@ -4956,6 +5094,7 @@ async fn auto_launch_with_settings(
+@@ -4956,6 +5109,7 @@ async fn auto_launch_with_settings(
      plugins: Vec<crate::plugins::PluginConfig>,
      cmd: &Value,
      strict_state: bool,
@@ -461,7 +629,7 @@ index aad976c..70eef49 100644
  ) -> Result<Value, String> {
      if state.attached_target.is_some() && cmd.is_null() {
          // Resume the attached browser; the launch handler resolves the target.
-@@ -4966,14 +5105,14 @@ async fn auto_launch_with_settings(
+@@ -4966,14 +5120,14 @@ async fn auto_launch_with_settings(
      if matches!(connection, Connection::Cdp(_) | Connection::AutoConnect)
          || !matches!(&connection, Connection::Provider(provider) if provider_is_browser_use(provider))
      {
@@ -478,7 +646,7 @@ index aad976c..70eef49 100644
      )
      .await
      {
-@@ -4993,6 +5132,7 @@ async fn auto_launch_inner(
+@@ -4993,6 +5147,7 @@ async fn auto_launch_inner(
      plugins: Vec<crate::plugins::PluginConfig>,
      cmd: &Value,
      strict_state: bool,
@@ -486,7 +654,7 @@ index aad976c..70eef49 100644
  ) -> Result<Value, String> {
      // Only a browser agent-browser launches itself keeps its session setup
      // across a relaunch; an attached or provider browser starts without one,
-@@ -5003,7 +5143,8 @@ async fn auto_launch_inner(
+@@ -5003,7 +5158,8 @@ async fn auto_launch_inner(
              std::mem::take(&mut state.touch_sessions),
          )
      });
@@ -496,7 +664,7 @@ index aad976c..70eef49 100644
      if let (Err(_), Some((setup, touch))) = (&result, saved) {
          state.session_setup = setup;
          state.touch_sessions = touch;
-@@ -5016,9 +5157,34 @@ async fn launch_browser_from_settings(
+@@ -5016,9 +5172,34 @@ async fn launch_browser_from_settings(
      plugins: Vec<crate::plugins::PluginConfig>,
      cmd: &Value,
      strict_state: bool,
@@ -531,7 +699,7 @@ index aad976c..70eef49 100644
      }
      let mut options = state.settings.launch_options();
      let effective_ca_cert = state.effective_ca_cert.clone();
-@@ -5079,6 +5245,10 @@ async fn launch_browser_from_settings(
+@@ -5079,6 +5260,10 @@ async fn launch_browser_from_settings(
      } else {
          engine
      };
@@ -542,7 +710,7 @@ index aad976c..70eef49 100644
      state.engine = engine.as_deref().unwrap_or("chrome").to_string();
      write_engine_file(&state.session_id, &state.engine);
      write_extensions_file(&state.session_id, &state.settings);
-@@ -5250,7 +5420,20 @@ async fn launch_browser_from_settings(
+@@ -5250,7 +5435,20 @@ async fn launch_browser_from_settings(
          storage_state,
      })?;
 
@@ -564,7 +732,7 @@ index aad976c..70eef49 100644
      validate_ca_cert_launch_mode(&options, engine.as_deref(), false)?;
      ensure_allowed_domains_supported_for_launch(AllowedDomainsLaunchSupport {
          contained,
-@@ -5269,10 +5452,35 @@ async fn launch_browser_from_settings(
+@@ -5269,10 +5467,35 @@ async fn launch_browser_from_settings(
          options.extensions.as_deref(),
      );
      if let Some(ref ca) = effective_ca_cert {
@@ -602,7 +770,7 @@ index aad976c..70eef49 100644
      let rollback_setup = state.session_setup.clone();
      let previous_setup = std::mem::take(&mut state.session_setup);
      state.session_setup = previous_setup.carried_into_relaunch(launch_setup);
-@@ -5284,25 +5492,82 @@ async fn launch_browser_from_settings(
+@@ -5284,25 +5507,82 @@ async fn launch_browser_from_settings(
      state.subscribe_to_browser_events();
      state.start_fetch_handler();
      state.start_dialog_handler();
@@ -691,7 +859,7 @@ index aad976c..70eef49 100644
  /// Puts the pre-relaunch session setup back when the relaunch failed.
  fn restore_setup_unless_launched<T>(
      state: &mut DaemonState,
-@@ -5401,10 +5666,24 @@ async fn apply_launch_init_scripts(
+@@ -5401,10 +5681,24 @@ async fn apply_launch_init_scripts(
      }
 
      for path in init_script_paths {
@@ -720,7 +888,24 @@ index aad976c..70eef49 100644
              }
          }
      }
-@@ -5847,16 +6126,53 @@ async fn handle_launch_with_deadline(
+@@ -5500,7 +5794,15 @@ async fn try_auto_restore_state(state: &mut DaemonState) {
+             return;
+         }
+     };
+-    if let Some(path) = state::find_auto_state_file(&session_name) {
++    // Saved-state discovery can traverse a slow home directory. Keep that
++    // filesystem walk off the async command thread so the managed launch
++    // deadline can cancel this await without a late state mutation.
++    let discovered =
++        tokio::task::spawn_blocking(move || state::find_auto_state_file(&session_name))
++            .await
++            .ok()
++            .flatten();
++    if let Some(path) = discovered {
+         if let Some(ref mgr) = state.browser {
+             if let Ok(session_id) = mgr.active_session_id() {
+                 match state::load_state(&mgr.client, session_id, &path).await {
+@@ -5847,16 +6149,53 @@ async fn handle_launch_with_deadline(
      cmd: &Value,
      state: &mut DaemonState,
      deadline: std::time::Duration,
@@ -776,7 +961,7 @@ index aad976c..70eef49 100644
      }
      result
  }
-@@ -5877,6 +6193,35 @@ async fn start_flow_capture(state: &mut DaemonState) -> Result<(), String> {
+@@ -5877,6 +6216,35 @@ async fn start_flow_capture(state: &mut DaemonState) -> Result<(), String> {
      Ok(())
  }
 
@@ -812,7 +997,7 @@ index aad976c..70eef49 100644
  /// Rejects capture modes the daemon cannot record, before they are stored.
  fn check_capture_setting(patch: &Patch) -> Result<(), String> {
      match patch.value(Key::Capture) {
-@@ -5906,6 +6251,7 @@ async fn handle_launch_for_target(
+@@ -5906,6 +6274,7 @@ async fn handle_launch_for_target(
      cmd: &Value,
      state: &mut DaemonState,
      deadline: std::time::Duration,
@@ -820,7 +1005,7 @@ index aad976c..70eef49 100644
  ) -> Result<Value, String> {
      if cmd.get("cdpUrl").and_then(Value::as_str).is_some()
          || cmd.get("cdpPort").and_then(Value::as_u64).is_some()
-@@ -5915,12 +6261,17 @@ async fn handle_launch_for_target(
+@@ -5915,12 +6284,17 @@ async fn handle_launch_for_target(
              .and_then(Value::as_str)
              .is_some_and(provider_is_browser_use)
      {
@@ -840,7 +1025,7 @@ index aad976c..70eef49 100644
          Ok(result) => result,
          Err(_) => Err(browser_use_setup_timeout(state).await),
      };
-@@ -6237,15 +6588,25 @@ fn with_rollback_error(error: &str, rollback: Option<String>) -> String {
+@@ -6237,15 +6611,25 @@ fn with_rollback_error(error: &str, rollback: Option<String>) -> String {
  /// CA trust is compared by content, not by path: the same certificates from
  /// another path change nothing, and an edited file at the same path is a
  /// change.
@@ -869,7 +1054,7 @@ index aad976c..70eef49 100644
      let digest = |ca: &Option<EffectiveCaCert>| ca.as_ref().map(|ca| *ca.bundle.digest());
      let running_path = state.settings.get(Key::CaCert).and_then(Value::as_str);
      match ca_trust_change(
-@@ -6261,7 +6622,7 @@ fn adjust_ca_patch(state: &mut DaemonState, patch: &mut Patch) -> Result<(), Str
+@@ -6261,7 +6645,7 @@ fn adjust_ca_patch(state: &mut DaemonState, patch: &mut Patch) -> Result<(), Str
          CaTrustChange::EditedInPlace => patch.mark_changed_in_place(Key::CaCert),
          CaTrustChange::Replaced => {}
      }
@@ -878,7 +1063,7 @@ index aad976c..70eef49 100644
  }
 
  /// Writes `pin` into the session's tab binding, when one exists.
-@@ -6300,12 +6661,35 @@ async fn apply_settings_patch(
+@@ -6300,12 +6684,35 @@ async fn apply_settings_patch(
      state: &mut DaemonState,
      patch: &Patch,
      launches: bool,
@@ -901,12 +1086,12 @@ index aad976c..70eef49 100644
 +        if let Some(mgr) = state.browser.as_mut() {
 +            mgr.try_has_process_exited()?;
 +        }
-     }
++    }
 +    if patch.value(Key::CaCert).is_some()
 +        && patch.value(Key::ClearCaCert).and_then(Value::as_bool) == Some(true)
 +    {
 +        return Err("Cannot use --ca-cert with --no-ca-cert".into());
-+    }
+     }
 +    let mut patch = patch.clone();
 +    let requested_ca = if launches {
 +        adjust_ca_patch(state, &mut patch, deadline, preloaded_ca).await?
@@ -916,7 +1101,7 @@ index aad976c..70eef49 100644
 
      let full = state.settings.plan(&patch);
      if full.is_empty() && full.ignored.is_empty() {
-@@ -6324,15 +6708,23 @@ async fn apply_settings_patch(
+@@ -6324,15 +6731,23 @@ async fn apply_settings_patch(
          let live = patch.without_launch_settings_for(state.session_name.as_deref());
          (state.settings.plan(&live), deferred)
      };
@@ -945,7 +1130,7 @@ index aad976c..70eef49 100644
      } else {
          None
      };
-@@ -6477,16 +6869,37 @@ async fn apply_settings_patch(
+@@ -6477,16 +6892,37 @@ async fn apply_settings_patch(
      if relaunch && had_browser {
          let _ = auto_save_restore_state(state).await;
          if let Err(e) = close_all_browser_backends(state).await {
@@ -987,7 +1172,7 @@ index aad976c..70eef49 100644
          }
          state.ref_map.invalidate_all_documents();
      }
-@@ -6563,6 +6976,15 @@ fn attach_settings_outcome(resp: &mut Value, outcome: &SettingsOutcome) {
+@@ -6563,6 +6999,15 @@ fn attach_settings_outcome(resp: &mut Value, outcome: &SettingsOutcome) {
  }
 
  async fn handle_launch_inner(cmd: &Value, state: &mut DaemonState) -> Result<Value, String> {
@@ -1003,7 +1188,7 @@ index aad976c..70eef49 100644
      let engine = cmd
          .get("engine")
          .and_then(Value::as_str)
-@@ -6571,14 +6993,30 @@ async fn handle_launch_inner(cmd: &Value, state: &mut DaemonState) -> Result<Val
+@@ -6571,14 +7016,30 @@ async fn handle_launch_inner(cmd: &Value, state: &mut DaemonState) -> Result<Val
      let patch = launch_envelope_patch(cmd, engine.as_deref())?;
      check_capture_setting(&patch)?;
      let had_browser_before_launch = has_active_browser_session(state);
@@ -1039,7 +1224,7 @@ index aad976c..70eef49 100644
      if reusable {
          return Ok(json!({ "launched": true, "reused": true, "relaunchedBrowser": false }));
      }
-@@ -6587,8 +7025,35 @@ async fn handle_launch_inner(cmd: &Value, state: &mut DaemonState) -> Result<Val
+@@ -6587,8 +7048,35 @@ async fn handle_launch_inner(cmd: &Value, state: &mut DaemonState) -> Result<Val
      let strict_state = patch.value(Key::StorageState).is_some()
          || Patch::from_wire(cmd.get("settings"))
              .is_ok_and(|settings| settings.value(Key::StorageState).is_some());
@@ -1076,7 +1261,7 @@ index aad976c..70eef49 100644
              let mut result = json!({
                  "launched": true,
                  "relaunchedBrowser": had_browser_before_launch,
-@@ -6903,6 +7368,9 @@ async fn handle_read(cmd: &Value, state: &DaemonState) -> Result<Value, String>
+@@ -6903,6 +7391,9 @@ async fn handle_read(cmd: &Value, state: &DaemonState) -> Result<Value, String>
 
  async fn handle_cdp_url(state: &DaemonState) -> Result<Value, String> {
      let mgr = state.browser.as_ref().ok_or("Browser not launched")?;
@@ -1086,7 +1271,7 @@ index aad976c..70eef49 100644
      if !mgr.is_connection_alive().await {
          return Err("Browser not launched".to_string());
      }
-@@ -6911,6 +7379,9 @@ async fn handle_cdp_url(state: &DaemonState) -> Result<Value, String> {
+@@ -6911,6 +7402,9 @@ async fn handle_cdp_url(state: &DaemonState) -> Result<Value, String> {
 
  async fn handle_inspect(state: &mut DaemonState) -> Result<Value, String> {
      let mgr = state.browser.as_ref().ok_or("Browser not launched")?;
@@ -1096,7 +1281,38 @@ index aad976c..70eef49 100644
 
      // Shut down any existing inspect server so we always target the current page
      if let Some(server) = state.inspect_server.take() {
-@@ -16918,15 +17389,9 @@ mod tests {
+@@ -7014,12 +7508,21 @@ async fn handle_close(state: &mut DaemonState) -> Result<Value, String> {
+ /// forgotten only when `forget_settings` is set and the close succeeded: the
+ /// daemon restarts the CLI asks for (upgrade, changed options) keep them.
+ async fn close_session(state: &mut DaemonState, forget_settings: bool) -> Result<Value, String> {
++    // A prior close may have detached an owned Chrome reaper after its bounded
++    // wait. Keep this daemon's listener alive until that worker releases the
++    // child and profile; a new daemon would have a fresh session counter.
++    ensure_managed_chrome_cleanup_settled(state)?;
+     let save_result = auto_save_restore_state(state).await;
+     let unfreeze_error = match state.browser.as_mut() {
++        // BrowserManager::close performs this under the managed pipe's shared
++        // graceful-close deadline. Doing it here first could wait a full CDP
++        // command timeout before the owned child reaches its reaper.
++        Some(mgr) if mgr.owns_managed_chrome_process() => None,
+         Some(mgr) => mgr.thaw_frozen_tabs().await.err(),
+         None => None,
+     };
+     close_all_browser_backends(state).await?;
++    ensure_managed_chrome_cleanup_settled(state)?;
+     state.attached_target = None;
+
+     // Stop background Fetch handler
+@@ -16464,6 +16967,8 @@ fn error_response(id: &str, error: &str) -> Value {
+         resp["code"] = json!("tab_gone");
+     } else if error.starts_with(super::browser::PAGE_WEDGED_PREFIX) {
+         resp["code"] = json!("page_wedged");
++    } else if error.starts_with(MANAGED_CHROME_CLEANUP_PENDING_ERROR) {
++        resp["code"] = json!(MANAGED_CHROME_CLEANUP_PENDING_CODE);
+     } else if let Some(code) = interaction::form_error_code(error) {
+         resp["code"] = json!(code);
+     } else if let Some(code) = super::browser::precondition_code(error) {
+@@ -16918,15 +17423,9 @@ mod tests {
      #[tokio::test]
      #[ignore = "requires Chrome"]
      async fn e2e_attached_download_fails_before_browser_or_filesystem_changes() {
@@ -1114,7 +1330,7 @@ index aad976c..70eef49 100644
          let dir = tempfile::tempdir().unwrap();
          let destination = dir.path().join("new-directory").join("output.bin");
 
-@@ -16938,7 +17403,6 @@ mod tests {
+@@ -16938,7 +17437,6 @@ mod tests {
          .unwrap_err();
          assert!(error.contains("--cdp"), "{error}");
          assert!(!destination.parent().unwrap().exists());
@@ -1122,7 +1338,7 @@ index aad976c..70eef49 100644
      }
 
      async fn start_finished_download(
-@@ -17081,17 +17545,37 @@ mod tests {
+@@ -17081,17 +17579,37 @@ mod tests {
          let dir = tempfile::tempdir().unwrap();
          let download_dir = dir.path().join("downloads");
          std::fs::create_dir_all(&download_dir).unwrap();
@@ -1169,7 +1385,7 @@ index aad976c..70eef49 100644
 
          let mut attached = super::DaemonState::new();
          for cmd in [
-@@ -20886,6 +21370,7 @@ mod tests {
+@@ -20886,6 +21404,7 @@ mod tests {
              Vec::new(),
              &cmd,
              false,
@@ -1177,17 +1393,34 @@ index aad976c..70eef49 100644
          ));
          let outer = std::mem::size_of_val(&auto_launch_with(&mut state, Vec::new(), &cmd, false));
          assert!(
-@@ -20894,6 +21379,1064 @@ mod tests {
+@@ -20894,172 +21413,1386 @@ mod tests {
          );
      }
 
+-    #[tokio::test]
+-    async fn test_a_confirmed_launch_keeps_the_allowed_domains_it_was_parked_with() {
 +    #[cfg(unix)]
 +    async fn assert_pipe_managed_post_launch_timeout(stall_capture: bool) {
 +        use std::os::unix::fs::PermissionsExt;
 +        use std::time::{Duration, Instant};
 +
-+        let (_env, mut state) = isolated_state();
-+        let dir = tempfile::tempdir().unwrap();
+         let (_env, mut state) = isolated_state();
+         let dir = tempfile::tempdir().unwrap();
+-        let policy = dir.path().join("policy.json");
+-        fs::write(&policy, r#"{"confirm":["navigate"]}"#).unwrap();
+-
+-        let parked = execute_command(
+-            &json!({
+-                "id": "parked",
+-                "action": "navigate",
+-                "url": "https://a.example",
+-                "settings": {
+-                    "action-policy": policy.to_str().unwrap(),
+-                    "allowed-domains": ["a.example"],
+-                    "executable-path": "/missing/chrome-for-test"
+-                }
+-            }),
+-            &mut state,
 +        let executable = dir.path().join("chrome");
 +        fs::write(
 +            &executable,
@@ -1228,7 +1461,12 @@ index aad976c..70eef49 100644
 +}
 +' "$root"
 +"#,
-+        )
+         )
+-        .await;
+-        assert_eq!(parked["data"]["confirmation_required"], true);
+-        assert!(
+-            state.domain_filter.read().await.is_none(),
+-            "deferred to the launch"
 +        .unwrap();
 +        fs::set_permissions(&executable, fs::Permissions::from_mode(0o700)).unwrap();
 +        let previous_executable = json!(dir.path().join("previous-chrome"));
@@ -1324,19 +1562,29 @@ index aad976c..70eef49 100644
 +        assert_eq!(
 +            std::io::Error::last_os_error().raw_os_error(),
 +            Some(libc::ESRCH)
-+        );
-+        assert_eq!(
+         );
+-
+-        // The launch fails (no browser binary) after the settings apply.
+-        let _ = execute_command(&json!({ "id": "c", "action": "confirm" }), &mut state).await;
+-
+         assert_eq!(
+-            state.settings.security().allowed_domains,
+-            Some(vec!["a.example".to_string()])
 +            unsafe { libc::waitpid(pid, std::ptr::null_mut(), libc::WNOHANG) },
 +            -1
 +        );
 +        assert_eq!(
 +            std::io::Error::last_os_error().raw_os_error(),
 +            Some(libc::ECHILD)
-+        );
-+    }
-+
+         );
+-        assert!(state.domain_filter.read().await.is_some());
+     }
+
 +    #[cfg(unix)]
-+    #[tokio::test]
+     #[tokio::test]
+-    async fn test_confirm_rechecks_unapproved_plugin_action() {
+-        let guard = EnvGuard::new(&["AGENT_BROWSER_PROVIDER"]);
+-        guard.remove("AGENT_BROWSER_PROVIDER");
 +    async fn pipe_managed_daemon_network_setup_timeout_reaps_chrome() {
 +        assert_pipe_managed_post_launch_timeout(false).await;
 +    }
@@ -1349,17 +1597,20 @@ index aad976c..70eef49 100644
 +        use std::time::{Duration, Instant};
 +
 +        let (_env, mut state) = isolated_state();
-+        let dir = tempfile::tempdir().unwrap();
+         let dir = tempfile::tempdir().unwrap();
+-        let policy_path = dir.path().join("policy.json");
 +        let fifo = dir.path().join("ca.pem");
 +        let fifo_name = std::ffi::CString::new(fifo.as_os_str().as_bytes()).unwrap();
 +        assert_eq!(unsafe { libc::mkfifo(fifo_name.as_ptr(), 0o600) }, 0);
 +        let executable = dir.path().join("chrome");
 +        let marker = dir.path().join("spawned");
-+        fs::write(
+         fs::write(
+-            &policy_path,
+-            r#"{"confirm":["navigate","plugin:stealth:launch.mutate"]}"#,
 +            &executable,
 +            format!("#!/bin/sh\ntouch '{}'\nexec sleep 60\n", marker.display()),
-+        )
-+        .unwrap();
+         )
+         .unwrap();
 +        fs::set_permissions(&executable, fs::Permissions::from_mode(0o700)).unwrap();
 +        state
 +            .settings
@@ -1370,7 +1621,29 @@ index aad976c..70eef49 100644
 +        };
 +        state.settings.set(Key::CaCert, json!(previous.path));
 +        state.effective_ca_cert = Some(previous.clone());
-+
+
+-        let mut state = DaemonState::new();
+-        state.policy = Some(ActionPolicy::load(policy_path.to_str().unwrap()).unwrap());
+-        let cmd = json!({
+-            "action": "navigate",
+-            "id": "policy-plugin-confirm",
+-            "url": "https://example.com",
+-            "plugins": [
+-                {
+-                    "name": "stealth",
+-                    "command": "agent-browser-plugin-stealth",
+-                    "capabilities": ["launch.mutate"]
+-                }
+-            ]
+-        });
+-
+-        let first = execute_command(&cmd, &mut state).await;
+-        assert_eq!(first["data"]["confirmation_required"], true);
+-        assert_eq!(first["data"]["action"], "navigate");
+-
+-        let second = execute_command(
+-            &json!({ "id": "policy-plugin-confirm-2", "action": "confirm" }),
+-            &mut state,
 +        let started = Instant::now();
 +        let response = tokio::time::timeout(
 +            Duration::from_secs(3),
@@ -1382,7 +1655,13 @@ index aad976c..70eef49 100644
 +                }),
 +                &mut state,
 +            ),
-+        )
+         )
+-        .await;
+-
+-        assert_eq!(second["success"], true);
+-        assert_eq!(
+-            second["data"]["result"]["data"]["confirmation_required"],
+-            true
 +        .await
 +        .expect("special CA input blocked the daemon");
 +        assert_eq!(response["success"], false, "{response}");
@@ -1391,16 +1670,21 @@ index aad976c..70eef49 100644
 +                .as_str()
 +                .is_some_and(|error| error.contains("regular file")),
 +            "{response}"
-+        );
+         );
 +        assert!(started.elapsed() < Duration::from_secs(2));
 +        assert_eq!(state.settings.get(Key::CaCert), Some(&json!(previous.path)));
-+        assert_eq!(
+         assert_eq!(
+-            second["data"]["result"]["data"]["action"],
+-            "plugin:stealth:launch.mutate"
 +            state
 +                .effective_ca_cert
 +                .as_ref()
 +                .map(|ca| ca.bundle.digest()),
 +            Some(previous.bundle.digest())
-+        );
+         );
+-        let pending = state.pending_confirmation.as_ref().unwrap();
+-        assert_eq!(pending.action, "plugin:stealth:launch.mutate");
+-        assert!(pending.approved_actions.iter().any(|a| a == "navigate"));
 +        assert!(state.browser.is_none());
 +        assert!(!marker.exists());
 +
@@ -1419,21 +1703,28 @@ index aad976c..70eef49 100644
 +        );
 +        assert!(state.browser.is_none());
 +        assert!(!marker.exists());
-+    }
-+
-+    #[cfg(unix)]
-+    #[tokio::test]
+     }
+
+     #[cfg(unix)]
+     #[tokio::test]
+-    async fn test_auth_login_does_not_resolve_plugin_without_browser() {
 +    async fn pipe_managed_startup_files_do_not_block_abort() {
 +        use std::os::unix::ffi::OsStrExt;
-+        use std::os::unix::fs::PermissionsExt;
+         use std::os::unix::fs::PermissionsExt;
 +        use std::time::{Duration, Instant};
-+
+
 +        let (_env, mut state) = isolated_state();
-+        let dir = tempfile::tempdir().unwrap();
+         let dir = tempfile::tempdir().unwrap();
+-        let marker_path = dir.path().join("credential-plugin-invoked");
+-        let plugin_path = dir.path().join("mock-credential-plugin");
 +        let executable = dir.path().join("chrome");
-+        fs::write(
+         fs::write(
+-            &plugin_path,
 +            &executable,
-+            r#"#!/bin/sh
+             r#"#!/bin/sh
+-printf invoked > "$1"
+-cat >/dev/null
+-printf '%s' '{"protocol":"agent-browser.plugin.v1","success":true,"credential":{"username":"user","password":"pass","url":"https://example.com/login"}}'
 +set -eu
 +root=$(dirname "$0")
 +printf '%s' "$$" > "$root/pid"
@@ -1468,9 +1759,28 @@ index aad976c..70eef49 100644
 +    syswrite($output, $response) or die $!;
 +}
 +' "$root"
-+"#,
-+        )
-+        .unwrap();
+ "#,
+         )
+         .unwrap();
+-        let mut perms = fs::metadata(&plugin_path).unwrap().permissions();
+-        perms.set_mode(0o755);
+-        fs::set_permissions(&plugin_path, perms).unwrap();
+-
+-        let mut state = DaemonState::new();
+-        let cmd = json!({
+-            "id": "auth-plugin-no-browser",
+-            "action": "auth_login",
+-            "name": "example",
+-            "credentialProvider": "mock",
+-            "plugins": [
+-                {
+-                    "name": "mock",
+-                    "command": plugin_path.to_string_lossy(),
+-                    "args": [marker_path.to_string_lossy()],
+-                    "capabilities": ["credential.read"]
+-                }
+-            ]
+-        });
 +        fs::set_permissions(&executable, fs::Permissions::from_mode(0o700)).unwrap();
 +        let good_init = dir.path().join("good.js");
 +        fs::write(&good_init, "window.goodInitMarker = true;").unwrap();
@@ -1485,7 +1795,8 @@ index aad976c..70eef49 100644
 +            .settings
 +            .set(Key::InitScripts, json!([good_init, fifo_init]));
 +        state.settings.set(Key::StorageState, json!(fifo_state));
-+
+
+-        let err = handle_auth_login(&cmd, &mut state).await.unwrap_err();
 +        let started = Instant::now();
 +        let error = tokio::time::timeout(
 +            Duration::from_secs(5),
@@ -1507,7 +1818,9 @@ index aad976c..70eef49 100644
 +        assert!(state.browser.is_none());
 +        assert!(state.fetch_handler_task.is_none());
 +        assert!(state.dialog_handler_task.is_none());
-+
+
+-        assert_eq!(err, "Browser not launched");
+-        assert!(!marker_path.exists());
 +        let pid: i32 = fs::read_to_string(dir.path().join("pid"))
 +            .unwrap()
 +            .parse()
@@ -1524,22 +1837,49 @@ index aad976c..70eef49 100644
 +            std::io::Error::last_os_error().raw_os_error(),
 +            Some(libc::ESRCH)
 +        );
-+    }
-+
-+    #[cfg(unix)]
-+    #[tokio::test]
+     }
+
+     #[cfg(unix)]
+     #[tokio::test]
+-    async fn test_auth_login_no_navigate_rejects_missing_page_before_plugin_resolution() {
 +    async fn pipe_relaunch_settings_defer_while_reaper_holds_process_lock() {
-+        use std::os::unix::fs::PermissionsExt;
+         use std::os::unix::fs::PermissionsExt;
 +        use std::time::{Duration, Instant};
-+
+
 +        let (_env, mut state) = isolated_state();
-+        let dir = tempfile::tempdir().unwrap();
+         let dir = tempfile::tempdir().unwrap();
+-        let marker_path = dir.path().join("credential-plugin-invoked");
+-        let plugin_path = dir.path().join("mock-credential-plugin");
 +        let executable = dir.path().join("chrome");
-+        fs::write(
+         fs::write(
+-            &plugin_path,
+-            r#"#!/bin/sh
+-printf invoked > "$1"
+-cat >/dev/null
+-printf '%s' '{"protocol":"agent-browser.plugin.v1","success":true,"credential":{"username":"user","password":"pass","url":"https://example.com/login"}}'
+-"#,
 +            &executable,
 +            "#!/bin/sh\nroot=$(dirname \"$0\")\nprintf '%s' \"$$\" > \"$root/pid\"\nexec sleep 60\n",
-+        )
-+        .unwrap();
+         )
+         .unwrap();
+-        let mut perms = fs::metadata(&plugin_path).unwrap().permissions();
+-        perms.set_mode(0o755);
+-        fs::set_permissions(&plugin_path, perms).unwrap();
+-
+-        let mut state = DaemonState::new();
+-        let cmd = json!({
+-            "id": "auth-plugin-no-page",
+-            "action": "auth_login",
+-            "name": "example",
+-            "noNavigate": true,
+-            "credentialProvider": "mock",
+-            "plugins": [
+-                {
+-                    "name": "mock",
+-                    "command": plugin_path.to_string_lossy(),
+-                    "args": [marker_path.to_string_lossy()],
+-                    "capabilities": ["credential.read"]
+-                }
 +        fs::set_permissions(&executable, fs::Permissions::from_mode(0o700)).unwrap();
 +        let options = LaunchOptions {
 +            executable_path: Some(executable.to_string_lossy().into_owned()),
@@ -1745,6 +2085,148 @@ index aad976c..70eef49 100644
 +
 +    #[cfg(unix)]
 +    #[tokio::test]
++    async fn pipe_repeated_close_waits_for_detached_child_cleanup() {
++        use std::os::unix::fs::PermissionsExt;
++        use std::time::Duration;
++
++        let (_env, mut state) = isolated_state();
++        let dir = tempfile::tempdir().unwrap();
++        let executable = dir.path().join("chrome");
++        fs::write(
++            &executable,
++            r#"#!/bin/sh
++set -eu
++root=$(dirname "$0")
++printf '%s' "$$" > "$root/pid"
++exec perl -e '
++use strict;
++use warnings;
++my $root = shift;
++open my $input, "<&=3" or die $!;
++open my $output, ">&=4" or die $!;
++while (1) {
++    my $frame = "";
++    my $byte;
++    while (sysread($input, $byte, 1)) {
++        last if $byte eq "\0";
++        $frame .= $byte;
++    }
++    last unless length $frame;
++    my ($id) = $frame =~ /"id":(\d+)/;
++    my ($method) = $frame =~ /"method":"([^"]+)"/;
++    die "missing command id or method" unless defined $id && defined $method;
++    if ($method eq "Browser.close") {
++        open my $marker, ">", "$root/close-seen" or die $!;
++        close $marker;
++        until (-e "$root/lock-held") {
++            select(undef, undef, undef, 0.01);
++        }
++    }
++    my $response = "{\"id\":$id,\"result\":{}}\0";
++    syswrite($output, $response) or die $!;
++}
++' "$root"
++"#,
++        )
++        .unwrap();
++        fs::set_permissions(&executable, fs::Permissions::from_mode(0o700)).unwrap();
++        let options = LaunchOptions {
++            executable_path: Some(executable.to_string_lossy().into_owned()),
++            cleanup_tracker: Some(state.managed_chrome_cleanup.clone()),
++            ..LaunchOptions::default()
++        };
++        let mut chrome =
++            tokio::task::spawn_blocking(move || super::super::cdp::chrome::launch_chrome(&options))
++                .await
++                .unwrap()
++                .unwrap();
++        let (reader, writer) = chrome.take_pipe().unwrap();
++        let process = Arc::new(std::sync::Mutex::new(chrome));
++        state.browser = Some(BrowserManager::for_test_with_chrome(
++            CdpClient::connect_pipe(reader, writer, None),
++            process.clone(),
++        ));
++
++        let (locked_tx, locked_rx) = std::sync::mpsc::channel();
++        let (release_tx, release_rx) = std::sync::mpsc::channel();
++        let fixture_root = dir.path().to_path_buf();
++        let holder = std::thread::spawn(move || {
++            for _ in 0..500 {
++                if fixture_root.join("close-seen").exists() {
++                    break;
++                }
++                std::thread::sleep(Duration::from_millis(10));
++            }
++            if !fixture_root.join("close-seen").exists() {
++                locked_tx.send(false).unwrap();
++                return;
++            }
++            let _guard = process.lock().unwrap();
++            fs::write(fixture_root.join("lock-held"), b"").unwrap();
++            locked_tx.send(true).unwrap();
++            let _ = release_rx.recv_timeout(Duration::from_secs(12));
++        });
++        let first = tokio::time::timeout(
++            Duration::from_secs(9),
++            execute_command(
++                &json!({ "id": "close-first", "action": "close" }),
++                &mut state,
++            ),
++        )
++        .await
++        .expect("first close waited beyond bounded child cleanup");
++        assert!(locked_rx.recv_timeout(Duration::from_secs(1)).unwrap());
++        assert_eq!(first["success"], false, "{first}");
++        assert_eq!(first["code"], json!(MANAGED_CHROME_CLEANUP_PENDING_CODE));
++        assert!(
++            first["error"]
++                .as_str()
++                .is_some_and(|error| error.contains("cleanup is still in progress")),
++            "{first}"
++        );
++        assert!(state.browser.is_none());
++        assert_eq!(state.managed_chrome_cleanup.load(Ordering::Acquire), 1);
++
++        let second = execute_command(
++            &json!({ "id": "close-second", "action": "close" }),
++            &mut state,
++        )
++        .await;
++        assert_eq!(second["success"], false, "{second}");
++        assert_eq!(second["code"], json!(MANAGED_CHROME_CLEANUP_PENDING_CODE));
++        assert_ne!(second["data"]["closed"], json!(true));
++        let launch = execute_command(
++            &json!({ "id": "open-before-reap", "action": "launch" }),
++            &mut state,
++        )
++        .await;
++        assert_eq!(launch["success"], false, "{launch}");
++        assert!(
++            launch["error"]
++                .as_str()
++                .is_some_and(|error| error.contains("cleanup is still in progress")),
++            "{launch}"
++        );
++        let _ = release_tx.send(());
++        holder.join().unwrap();
++        tokio::time::timeout(Duration::from_secs(3), async {
++            while state.managed_chrome_cleanup.load(Ordering::Acquire) != 0 {
++                tokio::time::sleep(Duration::from_millis(10)).await;
++            }
++        })
++        .await
++        .expect("old child cleanup did not finish");
++        let last = execute_command(
++            &json!({ "id": "close-after-reap", "action": "close" }),
++            &mut state,
++        )
++        .await;
++        assert_eq!(last["success"], true, "{last}");
++        assert_eq!(last["data"]["closed"], json!(true));
++    }
++
++    #[cfg(unix)]
++    #[tokio::test]
 +    async fn pipe_implicit_relaunch_stops_after_detached_close() {
 +        use std::os::unix::fs::PermissionsExt;
 +        use std::time::Duration;
@@ -1900,9 +2382,10 @@ index aad976c..70eef49 100644
 +    if ($method eq "Browser.close") {
 +        open my $marker, ">", "$root/close-seen" or die $!;
 +        close $marker;
-+        until (-e "$root/allow-close-response") {
++        until (-e "$root/lock-held") {
 +            select(undef, undef, undef, 0.01);
 +        }
++        next;
 +    }
 +    my $result = $method eq "Target.getTargets" ? q({"targetInfos":[]})
 +        : $method eq "Target.createTarget" ? q({"targetId":"page-1"})
@@ -1959,15 +2442,15 @@ index aad976c..70eef49 100644
 +                return;
 +            }
 +            let _guard = held_process.lock().unwrap();
++            fs::write(fixture_root.join("lock-held"), b"").unwrap();
 +            locked_tx.send(true).unwrap();
-+            fs::write(fixture_root.join("allow-close-response"), b"").unwrap();
-+            let _ = release_rx.recv_timeout(Duration::from_secs(10));
++            let _ = release_rx.recv_timeout(Duration::from_secs(15));
 +        });
 +        drop(process);
 +
 +        let started = Instant::now();
 +        let response = tokio::time::timeout(
-+            Duration::from_secs(9),
++            Duration::from_secs(12),
 +            execute_command(
 +                &json!({
 +                    "id": "close-race",
@@ -1988,7 +2471,7 @@ index aad976c..70eef49 100644
 +                .is_some_and(|error| error.contains("cleanup is still in progress")),
 +            "{response}"
 +        );
-+        assert!(elapsed < Duration::from_secs(9), "{elapsed:?}");
++        assert!(elapsed < Duration::from_secs(12), "{elapsed:?}");
 +        assert!(state.settings.get(Key::Profile).is_none());
 +        assert_eq!(
 +            state.settings.get(Key::ExecutablePath),
@@ -2031,6 +2514,19 @@ index aad976c..70eef49 100644
 +                .count(),
 +            1
 +        );
++        let second_close = execute_command(
++            &json!({ "id": "close-pending", "action": "close" }),
++            &mut state,
++        )
++        .await;
++        assert_eq!(second_close["success"], false, "{second_close}");
++        assert!(
++            second_close["error"]
++                .as_str()
++                .is_some_and(|error| error.contains("cleanup is still in progress")),
++            "{second_close}"
++        );
++        assert_ne!(second_close["data"]["closed"], true);
 +        let _ = release_tx.send(());
 +        holder.join().unwrap();
 +        let pid: i32 = fs::read_to_string(dir.path().join("pid"))
@@ -2239,10 +2735,176 @@ index aad976c..70eef49 100644
 +        assert!(state.browser.is_none());
 +    }
 +
-     #[tokio::test]
-     async fn test_a_confirmed_launch_keeps_the_allowed_domains_it_was_parked_with() {
-         let (_env, mut state) = isolated_state();
-@@ -21351,15 +22894,10 @@ printf '%s' '{"protocol":"agent-browser.plugin.v1","success":true,"data":{}}'
++    #[tokio::test]
++    async fn test_a_confirmed_launch_keeps_the_allowed_domains_it_was_parked_with() {
++        let (_env, mut state) = isolated_state();
++        let dir = tempfile::tempdir().unwrap();
++        let policy = dir.path().join("policy.json");
++        fs::write(&policy, r#"{"confirm":["navigate"]}"#).unwrap();
++
++        let parked = execute_command(
++            &json!({
++                "id": "parked",
++                "action": "navigate",
++                "url": "https://a.example",
++                "settings": {
++                    "action-policy": policy.to_str().unwrap(),
++                    "allowed-domains": ["a.example"],
++                    "executable-path": "/missing/chrome-for-test"
++                }
++            }),
++            &mut state,
++        )
++        .await;
++        assert_eq!(parked["data"]["confirmation_required"], true);
++        assert!(
++            state.domain_filter.read().await.is_none(),
++            "deferred to the launch"
++        );
++
++        // The launch fails (no browser binary) after the settings apply.
++        let _ = execute_command(&json!({ "id": "c", "action": "confirm" }), &mut state).await;
++
++        assert_eq!(
++            state.settings.security().allowed_domains,
++            Some(vec!["a.example".to_string()])
++        );
++        assert!(state.domain_filter.read().await.is_some());
++    }
++
++    #[tokio::test]
++    async fn test_confirm_rechecks_unapproved_plugin_action() {
++        let guard = EnvGuard::new(&["AGENT_BROWSER_PROVIDER"]);
++        guard.remove("AGENT_BROWSER_PROVIDER");
++        let dir = tempfile::tempdir().unwrap();
++        let policy_path = dir.path().join("policy.json");
++        fs::write(
++            &policy_path,
++            r#"{"confirm":["navigate","plugin:stealth:launch.mutate"]}"#,
++        )
++        .unwrap();
++
++        let mut state = DaemonState::new();
++        state.policy = Some(ActionPolicy::load(policy_path.to_str().unwrap()).unwrap());
++        let cmd = json!({
++            "action": "navigate",
++            "id": "policy-plugin-confirm",
++            "url": "https://example.com",
++            "plugins": [
++                {
++                    "name": "stealth",
++                    "command": "agent-browser-plugin-stealth",
++                    "capabilities": ["launch.mutate"]
++                }
++            ]
++        });
++
++        let first = execute_command(&cmd, &mut state).await;
++        assert_eq!(first["data"]["confirmation_required"], true);
++        assert_eq!(first["data"]["action"], "navigate");
++
++        let second = execute_command(
++            &json!({ "id": "policy-plugin-confirm-2", "action": "confirm" }),
++            &mut state,
++        )
++        .await;
++
++        assert_eq!(second["success"], true);
++        assert_eq!(
++            second["data"]["result"]["data"]["confirmation_required"],
++            true
++        );
++        assert_eq!(
++            second["data"]["result"]["data"]["action"],
++            "plugin:stealth:launch.mutate"
++        );
++        let pending = state.pending_confirmation.as_ref().unwrap();
++        assert_eq!(pending.action, "plugin:stealth:launch.mutate");
++        assert!(pending.approved_actions.iter().any(|a| a == "navigate"));
++    }
++
++    #[cfg(unix)]
++    #[tokio::test]
++    async fn test_auth_login_does_not_resolve_plugin_without_browser() {
++        use std::os::unix::fs::PermissionsExt;
++
++        let dir = tempfile::tempdir().unwrap();
++        let marker_path = dir.path().join("credential-plugin-invoked");
++        let plugin_path = dir.path().join("mock-credential-plugin");
++        fs::write(
++            &plugin_path,
++            r#"#!/bin/sh
++printf invoked > "$1"
++cat >/dev/null
++printf '%s' '{"protocol":"agent-browser.plugin.v1","success":true,"credential":{"username":"user","password":"pass","url":"https://example.com/login"}}'
++"#,
++        )
++        .unwrap();
++        let mut perms = fs::metadata(&plugin_path).unwrap().permissions();
++        perms.set_mode(0o755);
++        fs::set_permissions(&plugin_path, perms).unwrap();
++
++        let mut state = DaemonState::new();
++        let cmd = json!({
++            "id": "auth-plugin-no-browser",
++            "action": "auth_login",
++            "name": "example",
++            "credentialProvider": "mock",
++            "plugins": [
++                {
++                    "name": "mock",
++                    "command": plugin_path.to_string_lossy(),
++                    "args": [marker_path.to_string_lossy()],
++                    "capabilities": ["credential.read"]
++                }
++            ]
++        });
++
++        let err = handle_auth_login(&cmd, &mut state).await.unwrap_err();
++
++        assert_eq!(err, "Browser not launched");
++        assert!(!marker_path.exists());
++    }
++
++    #[cfg(unix)]
++    #[tokio::test]
++    async fn test_auth_login_no_navigate_rejects_missing_page_before_plugin_resolution() {
++        use std::os::unix::fs::PermissionsExt;
++
++        let dir = tempfile::tempdir().unwrap();
++        let marker_path = dir.path().join("credential-plugin-invoked");
++        let plugin_path = dir.path().join("mock-credential-plugin");
++        fs::write(
++            &plugin_path,
++            r#"#!/bin/sh
++printf invoked > "$1"
++cat >/dev/null
++printf '%s' '{"protocol":"agent-browser.plugin.v1","success":true,"credential":{"username":"user","password":"pass","url":"https://example.com/login"}}'
++"#,
++        )
++        .unwrap();
++        let mut perms = fs::metadata(&plugin_path).unwrap().permissions();
++        perms.set_mode(0o755);
++        fs::set_permissions(&plugin_path, perms).unwrap();
++
++        let mut state = DaemonState::new();
++        let cmd = json!({
++            "id": "auth-plugin-no-page",
++            "action": "auth_login",
++            "name": "example",
++            "noNavigate": true,
++            "credentialProvider": "mock",
++            "plugins": [
++                {
++                    "name": "mock",
++                    "command": plugin_path.to_string_lossy(),
++                    "args": [marker_path.to_string_lossy()],
++                    "capabilities": ["credential.read"]
++                }
+             ]
+         });
+
+@@ -21351,15 +23084,10 @@ printf '%s' '{"protocol":"agent-browser.plugin.v1","success":true,"data":{}}'
      #[tokio::test]
      #[ignore = "requires Chrome"]
      async fn e2e_browser_use_owned_connection_preserves_plain_command_state() {
@@ -2261,7 +2923,7 @@ index aad976c..70eef49 100644
          state.active_provider_session = Some(pending_browser_use_session());
          state.active_provider_connection = true;
          let target = state
-@@ -22330,6 +23868,57 @@ printf '%s' '{"protocol":"agent-browser.plugin.v1","success":true,"data":{}}'
+@@ -22330,6 +24058,57 @@ printf '%s' '{"protocol":"agent-browser.plugin.v1","success":true,"data":{}}'
          assert!(error.contains("Cannot use --ca-cert with --no-ca-cert"));
      }
 
@@ -2320,7 +2982,7 @@ index aad976c..70eef49 100644
      fn test_daemon_rejects_ca_cert_outside_local_chrome() {
          let ca = LaunchOptions {
 diff --git a/cli/src/native/browser.rs b/cli/src/native/browser.rs
-index 27ef4d1..5b71b7d 100644
+index 27ef4d1..2926c2b 100644
 --- a/cli/src/native/browser.rs
 +++ b/cli/src/native/browser.rs
 @@ -1,11 +1,17 @@
@@ -2361,7 +3023,7 @@ index 27ef4d1..5b71b7d 100644
              BrowserProcess::Lightpanda(p) => p.kill(),
              BrowserProcess::Obscura(p) => p.kill(),
          }
-@@ -714,19 +720,384 @@ impl BrowserProcess {
+@@ -714,22 +720,388 @@ impl BrowserProcess {
 
      pub fn wait_or_kill(&mut self, timeout: std::time::Duration) {
          match self {
@@ -2401,6 +3063,7 @@ index 27ef4d1..5b71b7d 100644
 +pub(super) const CHROME_PIPE_STARTUP_BUDGET: Duration = Duration::from_secs(20);
 +const CHROME_PIPE_RETRY_DELAY: Duration = Duration::from_millis(500);
 +const CHROME_PIPE_CLEANUP_MARGIN: Duration = Duration::from_secs(2);
++const CHROME_PIPE_GRACEFUL_CLOSE_TIMEOUT: Duration = Duration::from_secs(2);
 +
 +enum PipeAttemptError {
 +    Retry(String),
@@ -2485,10 +3148,10 @@ index 27ef4d1..5b71b7d 100644
 +            // Cancellation can drop the launch future between any two awaits.
 +            // The reaper must retain the child and copied profile in that case.
 +            let _ = self.start_reaper();
-+        }
-+    }
-+}
-+
+         }
+     }
+ }
+
 +struct CancelPendingChromeSpawn(Arc<AtomicBool>);
 +
 +impl Drop for CancelPendingChromeSpawn {
@@ -2573,7 +3236,7 @@ index 27ef4d1..5b71b7d 100644
 +                .lock()
 +                .unwrap_or_else(|error| error.into_inner())
 +                .kill();
-         }
++        }
 +    });
 +    let client = Arc::new(CdpClient::connect_pipe(reader, writer, Some(on_failure)));
 +
@@ -2749,10 +3412,13 @@ index 27ef4d1..5b71b7d 100644
 +        Err("Chrome pipe startup deadline expired before another attempt".to_string())
 +    } else {
 +        Err(last_error)
-     }
- }
-
-@@ -884,6 +1255,32 @@ impl BrowserManager {
++    }
++}
++
+ pub struct BrowserManager {
+     pub client: Arc<CdpClient>,
+     browser_process: Option<BrowserProcess>,
+@@ -884,6 +1256,32 @@ impl BrowserManager {
      }
 
      pub async fn launch(options: LaunchOptions, engine: Option<&str>) -> Result<Self, String> {
@@ -2785,7 +3451,7 @@ index 27ef4d1..5b71b7d 100644
          let engine = engine.unwrap_or("chrome");
 
          match engine {
-@@ -922,8 +1319,10 @@ impl BrowserManager {
+@@ -922,8 +1320,10 @@ impl BrowserManager {
          let color_scheme = options.color_scheme.clone();
          let download_path = options.download_path.clone();
          let headless = options.effectively_headless();
@@ -2797,7 +3463,7 @@ index 27ef4d1..5b71b7d 100644
              "lightpanda" => {
                  let lp_options = LightpandaLaunchOptions {
                      executable_path: options.executable_path.clone(),
-@@ -932,7 +1331,7 @@ impl BrowserManager {
+@@ -932,7 +1332,7 @@ impl BrowserManager {
                  };
                  let lp = launch_lightpanda(&lp_options).await?;
                  let url = lp.ws_url.clone();
@@ -2806,7 +3472,7 @@ index 27ef4d1..5b71b7d 100644
              }
              "obscura" => {
                  let obscura_options = ObscuraLaunchOptions {
-@@ -943,14 +1342,12 @@ impl BrowserManager {
+@@ -943,14 +1343,12 @@ impl BrowserManager {
                  };
                  let ob = launch_obscura(&obscura_options).await?;
                  let url = ob.ws_url.clone();
@@ -2825,7 +3491,7 @@ index 27ef4d1..5b71b7d 100644
              }
          };
 
-@@ -959,7 +1356,11 @@ impl BrowserManager {
+@@ -959,7 +1357,11 @@ impl BrowserManager {
          } else if engine == "obscura" {
              initialize_obscura_manager(ws_url, process).await?
          } else {
@@ -2838,7 +3504,7 @@ index 27ef4d1..5b71b7d 100644
              let mut manager = Self {
                  client,
                  browser_process: Some(process),
-@@ -980,10 +1381,15 @@ impl BrowserManager {
+@@ -980,10 +1382,15 @@ impl BrowserManager {
                  headless,
                  product_checked: false,
              };
@@ -2858,7 +3524,7 @@ index 27ef4d1..5b71b7d 100644
                  return Err(error);
              }
              manager
-@@ -992,47 +1398,66 @@ impl BrowserManager {
+@@ -992,47 +1399,66 @@ impl BrowserManager {
          let session_id = match manager.active_session_id() {
              Ok(session_id) => session_id.to_string(),
              Err(error) => {
@@ -2959,7 +3625,7 @@ index 27ef4d1..5b71b7d 100644
 
          Ok(manager)
      }
-@@ -1897,15 +2322,57 @@ impl BrowserManager {
+@@ -1897,17 +2323,72 @@ impl BrowserManager {
          self.close_with_timeout(None).await
      }
 
@@ -2992,6 +3658,7 @@ index 27ef4d1..5b71b7d 100644
          &mut self,
          browser_close_timeout: Option<Duration>,
      ) -> Result<(), String> {
+-        let _ = self.thaw_frozen_tabs().await;
 +        if self.ws_url.is_empty()
 +            && matches!(
 +                self.browser_process.as_ref(),
@@ -3008,16 +3675,32 @@ index 27ef4d1..5b71b7d 100644
 +                Err("Managed Chrome cleanup is still in progress; retry the command".into())
 +            };
 +        }
-         let _ = self.thaw_frozen_tabs().await;
++        // A relaunch cannot spend the CLI's entire 30-second response window
++        // waiting for a live pipe peer to acknowledge Browser.close. Share a
++        // short graceful budget across tab thaw and the close command, then
++        // close the pipe and reap the owned process.
++        let managed_close_deadline = self.owns_managed_chrome_process().then(|| {
++            Instant::now() + browser_close_timeout.unwrap_or(CHROME_PIPE_GRACEFUL_CLOSE_TIMEOUT)
++        });
++        if let Some(deadline) = managed_close_deadline {
++            let _ = tokio::time::timeout_at(deadline.into(), self.thaw_frozen_tabs()).await;
++        } else {
++            let _ = self.thaw_frozen_tabs().await;
++        }
          if self.browser_process.is_some() {
              // Only send Browser.close when we launched the browser ourselves.
              // For external connections (--auto-connect, --cdp) we just disconnect
              // without shutting down the user's browser.
 +            self.client.expect_pipe_shutdown();
              let close = self.client.send_command_no_params("Browser.close", None);
-             if let Some(timeout) = browser_close_timeout {
+-            if let Some(timeout) = browser_close_timeout {
++            if let Some(deadline) = managed_close_deadline {
++                let _ = tokio::time::timeout_at(deadline.into(), close).await;
++            } else if let Some(timeout) = browser_close_timeout {
                  let _ = tokio::time::timeout(timeout, close).await;
-@@ -1918,10 +2385,23 @@ impl BrowserManager {
+             } else {
+                 let _ = close.await;
+@@ -1918,10 +2399,23 @@ impl BrowserManager {
 
          if let Some(mut process) = self.browser_process.take() {
              let timeout = std::time::Duration::from_secs(5);
@@ -3044,7 +3727,7 @@ index 27ef4d1..5b71b7d 100644
          }
 
          Ok(())
-@@ -1952,17 +2432,23 @@ impl BrowserManager {
+@@ -1952,17 +2446,23 @@ impl BrowserManager {
          }
      }
 
@@ -3074,7 +3757,7 @@ index 27ef4d1..5b71b7d 100644
      pub fn get_cdp_url(&self) -> &str {
          &self.ws_url
      }
-@@ -1993,6 +2479,16 @@ impl BrowserManager {
+@@ -1993,6 +2493,16 @@ impl BrowserManager {
          }
      }
 
@@ -3091,7 +3774,7 @@ index 27ef4d1..5b71b7d 100644
      pub fn product_checked(&self) -> bool {
          self.product_checked
      }
-@@ -4531,7 +5027,7 @@ mod tests {
+@@ -4531,7 +5041,7 @@ mod tests {
          let executable = dir.path().join("chrome");
          let port = url::Url::parse(url).unwrap().port().unwrap();
          std::fs::write(&executable, format!(
@@ -3100,7 +3783,7 @@ index 27ef4d1..5b71b7d 100644
              dir.path().display()
          )).unwrap();
          std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
-@@ -4549,6 +5045,86 @@ mod tests {
+@@ -4549,6 +5059,86 @@ mod tests {
              .trim()
              .parse()
              .unwrap();
@@ -3187,7 +3870,7 @@ index 27ef4d1..5b71b7d 100644
          assert_eq!(
              unsafe { libc::kill(pid, 0) },
              -1,
-@@ -4570,23 +5146,492 @@ mod tests {
+@@ -4570,23 +5160,492 @@ mod tests {
 
      #[cfg(unix)]
      #[tokio::test]
@@ -3694,7 +4377,7 @@ index 27ef4d1..5b71b7d 100644
      }
 
      #[cfg(unix)]
-@@ -4600,12 +5645,20 @@ mod tests {
+@@ -4600,12 +5659,20 @@ mod tests {
              .unwrap();
          let mut manager = tokio::time::timeout(
              Duration::from_secs(4),
@@ -3717,7 +4400,7 @@ index 27ef4d1..5b71b7d 100644
          manager.close().await.unwrap();
          let observed = server.await.unwrap();
          assert!(!observed[0].iter().any(|method| method == "Browser.close"));
-@@ -4649,7 +5702,12 @@ mod tests {
+@@ -4649,7 +5716,12 @@ mod tests {
              .expect("Obscura should disconnect before retrying")
              .unwrap();
              assert!(manager.owns_obscura_process());
@@ -6100,10 +6783,97 @@ index 6838149..f8eb660 100644
 +    }
  }
 diff --git a/cli/src/native/daemon.rs b/cli/src/native/daemon.rs
-index f2737f1..4572ed1 100644
+index f2737f1..009c2d7 100644
 --- a/cli/src/native/daemon.rs
 +++ b/cli/src/native/daemon.rs
-@@ -609,8 +609,13 @@ fn spawn_background_tick_if_idle(
+@@ -289,6 +289,23 @@ fn arm_idle_sleep(activity: &IdleActivity) -> Option<std::pin::Pin<Box<tokio::ti
+     Some(Box::pin(tokio::time::sleep(remaining)))
+ }
+
++fn defer_idle_shutdown_for_chrome_cleanup(
++    state: &DaemonState,
++    timeout_ms: u64,
++    idle_sleep: &mut Option<std::pin::Pin<Box<tokio::time::Sleep>>>,
++) -> bool {
++    if !state.managed_chrome_cleanup_pending() {
++        return false;
++    }
++    // The worker still owns an old child/profile. Keep this daemon's lease
++    // alive and retry after a bounded pause instead of starting a new daemon
++    // that could launch another Chrome against the same profile.
++    *idle_sleep = Some(Box::pin(tokio::time::sleep(Duration::from_millis(
++        timeout_ms.clamp(100, 1_000),
++    ))));
++    true
++}
++
+ /// Minimum ms between periodic session autosaves while the browser is open.
+ /// Defaults to 30s; 0 disables periodic autosave (save-on-close still runs).
+ fn autosave_interval_ms_from_env() -> u64 {
+@@ -401,6 +418,9 @@ async fn run_socket_server(
+                         Some(Box::pin(tokio::time::sleep(Duration::from_millis(timeout_ms))));
+                     continue;
+                 }
++                if defer_idle_shutdown_for_chrome_cleanup(&s, timeout_ms, &mut idle_sleep_pin) {
++                    continue;
++                }
+                 if idle_timeout.is_some_and(|t| t.is_default) {
+                     let _ = writeln!(
+                         std::io::stderr(),
+@@ -410,6 +430,9 @@ async fn run_socket_server(
+                 }
+                 let _ = auto_save_restore_state(&mut s).await;
+                 let _ = close_all_browser_backends(&mut s).await;
++                if defer_idle_shutdown_for_chrome_cleanup(&s, timeout_ms, &mut idle_sleep_pin) {
++                    continue;
++                }
+                 break;
+             }
+             _ = idle_activity.notified() => {
+@@ -432,6 +455,12 @@ async fn run_socket_server(
+                 };
+                 let _ = auto_save_restore_state(&mut s).await;
+                 let _ = close_all_browser_backends(&mut s).await;
++                // Hold the daemon state lock while the detached worker
++                // finishes. The listener stays bound, but no request can
++                // launch a replacement just before shutdown exits.
++                while s.managed_chrome_cleanup_pending() {
++                    tokio::time::sleep(Duration::from_millis(100)).await;
++                }
+                 break;
+             }
+         }
+@@ -551,6 +580,9 @@ async fn run_socket_server(
+                         Some(Box::pin(tokio::time::sleep(Duration::from_millis(timeout_ms))));
+                     continue;
+                 }
++                if defer_idle_shutdown_for_chrome_cleanup(&s, timeout_ms, &mut idle_sleep_pin) {
++                    continue;
++                }
+                 if idle_timeout.is_some_and(|t| t.is_default) {
+                     let _ = writeln!(
+                         std::io::stderr(),
+@@ -560,6 +592,9 @@ async fn run_socket_server(
+                 }
+                 let _ = auto_save_restore_state(&mut s).await;
+                 let _ = close_all_browser_backends(&mut s).await;
++                if defer_idle_shutdown_for_chrome_cleanup(&s, timeout_ms, &mut idle_sleep_pin) {
++                    continue;
++                }
+                 break;
+             }
+             _ = idle_activity.notified() => {
+@@ -579,6 +614,9 @@ async fn run_socket_server(
+                 };
+                 let _ = auto_save_restore_state(&mut s).await;
+                 let _ = close_all_browser_backends(&mut s).await;
++                while s.managed_chrome_cleanup_pending() {
++                    tokio::time::sleep(Duration::from_millis(100)).await;
++                }
+                 break;
+             }
+         }
+@@ -609,8 +647,13 @@ fn spawn_background_tick_if_idle(
          let process_exited = state
              .browser
              .as_mut()
@@ -6119,7 +6889,40 @@ index f2737f1..4572ed1 100644
          if process_exited {
              let _ = close_current_browser(&mut state).await;
          } else if state.browser.is_some() {
-@@ -1090,12 +1095,12 @@ mod tests {
+@@ -976,6 +1019,32 @@ mod tests {
+         assert!(arm_idle_sleep(&activity).is_none(), "disabled live");
+     }
+
++    #[tokio::test]
++    async fn pipe_pending_cleanup_rechecks_idle_within_one_second() {
++        let state = DaemonState::new();
++        state.set_managed_chrome_cleanup_count_for_test(1);
++        let mut idle_sleep = None;
++        assert!(defer_idle_shutdown_for_chrome_cleanup(
++            &state,
++            3_600_000,
++            &mut idle_sleep,
++        ));
++        let remaining = idle_sleep.unwrap().deadline() - tokio::time::Instant::now();
++        assert!(
++            remaining <= Duration::from_secs(1),
++            "re-armed for {remaining:?}"
++        );
++
++        state.set_managed_chrome_cleanup_count_for_test(0);
++        let mut idle_sleep = None;
++        assert!(!defer_idle_shutdown_for_chrome_cleanup(
++            &state,
++            3_600_000,
++            &mut idle_sleep,
++        ));
++        assert!(idle_sleep.is_none());
++    }
++
+     #[tokio::test]
+     async fn test_command_completion_rearms_expired_idle_timeout() {
+         let activity = IdleActivity::new();
+@@ -1090,12 +1159,12 @@ mod tests {
      /// added in v0.22.3 to reap zombie Chrome processes. This races with
      /// Rust's `Child::try_wait()` / `Child::wait()` because `waitpid(-1)`
      /// reaps *any* child, stealing the exit status before Rust can collect
@@ -6134,7 +6937,7 @@ index f2737f1..4572ed1 100644
      /// for targeted, race-free zombie detection.
      #[test]
      fn test_no_waitpid_minus_one_in_daemon() {
-@@ -1105,14 +1110,14 @@ mod tests {
+@@ -1105,14 +1174,14 @@ mod tests {
          assert!(
              !production_code.contains("waitpid(-1"),
              "daemon.rs production code must not call waitpid(-1, ...). \

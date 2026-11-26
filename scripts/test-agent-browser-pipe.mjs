@@ -27,6 +27,7 @@ const env = {
 };
 const sessions = [];
 let externalChrome;
+let primaryError;
 
 async function run(file, args, options = {}) {
   const started = performance.now();
@@ -203,8 +204,11 @@ try {
   assert.match(requireSuccess(await cli(blank, ['get', 'url']), 'no-URL CDP command'), /about:blank/);
   assert(!existsSync(join(blankProfile, 'DevToolsActivePort')),
     'No-URL managed launch wrote DevToolsActivePort');
+  const blankPid = process.platform === 'win32'
+    ? await checkWindowsHandlesAndListeners(blankProfile) : null;
   requireSuccess(await cli(blank, ['close']), 'close no-URL Chromium');
   sessions.pop();
+  if (blankPid) await waitFor(() => !alive(blankPid), 'no-URL Chromium exit');
 
   for (const [index, flag] of ['--remote-debugging-port=0', '-remote-debugging-port=0',
     '/remote-debugging-port=0', '--remote-debugging-pipe',
@@ -249,8 +253,21 @@ try {
   assert.match(requireSuccess(await cli(attached, ['--cdp', activePort, 'get', 'cdp-url']),
     'read external CDP URL'), /ws:\/\//);
   console.log('Native browser pipe smoke passed: round trip, private handles, no managed TCP listener, denied overrides/endpoints, failure cleanup, and external CDP attachment.');
+} catch (error) {
+  primaryError = error;
+  throw error;
 } finally {
   for (const session of sessions.reverse()) await cli(session, ['close']).catch(() => {});
-  await stopExternal();
-  await rm(root, { recursive: true, force: true });
+  let cleanupError;
+  try { await stopExternal(); } catch (error) { cleanupError = error; }
+  try {
+    // Windows can release a closed Chromium profile handle a moment after the
+    // CLI reports close. A persistent lock still fails this bounded cleanup.
+    await rm(root, { recursive: true, force: true,
+      maxRetries: process.platform === 'win32' ? 10 : 0, retryDelay: 200 });
+  } catch (error) { cleanupError ??= error; }
+  if (cleanupError) {
+    if (primaryError) console.error('Fixture cleanup also failed:', cleanupError);
+    else throw cleanupError;
+  }
 }
