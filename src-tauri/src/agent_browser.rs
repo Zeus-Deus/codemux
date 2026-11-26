@@ -5184,10 +5184,11 @@ fn execute_agent_browser_action_with_status(
         if let Some((dir, record, files)) = closing_files.as_ref() {
             finish_closed_browser_files(dir, session, record, files, Instant::now() + CLOSE_TIMEOUT);
         }
-        // Windows may still be exiting after the CLI reports success. Keep
-        // the record so a subsequent start can verify that daemon's PID.
-        #[cfg(not(any(target_os = "macos", windows)))]
-        clear_session_pid(session);
+        // The daemon may still be exiting after the CLI reports success.
+        // Keep its native-start record until a later guarded cleanup can
+        // inspect the daemon PID file and control endpoint.
+        #[cfg(target_os = "linux")]
+        retire_exited_provisional_browser_files(session);
     } else {
         let _ = track_current_browser_daemon(session);
     }
@@ -7847,6 +7848,31 @@ mod tests {
             manager.allocate_port(&session).await.unwrap();
             assert!(!manager.note_action_start(&session, "open").await);
         }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn automation_close_retains_identity_until_daemon_exit() {
+        let session = format!("automation-close-{}", uuid::Uuid::new_v4().simple());
+        let dir = run_dir_for_session(&session).unwrap();
+        let (_temp, mut daemon, record) = browser_identity_fixture_with_attempt_and_dir(
+            &session, browser_owner_token(), None, Some(&dir),
+        );
+        let pid_path = dir.join(format!("{session}.pid"));
+        let record_path = session_pid_path(&session).unwrap();
+        std::fs::write(&pid_path, record.pid.to_string()).unwrap();
+        write_session_pid(&session, &record).unwrap();
+
+        // The CLI can report close success before the daemon has exited.
+        retire_exited_provisional_browser_files(&session);
+        assert_eq!(read_daemon_pid_file(&pid_path), Some(record.pid));
+        assert_eq!(read_browser_pid_record(&record_path), Some(record.clone()));
+
+        daemon.kill().unwrap();
+        daemon.wait().unwrap();
+        retire_exited_provisional_browser_files(&session);
+        assert!(!pid_path.exists());
+        assert!(!record_path.exists());
     }
 
     #[cfg(unix)]
