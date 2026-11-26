@@ -11,6 +11,69 @@ index f31f005..e6488c6 100644
  tokio-tungstenite = { version = "0.24", features = ["rustls-tls-webpki-roots"] }
  rustls = { version = "0.23", default-features = false }
  rustls-native-certs = "0.8"
+diff --git a/cli/src/ca_bundle.rs b/cli/src/ca_bundle.rs
+index 4efd513..64ce8d1 100644
+--- a/cli/src/ca_bundle.rs
++++ b/cli/src/ca_bundle.rs
+@@ -13,6 +13,7 @@
+ use rustls::pki_types::CertificateDer;
+ use rustls::RootCertStore;
+ use sha2::{Digest, Sha256};
++use std::io::Read;
+
+ #[derive(Clone, Debug)]
+ pub struct CaBundle {
+@@ -36,8 +37,27 @@ impl CaBundle {
+ /// usable certificate is an error; a partially valid PEM bundle is an error
+ /// too, so two consumers can never end up trusting different subsets of it.
+ pub fn load(path: &str) -> Result<CaBundle, String> {
+-    let data =
+-        std::fs::read(path).map_err(|e| format!("Failed to read CA certificate '{path}': {e}"))?;
++    let mut options = std::fs::OpenOptions::new();
++    options.read(true);
++    // Opening a FIFO for reading can block before its type can be checked.
++    // Symlinks to ordinary files still work, while special files fail closed.
++    #[cfg(unix)]
++    {
++        use std::os::unix::fs::OpenOptionsExt;
++        options.custom_flags(libc::O_NONBLOCK);
++    }
++    let mut file = options
++        .open(path)
++        .map_err(|e| format!("Failed to read CA certificate '{path}': {e}"))?;
++    let metadata = file
++        .metadata()
++        .map_err(|e| format!("Failed to inspect CA certificate '{path}': {e}"))?;
++    if !metadata.is_file() {
++        return Err(format!("CA certificate '{path}' must be a regular file"));
++    }
++    let mut data = Vec::new();
++    file.read_to_end(&mut data)
++        .map_err(|e| format!("Failed to read CA certificate '{path}': {e}"))?;
+
+     let mut reader = std::io::BufReader::new(data.as_slice());
+     let mut certs: Vec<CertificateDer<'static>> = Vec::new();
+@@ -219,4 +239,20 @@ JtnWOCSAT+dNsAXmz4ebm7kp9OnpLLKjvrNEUNPA20J5S+BXTtPv7x/koRwSX35M\n\
+         let err = load("/nonexistent/ca.pem").unwrap_err();
+         assert!(err.contains("/nonexistent/ca.pem"), "{err}");
+     }
++
++    #[cfg(unix)]
++    #[test]
++    fn a_fifo_is_refused_without_waiting_for_a_writer() {
++        use std::os::unix::ffi::OsStrExt;
++        use std::time::{Duration, Instant};
++
++        let dir = tempfile::tempdir().unwrap();
++        let path = dir.path().join("ca.pem");
++        let name = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
++        assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
++        let started = Instant::now();
++        let error = load(path.to_str().unwrap()).unwrap_err();
++        assert!(error.contains("regular file"), "{error}");
++        assert!(started.elapsed() < Duration::from_secs(1));
++    }
+ }
 diff --git a/cli/src/codemux_auth.rs b/cli/src/codemux_auth.rs
 index 719543c..740c500 100644
 --- a/cli/src/codemux_auth.rs
@@ -24,6 +87,60 @@ index 719543c..740c500 100644
 
  pub fn expected_token() -> Option<&'static str> {
      static TOKEN: OnceLock<Option<String>> = OnceLock::new();
+diff --git a/cli/src/connection.rs b/cli/src/connection.rs
+index 40e8f4a..c00acda 100644
+--- a/cli/src/connection.rs
++++ b/cli/src/connection.rs
+@@ -1438,8 +1438,8 @@ fn send_command_once(cmd: &Value, session: &str) -> Result<Response, SendError>
+         .ok_or_else(|| SendError::NotSent("Codemux browser token is missing".into()))?;
+     let mut authenticated = cmd.clone();
+     authenticated[crate::codemux_auth::FIELD] = Value::String(token.to_owned());
+-    let mut json_str = serde_json::to_string(&authenticated)
+-        .map_err(|e| SendError::NotSent(e.to_string()))?;
++    let mut json_str =
++        serde_json::to_string(&authenticated).map_err(|e| SendError::NotSent(e.to_string()))?;
+     json_str.push('\n');
+
+     let stream = connect(session).map_err(SendError::NotSent)?;
+diff --git a/cli/src/main.rs b/cli/src/main.rs
+index 2e44178..3c4fa91 100644
+--- a/cli/src/main.rs
++++ b/cli/src/main.rs
+@@ -1,8 +1,8 @@
+ mod browser_security;
+ mod ca_bundle;
+ mod chat;
+-mod color;
+ mod codemux_auth;
++mod color;
+ mod commands;
+ mod connection;
+ mod doctor;
+@@ -1927,13 +1927,18 @@ fn main() {
+     }
+
+     if let Some(ref ca_path) = flags.ca_cert {
+-        if let Err(msg) = ca_bundle::load(ca_path) {
+-            if flags.json {
+-                print_json_error(&msg);
+-            } else {
+-                eprintln!("{} {}", color::error_indicator(), msg);
++        // Browser launches validate CA trust in the daemon before changing
++        // session settings. Reading a certificate here would precede the
++        // managed Chromium startup deadline.
++        if !native::actions::command_launches_browser(&cmd) {
++            if let Err(msg) = ca_bundle::load(ca_path) {
++                if flags.json {
++                    print_json_error(&msg);
++                } else {
++                    eprintln!("{} {}", color::error_indicator(), msg);
++                }
++                exit(1);
+             }
+-            exit(1);
+         }
+         let canonical = std::path::Path::new(ca_path)
+             .canonicalize()
 diff --git a/cli/src/mcp.rs b/cli/src/mcp.rs
 index afb567c..30e5501 100644
 --- a/cli/src/mcp.rs
@@ -47,7 +164,7 @@ index afb567c..30e5501 100644
              &[],
          ),
 diff --git a/cli/src/native/actions.rs b/cli/src/native/actions.rs
-index aad976c..e589133 100644
+index aad976c..b8cecbf 100644
 --- a/cli/src/native/actions.rs
 +++ b/cli/src/native/actions.rs
 @@ -19,7 +19,7 @@ use crate::session_settings::{
@@ -59,13 +176,114 @@ index aad976c..e589133 100644
  use super::cdp::client::{is_session_detached_error, CdpClient};
  use super::cdp::types::{
      session_matches, AttachToTargetParams, AttachToTargetResult, CdpEvent,
-@@ -3445,15 +3445,18 @@ async fn execute_command_inner(cmd: &Value, state: &mut DaemonState) -> Value {
+@@ -475,6 +475,54 @@ fn resolve_effective_ca_cert(
+     }))
+ }
+
++async fn resolve_effective_ca_cert_until(
++    cmd: &Value,
++    state: &DaemonState,
++    deadline: Option<std::time::Instant>,
++) -> Result<Option<EffectiveCaCert>, String> {
++    let Some(deadline) = deadline else {
++        return resolve_effective_ca_cert(cmd, state);
++    };
++    let requested_path = cmd.get("caCert").and_then(Value::as_str);
++    let clear = cmd
++        .get("clearCaCert")
++        .and_then(Value::as_bool)
++        .unwrap_or(false);
++    if requested_path.is_some() && clear {
++        return Err("Cannot use --ca-cert with --no-ca-cert".to_string());
++    }
++    if clear {
++        return Ok(None);
++    }
++    let Some(path) = requested_path else {
++        return Ok(state.effective_ca_cert.clone());
++    };
++    if std::time::Instant::now() >= deadline {
++        return Err("Managed Chrome startup timed out while loading CA trust".into());
++    }
++    let path = path.to_string();
++    let load_path = path.clone();
++    let mut worker = tokio::task::spawn_blocking(move || crate::ca_bundle::load(&load_path));
++    let bundle = match tokio::time::timeout_at(deadline.into(), &mut worker).await {
++        Ok(Ok(result)) => result?,
++        Ok(Err(error)) => return Err(format!("Managed Chrome CA trust task failed: {error}")),
++        Err(_) => {
++            // A queued blocking task can still be cancelled. A running file
++            // read cannot; its late result is dropped without changing state.
++            worker.abort();
++            return Err("Managed Chrome startup timed out while loading CA trust".into());
++        }
++    };
++    if state
++        .effective_ca_cert
++        .as_ref()
++        .is_some_and(|current| current.bundle.digest() == bundle.digest())
++    {
++        return Ok(state.effective_ca_cert.clone());
++    }
++    Ok(Some(EffectiveCaCert { path, bundle }))
++}
++
+ fn apply_effective_ca_cert(
+     options: &mut LaunchOptions,
+     effective_ca_cert: &Option<EffectiveCaCert>,
+@@ -3166,6 +3214,7 @@ async fn execute_command_inner(cmd: &Value, state: &mut DaemonState) -> Value {
+         .to_string();
+
+     let cmd_start = std::time::Instant::now();
++    let managed_deadline = cmd_start + super::browser::CHROME_PIPE_STARTUP_BUDGET;
+
+     // A retry of the request that wedged the tab must not run on its blank
+     // replacement: `url` would report about:blank as a success.
+@@ -3230,6 +3279,7 @@ async fn execute_command_inner(cmd: &Value, state: &mut DaemonState) -> Value {
+     // the browser and these settings alone.
+     let launches = command_launches_browser(cmd);
+     let mut launch_patch: Option<Patch> = None;
++    let mut launch_ca: Option<EffectiveCaCert> = None;
+     let wire_patch = match Patch::from_wire(cmd.get("settings")) {
+         Ok(patch) => patch,
+         Err(e) => return error_response(&id, &e.to_string()),
+@@ -3247,9 +3297,11 @@ async fn execute_command_inner(cmd: &Value, state: &mut DaemonState) -> Value {
+         };
+         if launches {
+             let mut patch = patch;
+-            if let Err(e) = adjust_ca_patch(state, &mut patch) {
+-                return error_response(&id, &e);
+-            }
++            launch_ca = match adjust_ca_patch(state, &mut patch, Some(managed_deadline), None).await
++            {
++                Ok(ca) => ca,
++                Err(e) => return error_response(&id, &e),
++            };
+             launch_patch = Some(patch);
+         }
+         outcome
+@@ -3421,7 +3473,15 @@ async fn execute_command_inner(cmd: &Value, state: &mut DaemonState) -> Value {
+             lifecycle_relaunched_browser |= restore_applied.relaunched_browser;
+             // The launch settings take effect now.
+             if let (Some(patch), Some(_)) = (launch_patch.as_ref(), launch_plan.as_ref()) {
+-                match apply_settings_patch(state, patch, true).await {
++                match apply_settings_patch_until(
++                    state,
++                    patch,
++                    true,
++                    Some(managed_deadline),
++                    launch_ca.as_ref(),
++                )
++                .await
++                {
+                     Ok(outcome) => settings_outcome.absorb(outcome),
+                     Err(e) => {
+                         let cleanup = Box::pin(rollback_restore_unit(
+@@ -3445,15 +3505,16 @@ async fn execute_command_inner(cmd: &Value, state: &mut DaemonState) -> Value {
              let strict_state = launch_patch
                  .as_ref()
                  .is_some_and(|patch| patch.value(Key::StorageState).is_some());
 -            let launched = auto_launch_with(
-+            let managed_deadline =
-+                std::time::Instant::now() + super::browser::CHROME_PIPE_STARTUP_BUDGET;
 +            let launched = auto_launch_with_managed_deadline(
                  state,
                  plugins_from_command_or_env(cmd),
@@ -80,7 +298,41 @@ index aad976c..e589133 100644
                  Err(e) => Err(e),
              };
              if let Err(e) = launched {
-@@ -4931,9 +4934,28 @@ async fn auto_launch_with(
+@@ -3565,15 +3626,29 @@ async fn execute_command_inner(cmd: &Value, state: &mut DaemonState) -> Value {
+     let mut result = match action {
+         "launch" => {
+             let applied = match launch_patch.as_ref() {
+-                Some(patch) => apply_settings_patch(state, patch, true)
+-                    .await
+-                    .map(|outcome| settings_outcome.absorb(outcome)),
++                Some(patch) => apply_settings_patch_until(
++                    state,
++                    patch,
++                    true,
++                    Some(managed_deadline),
++                    launch_ca.as_ref(),
++                )
++                .await
++                .map(|outcome| settings_outcome.absorb(outcome)),
+                 None => Ok(()),
+             };
+             lifecycle_relaunched_browser |=
+                 restore_applied.relaunched_browser || settings_outcome.relaunched_browser;
+             let result = match applied {
+-                Ok(()) => handle_launch(cmd, state).await,
++                Ok(()) => {
++                    handle_launch_with_managed_deadline(
++                        cmd,
++                        state,
++                        BROWSER_USE_SETUP_DEADLINE,
++                        managed_deadline,
++                    )
++                    .await
++                }
+                 Err(e) => Err(e),
+             };
+             match result {
+@@ -4931,9 +5006,28 @@ async fn auto_launch_with(
      plugins: Vec<crate::plugins::PluginConfig>,
      cmd: &Value,
      strict_state: bool,
@@ -110,7 +362,7 @@ index aad976c..e589133 100644
      if result.is_ok() && !resumed {
          state.attached_target = attached_target_for(&state.settings.connection());
      }
-@@ -4956,6 +4978,7 @@ async fn auto_launch_with_settings(
+@@ -4956,6 +5050,7 @@ async fn auto_launch_with_settings(
      plugins: Vec<crate::plugins::PluginConfig>,
      cmd: &Value,
      strict_state: bool,
@@ -118,7 +370,7 @@ index aad976c..e589133 100644
  ) -> Result<Value, String> {
      if state.attached_target.is_some() && cmd.is_null() {
          // Resume the attached browser; the launch handler resolves the target.
-@@ -4966,14 +4989,14 @@ async fn auto_launch_with_settings(
+@@ -4966,14 +5061,14 @@ async fn auto_launch_with_settings(
      if matches!(connection, Connection::Cdp(_) | Connection::AutoConnect)
          || !matches!(&connection, Connection::Provider(provider) if provider_is_browser_use(provider))
      {
@@ -135,7 +387,7 @@ index aad976c..e589133 100644
      )
      .await
      {
-@@ -4993,6 +5016,7 @@ async fn auto_launch_inner(
+@@ -4993,6 +5088,7 @@ async fn auto_launch_inner(
      plugins: Vec<crate::plugins::PluginConfig>,
      cmd: &Value,
      strict_state: bool,
@@ -143,7 +395,7 @@ index aad976c..e589133 100644
  ) -> Result<Value, String> {
      // Only a browser agent-browser launches itself keeps its session setup
      // across a relaunch; an attached or provider browser starts without one,
-@@ -5003,7 +5027,8 @@ async fn auto_launch_inner(
+@@ -5003,7 +5099,8 @@ async fn auto_launch_inner(
              std::mem::take(&mut state.touch_sessions),
          )
      });
@@ -153,7 +405,7 @@ index aad976c..e589133 100644
      if let (Err(_), Some((setup, touch))) = (&result, saved) {
          state.session_setup = setup;
          state.touch_sessions = touch;
-@@ -5016,6 +5041,26 @@ async fn launch_browser_from_settings(
+@@ -5016,6 +5113,26 @@ async fn launch_browser_from_settings(
      plugins: Vec<crate::plugins::PluginConfig>,
      cmd: &Value,
      strict_state: bool,
@@ -180,7 +432,7 @@ index aad976c..e589133 100644
  ) -> Result<Value, String> {
      if has_active_browser_session(state) {
          close_before_implicit_relaunch(state).await?;
-@@ -5079,6 +5124,10 @@ async fn launch_browser_from_settings(
+@@ -5079,6 +5196,10 @@ async fn launch_browser_from_settings(
      } else {
          engine
      };
@@ -191,7 +443,7 @@ index aad976c..e589133 100644
      state.engine = engine.as_deref().unwrap_or("chrome").to_string();
      write_engine_file(&state.session_id, &state.engine);
      write_extensions_file(&state.session_id, &state.settings);
-@@ -5250,7 +5299,20 @@ async fn launch_browser_from_settings(
+@@ -5250,7 +5371,20 @@ async fn launch_browser_from_settings(
          storage_state,
      })?;
 
@@ -213,7 +465,7 @@ index aad976c..e589133 100644
      validate_ca_cert_launch_mode(&options, engine.as_deref(), false)?;
      ensure_allowed_domains_supported_for_launch(AllowedDomainsLaunchSupport {
          contained,
-@@ -5269,10 +5331,32 @@ async fn launch_browser_from_settings(
+@@ -5269,10 +5403,32 @@ async fn launch_browser_from_settings(
          options.extensions.as_deref(),
      );
      if let Some(ref ca) = effective_ca_cert {
@@ -248,7 +500,7 @@ index aad976c..e589133 100644
      let rollback_setup = state.session_setup.clone();
      let previous_setup = std::mem::take(&mut state.session_setup);
      state.session_setup = previous_setup.carried_into_relaunch(launch_setup);
-@@ -5284,11 +5368,11 @@ async fn launch_browser_from_settings(
+@@ -5284,25 +5440,82 @@ async fn launch_browser_from_settings(
      state.subscribe_to_browser_events();
      state.start_fetch_handler();
      state.start_dialog_handler();
@@ -257,14 +509,33 @@ index aad976c..e589133 100644
      // The carried setup is kept only when every step after the launch
      // succeeds, like the launch settings.
 -    let result = async {
+-        install_network_controls_or_close(state, has_proxy_auth).await?;
 +    let setup = async {
 +        state.update_stream_client().await;
-         install_network_controls_or_close(state, has_proxy_auth).await?;
++        if managed_deadline.is_some() {
++            // Keep the owned Chrome in state until the bounded abort below.
++            // The regular helper moves it out before awaiting Browser.close.
++            install_active_network_controls(state, has_proxy_auth)
++                .await
++                .map_err(|error| format!("Failed to install browser network controls: {error}"))?;
++        } else {
++            install_network_controls_or_close(state, has_proxy_auth).await?;
++        }
 
          let replay_warning = replay_session_setup_after_launch(state).await;
-@@ -5297,12 +5381,49 @@ async fn launch_browser_from_settings(
+
+         apply_launch_init_scripts(state, &enable_features, &init_script_paths).await;
          try_auto_restore_state(state).await;
-         load_storage_state_for_launch(state, &storage_state_path, strict_state).await?;
+-        load_storage_state_for_launch(state, &storage_state_path, strict_state).await?;
++        if managed_deadline.is_some() {
++            if strict_state {
++                load_storage_state(state, &storage_state_path).await?;
++            } else {
++                let _ = load_storage_state(state, &storage_state_path).await;
++            }
++        } else {
++            load_storage_state_for_launch(state, &storage_state_path, strict_state).await?;
++        }
          Ok(with_session_setup_warning(state, json!({}), replay_warning))
 -    }
 -    .await;
@@ -272,7 +543,11 @@ index aad976c..e589133 100644
 +    let result = if let Some(deadline) = managed_deadline {
 +        let setup_deadline = deadline - std::time::Duration::from_secs(2);
 +        match tokio::time::timeout_at(setup_deadline.into(), setup).await {
-+            Ok(result) => result,
++            Ok(Ok(value)) => Ok(value),
++            Ok(Err(error)) => {
++                abort_failed_managed_chrome_setup(state).await;
++                Err(error)
++            }
 +            Err(_) => {
 +                abort_failed_managed_chrome_setup(state).await;
 +                Err("Managed Chrome startup timed out during daemon setup".to_string())
@@ -314,10 +589,11 @@ index aad976c..e589133 100644
  /// Puts the pre-relaunch session setup back when the relaunch failed.
  fn restore_setup_unless_launched<T>(
      state: &mut DaemonState,
-@@ -5848,15 +5969,38 @@ async fn handle_launch_with_deadline(
+@@ -5847,16 +6060,53 @@ async fn handle_launch_with_deadline(
+     cmd: &Value,
      state: &mut DaemonState,
      deadline: std::time::Duration,
- ) -> Result<Value, String> {
++) -> Result<Value, String> {
 +    handle_launch_with_managed_budget(
 +        cmd,
 +        state,
@@ -333,7 +609,21 @@ index aad976c..e589133 100644
 +    deadline: std::time::Duration,
 +    managed_budget: std::time::Duration,
 +) -> Result<Value, String> {
-+    let managed_deadline = std::time::Instant::now() + managed_budget;
++    handle_launch_with_managed_deadline(
++        cmd,
++        state,
++        deadline,
++        std::time::Instant::now() + managed_budget,
++    )
++    .await
++}
++
++async fn handle_launch_with_managed_deadline(
++    cmd: &Value,
++    state: &mut DaemonState,
++    deadline: std::time::Duration,
++    managed_deadline: std::time::Instant,
+ ) -> Result<Value, String> {
      let mut resolved = resolve_launch_target(cmd, state.attached_target.as_ref());
      if let Some(launch) = resolved.as_mut() {
          attach_saved_cdp_headers(launch, state);
@@ -355,7 +645,7 @@ index aad976c..e589133 100644
      }
      result
  }
-@@ -5877,6 +6021,35 @@ async fn start_flow_capture(state: &mut DaemonState) -> Result<(), String> {
+@@ -5877,6 +6127,35 @@ async fn start_flow_capture(state: &mut DaemonState) -> Result<(), String> {
      Ok(())
  }
 
@@ -391,7 +681,7 @@ index aad976c..e589133 100644
  /// Rejects capture modes the daemon cannot record, before they are stored.
  fn check_capture_setting(patch: &Patch) -> Result<(), String> {
      match patch.value(Key::Capture) {
-@@ -5906,6 +6079,7 @@ async fn handle_launch_for_target(
+@@ -5906,6 +6185,7 @@ async fn handle_launch_for_target(
      cmd: &Value,
      state: &mut DaemonState,
      deadline: std::time::Duration,
@@ -399,7 +689,7 @@ index aad976c..e589133 100644
  ) -> Result<Value, String> {
      if cmd.get("cdpUrl").and_then(Value::as_str).is_some()
          || cmd.get("cdpPort").and_then(Value::as_u64).is_some()
-@@ -5915,12 +6089,17 @@ async fn handle_launch_for_target(
+@@ -5915,12 +6195,17 @@ async fn handle_launch_for_target(
              .and_then(Value::as_str)
              .is_some_and(provider_is_browser_use)
      {
@@ -419,7 +709,85 @@ index aad976c..e589133 100644
          Ok(result) => result,
          Err(_) => Err(browser_use_setup_timeout(state).await),
      };
-@@ -6563,6 +6742,14 @@ fn attach_settings_outcome(resp: &mut Value, outcome: &SettingsOutcome) {
+@@ -6237,15 +6522,25 @@ fn with_rollback_error(error: &str, rollback: Option<String>) -> String {
+ /// CA trust is compared by content, not by path: the same certificates from
+ /// another path change nothing, and an edited file at the same path is a
+ /// change.
+-fn adjust_ca_patch(state: &mut DaemonState, patch: &mut Patch) -> Result<(), String> {
++async fn adjust_ca_patch(
++    state: &mut DaemonState,
++    patch: &mut Patch,
++    deadline: Option<std::time::Instant>,
++    preloaded: Option<&EffectiveCaCert>,
++) -> Result<Option<EffectiveCaCert>, String> {
+     let Some(path) = patch
+         .value(Key::CaCert)
+         .and_then(Value::as_str)
+         .map(String::from)
+     else {
+-        return Ok(());
++        return Ok(None);
++    };
++    let requested = match preloaded.filter(|ca| ca.path == path) {
++        Some(ca) => Some(ca.clone()),
++        None => {
++            resolve_effective_ca_cert_until(&json!({ "caCert": path }), state, deadline).await?
++        }
+     };
+-    let requested = resolve_effective_ca_cert(&json!({ "caCert": path }), state)?;
+     let digest = |ca: &Option<EffectiveCaCert>| ca.as_ref().map(|ca| *ca.bundle.digest());
+     let running_path = state.settings.get(Key::CaCert).and_then(Value::as_str);
+     match ca_trust_change(
+@@ -6261,7 +6556,7 @@ fn adjust_ca_patch(state: &mut DaemonState, patch: &mut Patch) -> Result<(), Str
+         CaTrustChange::EditedInPlace => patch.mark_changed_in_place(Key::CaCert),
+         CaTrustChange::Replaced => {}
+     }
+-    Ok(())
++    Ok(requested)
+ }
+
+ /// Writes `pin` into the session's tab binding, when one exists.
+@@ -6300,12 +6595,24 @@ async fn apply_settings_patch(
+     state: &mut DaemonState,
+     patch: &Patch,
+     launches: bool,
++) -> Result<SettingsOutcome, String> {
++    apply_settings_patch_until(state, patch, launches, None, None).await
++}
++
++async fn apply_settings_patch_until(
++    state: &mut DaemonState,
++    patch: &Patch,
++    launches: bool,
++    deadline: Option<std::time::Instant>,
++    preloaded_ca: Option<&EffectiveCaCert>,
+ ) -> Result<SettingsOutcome, String> {
+     check_allowed_domains_setting(patch)?;
+     let mut patch = patch.clone();
+-    if launches {
+-        adjust_ca_patch(state, &mut patch)?;
+-    }
++    let requested_ca = if launches {
++        adjust_ca_patch(state, &mut patch, deadline, preloaded_ca).await?
++    } else {
++        None
++    };
+
+     let full = state.settings.plan(&patch);
+     if full.is_empty() && full.ignored.is_empty() {
+@@ -6332,7 +6639,10 @@ async fn apply_settings_patch(
+             Some(path) => json!({ "caCert": path }),
+             None => json!({ "clearCaCert": true }),
+         };
+-        Some(resolve_effective_ca_cert(&request, state)?)
++        Some(match requested_ca {
++            Some(ca) => Some(ca),
++            None => resolve_effective_ca_cert_until(&request, state, deadline).await?,
++        })
+     } else {
+         None
+     };
+@@ -6563,6 +6873,14 @@ fn attach_settings_outcome(resp: &mut Value, outcome: &SettingsOutcome) {
  }
 
  async fn handle_launch_inner(cmd: &Value, state: &mut DaemonState) -> Result<Value, String> {
@@ -434,7 +802,17 @@ index aad976c..e589133 100644
      let engine = cmd
          .get("engine")
          .and_then(Value::as_str)
-@@ -6587,8 +6774,35 @@ async fn handle_launch_inner(cmd: &Value, state: &mut DaemonState) -> Result<Val
+@@ -6572,7 +6890,8 @@ async fn handle_launch_inner(cmd: &Value, state: &mut DaemonState) -> Result<Val
+     check_capture_setting(&patch)?;
+     let had_browser_before_launch = has_active_browser_session(state);
+
+-    let mut outcome = apply_settings_patch(state, &patch, true).await?;
++    let mut outcome =
++        apply_settings_patch_until(state, &patch, true, managed_deadline, None).await?;
+     let reusable = !outcome.relaunched_browser
+         && match (state.browser.as_mut(), state.webdriver_backend.as_ref()) {
+             (Some(mgr), _) => !mgr.has_process_exited() && mgr.is_connection_alive().await,
+@@ -6587,8 +6906,35 @@ async fn handle_launch_inner(cmd: &Value, state: &mut DaemonState) -> Result<Val
      let strict_state = patch.value(Key::StorageState).is_some()
          || Patch::from_wire(cmd.get("settings"))
              .is_ok_and(|settings| settings.value(Key::StorageState).is_some());
@@ -471,7 +849,7 @@ index aad976c..e589133 100644
              let mut result = json!({
                  "launched": true,
                  "relaunchedBrowser": had_browser_before_launch,
-@@ -6903,6 +7117,9 @@ async fn handle_read(cmd: &Value, state: &DaemonState) -> Result<Value, String>
+@@ -6903,6 +7249,9 @@ async fn handle_read(cmd: &Value, state: &DaemonState) -> Result<Value, String>
 
  async fn handle_cdp_url(state: &DaemonState) -> Result<Value, String> {
      let mgr = state.browser.as_ref().ok_or("Browser not launched")?;
@@ -481,7 +859,7 @@ index aad976c..e589133 100644
      if !mgr.is_connection_alive().await {
          return Err("Browser not launched".to_string());
      }
-@@ -6911,6 +7128,9 @@ async fn handle_cdp_url(state: &DaemonState) -> Result<Value, String> {
+@@ -6911,6 +7260,9 @@ async fn handle_cdp_url(state: &DaemonState) -> Result<Value, String> {
 
  async fn handle_inspect(state: &mut DaemonState) -> Result<Value, String> {
      let mgr = state.browser.as_ref().ok_or("Browser not launched")?;
@@ -491,7 +869,7 @@ index aad976c..e589133 100644
 
      // Shut down any existing inspect server so we always target the current page
      if let Some(server) = state.inspect_server.take() {
-@@ -16918,15 +17138,9 @@ mod tests {
+@@ -16918,15 +17270,9 @@ mod tests {
      #[tokio::test]
      #[ignore = "requires Chrome"]
      async fn e2e_attached_download_fails_before_browser_or_filesystem_changes() {
@@ -509,7 +887,7 @@ index aad976c..e589133 100644
          let dir = tempfile::tempdir().unwrap();
          let destination = dir.path().join("new-directory").join("output.bin");
 
-@@ -16938,7 +17152,6 @@ mod tests {
+@@ -16938,7 +17284,6 @@ mod tests {
          .unwrap_err();
          assert!(error.contains("--cdp"), "{error}");
          assert!(!destination.parent().unwrap().exists());
@@ -517,7 +895,7 @@ index aad976c..e589133 100644
      }
 
      async fn start_finished_download(
-@@ -17081,17 +17294,37 @@ mod tests {
+@@ -17081,17 +17426,37 @@ mod tests {
          let dir = tempfile::tempdir().unwrap();
          let download_dir = dir.path().join("downloads");
          std::fs::create_dir_all(&download_dir).unwrap();
@@ -564,7 +942,7 @@ index aad976c..e589133 100644
 
          let mut attached = super::DaemonState::new();
          for cmd in [
-@@ -20886,6 +21119,7 @@ mod tests {
+@@ -20886,6 +21251,7 @@ mod tests {
              Vec::new(),
              &cmd,
              false,
@@ -572,7 +950,7 @@ index aad976c..e589133 100644
          ));
          let outer = std::mem::size_of_val(&auto_launch_with(&mut state, Vec::new(), &cmd, false));
          assert!(
-@@ -20894,6 +21128,230 @@ mod tests {
+@@ -20894,6 +21260,415 @@ mod tests {
          );
      }
 
@@ -738,6 +1116,191 @@ index aad976c..e589133 100644
 +
 +    #[cfg(unix)]
 +    #[tokio::test]
++    async fn pipe_managed_ca_input_fails_before_spawn_without_changing_trust() {
++        use std::os::unix::ffi::OsStrExt;
++        use std::os::unix::fs::PermissionsExt;
++        use std::time::{Duration, Instant};
++
++        let (_env, mut state) = isolated_state();
++        let dir = tempfile::tempdir().unwrap();
++        let fifo = dir.path().join("ca.pem");
++        let fifo_name = std::ffi::CString::new(fifo.as_os_str().as_bytes()).unwrap();
++        assert_eq!(unsafe { libc::mkfifo(fifo_name.as_ptr(), 0o600) }, 0);
++        let executable = dir.path().join("chrome");
++        let marker = dir.path().join("spawned");
++        fs::write(
++            &executable,
++            format!("#!/bin/sh\ntouch '{}'\nexec sleep 60\n", marker.display()),
++        )
++        .unwrap();
++        fs::set_permissions(&executable, fs::Permissions::from_mode(0o700)).unwrap();
++        state.settings.set(Key::ExecutablePath, json!(executable));
++        let previous = EffectiveCaCert {
++            path: "/previous-ca.pem".into(),
++            bundle: crate::ca_bundle::test_bundle(b"previous"),
++        };
++        state.settings.set(Key::CaCert, json!(previous.path));
++        state.effective_ca_cert = Some(previous.clone());
++
++        let started = Instant::now();
++        let response = tokio::time::timeout(
++            Duration::from_secs(3),
++            execute_command(
++                &json!({
++                    "id": "ca-input",
++                    "action": "launch",
++                    "settings": { "ca-cert": fifo },
++                }),
++                &mut state,
++            ),
++        )
++        .await
++        .expect("special CA input blocked the daemon");
++        assert_eq!(response["success"], false, "{response}");
++        assert!(
++            response["error"]
++                .as_str()
++                .is_some_and(|error| error.contains("regular file")),
++            "{response}"
++        );
++        assert!(started.elapsed() < Duration::from_secs(2));
++        assert_eq!(state.settings.get(Key::CaCert), Some(&json!(previous.path)));
++        assert_eq!(
++            state
++                .effective_ca_cert
++                .as_ref()
++                .map(|ca| ca.bundle.digest()),
++            Some(previous.bundle.digest())
++        );
++        assert!(state.browser.is_none());
++        assert!(!marker.exists());
++
++        let expired = Instant::now() - Duration::from_millis(1);
++        let error = handle_launch_with_managed_deadline(
++            &json!({ "action": "launch", "caCert": dir.path().join("invalid.pem") }),
++            &mut state,
++            BROWSER_USE_SETUP_DEADLINE,
++            expired,
++        )
++        .await
++        .unwrap_err();
++        assert!(
++            error.contains("timed out while loading CA trust"),
++            "{error}"
++        );
++        assert!(state.browser.is_none());
++        assert!(!marker.exists());
++    }
++
++    #[cfg(unix)]
++    #[tokio::test]
++    async fn pipe_managed_network_error_aborts_without_browser_close() {
++        use std::os::unix::fs::PermissionsExt;
++        use std::time::{Duration, Instant};
++
++        let (_env, mut state) = isolated_state();
++        let dir = tempfile::tempdir().unwrap();
++        let executable = dir.path().join("chrome");
++        fs::write(
++            &executable,
++            r#"#!/bin/sh
++set -eu
++root=$(dirname "$0")
++printf '%s' "$$" > "$root/pid"
++exec perl -e '
++use strict;
++use warnings;
++my $root = shift;
++open my $input, "<&=3" or die $!;
++open my $output, ">&=4" or die $!;
++while (1) {
++    my $frame = "";
++    my $byte;
++    while (sysread($input, $byte, 1)) {
++        last if $byte eq "\0";
++        $frame .= $byte;
++    }
++    last unless length $frame;
++    my ($id) = $frame =~ /"id":(\d+)/;
++    my ($method) = $frame =~ /"method":"([^"]+)"/;
++    die "missing command id or method" unless defined $id && defined $method;
++    if ($method eq "Browser.close") {
++        open my $marker, ">", "$root/browser-close" or die $!;
++        close $marker;
++        sleep 60;
++    }
++    if ($method eq "Target.setAutoAttach" && $frame !~ /"sessionId":/) {
++        open my $marker, ">", "$root/network-error" or die $!;
++        close $marker;
++        my $response = "{\"id\":$id,\"error\":{\"code\":-32000,\"message\":\"network controls rejected\"}}\0";
++        syswrite($output, $response) or die $!;
++        next;
++    }
++    my $result = $method eq "Target.getTargets" ? q({"targetInfos":[]})
++        : $method eq "Target.createTarget" ? q({"targetId":"page-1"})
++        : $method eq "Target.attachToTarget" ? q({"sessionId":"session-1"})
++        : q({});
++    my $response = "{\"id\":$id,\"result\":$result}\0";
++    syswrite($output, $response) or die $!;
++}
++' "$root"
++"#,
++        )
++        .unwrap();
++        fs::set_permissions(&executable, fs::Permissions::from_mode(0o700)).unwrap();
++        state.settings.set(Key::ExecutablePath, json!(executable));
++        state
++            .settings
++            .set(Key::AllowedDomains, json!(["localhost"]));
++        *state.domain_filter.write().await = Some(DomainFilter::new("localhost"));
++
++        let started = Instant::now();
++        let error = tokio::time::timeout(
++            Duration::from_secs(5),
++            launch_browser_from_settings_with_budget(
++                &mut state,
++                Vec::new(),
++                &Value::Null,
++                false,
++                None,
++                Duration::from_secs(7),
++            ),
++        )
++        .await
++        .expect("managed setup error waited for Browser.close")
++        .unwrap_err();
++        assert!(
++            error.contains("Failed to install browser network controls"),
++            "{error}"
++        );
++        assert!(started.elapsed() < Duration::from_secs(5), "{error}");
++        assert!(dir.path().join("network-error").exists());
++        assert!(!dir.path().join("browser-close").exists());
++        assert!(state.browser.is_none());
++        assert!(state.fetch_handler_task.is_none());
++        assert!(state.dialog_handler_task.is_none());
++        assert!(state.event_rx.is_none());
++
++        let pid: i32 = fs::read_to_string(dir.path().join("pid"))
++            .unwrap()
++            .parse()
++            .unwrap();
++        tokio::time::timeout(Duration::from_secs(3), async {
++            while unsafe { libc::kill(pid, 0) } == 0 {
++                tokio::time::sleep(Duration::from_millis(10)).await;
++            }
++        })
++        .await
++        .expect("failed Chrome was not reaped");
++        assert_eq!(unsafe { libc::kill(pid, 0) }, -1);
++        assert_eq!(
++            std::io::Error::last_os_error().raw_os_error(),
++            Some(libc::ESRCH)
++        );
++    }
++
++    #[cfg(unix)]
++    #[tokio::test]
 +    async fn pipe_managed_flow_capture_timeout_reaps_chrome() {
 +        assert_pipe_managed_post_launch_timeout(true).await;
 +    }
@@ -803,7 +1366,7 @@ index aad976c..e589133 100644
      #[tokio::test]
      async fn test_a_confirmed_launch_keeps_the_allowed_domains_it_was_parked_with() {
          let (_env, mut state) = isolated_state();
-@@ -21351,15 +21809,10 @@ printf '%s' '{"protocol":"agent-browser.plugin.v1","success":true,"data":{}}'
+@@ -21351,15 +22126,10 @@ printf '%s' '{"protocol":"agent-browser.plugin.v1","success":true,"data":{}}'
      #[tokio::test]
      #[ignore = "requires Chrome"]
      async fn e2e_browser_use_owned_connection_preserves_plain_command_state() {
@@ -3184,7 +3747,7 @@ index bf572f9..6fbb988 100644
                  temp_nss_home: None,
                  #[cfg(unix)]
 diff --git a/cli/src/native/cdp/client.rs b/cli/src/native/cdp/client.rs
-index f06379b..4fd2b0e 100644
+index f06379b..f6ac0b3 100644
 --- a/cli/src/native/cdp/client.rs
 +++ b/cli/src/native/cdp/client.rs
 @@ -1,4 +1,5 @@
@@ -3501,7 +4064,7 @@ index f06379b..4fd2b0e 100644
                  // Broadcast raw message for inspect proxy subscribers before typed parse,
                  // so messages with negative IDs (used by the inspect proxy) are still delivered.
                  if raw_tx_clone.receiver_count() > 0 {
-@@ -630,39 +799,48 @@ impl CdpClient {
+@@ -630,39 +799,50 @@ impl CdpClient {
              // Reader loop exited (connection closed or error). Drop all pending
              // command senders so callers get an immediate channel-closed error
              // instead of waiting for the 30-second timeout.
@@ -3514,7 +4077,9 @@ index f06379b..4fd2b0e 100644
              let _ = reader_cancel_tx.send(true);
 +            if !already_closed && !reader_close_expected.load(Ordering::SeqCst) {
 +                if let Some(handler) = reader_pipe_failure_handler {
-+                    let _ = tokio::task::spawn_blocking(move || handler()).await;
++                    // Reaping Chrome may wait on the OS. The transport is
++                    // already closed and callers must be released promptly.
++                    let _ = tokio::task::spawn_blocking(move || handler());
 +                }
 +            }
          });
@@ -3568,7 +4133,7 @@ index f06379b..4fd2b0e 100644
              socket,
              closed,
              close_complete: AtomicBool::new(false),
-@@ -674,11 +852,11 @@ impl CdpClient {
+@@ -674,11 +854,11 @@ impl CdpClient {
              event_tx,
              raw_tx,
              reader_handle: Mutex::new(Some(reader_handle)),
@@ -3582,7 +4147,7 @@ index f06379b..4fd2b0e 100644
      }
 
      /// Refuse a command to a session Chrome already reported detached.
-@@ -716,6 +894,23 @@ impl CdpClient {
+@@ -716,6 +896,31 @@ impl CdpClient {
          }
      }
 
@@ -3590,23 +4155,31 @@ index f06379b..4fd2b0e 100644
 +        self.pipe_close_expected.store(true, Ordering::SeqCst);
 +    }
 +
-+    async fn mark_transport_failed(&self) {
-+        let already_closed = self.closed.swap(true, Ordering::SeqCst);
-+        self.pending.lock().await.clear();
-+        self.raw_pending.lock().await.clear();
++    /// Claim the first write failure while the transport lock is still held,
++    /// so another writer cannot slip a frame through before it sees `closed`.
++    fn claim_transport_failure(&self) -> bool {
++        !self.closed.swap(true, Ordering::SeqCst)
++    }
++
++    async fn finish_transport_failure(&self, first_failure: bool) {
 +        let _ = self.cancel_tx.send(true);
-+        if !already_closed {
++        if first_failure {
 +            if let Some(handler) = &self.pipe_failure_handler {
 +                let handler = handler.clone();
-+                let _ = tokio::task::spawn_blocking(move || handler()).await;
++                // Child kill/reap can be slow. It must not hold the writer
++                // mutex or the failed command while it runs. Schedule it
++                // before any await so caller cancellation cannot lose it.
++                let _ = tokio::task::spawn_blocking(move || handler());
 +            }
 +        }
++        self.pending.lock().await.clear();
++        self.raw_pending.lock().await.clear();
 +    }
 +
      async fn abort_task(handle: &Mutex<Option<JoinHandle<()>>>) {
          let Some(task) = handle.lock().await.take() else {
              return;
-@@ -735,12 +930,14 @@ impl CdpClient {
+@@ -735,12 +940,14 @@ impl CdpClient {
          Self::abort_task(&self.keepalive_handle).await;
 
          let _ = tokio::time::timeout(TRANSPORT_CLOSE_TIMEOUT, async {
@@ -3624,27 +4197,38 @@ index f06379b..4fd2b0e 100644
          Self::abort_task(&self.reader_handle).await;
          self.pending.lock().await.clear();
          self.raw_pending.lock().await.clear();
-@@ -776,7 +973,7 @@ impl CdpClient {
+@@ -775,8 +982,8 @@ impl CdpClient {
+             done: false,
          };
 
-         {
+-        {
 -            let mut ws_tx = self.ws_tx.lock().await;
++        let (write_result, first_failure) = {
 +            let mut transport = self.transport_tx.lock().await;
              self.ensure_open()?;
              let mut pending = self.pending.lock().await;
              if let Err(error) = self.ensure_session_attached(method, cmd.session_id.as_deref()) {
-@@ -791,8 +988,8 @@ impl CdpClient {
+@@ -791,11 +998,14 @@ impl CdpClient {
                  },
              );
              drop(pending);
 -            if let Err(error) = ws_tx.send(Message::Text(json)).await {
 -                self.pending.lock().await.remove(&id);
-+            if let Err(error) = transport.send_text(json).await {
-+                self.mark_transport_failed().await;
-                 guard.done = true;
-                 return Err(format!("Failed to send CDP command: {}", error));
-             }
-@@ -872,7 +1069,7 @@ impl CdpClient {
+-                guard.done = true;
+-                return Err(format!("Failed to send CDP command: {}", error));
+-            }
++            let result = transport.send_text(json).await;
++            let first_failure = result.is_err() && self.claim_transport_failure();
++            (result, first_failure)
++        };
++        if let Err(error) = write_result {
++            self.finish_transport_failure(first_failure).await;
++            guard.done = true;
++            return Err(format!("Failed to send CDP command: {}", error));
+         }
+
+         let response = match tokio::time::timeout(std::time::Duration::from_secs(30), rx).await {
+@@ -872,7 +1082,7 @@ impl CdpClient {
      /// Contains only what's needed to forward messages bidirectionally.
      pub fn inspect_handle(&self) -> InspectProxyHandle {
          InspectProxyHandle {
@@ -3653,39 +4237,56 @@ index f06379b..4fd2b0e 100644
              raw_tx: self.raw_tx.clone(),
              closed: self.closed.clone(),
          }
-@@ -936,7 +1133,7 @@ impl CdpClient {
+@@ -935,8 +1145,8 @@ impl CdpClient {
+             done: false,
          };
 
-         {
+-        {
 -            let mut ws_tx = self.ws_tx.lock().await;
++        let (write_result, first_failure) = {
 +            let mut transport = self.transport_tx.lock().await;
              self.ensure_open()?;
              let mut raw_pending = self.raw_pending.lock().await;
              if let Err(error) = self.ensure_session_attached(method, cmd.session_id.as_deref()) {
-@@ -951,8 +1148,8 @@ impl CdpClient {
+@@ -951,11 +1161,14 @@ impl CdpClient {
                  },
              );
              drop(raw_pending);
 -            if let Err(error) = ws_tx.send(Message::Text(json)).await {
 -                self.raw_pending.lock().await.remove(&id);
-+            if let Err(error) = transport.send_text(json).await {
-+                self.mark_transport_failed().await;
-                 guard.done = true;
-                 return Err(format!("Failed to send CDP command: {}", error));
-             }
-@@ -1018,23 +1215,25 @@ impl CdpClient {
+-                guard.done = true;
+-                return Err(format!("Failed to send CDP command: {}", error));
+-            }
++            let result = transport.send_text(json).await;
++            let first_failure = result.is_err() && self.claim_transport_failure();
++            (result, first_failure)
++        };
++        if let Err(error) = write_result {
++            self.finish_transport_failure(first_failure).await;
++            guard.done = true;
++            return Err(format!("Failed to send CDP command: {}", error));
+         }
+
+         let text = match tokio::time::timeout(std::time::Duration::from_secs(30), rx).await {
+@@ -1018,23 +1231,35 @@ impl CdpClient {
          let json = serde_json::to_string(&cmd)
              .map_err(|e| format!("Failed to serialize CDP command: {}", e))?;
 
 -        let mut ws_tx = self.ws_tx.lock().await;
-+        let mut transport = self.transport_tx.lock().await;
-         self.ensure_open()?;
+-        self.ensure_open()?;
 -        ws_tx
 -            .send(Message::Text(json))
 -            .await
 -            .map_err(|e| format!("Failed to send CDP command: {}", e))
-+        if let Err(error) = transport.send_text(json).await {
-+            self.mark_transport_failed().await;
++        let (write_result, first_failure) = {
++            let mut transport = self.transport_tx.lock().await;
++            self.ensure_open()?;
++            let result = transport.send_text(json).await;
++            let first_failure = result.is_err() && self.claim_transport_failure();
++            (result, first_failure)
++        };
++        if let Err(error) = write_result {
++            self.finish_transport_failure(first_failure).await;
 +            return Err(format!("Failed to send CDP command: {}", error));
 +        }
 +        Ok(())
@@ -3695,21 +4296,27 @@ index f06379b..4fd2b0e 100644
      /// Used by the inspect proxy to forward DevTools frontend messages.
      pub async fn send_raw(&self, json: String) -> Result<(), String> {
 -        let mut ws_tx = self.ws_tx.lock().await;
-+        let mut transport = self.transport_tx.lock().await;
-         self.ensure_open()?;
+-        self.ensure_open()?;
 -        ws_tx
 -            .send(Message::Text(json))
 -            .await
 -            .map_err(|e| format!("Failed to send raw CDP message: {}", e))
-+        if let Err(error) = transport.send_text(json).await {
-+            self.mark_transport_failed().await;
++        let (write_result, first_failure) = {
++            let mut transport = self.transport_tx.lock().await;
++            self.ensure_open()?;
++            let result = transport.send_text(json).await;
++            let first_failure = result.is_err() && self.claim_transport_failure();
++            (result, first_failure)
++        };
++        if let Err(error) = write_result {
++            self.finish_transport_failure(first_failure).await;
 +            return Err(format!("Failed to send raw CDP message: {}", error));
 +        }
 +        Ok(())
      }
 
      /// Test-only: count of in-flight commands still awaiting a response, so a
-@@ -1055,19 +1254,19 @@ impl CdpClient {
+@@ -1055,19 +1280,19 @@ impl CdpClient {
  /// Lightweight handle for the inspect WebSocket proxy, holding only
  /// the cloneable parts of CdpClient needed for bidirectional message forwarding.
  pub struct InspectProxyHandle {
@@ -3733,7 +4340,7 @@ index f06379b..4fd2b0e 100644
              .await
              .map_err(|e| format!("Failed to send raw CDP message: {}", e))
      }
-@@ -1123,6 +1322,193 @@ mod tests {
+@@ -1123,6 +1348,315 @@ mod tests {
      const TEST_CERT_DER: &str = "MIIBPDCB46ADAgECAgkA9xwXmIhbzQIwCgYIKoZIzj0EAwIwFDESMBAGA1UEAwwJbG9jYWxob3N0MB4XDTI2MDgzMDA1NTU0NFoXDTM2MDgyNzA1NTU0NFowFDESMBAGA1UEAwwJbG9jYWxob3N0MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEQdmPO0sXXFRmVn7+8MViXGom2rYy8aV3Oc0pNZhUmFGaPl4MRFzc1G0yaV/WRBPF/BUh2LGsXCvUsn7NqaYkFaMeMBwwGgYDVR0RBBMwEYIJbG9jYWxob3N0hwR/AAABMAoGCCqGSM49BAMCA0gAMEUCIQC32oureGNAupABEmonQPAQBD7OdJjXmUxoVQNr0UB+6AIgb23GMwxTjwHyLG4tZcJST7r3cCW8K/Y+1h618j2f+Uw=";
      const TEST_KEY_DER: &str = "MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgIVZST8Vhc5f3OW+4kF78f8o1nQCRwjW/Yo8CXQ35Y9uhRANCAARB2Y87SxdcVGZWfv7wxWJcaibatjLxpXc5zSk1mFSYUZo+XgxEXNzUbTJpX9ZEE8X8FSHYsaxcK9Syfs2ppiQV";
 
@@ -3847,6 +4454,122 @@ index f06379b..4fd2b0e 100644
 +
 +    #[cfg(unix)]
 +    #[tokio::test]
++    async fn pipe_slow_failure_handler_does_not_hold_command_or_transport() {
++        use std::os::fd::{FromRawFd, IntoRawFd};
++        use std::os::unix::net::UnixStream;
++        use std::sync::atomic::AtomicUsize;
++        use std::sync::{Condvar, Mutex as StdMutex};
++
++        #[derive(Clone, Copy, Debug)]
++        enum WritePath {
++            Command,
++            RawCommand,
++            NoWait,
++            RawMessage,
++        }
++
++        for path in [
++            WritePath::Command,
++            WritePath::RawCommand,
++            WritePath::NoWait,
++            WritePath::RawMessage,
++        ] {
++            let (child_reader, parent_writer) = UnixStream::pair().unwrap();
++            let (parent_reader, _child_writer) = UnixStream::pair().unwrap();
++            drop(child_reader);
++            let reader = unsafe { File::from_raw_fd(parent_reader.into_raw_fd()) };
++            let writer = unsafe { File::from_raw_fd(parent_writer.into_raw_fd()) };
++
++            let started = Arc::new(AtomicUsize::new(0));
++            let finished = Arc::new(AtomicUsize::new(0));
++            let release = Arc::new((StdMutex::new(false), Condvar::new()));
++            let callback: PipeFailureHandler = {
++                let started = started.clone();
++                let finished = finished.clone();
++                let release = release.clone();
++                Arc::new(move || {
++                    started.fetch_add(1, Ordering::SeqCst);
++                    let (lock, wake) = &*release;
++                    let mut released = lock.lock().unwrap();
++                    while !*released {
++                        released = wake.wait(released).unwrap();
++                    }
++                    finished.fetch_add(1, Ordering::SeqCst);
++                })
++            };
++            let client = Arc::new(CdpClient::connect_pipe(reader, writer, Some(callback)));
++            let writer_client = client.clone();
++            let mut first = tokio::spawn(async move {
++                match path {
++                    WritePath::Command => writer_client
++                        .send_command_no_params("Browser.getVersion", None)
++                        .await
++                        .map(|_| ()),
++                    WritePath::RawCommand => {
++                        let params = json!({});
++                        writer_client
++                            .send_command_typed_raw::<_, Value>("Browser.getVersion", &params, None)
++                            .await
++                            .map(|_| ())
++                    }
++                    WritePath::NoWait => {
++                        writer_client
++                            .send_command_no_wait("Browser.getVersion", None, None)
++                            .await
++                    }
++                    WritePath::RawMessage => writer_client.send_raw("{}".to_string()).await,
++                }
++            });
++
++            let started_result = tokio::time::timeout(Duration::from_secs(2), async {
++                while started.load(Ordering::SeqCst) == 0 {
++                    tokio::task::yield_now().await;
++                }
++            })
++            .await;
++
++            let first_result = tokio::time::timeout(Duration::from_secs(1), &mut first).await;
++            let next_result = tokio::time::timeout(
++                Duration::from_secs(1),
++                client.send_command_no_params("Browser.getVersion", None),
++            )
++            .await;
++            let close_result = tokio::time::timeout(Duration::from_secs(2), client.close()).await;
++            let finished_while_blocked = finished.load(Ordering::SeqCst);
++
++            let (lock, wake) = &*release;
++            *lock.lock().unwrap() = true;
++            wake.notify_all();
++
++            started_result.expect("write failure must start Chrome cleanup");
++            assert_eq!(finished_while_blocked, 0, "{path:?}");
++            let error = first_result
++                .unwrap_or_else(|_| panic!("{path:?} waited for Chrome cleanup"))
++                .unwrap()
++                .unwrap_err();
++            assert!(error.contains("Failed to send"), "{path:?}: {error}");
++            assert_eq!(
++                next_result
++                    .unwrap_or_else(|_| panic!("{path:?} held the transport lock"))
++                    .unwrap_err(),
++                CONNECTION_CLOSED_ERROR,
++                "{path:?}"
++            );
++            close_result.expect("close must not wait for Chrome cleanup");
++            tokio::time::timeout(Duration::from_secs(2), async {
++                while finished.load(Ordering::SeqCst) == 0 {
++                    tokio::task::yield_now().await;
++                }
++            })
++            .await
++            .expect("Chrome cleanup must finish after release");
++            assert_eq!(started.load(Ordering::SeqCst), 1, "{path:?}");
++            assert_eq!(finished.load(Ordering::SeqCst), 1, "{path:?}");
++        }
++    }
++
++    #[cfg(unix)]
++    #[tokio::test]
 +    async fn stalled_pipe_write_hits_deadline_and_closes_transport() {
 +        use std::os::fd::{FromRawFd, IntoRawFd};
 +        use std::os::unix::net::UnixStream;
@@ -3871,7 +4594,13 @@ index f06379b..4fd2b0e 100644
 +        .expect("stalled write must reach its deadline")
 +        .unwrap_err();
 +        assert!(error.contains("CDP pipe write timed out"), "{error}");
-+        assert!(failed.load(Ordering::SeqCst));
++        tokio::time::timeout(Duration::from_secs(2), async {
++            while !failed.load(Ordering::SeqCst) {
++                tokio::task::yield_now().await;
++            }
++        })
++        .await
++        .expect("failed pipe must schedule Chrome cleanup");
 +        assert_eq!(
 +            client
 +                .send_command_no_params("Browser.getVersion", None)
@@ -3927,7 +4656,7 @@ index f06379b..4fd2b0e 100644
      #[test]
      fn repairs_only_unpaired_surrogate_escapes() {
          let msg = r#"{"id":1,"result":{"high":"\ud800","low":"\udfff","pair":"\ud83d\ude00","escaped":"\\ud800","text":"café 中文"}}"#;
-@@ -1888,7 +2274,7 @@ mod tests {
+@@ -1888,7 +2422,7 @@ mod tests {
 
          let client = Arc::new(CdpClient::connect(&url).await.unwrap());
          accepted_rx.await.unwrap();
@@ -4435,6 +5164,22 @@ index 749a5b7..f0db2e2 100644
 
      let url_a = "data:text/html,gone-session-a";
      let url_b = "data:text/html,gone-session-b";
+diff --git a/cli/src/native/stream/http.rs b/cli/src/native/stream/http.rs
+index 0ebfa48..1504b96 100644
+--- a/cli/src/native/stream/http.rs
++++ b/cli/src/native/stream/http.rs
+@@ -72,7 +72,10 @@ fn is_same_origin_read_request(request: &str) -> bool {
+ /// same-origin `Origin` or `Referer`; reads also accept header-less loopback
+ /// clients.
+ fn is_authorized_api_request(method: &str, request: &str) -> bool {
+-    if !crate::codemux_auth::token_matches(request_header_value(request, crate::codemux_auth::HEADER)) {
++    if !crate::codemux_auth::token_matches(request_header_value(
++        request,
++        crate::codemux_auth::HEADER,
++    )) {
+         return false;
+     }
+     if !fetch_site_allows(request) {
 diff --git a/cli/src/output.rs b/cli/src/output.rs
 index 80f0140..4448b53 100644
 --- a/cli/src/output.rs
