@@ -1864,15 +1864,6 @@ pub(crate) async fn dispatch_request_as<R: Runtime>(
             };
 
             let result = match action_kind.as_str() {
-                // Tier 2: coordinate-based CDP tools via stream WebSocket
-                "click_at" | "type_at" | "scroll_at" | "key_press" | "drag" => {
-                    match agent_browser.verified_stream_identity(&cli_session_name).await {
-                        Ok(identity) => crate::stream_input::handle_vision_action(identity, &action_kind, params, &cli_session_name)
-                            .await
-                            .and_then(|result| serde_json::to_value(result).map_err(|error| error.to_string())),
-                        Err(error) => Err(error),
-                    }
-                }
                 "viewport_status" => {
                     match agent_browser.verified_stream_identity(&cli_session_name).await {
                         Ok(identity) => crate::stream_input::get_viewport(identity)
@@ -1881,9 +1872,10 @@ pub(crate) async fn dispatch_request_as<R: Runtime>(
                         Err(error) => Err(error),
                     }
                 }
-                // Tier 3: OS-level kernel input via ydotool
-                "click_os" | "type_os" => {
-                    crate::os_input::handle_os_action(&action_kind, params, &cli_session_name)
+                // Direct stream and OS input share the browser confirmation
+                // lifecycle gate before resolving a port or sending input.
+                "click_at" | "type_at" | "scroll_at" | "key_press" | "drag" | "click_os" | "type_os" => {
+                    agent_browser.run_direct_input_action(&cli_session_name, &action_kind, params)
                         .await
                         .and_then(|result| serde_json::to_value(result).map_err(|error| error.to_string()))
                 }
