@@ -1975,6 +1975,30 @@ fn live_owned_browser_record(session: &str) -> Option<BrowserPidRecord> {
     owned_browser_pid(session, pid)
 }
 
+#[cfg(not(windows))]
+fn retire_exited_provisional_browser_files(session: &str) {
+    if let Some(pid) = read_agent_browser_daemon_pid(session) {
+        if process_exit_confirmed(pid) {
+            // This path rechecks the PID and control endpoint before each
+            // removal, and leaves an inconclusive endpoint untouched.
+            let _ = require_owned_browser_session_for_cleanup(session);
+        }
+    }
+    let Some(record_path) = session_pid_path(session) else { return };
+    let Some(record) = read_browser_pid_record(&record_path) else { return };
+    if !(record.token == browser_owner_token() || previous_app_has_exited(&record))
+        || !process_exit_confirmed(record.pid) {
+        return;
+    }
+    let Some(pid_path) = agent_browser_daemon_pid_path(session) else { return };
+    let Some(dir) = run_dir_for_session(session) else { return };
+    if matches!(std::fs::symlink_metadata(pid_path), Err(error) if error.kind() == std::io::ErrorKind::NotFound)
+        && probe_browser_control_endpoint(session, &dir) == BrowserControlEndpointProbe::Absent
+        && read_browser_pid_record(&record_path).as_ref() == Some(&record) {
+        let _ = std::fs::remove_file(record_path);
+    }
+}
+
 fn shutdown_record_owned_by_this_app(session: &str, removed_pid: Option<u32>) -> Option<BrowserPidRecord> {
     let pid = removed_pid.or_else(|| read_agent_browser_daemon_pid(session))?;
     let record = owned_browser_pid(session, pid)?;
@@ -4426,6 +4450,7 @@ impl AgentBrowserManager {
         }
         let lookup_session = session.to_owned();
         let confirmed_absent = tokio::task::spawn_blocking(move || {
+            retire_exited_provisional_browser_files(&lookup_session);
             let file_absent = |path: Option<PathBuf>| path.is_some_and(|path| {
                 matches!(std::fs::symlink_metadata(path), Err(error) if error.kind() == std::io::ErrorKind::NotFound)
             });
@@ -6324,6 +6349,33 @@ mod tests {
         assert!(manager.sessions.lock().await.get(&session).is_none());
         manager.allocate_port(&session).await.unwrap();
         assert!(!manager.note_action_start(&session, "open").await);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn reaped_daemon_pid_file_allows_provisional_spawn_and_pane_retries() {
+        for (retry, write_record) in [("spawn", false), ("pane", true)] {
+            let session = format!("browser-dead-pid-{retry}-{}", uuid::Uuid::new_v4().simple());
+            let (_temp, mut daemon, record) = browser_identity_fixture(&session, browser_owner_token());
+            let pid_path = agent_browser_daemon_pid_path(&session).unwrap();
+            std::fs::write(&pid_path, record.pid.to_string()).unwrap();
+            if write_record {
+                write_session_pid(&session, &record).unwrap();
+            }
+            let manager = AgentBrowserManager::new();
+            manager.allocate_port(&session).await.unwrap();
+            assert!(!manager.note_action_start(&session, "open").await);
+
+            daemon.kill().unwrap();
+            daemon.wait().unwrap();
+            assert!(process_exit_confirmed(record.pid));
+            manager.settle_provisional_session(&session, &session, None).await;
+            assert!(!pid_path.exists(), "{retry} left a dead daemon PID file");
+            assert!(!session_pid_path(&session).unwrap().exists(), "{retry} left a dead ownership record");
+            assert!(manager.sessions.lock().await.get(&session).is_none(), "{retry} kept the provisional session");
+            manager.allocate_port(&session).await.unwrap();
+            assert!(!manager.note_action_start(&session, "open").await);
+        }
     }
 
     #[cfg(unix)]
