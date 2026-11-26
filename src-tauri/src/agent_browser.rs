@@ -304,6 +304,7 @@ struct PendingBrowserConfirmation {
     upstream_id: Option<String>,
     daemon: Option<BrowserPidRecord>,
     expires_at: Instant,
+    decision_in_flight: bool,
 }
 
 impl PendingBrowserConfirmation {
@@ -327,7 +328,21 @@ impl PendingBrowserConfirmation {
             upstream_id,
             daemon,
             expires_at: Instant::now() + ttl,
+            decision_in_flight: false,
         }
+    }
+
+    fn begin_decision(&mut self, id: &str) -> Result<(Self, String), String> {
+        if self.details.id.as_deref() != Some(id) {
+            return Err("Browser confirmation ID no longer matches this session".into());
+        }
+        if self.decision_in_flight {
+            return Err("Browser confirmation decision is already in progress".into());
+        }
+        let upstream_id = self.upstream_id.clone()
+            .ok_or("Browser confirmation has no daemon ID")?;
+        self.decision_in_flight = true;
+        Ok((self.clone(), upstream_id))
     }
 }
 
@@ -6102,7 +6117,8 @@ impl AgentBrowserManager {
     async fn clear_expired_confirmation(&self, browser_id: &str) {
         let mut sessions = self.sessions.lock().await;
         if let Some(entry) = sessions.get_mut(browser_id) {
-            if entry.pending_confirmation.as_ref().is_some_and(|pending| Instant::now() >= pending.expires_at) {
+            if entry.pending_confirmation.as_ref().is_some_and(|pending|
+                !pending.decision_in_flight && Instant::now() >= pending.expires_at) {
                 entry.confirmation_pending = false;
                 entry.pending_confirmation = None;
             }
@@ -6133,28 +6149,30 @@ impl AgentBrowserManager {
 
     async fn respond_confirmation_locked(&self, browser_id: &str, id: &str, approve: bool) -> Result<Option<BrowserPendingConfirmation>, String> {
         let session = session_name(browser_id).to_owned();
-        self.clear_expired_confirmation(browser_id).await;
-        let (port, pending) = {
-            let sessions = self.sessions.lock().await;
-            let entry = sessions.get(browser_id).ok_or("Browser session has no pending confirmation")?;
-            let pending = entry.pending_confirmation.clone().ok_or("Browser session has no pending confirmation")?;
-            (entry.port, pending)
+        let (port, pending, upstream_id) = {
+            let mut sessions = self.sessions.lock().await;
+            let entry = sessions.get_mut(browser_id).ok_or("Browser session has no pending confirmation")?;
+            if entry.pending_confirmation.as_ref().is_some_and(|pending|
+                !pending.decision_in_flight && Instant::now() >= pending.expires_at) {
+                entry.confirmation_pending = false;
+                entry.pending_confirmation = None;
+            }
+            let pending = entry.pending_confirmation.as_mut().ok_or("Browser session has no pending confirmation")?;
+            let (pending, upstream_id) = pending.begin_decision(id)?;
+            (entry.port, pending, upstream_id)
         };
-        if pending.details.id.as_deref() != Some(id) {
-            return Err("Browser confirmation ID no longer matches this session".into());
-        }
-        let upstream_id = pending.upstream_id.clone()
-            .ok_or("Browser confirmation has no daemon ID")?;
         let pending_for_command = pending.clone();
         let session_for_command = session.clone();
         let result = tokio::task::spawn_blocking(move || {
             run_browser_confirmation_decision(&session_for_command, port, &pending_for_command, &upstream_id, approve)
-        }).await.map_err(|error| format!("Browser confirmation task failed: {error}"))?;
+        }).await.map_err(|error| format!("Browser confirmation task failed: {error}"))
+            .and_then(|result| result);
         let mut sessions = self.sessions.lock().await;
         let entry = sessions.get_mut(browser_id).ok_or("Browser session closed during confirmation")?;
         if entry.pending_confirmation.as_ref().is_none_or(|current| current.daemon != pending.daemon || current.details.id.as_deref() != Some(id)) {
             return Err("Browser confirmation changed while it was processed".into());
         }
+        entry.pending_confirmation.as_mut().unwrap().decision_in_flight = false;
         let (record, decision) = result?;
         Self::finish_confirmation_decision(entry, &session, record, decision)
     }
@@ -11773,6 +11791,7 @@ mod tests {
         let entry = sessions.get(&session).unwrap();
         assert!(entry.confirmation_pending);
         assert_eq!(entry.pending_confirmation.as_ref().unwrap().details.id.as_deref(), Some(host_id.as_str()));
+        assert!(!entry.pending_confirmation.as_ref().unwrap().decision_in_flight);
         drop(sessions);
 
         daemon.kill().unwrap();
@@ -11875,6 +11894,55 @@ mod tests {
             ).unwrap().is_none());
         }
         assert!(manager.pending_confirmation(&session).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn in_flight_decision_survives_expiry_poll_and_publishes_follow_up() {
+        let manager = AgentBrowserManager::new();
+        let session = format!("browser-in-flight-confirm-{}", uuid::Uuid::new_v4().simple());
+        manager.allocate_port(&session).await.unwrap();
+        let pid = std::process::id();
+        let start_time = process_start_time(pid).unwrap();
+        let record = BrowserPidRecord {
+            pid,
+            start_time,
+            token: browser_owner_token().into(),
+            owner_pid: pid,
+            owner_start_time: start_time,
+            native_start: true,
+        };
+        {
+            let mut sessions = manager.sessions.lock().await;
+            let entry = sessions.get_mut(&session).unwrap();
+            entry.running = true;
+            entry.confirmation_pending = true;
+            entry.pending_confirmation = Some(PendingBrowserConfirmation::new(
+                BrowserConfirmationDetails { id: Some("c_reused".into()), description: "Approve navigation".into() },
+                Some(record.clone()),
+            ));
+        }
+        let first_id = manager.pending_confirmation(&session).await.unwrap().unwrap().id.unwrap();
+        {
+            let mut sessions = manager.sessions.lock().await;
+            let pending = sessions.get_mut(&session).unwrap().pending_confirmation.as_mut().unwrap();
+            let (started, upstream_id) = pending.begin_decision(&first_id).unwrap();
+            assert_eq!(upstream_id, "c_reused");
+            assert!(started.decision_in_flight);
+            pending.expires_at = Instant::now() - Duration::from_millis(1);
+        }
+        assert_eq!(manager.pending_confirmation(&session).await.unwrap().unwrap().id.as_deref(), Some(first_id.as_str()));
+        let next = {
+            let mut sessions = manager.sessions.lock().await;
+            let entry = sessions.get_mut(&session).unwrap();
+            entry.pending_confirmation.as_mut().unwrap().decision_in_flight = false;
+            AgentBrowserManager::finish_confirmation_decision(entry, record,
+                BrowserConfirmationResponse::FollowUp(BrowserConfirmationDetails {
+                    id: Some("c_reused".into()), description: "Approve plugin action".into(),
+                })).unwrap().unwrap()
+        };
+        assert_ne!(next.id.as_deref(), Some(first_id.as_str()));
+        assert_eq!(manager.pending_confirmation(&session).await.unwrap().unwrap().id, next.id);
+        assert!(manager.respond_confirmation_locked(&session, &first_id, true).await.unwrap_err().contains("no longer matches"));
     }
 
     #[tokio::test]

@@ -264,6 +264,10 @@ async fn bridge_http<R: Runtime>(
     let Some(target) = verified_target(state, token, headers).await else {
         return StatusCode::FORBIDDEN.into_response();
     };
+    let Some(authorization) = state.app.state::<AgentBrowserManager>()
+        .subscribe_active_stream(target.identity).await else {
+        return StatusCode::FORBIDDEN.into_response();
+    };
     let mut daemon_headers = HeaderMap::new();
     if method == Method::POST {
         daemon_headers.insert(
@@ -273,6 +277,7 @@ async fn bridge_http<R: Runtime>(
     }
     match crate::web_remote::proxy::forward(
         target.identity,
+        authorization,
         method,
         rest,
         None,
@@ -359,6 +364,42 @@ mod tests {
             assert!(matches!(denied, tokio_tungstenite::tungstenite::Error::Http(response)
                 if response.status() == StatusCode::FORBIDDEN));
         }).await.expect("approval must revoke existing and new desktop bridges");
+    }
+
+    #[tokio::test]
+    async fn pending_approval_cancels_desktop_http_during_peer_verification() {
+        use tokio::io::AsyncReadExt;
+
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            let app = tauri::test::mock_app();
+            let manager = AgentBrowserManager::new();
+            app.manage(manager.clone());
+            let daemon = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let port = daemon.local_addr().unwrap().port();
+            manager.allow_test_stream_session("browser-http-pending", port).await;
+            let bridge = BrowserStreamBridge::default();
+            let endpoints = bridge.endpoints(app.handle().clone(), &manager, "browser-http-pending".into()).await.unwrap();
+            let base = url::Url::parse(&endpoints.http_base).unwrap();
+            let token = base.path().trim_start_matches('/').to_owned();
+            let bridge_port = base.port().unwrap();
+            let state = RouterState { app: app.handle().clone(), targets: bridge.targets.clone(), port: bridge_port };
+            let mut headers = HeaderMap::new();
+            headers.insert(header::HOST, format!("127.0.0.1:{bridge_port}").parse().unwrap());
+            headers.insert(header::ORIGIN, HeaderValue::from_static("tauri://localhost"));
+            let request = tokio::spawn(async move {
+                bridge_http(&state, &token, &headers, &Method::POST, "command", br#"{"action":"stream_status"}"#).await
+            });
+
+            let (mut stream, _) = daemon.accept().await.unwrap();
+            // The single-thread test executor parks approval before the
+            // verifier can resume the forwarding task after accept.
+            manager.park_test_stream_confirmation("browser-http-pending").await;
+            let mut byte = [0; 1];
+            let received = tokio::time::timeout(std::time::Duration::from_secs(2), stream.read(&mut byte))
+                .await.unwrap().unwrap();
+            assert_eq!(received, 0, "revoked desktop HTTP request reached the daemon");
+            assert_eq!(request.await.unwrap().status(), StatusCode::BAD_GATEWAY);
+        }).await.expect("desktop HTTP must stop while its peer is being verified");
     }
 
     #[test]
