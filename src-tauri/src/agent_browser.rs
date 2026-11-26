@@ -5104,17 +5104,26 @@ impl AgentBrowserManager {
         #[cfg(not(target_os = "macos"))]
         let had_session = removed.is_some();
         #[cfg(target_os = "macos")]
-        let closing_files = removed.as_ref().and_then(|removed| {
-            let dir = run_dir_for_session(&session)?;
-            let (_, record) = session_pid_record(&session)?;
-            if record.token != browser_owner_token()
-                || removed.pid.is_some_and(|pid| pid != record.pid)
-            {
-                return None;
-            }
-            let files = capture_closed_browser_files(&dir, &session, &record)?;
-            Some((dir, record, files))
-        });
+        let closing_files = if let Some(removed) = removed.as_ref() {
+            let session = session.clone();
+            let removed_pid = removed.pid;
+            tokio::task::spawn_blocking(move || {
+                let dir = run_dir_for_session(&session)?;
+                let (_, record) = session_pid_record(&session)?;
+                if record.token != browser_owner_token()
+                    || removed_pid.is_some_and(|pid| pid != record.pid)
+                {
+                    return None;
+                }
+                let files = capture_closed_browser_files(&dir, &session, &record)?;
+                Some((dir, record, files))
+            })
+            .await
+            .ok()
+            .flatten()
+        } else {
+            None
+        };
 
         // Steps 2–3 spawn external processes for a verified daemon. They are compiled
         // out of unit-test builds: the close() tests assert session-map and
@@ -5152,12 +5161,18 @@ impl AgentBrowserManager {
         // process-exit sweep can retry stopping the same daemon.
         #[cfg(not(target_os = "macos"))]
         {
-        let owned_daemon_still_running = read_agent_browser_daemon_pid(&session)
-            .and_then(|pid| owned_browser_pid(&session, pid))
-            .is_some_and(|record| browser_process_matches(&record, &session));
-        if (had_session || had_failed_attempts) && !owned_daemon_still_running {
-            clear_session_pid(&session);
-        }
+            if had_session || had_failed_attempts {
+                let session = session.clone();
+                let _ = tokio::task::spawn_blocking(move || {
+                    let owned_daemon_still_running = read_agent_browser_daemon_pid(&session)
+                        .and_then(|pid| owned_browser_pid(&session, pid))
+                        .is_some_and(|record| browser_process_matches(&record, &session));
+                    if !owned_daemon_still_running {
+                        clear_session_pid(&session);
+                    }
+                })
+                .await;
+            }
         }
         // A daemon can exit between the first ownership check and the peer
         // close. Retire only the files captured before teardown, and keep
@@ -5165,10 +5180,13 @@ impl AgentBrowserManager {
         #[cfg(target_os = "macos")]
         {
             let _ = had_failed_attempts;
-            if let Some((dir, record, files)) = closing_files.as_ref() {
-                let _ = cleanup_closed_browser_files(dir, &session, record, files, || {
-                    macos_browser_process_exited(record)
-                });
+            if let Some((dir, record, files)) = closing_files {
+                let _ = tokio::task::spawn_blocking(move || {
+                    cleanup_closed_browser_files(&dir, &session, &record, &files, || {
+                        macos_browser_process_exited(&record)
+                    })
+                })
+                .await;
             }
         }
 
