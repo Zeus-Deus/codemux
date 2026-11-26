@@ -3852,6 +3852,44 @@ fn classify_completed_preset_verification(
     }
 }
 
+fn classify_preset_noncompleted_outcome(
+    matching_prompt_id: Option<String>,
+    outcome: Option<BrowserActionOutcome>,
+    command_peer_bound: bool,
+) -> Option<(PresetNavigationPhase, BrowserPresetNavigationStatus, Option<String>)> {
+    if let Some(prompt_id) = matching_prompt_id.filter(|_| {
+        command_peer_bound || outcome == Some(BrowserActionOutcome::ConfirmationPending)
+    }) {
+        return Some((PresetNavigationPhase::Pending, BrowserPresetNavigationStatus::Pending, Some(prompt_id)));
+    }
+    if outcome == Some(BrowserActionOutcome::Completed) {
+        return None;
+    }
+    // An unbound Unix CLI may have sent the open to a replacement daemon
+    // before reporting Pending, Failed, or an error. While this session is
+    // tracked, only explicit retry may issue another open after that ambiguity.
+    let phase = if command_peer_bound { PresetNavigationPhase::Failed } else { PresetNavigationPhase::FailedAmbiguous };
+    Some((phase, BrowserPresetNavigationStatus::Failed, None))
+}
+
+fn matching_preset_prompt_id(
+    stream: &StreamSession, attempted: BrowserStreamIdentity, command_peer_bound: bool,
+) -> Option<String> {
+    let tracked = stream.pid.zip(stream.pid_start_time).map(|(pid, start_time)| BrowserStreamIdentity {
+        port: stream.port, pid, start_time, generation: stream.stream_generation,
+    });
+    // Unix CLI dispatch is not peer-bound: a prompt without both observed
+    // daemon identities cannot be attributed to the pre-dispatch process.
+    let tracked_matches = tracked.map_or(command_peer_bound, |current| same_stream_process(current, attempted));
+    (stream.confirmation_pending && stream.port == attempted.port && tracked_matches)
+        .then(|| stream.pending_confirmation.as_ref().filter(|pending| {
+            pending.daemon.as_ref().map_or(command_peer_bound, |daemon| {
+                daemon.pid == attempted.pid && daemon.start_time == attempted.start_time
+            })
+        }).and_then(|pending| pending.details.id.clone()))
+        .flatten()
+}
+
 fn settle_preset_navigation(
     stream: &mut StreamSession,
     attempted: BrowserStreamIdentity,
@@ -6726,25 +6764,20 @@ impl AgentBrowserManager {
             let tracked = stream.pid.zip(stream.pid_start_time).map(|(pid, start_time)| BrowserStreamIdentity {
                 port: stream.port, pid, start_time, generation: stream.stream_generation,
             });
-            let pending = (stream.confirmation_pending && stream.port == identity.port
-                && tracked.is_none_or(|current| same_stream_process(current, identity)))
-                .then(|| stream.pending_confirmation.as_ref().filter(|pending| {
-                    pending.daemon.as_ref().is_none_or(|daemon| {
-                        daemon.pid == identity.pid && daemon.start_time == identity.start_time
-                    })
-                }).map(|pending| pending.details.id.clone()))
-                .flatten();
-            (pending, tracked)
+            (matching_preset_prompt_id(stream, identity, cfg!(target_os = "windows")), tracked)
         });
-        let (phase, response, prompt_id) = if let Some(Some(prompt_id)) = pending_id {
-            (PresetNavigationPhase::Pending, Ok(BrowserPresetNavigationStatus::Pending), Some(prompt_id))
-        } else if result.as_ref().is_ok_and(|(_, outcome)| *outcome == BrowserActionOutcome::Completed) {
+        let outcome = result.as_ref().ok().map(|(_, outcome)| *outcome);
+        let (phase, response, prompt_id) = if let Some((phase, status, prompt_id)) = classify_preset_noncompleted_outcome(
+            pending_id,
+            outcome,
+            cfg!(target_os = "windows"),
+        ) {
+            (phase, Ok(status), prompt_id)
+        } else {
             let (phase, response) = classify_completed_preset_verification(
                 identity, self.verified_stream_identity(browser_id).await, cfg!(target_os = "windows"),
             );
             (phase, response, None)
-        } else {
-            (PresetNavigationPhase::Failed, Ok(BrowserPresetNavigationStatus::Failed), None)
         };
         let mut stored = false;
         if let Some(stream) = self.sessions.lock().await.get_mut(browser_id) {
@@ -9034,6 +9067,148 @@ mod tests {
         assert_eq!(stream.preset_navigation.as_ref().unwrap().phase, PresetNavigationPhase::FailedAmbiguous);
         assert_eq!(begin_preset_navigation(stream, replacement, true), None);
         assert_eq!(stream.preset_navigation.as_ref().unwrap().identity, replacement);
+    }
+
+    #[test]
+    fn unbound_pending_preset_requires_tracked_daemon_and_prompt_record() {
+        let identity = BrowserStreamIdentity { port: 9223, pid: 41, start_time: 100, generation: 1 };
+        let pending = PendingBrowserConfirmation::new(
+            BrowserConfirmationDetails { id: Some("open".into()), description: "Approve open".into() },
+            Some(test_browser_record(identity.pid, identity.start_time, "a".repeat(32))),
+        );
+        let prompt_id = pending.details.id.clone();
+        let mut stream = StreamSession {
+            port: identity.port,
+            running: true,
+            browser_ready: false,
+            confirmation_pending: true,
+            pending_confirmation: Some(pending),
+            pid: Some(identity.pid),
+            pid_start_time: Some(identity.start_time),
+            stream_generation: identity.generation,
+            preset_navigation: None,
+            stream_revocation: watch::channel(0).0,
+            last_seen_at: None,
+        };
+        assert_eq!(matching_preset_prompt_id(&stream, identity, false), prompt_id);
+        assert_eq!(classify_preset_noncompleted_outcome(
+            matching_preset_prompt_id(&stream, identity, false), Some(BrowserActionOutcome::ConfirmationPending), false,
+        ).unwrap().0, PresetNavigationPhase::Pending);
+
+        stream.pid = None;
+        assert_eq!(matching_preset_prompt_id(&stream, identity, false), None);
+        assert_eq!(matching_preset_prompt_id(&stream, identity, true), prompt_id);
+        stream.pid = Some(identity.pid);
+        stream.pending_confirmation.as_mut().unwrap().daemon = None;
+        assert_eq!(matching_preset_prompt_id(&stream, identity, false), None);
+        assert_eq!(matching_preset_prompt_id(&stream, identity, true), prompt_id);
+    }
+
+    #[tokio::test]
+    async fn unbound_pending_preset_on_replacement_does_not_replay_after_approval() {
+        let manager = AgentBrowserManager::new();
+        let session = format!("preset-pending-replacement-{}", uuid::Uuid::new_v4().simple());
+        manager.allow_test_stream_session(&session, 9223).await;
+        let original = manager.verified_stream_identity(&session).await.unwrap();
+        let replacement = BrowserStreamIdentity {
+            pid: original.pid.wrapping_add(1),
+            start_time: original.start_time.wrapping_add(1),
+            generation: original.generation.wrapping_add(1),
+            ..original
+        };
+        let replacement_record = test_browser_record(replacement.pid, replacement.start_time, "a".repeat(32));
+        let pending = PendingBrowserConfirmation::new(
+            BrowserConfirmationDetails { id: Some("replacement-open".into()), description: "Approve open".into() },
+            Some(replacement_record.clone()),
+        );
+        let prompt_id = pending.details.id.clone().unwrap();
+
+        // The pane verified the original, but the unbound Unix CLI selected
+        // the replacement and returned a pending approval for its open.
+        {
+            let mut sessions = manager.sessions.lock().await;
+            let stream = sessions.get_mut(&session).unwrap();
+            assert_eq!(begin_preset_navigation(stream, original, false), None);
+            stream.pid = Some(replacement.pid);
+            stream.pid_start_time = Some(replacement.start_time);
+            stream.stream_generation = replacement.generation;
+            stream.browser_ready = false;
+            stream.confirmation_pending = true;
+            stream.pending_confirmation = Some(pending);
+            assert_eq!(matching_preset_prompt_id(stream, original, false), None);
+            let (phase, status, tracked_prompt_id) = classify_preset_noncompleted_outcome(
+                matching_preset_prompt_id(stream, original, false), Some(BrowserActionOutcome::ConfirmationPending), false,
+            ).unwrap();
+            assert_eq!(phase, PresetNavigationPhase::FailedAmbiguous);
+            assert_eq!(status, BrowserPresetNavigationStatus::Failed);
+            assert_eq!(tracked_prompt_id, None);
+            assert!(settle_preset_navigation(stream, original, Some(replacement), phase, tracked_prompt_id));
+            assert_eq!(stream.preset_navigation.as_ref().unwrap().identity, original);
+        }
+        assert_eq!(classify_preset_noncompleted_outcome(None, Some(BrowserActionOutcome::ConfirmationPending), true).unwrap().0,
+            PresetNavigationPhase::Failed);
+        assert_eq!(classify_preset_noncompleted_outcome(None, Some(BrowserActionOutcome::Completed), true), None);
+        assert_eq!(classify_preset_noncompleted_outcome(None, Some(BrowserActionOutcome::Failed), false).unwrap().0,
+            PresetNavigationPhase::FailedAmbiguous);
+        manager.test_stream_ports.lock().await.insert(original.port, (replacement, watch::channel(0u64).0));
+        assert_eq!(manager.preset_navigation_status(&session).await.unwrap(), Some(BrowserPresetNavigationStatus::ApprovalPending));
+
+        apply_preset_decision_for_test(&manager, &session, &prompt_id, replacement_record, true,
+            BrowserConfirmationResponse::Resolved).await.unwrap();
+        manager.sessions.lock().await.get_mut(&session).unwrap().browser_ready = true;
+        assert_eq!(manager.preset_navigation_status(&session).await.unwrap(), Some(BrowserPresetNavigationStatus::Failed));
+        {
+            let mut sessions = manager.sessions.lock().await;
+            let stream = sessions.get_mut(&session).unwrap();
+            assert_eq!(begin_preset_navigation(stream, replacement, false), Some(BrowserPresetNavigationStatus::Failed));
+            assert_eq!(stream.preset_navigation.as_ref().unwrap().phase, PresetNavigationPhase::FailedAmbiguous);
+        }
+        assert_eq!(manager.ensure_preset_navigation(&session, "https://example.com".into(), false).await.unwrap(),
+            BrowserPresetNavigationStatus::Failed);
+    }
+
+    #[tokio::test]
+    async fn unbound_lost_preset_reply_does_not_replay_on_replacement_reconnect() {
+        let manager = AgentBrowserManager::new();
+        let session = format!("preset-lost-reply-{}", uuid::Uuid::new_v4().simple());
+        manager.allow_test_stream_session(&session, 9223).await;
+        let original = manager.verified_stream_identity(&session).await.unwrap();
+        let replacement = BrowserStreamIdentity {
+            pid: original.pid.wrapping_add(1),
+            start_time: original.start_time.wrapping_add(1),
+            generation: original.generation.wrapping_add(1),
+            ..original
+        };
+
+        // The unbound CLI may have sent the open to the replacement before
+        // timing out. No pending prompt or command reply reached the manager.
+        let (phase, status, prompt_id) = classify_preset_noncompleted_outcome(None, None, false).unwrap();
+        assert_eq!(phase, PresetNavigationPhase::FailedAmbiguous);
+        assert_eq!(status, BrowserPresetNavigationStatus::Failed);
+        assert_eq!(prompt_id, None);
+        assert_eq!(classify_preset_noncompleted_outcome(Some("old-prompt".into()), None, false).unwrap().0,
+            PresetNavigationPhase::FailedAmbiguous);
+        assert_eq!(classify_preset_noncompleted_outcome(Some("old-prompt".into()), None, true).unwrap().0,
+            PresetNavigationPhase::Pending);
+        {
+            let mut sessions = manager.sessions.lock().await;
+            let stream = sessions.get_mut(&session).unwrap();
+            assert_eq!(begin_preset_navigation(stream, original, false), None);
+            stream.pid = Some(replacement.pid);
+            stream.pid_start_time = Some(replacement.start_time);
+            stream.stream_generation = replacement.generation;
+            assert!(settle_preset_navigation(stream, original, Some(replacement), phase, prompt_id));
+            assert_eq!(stream.preset_navigation.as_ref().unwrap().identity, original);
+        }
+        manager.test_stream_ports.lock().await.insert(original.port, (replacement, watch::channel(0u64).0));
+        assert_eq!(manager.preset_navigation_status(&session).await.unwrap(), Some(BrowserPresetNavigationStatus::Failed));
+        {
+            let mut sessions = manager.sessions.lock().await;
+            let stream = sessions.get_mut(&session).unwrap();
+            assert_eq!(begin_preset_navigation(stream, replacement, false), Some(BrowserPresetNavigationStatus::Failed));
+        }
+        assert_eq!(manager.ensure_preset_navigation(&session, "https://example.com".into(), false).await.unwrap(),
+            BrowserPresetNavigationStatus::Failed);
     }
 
     #[tokio::test]

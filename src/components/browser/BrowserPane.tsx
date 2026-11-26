@@ -431,9 +431,9 @@ export const BrowserPane = memo(function BrowserPane({ browserId, focused, visib
         if (String(err).includes("Browser confirmation is pending")) {
           pendingConfirmationRef.current = true;
           const revision = confirmationRevisionRef.current;
-          const presetState = await browserPresetNavigationStatus(streamSessionId).catch(() => null);
+          const presetState = await browserPresetNavigationStatus(streamSessionId).catch(() => undefined);
           if (!active || !paneIsCurrent() || confirmationBusyRef.current || revision !== confirmationRevisionRef.current) return;
-          if (presetState === "completed" || presetState === "failed") {
+          if (presetState === "completed" || presetState === "failed" || presetState === null) {
             // The approval settled while we read its status. A cached preset
             // result may belong to an earlier action; reconnect first.
             pendingConfirmationRef.current = false;
@@ -444,7 +444,7 @@ export const BrowserPane = memo(function BrowserPane({ browserId, focused, visib
             }, 1500);
             return;
           }
-          if (presetState === "pending" || presetState === "approval_pending") {
+          if (presetState === "pending" || presetState === "approval_pending" || presetState === undefined) {
             setPendingPreset({ sessionId: streamSessionId, paneEpoch, kind: presetState === "pending" ? "preset" : "approval" });
           }
           if (!remoteClient) {
@@ -944,10 +944,40 @@ export const BrowserPane = memo(function BrowserPane({ browserId, focused, visib
     } catch (err) {
       if (!paneIsCurrent() || decisionRevision !== confirmationRevisionRef.current) return;
       const message = String(err);
+      const reason = message.replace(/^Error: /, "");
+      const replayFailed = reason.startsWith("Browser action failed after confirmation:");
+      const staleDecision = [
+        "Browser session has no pending confirmation",
+        "Browser confirmation ID no longer matches this session",
+      ].includes(reason);
+      if (replayFailed) {
+        // The backend consumed this prompt before reporting the action error.
+        // A second status read may fail, but must not revive its decision UI.
+        confirmationRevisionRef.current++;
+        pendingConfirmationRef.current = false;
+        visibleConfirmationRef.current = null;
+        setPendingConfirmation(null);
+        setPendingPreset(null);
+        setConfirmationError(null);
+        setStatus("error");
+        setErrorMsg(message);
+        return;
+      }
       try {
         const current = await agentBrowserPendingConfirmation(pending.sessionId);
         if (!paneIsCurrent() || decisionRevision !== confirmationRevisionRef.current) return;
         if (!current) {
+          if (!staleDecision) {
+            confirmationRevisionRef.current++;
+            pendingConfirmationRef.current = false;
+            visibleConfirmationRef.current = null;
+            setPendingConfirmation(null);
+            setPendingPreset(null);
+            setConfirmationError(null);
+            setStatus("error");
+            setErrorMsg(message);
+            return;
+          }
           const presetState = await browserPresetNavigationStatus(pending.sessionId).catch(() => undefined);
           if (!paneIsCurrent() || decisionRevision !== confirmationRevisionRef.current) return;
           if (presetState === "pending" || presetState === "approval_pending") {
