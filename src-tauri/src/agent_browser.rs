@@ -9171,7 +9171,7 @@ mod tests {
 
     #[test]
     fn preset_dispatch_rejects_pre_command_replacement_and_post_command_replacement_is_not_completion() {
-        let identity = BrowserStreamIdentity { port: 9223, pid: 41, start_time: 100, generation: 1 };
+        let identity = BrowserStreamIdentity { port: 9223, pid: 41, start_time: 100, generation: 1, listener_token: [7; 32] };
         let original = test_browser_record(identity.pid, identity.start_time, "a".repeat(32));
         let replacement = test_browser_record(42, 200, "a".repeat(32));
 
