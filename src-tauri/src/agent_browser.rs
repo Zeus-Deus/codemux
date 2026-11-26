@@ -6901,6 +6901,8 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn captured_legacy_cleanup_preserves_replacement_daemon_files() {
+        use std::io::Write;
+
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path();
         let session = format!("legacy-replaced-{}", uuid::Uuid::new_v4().simple());
@@ -6910,7 +6912,10 @@ mod tests {
         let old_pid_path = root.join(format!("{session}.pid"));
         std::fs::write(&old_pid_path, old_pid.to_string()).unwrap();
         let ephemeral = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
-        std::fs::write(root.join(format!("{session}.port")), ephemeral.local_addr().unwrap().port().to_string()).unwrap();
+        let mut port_file = clack_private_fs::create_new_file(&root.join(format!("{session}.port"))).unwrap();
+        write!(port_file, "{}", ephemeral.local_addr().unwrap().port()).unwrap();
+        port_file.sync_all().unwrap();
+        drop(port_file);
         drop(ephemeral);
         for ext in ["engine", "stream"] {
             std::fs::write(root.join(format!("{session}.{ext}")), b"old").unwrap();
