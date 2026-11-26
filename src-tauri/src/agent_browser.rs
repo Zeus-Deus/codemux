@@ -4519,13 +4519,24 @@ impl AgentBrowserManager {
             let file_absent = |path: Option<PathBuf>| path.is_some_and(|path| {
                 matches!(std::fs::symlink_metadata(path), Err(error) if error.kind() == std::io::ErrorKind::NotFound)
             });
+            let Some(dir) = run_dir_for_session(&lookup_session) else { return false };
+            let legacy_safe = legacy_session_pid_path_in(&dir, &lookup_session).is_some_and(|path| {
+                match std::fs::symlink_metadata(&path) {
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => true,
+                    Ok(_) => read_browser_pid_record(&path)
+                        .map_or_else(|| read_daemon_pid_file(&path).is_some(), |record| {
+                            process_exit_confirmed(record.pid)
+                                || (process_start_time(record.pid).is_some_and(|start| start != record.start_time)
+                                    && process_looks_like_agent_browser(record.pid) == Some(false))
+                        }),
+                    Err(_) => false,
+                }
+            });
             live_owned_browser_record(&lookup_session).is_none()
                 && file_absent(agent_browser_daemon_pid_path(&lookup_session))
                 && file_absent(session_pid_path(&lookup_session))
-                && run_dir_for_session(&lookup_session).is_some_and(|dir| {
-                    probe_browser_control_endpoint(&lookup_session, &dir)
-                        == BrowserControlEndpointProbe::Absent
-                })
+                && legacy_safe
+                && probe_browser_control_endpoint(&lookup_session, &dir) == BrowserControlEndpointProbe::Absent
         }).await.unwrap_or(false);
         if confirmed_absent {
             let mut sessions = self.sessions.lock().await;
@@ -6445,6 +6456,52 @@ mod tests {
             manager.allocate_port(&session).await.unwrap();
             assert!(!manager.note_action_start(&session, "open").await);
         }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn legacy_record_blocks_provisional_retry_only_while_its_daemon_may_live() {
+        let session = format!("browser-legacy-retry-{}", uuid::Uuid::new_v4().simple());
+        let (_temp, mut daemon, record) = browser_identity_fixture(&session, browser_owner_token());
+        let dir = run_dir_for_session(&session).unwrap();
+        let legacy = legacy_session_pid_path_in(&dir, &session).unwrap();
+        write_browser_pid_record(&legacy, &record).unwrap();
+        let manager = AgentBrowserManager::new();
+        manager.allocate_port(&session).await.unwrap();
+        assert!(!manager.note_action_start(&session, "open").await);
+
+        manager.settle_provisional_session(&session, &session, None).await;
+        assert!(manager.sessions.lock().await.get(&session).unwrap().running);
+        daemon.kill().unwrap();
+        daemon.wait().unwrap();
+        manager.settle_provisional_session(&session, &session, None).await;
+        assert!(manager.sessions.lock().await.get(&session).is_none());
+        assert!(legacy.exists(), "legacy records are left for coordinated migration");
+        std::fs::remove_file(legacy).unwrap();
+
+        let colliding = format!("browser-numeric-legacy-{}", uuid::Uuid::new_v4().simple());
+        let dir = run_dir_for_session(&colliding).unwrap();
+        let numeric = legacy_session_pid_path_in(&dir, &colliding).unwrap();
+        std::fs::write(&numeric, b"12345\n").unwrap();
+        manager.allocate_port(&colliding).await.unwrap();
+        assert!(!manager.note_action_start(&colliding, "open").await);
+        manager.settle_provisional_session(&colliding, &colliding, None).await;
+        assert!(manager.sessions.lock().await.get(&colliding).is_none());
+        assert_eq!(std::fs::read(&numeric).unwrap(), b"12345\n");
+        std::fs::remove_file(numeric).unwrap();
+
+        let reused = format!("browser-reused-legacy-{}", uuid::Uuid::new_v4().simple());
+        let dir = run_dir_for_session(&reused).unwrap();
+        let legacy = legacy_session_pid_path_in(&dir, &reused).unwrap();
+        let pid = std::process::id();
+        let old = test_browser_record(pid, process_start_time(pid).unwrap() + 1, browser_owner_token().to_owned());
+        write_browser_pid_record(&legacy, &old).unwrap();
+        manager.allocate_port(&reused).await.unwrap();
+        assert!(!manager.note_action_start(&reused, "open").await);
+        manager.settle_provisional_session(&reused, &reused, None).await;
+        assert!(manager.sessions.lock().await.get(&reused).is_none());
+        assert_eq!(read_browser_pid_record(&legacy), Some(old));
+        std::fs::remove_file(legacy).unwrap();
     }
 
     #[cfg(unix)]
