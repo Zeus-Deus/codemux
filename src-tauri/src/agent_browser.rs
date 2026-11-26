@@ -5770,6 +5770,40 @@ mod tests {
         std::fs::remove_file(socket_path).unwrap();
     }
 
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn pane_close_with_saturated_legacy_sockets_keeps_executor_available() {
+        let manager = std::sync::Arc::new(AgentBrowserManager::new());
+        let mut sockets = Vec::new();
+        let mut sessions = Vec::new();
+        for _ in 0..6 {
+            let session = format!("browser-close-probe-{}", uuid::Uuid::new_v4().simple());
+            manager.allocate_port(&session).await.unwrap();
+            let root = browser_run_root_for_session(&session).unwrap();
+            let socket_path = root.join(format!("{session}.sock"));
+            let (listener, clients) = saturated_control_socket(&socket_path);
+            sockets.push((socket_path, listener, clients));
+            sessions.push(session);
+        }
+        let mut closing = Vec::new();
+        for session in sessions {
+            let manager = manager.clone();
+            closing.push(tokio::spawn(async move { manager.close(&session).await }));
+        }
+
+        let started = Instant::now();
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        assert!(started.elapsed() < Duration::from_millis(200), "Pane close probes blocked the async executor");
+        for task in closing {
+            task.await.unwrap().unwrap();
+        }
+        for (socket_path, listener, clients) in sockets {
+            drop(clients);
+            drop(listener);
+            std::fs::remove_file(socket_path).unwrap();
+        }
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn slow_stream_identity_lookup_keeps_executor_available() {
         let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
