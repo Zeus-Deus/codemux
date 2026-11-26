@@ -5047,6 +5047,8 @@ const handlers: Record<string, Handler> = {
   // The mock has no Rust browser bridge, so the pane stays in its
   // connecting/retry state. Use tauri:dev to exercise a live browser stream.
   start_browser_stream: () => "ws://127.0.0.1:9777",
+  ensure_browser_preset_navigation: () => "completed",
+  browser_preset_navigation_status: () => "completed",
   browser_stream_bridge_endpoints: () => ({
     ws_url: "ws://127.0.0.1:9777",
     http_base: "http://127.0.0.1:9777",

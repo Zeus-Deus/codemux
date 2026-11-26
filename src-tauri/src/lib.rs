@@ -3003,6 +3003,8 @@ fn build_core_app<R: tauri::Runtime>(
             commands::agent_browser_close,
             commands::agent_browser_screenshot,
             commands::start_browser_stream,
+            commands::ensure_browser_preset_navigation,
+            commands::browser_preset_navigation_status,
             commands::browser_stream_bridge_endpoints,
             commands::get_browser_data_size,
             commands::clear_browser_cookies,

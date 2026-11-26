@@ -8,6 +8,8 @@ import type { AppStateSnapshot } from "@/tauri/types";
 
 const mocks = vi.hoisted(() => ({
   startBrowserStream: vi.fn(),
+  ensureBrowserPresetNavigation: vi.fn(),
+  browserPresetNavigationStatus: vi.fn(),
   browserStreamBridgeEndpoints: vi.fn(),
   agentBrowserRun: vi.fn(),
   agentBrowserPendingConfirmation: vi.fn(),
@@ -15,16 +17,23 @@ const mocks = vi.hoisted(() => ({
   copyToClipboard: vi.fn(),
   toastSuccess: vi.fn(),
   toastError: vi.fn(),
+  isRemoteClient: vi.fn(),
 }));
 
 vi.mock("@/tauri/commands", () => ({
   startBrowserStream: (...a: unknown[]) => mocks.startBrowserStream(...a),
+  ensureBrowserPresetNavigation: (...a: unknown[]) => mocks.ensureBrowserPresetNavigation(...a),
+  browserPresetNavigationStatus: (...a: unknown[]) => mocks.browserPresetNavigationStatus(...a),
   browserStreamBridgeEndpoints: (...a: unknown[]) => mocks.browserStreamBridgeEndpoints(...a),
   agentBrowserRun: (...a: unknown[]) => mocks.agentBrowserRun(...a),
   agentBrowserPendingConfirmation: (...a: unknown[]) => mocks.agentBrowserPendingConfirmation(...a),
   agentBrowserRespondConfirmation: (...a: unknown[]) => mocks.agentBrowserRespondConfirmation(...a),
   activatePane: vi.fn(),
   writeToPty: vi.fn(),
+}));
+
+vi.mock("@/components/remote/is-remote-client", () => ({
+  isRemoteClient: () => mocks.isRemoteClient(),
 }));
 
 vi.mock("@tauri-apps/plugin-opener", () => ({ openUrl: vi.fn() }));
@@ -71,12 +80,51 @@ class FakeWebSocket {
   }
 }
 
-function renderPane() {
-  return render(<BrowserPane browserId="browser-1" focused={false} visible />);
+function renderPane(browserId = "browser-1") {
+  return render(<BrowserPane browserId={browserId} focused={false} visible />);
+}
+
+function emitFrame() {
+  FakeWebSocket.lastSocket?.onmessage?.({
+    data: JSON.stringify({ type: "frame", data: "", metadata: { deviceWidth: 1280, deviceHeight: 720 } }),
+  });
+}
+
+function setPresetBrowser(browserId: string, url = "https://example.com") {
+  useAppStore.setState({
+    appState: {
+      schema_version: 1,
+      active_workspace_id: "ws-1",
+      workspaces: [],
+      terminal_sessions: [],
+      browser_sessions: [{
+        browser_id: browserId,
+        title: "Example",
+        current_url: url,
+        history: [],
+        history_index: -1,
+        is_loading: false,
+        last_error: null,
+      }],
+      agent_browser_sessions: [],
+      notifications: [],
+      detected_ports: [],
+      pane_statuses: {},
+      persistence: {
+        schema_version: 1,
+        stores_layout_metadata: true,
+        stores_terminal_metadata: true,
+        stores_live_process_state: false,
+      },
+      config: {} as AppStateSnapshot["config"],
+    },
+  });
 }
 
 beforeEach(() => {
   mocks.startBrowserStream.mockReset();
+  mocks.ensureBrowserPresetNavigation.mockReset().mockResolvedValue("completed");
+  mocks.browserPresetNavigationStatus.mockReset().mockResolvedValue(null);
   mocks.browserStreamBridgeEndpoints.mockReset().mockResolvedValue({
     ws_url: "ws://127.0.0.1:9777/private/browser/9999/ws",
     http_base: "http://127.0.0.1:9777/private/browser/9999",
@@ -87,6 +135,7 @@ beforeEach(() => {
   mocks.copyToClipboard.mockReset();
   mocks.toastSuccess.mockReset();
   mocks.toastError.mockReset();
+  mocks.isRemoteClient.mockReset().mockReturnValue(false);
   FakeWebSocket.sent = [];
   FakeWebSocket.urls = [];
   FakeWebSocket.opened = 0;
@@ -176,6 +225,231 @@ describe("BrowserPane start failures", () => {
     expect(mocks.agentBrowserRespondConfirmation).toHaveBeenCalledWith("browser-1", "c_second", true);
   });
 
+  it("reads the backend's cached preset result after approval reconnects or remounts the pane", async () => {
+    setPresetBrowser("browser-1");
+    mocks.startBrowserStream.mockResolvedValue("ws://127.0.0.1:9223");
+    const firstPrompt = {
+      id: "host_first",
+      description: "Approve navigation",
+      expires_at_ms: Date.now() + 60_000,
+    };
+    let backendPending: typeof firstPrompt | null = null;
+    let submitted = 0;
+    mocks.agentBrowserPendingConfirmation.mockImplementation(async () => backendPending);
+    mocks.ensureBrowserPresetNavigation.mockImplementation(async () => {
+      if (submitted === 0) {
+        submitted++;
+        backendPending = firstPrompt;
+        return "pending";
+      }
+      return backendPending ? "pending" : "completed";
+    });
+    mocks.browserPresetNavigationStatus.mockImplementation(async () => backendPending ? "pending" : "completed");
+    mocks.agentBrowserRespondConfirmation.mockImplementation(async () => {
+      backendPending = null;
+      return null;
+    });
+    const pane = renderPane();
+    await vi.waitFor(() => expect(FakeWebSocket.opened).toBe(1));
+    expect(FakeWebSocket.opened).toBe(1);
+    act(emitFrame);
+    await vi.waitFor(() => expect(submitted).toBe(1));
+    await vi.waitFor(() => expect(screen.getByText("Approve navigation")).toBeInTheDocument());
+
+    fireEvent.click(screen.getByRole("button", { name: "Approve browser action" }));
+    await vi.waitFor(() => expect(FakeWebSocket.opened).toBe(2));
+    act(emitFrame);
+    await act(async () => { await new Promise((resolve) => setTimeout(resolve, 350)); });
+    expect(submitted).toBe(1);
+    expect(mocks.agentBrowserRespondConfirmation).toHaveBeenCalledWith("browser-1", "host_first", true);
+
+    pane.unmount();
+    renderPane();
+    await vi.waitFor(() => expect(FakeWebSocket.opened).toBe(3));
+    act(emitFrame);
+    await act(async () => { await new Promise((resolve) => setTimeout(resolve, 350)); });
+    expect(submitted).toBe(1);
+    expect(mocks.ensureBrowserPresetNavigation).toHaveBeenCalledWith("browser-1", "https://example.com", false);
+  });
+
+  it("keeps a failed preset visible through later frames and retries only on request", async () => {
+    const browserId = "browser-preset-failure";
+    setPresetBrowser(browserId);
+    mocks.startBrowserStream.mockResolvedValue("ws://127.0.0.1:9223");
+    mocks.ensureBrowserPresetNavigation.mockResolvedValueOnce("failed").mockResolvedValue("completed");
+
+    renderPane(browserId);
+    await vi.waitFor(() => expect(FakeWebSocket.opened).toBe(1));
+    act(emitFrame);
+    await vi.waitFor(() => expect(screen.getByText("Preset navigation did not complete. Check the page, then retry if needed.")).toBeInTheDocument());
+    act(emitFrame);
+    expect(screen.getByText("Preset navigation did not complete. Check the page, then retry if needed.")).toBeInTheDocument();
+    expect(mocks.ensureBrowserPresetNavigation).toHaveBeenCalledTimes(1);
+
+    fireEvent.click(screen.getByRole("button", { name: "Retry now" }));
+    await vi.waitFor(() => expect(FakeWebSocket.opened).toBe(2));
+    act(emitFrame);
+    await vi.waitFor(() => expect(mocks.ensureBrowserPresetNavigation).toHaveBeenCalledTimes(2));
+    expect(mocks.ensureBrowserPresetNavigation).toHaveBeenLastCalledWith(browserId, "https://example.com", true);
+  });
+
+  it("waits for host approval on a remote pane without reading host-only prompt details", async () => {
+    const browserId = "browser-remote-preset";
+    setPresetBrowser(browserId);
+    mocks.isRemoteClient.mockReturnValue(true);
+    mocks.startBrowserStream.mockResolvedValue("ws://127.0.0.1:9223");
+    mocks.ensureBrowserPresetNavigation.mockResolvedValueOnce("pending").mockResolvedValue("completed");
+    let presetStatus = "pending";
+    mocks.browserPresetNavigationStatus.mockImplementation(async () => presetStatus);
+
+    renderPane(browserId);
+    await vi.waitFor(() => expect(FakeWebSocket.opened).toBe(1));
+    act(emitFrame);
+    await vi.waitFor(() => expect(screen.getByText("Browser approval is waiting on the host device.")).toBeInTheDocument());
+    expect(mocks.agentBrowserPendingConfirmation).not.toHaveBeenCalled();
+    expect(mocks.browserStreamBridgeEndpoints).not.toHaveBeenCalled();
+
+    presetStatus = "completed";
+    await vi.waitFor(() => expect(FakeWebSocket.opened).toBe(2), { timeout: 3500 });
+    act(emitFrame);
+    await vi.waitFor(() => expect(mocks.ensureBrowserPresetNavigation).toHaveBeenCalledTimes(2));
+    expect(mocks.ensureBrowserPresetNavigation).toHaveBeenLastCalledWith(browserId, "https://example.com", false);
+    expect(mocks.agentBrowserPendingConfirmation).not.toHaveBeenCalled();
+  });
+
+  it("does not apply a former browser's preset poll or stale frame after switching panes", async () => {
+    const firstId = "browser-preset-first";
+    const secondId = "browser-preset-second";
+    setPresetBrowser(firstId, "https://first.example");
+    mocks.startBrowserStream.mockResolvedValue("ws://127.0.0.1:9223");
+    let firstPending = false;
+    mocks.ensureBrowserPresetNavigation.mockImplementation(async (sessionId: string) => {
+      if (sessionId === firstId) firstPending = true;
+      return sessionId === firstId ? "pending" : "completed";
+    });
+    const firstPrompt = {
+      id: "first_prompt",
+      description: "Approve first browser",
+      expires_at_ms: Date.now() + 60_000,
+    };
+    mocks.agentBrowserPendingConfirmation.mockImplementation(async (sessionId: string) =>
+      sessionId === firstId && firstPending ? firstPrompt : null);
+    let releaseFirstStatus: ((state: string) => void) | undefined;
+    const firstStatus = new Promise<string>((resolve) => { releaseFirstStatus = resolve; });
+    mocks.browserPresetNavigationStatus.mockImplementation((sessionId: string) =>
+      sessionId === firstId ? firstStatus : Promise.resolve(null));
+    let releaseFirstApproval: ((details: typeof firstPrompt) => void) | undefined;
+    const firstApproval = new Promise<typeof firstPrompt>((resolve) => { releaseFirstApproval = resolve; });
+    mocks.agentBrowserRespondConfirmation.mockImplementation(() => firstApproval);
+    const onStatusChange = vi.fn();
+
+    const pane = render(<BrowserPane browserId={firstId} focused={false} visible onStatusChange={onStatusChange} />);
+    await vi.waitFor(() => expect(FakeWebSocket.opened).toBe(1));
+    const firstSocket = FakeWebSocket.lastSocket;
+    act(emitFrame);
+    await vi.waitFor(() => expect(screen.getByText("Approve first browser")).toBeInTheDocument());
+    await vi.waitFor(() => expect(mocks.browserPresetNavigationStatus).toHaveBeenCalledWith(firstId));
+    fireEvent.click(screen.getByRole("button", { name: "Approve browser action" }));
+    await vi.waitFor(() => expect(mocks.agentBrowserRespondConfirmation).toHaveBeenCalledWith(firstId, "first_prompt", true));
+
+    act(() => {
+      setPresetBrowser(secondId, "https://second.example");
+      pane.rerender(<BrowserPane browserId={secondId} focused={false} visible onStatusChange={onStatusChange} />);
+    });
+    await vi.waitFor(() => expect(FakeWebSocket.opened).toBe(2));
+    expect(screen.queryByText("Approve first browser")).not.toBeInTheDocument();
+    onStatusChange.mockClear();
+    act(() => firstSocket?.onmessage?.({
+      data: JSON.stringify({ type: "frame", data: "", metadata: { deviceWidth: 1280, deviceHeight: 720 } }),
+    }));
+    expect(onStatusChange).not.toHaveBeenCalledWith("live");
+    expect(mocks.ensureBrowserPresetNavigation).not.toHaveBeenCalledWith(secondId, "https://second.example", false);
+
+    act(emitFrame);
+    await vi.waitFor(() => expect(mocks.ensureBrowserPresetNavigation).toHaveBeenCalledWith(secondId, "https://second.example", false));
+    const firstReadsBefore = mocks.agentBrowserPendingConfirmation.mock.calls
+      .filter(([sessionId]) => sessionId === firstId).length;
+    await act(async () => { releaseFirstStatus?.("pending"); });
+    await act(async () => { releaseFirstApproval?.({ ...firstPrompt, id: "old_follow_up", description: "Old follow-up" }); });
+    expect(screen.queryByText("Approve first browser")).not.toBeInTheDocument();
+    expect(screen.queryByText("Old follow-up")).not.toBeInTheDocument();
+    expect(mocks.agentBrowserPendingConfirmation.mock.calls.filter(([sessionId]) => sessionId === firstId)).toHaveLength(firstReadsBefore);
+  });
+
+  it("ignores an old pending-prompt poll after approval reveals a follow-up", async () => {
+    const firstPrompt = {
+      id: "first_prompt",
+      description: "Approve navigation",
+      expires_at_ms: Date.now() + 60_000,
+    };
+    const followUp = {
+      id: "follow_up",
+      description: "Approve plugin",
+      expires_at_ms: Date.now() + 60_000,
+    };
+    mocks.startBrowserStream.mockRejectedValue("Browser confirmation is pending for session browser-1");
+    let releaseOldPoll: ((details: typeof firstPrompt) => void) | undefined;
+    const oldPoll = new Promise<typeof firstPrompt>((resolve) => { releaseOldPoll = resolve; });
+    let holdPoll = false;
+    mocks.agentBrowserPendingConfirmation.mockImplementation(() => holdPoll ? oldPoll : Promise.resolve(firstPrompt));
+    mocks.agentBrowserRespondConfirmation.mockResolvedValue(followUp);
+
+    renderPane();
+    await vi.waitFor(() => expect(screen.getByText("Approve navigation")).toBeInTheDocument());
+    const initialReads = mocks.agentBrowserPendingConfirmation.mock.calls.length;
+    holdPoll = true;
+    await vi.waitFor(() => expect(mocks.agentBrowserPendingConfirmation.mock.calls.length).toBeGreaterThan(initialReads), { timeout: 3500 });
+
+    fireEvent.click(screen.getByRole("button", { name: "Approve browser action" }));
+    await vi.waitFor(() => expect(screen.getByText("Approve plugin")).toBeInTheDocument());
+    await act(async () => { releaseOldPoll?.(firstPrompt); });
+    expect(screen.getByText("Approve plugin")).toBeInTheDocument();
+    expect(screen.queryByText("Approve navigation")).not.toBeInTheDocument();
+  });
+
+  it("shows a cached failure after a pane remounts during the first preset open", async () => {
+    const browserId = "browser-preset-remount";
+    setPresetBrowser(browserId);
+    let resolveFirst: ((status: string) => void) | undefined;
+    const firstResult = new Promise<string>((resolve) => { resolveFirst = resolve; });
+    let starts = 0;
+    mocks.startBrowserStream.mockImplementation(async () => {
+      if (++starts > 1) await firstResult;
+      return "ws://127.0.0.1:9223";
+    });
+    mocks.ensureBrowserPresetNavigation.mockImplementationOnce(async () => firstResult)
+      .mockResolvedValue("failed");
+
+    const firstPane = renderPane(browserId);
+    await vi.waitFor(() => expect(FakeWebSocket.opened).toBe(1));
+    act(emitFrame);
+    await vi.waitFor(() => expect(mocks.ensureBrowserPresetNavigation).toHaveBeenCalledTimes(1));
+    firstPane.unmount();
+    renderPane(browserId);
+    await vi.waitFor(() => expect(mocks.startBrowserStream).toHaveBeenCalledTimes(2));
+    await act(async () => { resolveFirst?.("failed"); });
+    await vi.waitFor(() => expect(FakeWebSocket.opened).toBe(2));
+    act(emitFrame);
+    await vi.waitFor(() => expect(screen.getByText("Preset navigation did not complete. Check the page, then retry if needed.")).toBeInTheDocument());
+    expect(mocks.ensureBrowserPresetNavigation).toHaveBeenCalledTimes(2);
+  });
+
+  it("rechecks the backend preset after a live same-port socket reconnect", async () => {
+    const browserId = "browser-preset-reconnect";
+    setPresetBrowser(browserId);
+    mocks.startBrowserStream.mockResolvedValue("ws://127.0.0.1:9223");
+
+    renderPane(browserId);
+    await vi.waitFor(() => expect(FakeWebSocket.opened).toBe(1));
+    act(emitFrame);
+    await vi.waitFor(() => expect(mocks.ensureBrowserPresetNavigation).toHaveBeenCalledTimes(1));
+    act(() => FakeWebSocket.lastSocket?.onclose?.());
+    await vi.waitFor(() => expect(FakeWebSocket.opened).toBe(2), { timeout: 2500 });
+    act(emitFrame);
+    await vi.waitFor(() => expect(mocks.ensureBrowserPresetNavigation).toHaveBeenCalledTimes(2));
+    expect(mocks.startBrowserStream).toHaveBeenCalledTimes(1);
+  });
+
   it("shows a consumed replay failure without leaving the spent approval visible", async () => {
     mocks.startBrowserStream.mockRejectedValue("Browser confirmation is pending for session browser-1");
     let pending: { id: string; description: string; expires_at_ms: number } | null = {
@@ -217,15 +491,44 @@ describe("BrowserPane start failures", () => {
   it("expires an unanswered confirmation without silently retrying", async () => {
     vi.useFakeTimers();
     mocks.startBrowserStream.mockRejectedValue("Browser confirmation is pending for session browser-1");
-    mocks.agentBrowserPendingConfirmation.mockResolvedValue({
+    const details = {
       id: "c_expire",
       description: "navigation: expired.example",
       expires_at_ms: Date.now() + 1_000,
-    });
+    };
+    mocks.agentBrowserPendingConfirmation.mockImplementation(async () =>
+      Date.now() < details.expires_at_ms ? details : null);
     renderPane();
     await act(async () => {});
-    await act(async () => { vi.advanceTimersByTime(1_200); });
-    expect(screen.getByText("Browser confirmation expired. Retry to request it again.")).toBeInTheDocument();
+    await act(async () => { await vi.advanceTimersByTimeAsync(2_100); });
+    expect(screen.getByText("Browser confirmation is no longer pending. Retry to reconnect.")).toBeInTheDocument();
+    expect(mocks.startBrowserStream).toHaveBeenCalledTimes(1);
+    expect(mocks.agentBrowserRespondConfirmation).not.toHaveBeenCalled();
+  });
+
+  it("keeps an in-flight prompt visible past its deadline and shows the next approval", async () => {
+    vi.useFakeTimers();
+    mocks.startBrowserStream.mockRejectedValue("Browser confirmation is pending for session browser-1");
+    let backendPending = {
+      id: "host_first",
+      description: "Approve navigation",
+      expires_at_ms: Date.now() + 1_000,
+    };
+    mocks.agentBrowserPendingConfirmation.mockImplementation(async () => backendPending);
+
+    renderPane();
+    await act(async () => {});
+    expect(screen.getByText("Approve navigation")).toBeInTheDocument();
+    await act(async () => { await vi.advanceTimersByTimeAsync(1_200); });
+    expect(screen.getByText("Approve navigation")).toBeInTheDocument();
+    backendPending = {
+      id: "host_second",
+      description: "Approve plugin action",
+      expires_at_ms: Date.now() + 60_000,
+    };
+    await act(async () => { await vi.advanceTimersByTimeAsync(900); });
+    expect(screen.getByText("Approve plugin action")).toBeInTheDocument();
+    expect(screen.queryByText("Approve navigation")).not.toBeInTheDocument();
     expect(mocks.startBrowserStream).toHaveBeenCalledTimes(1);
     expect(mocks.agentBrowserRespondConfirmation).not.toHaveBeenCalled();
   });

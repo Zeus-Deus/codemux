@@ -244,6 +244,24 @@ pub async fn start_browser_stream(
 }
 
 #[tauri::command]
+pub async fn ensure_browser_preset_navigation(
+    manager: State<'_, AgentBrowserManager>,
+    browser_id: String,
+    url: String,
+    retry_failed: bool,
+) -> Result<crate::agent_browser::BrowserPresetNavigationStatus, String> {
+    manager.ensure_preset_navigation(&browser_id, url, retry_failed).await
+}
+
+#[tauri::command]
+pub async fn browser_preset_navigation_status(
+    manager: State<'_, AgentBrowserManager>,
+    browser_id: String,
+) -> Result<Option<crate::agent_browser::BrowserPresetNavigationStatus>, String> {
+    manager.preset_navigation_status(&browser_id).await
+}
+
+#[tauri::command]
 pub async fn browser_stream_bridge_endpoints<R: tauri::Runtime>(
     app: tauri::AppHandle<R>,
     manager: State<'_, AgentBrowserManager>,

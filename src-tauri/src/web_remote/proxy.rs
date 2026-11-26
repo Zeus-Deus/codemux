@@ -11,8 +11,9 @@
 //!
 //! - `GET /proxy/browser/:port/ws` upgrades the client socket and pipes it,
 //!   frame-for-frame (binary-safe, backpressure-aware), to `ws://127.0.0.1:<port>`.
-//! - `GET /proxy/browser/:port/api/status` and
-//!   `POST /proxy/browser/:port/api/command` forward the pane's HTTP requests.
+//! - `GET /proxy/browser/:port/api/status` forwards a liveness request;
+//!   `POST /proxy/browser/:port/api/command` accepts only typed pane actions
+//!   and constructs the daemon command on the trusted side.
 //!
 //! ## The single-segment HTTP constraint
 //!
@@ -46,6 +47,7 @@ use axum::{
     Extension,
 };
 use futures_util::{SinkExt, StreamExt};
+use serde::Deserialize;
 use tauri::{AppHandle, Manager, Runtime};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio::sync::watch;
@@ -63,6 +65,8 @@ const BROWSER_PORT_MIN: u16 = crate::agent_browser::DEFAULT_STREAM_PORT; // 9223
 /// `port_range_low_bound_tracks_agent_browser` test's floor assertion.
 const BROWSER_PORT_MAX: u16 = 9299;
 const MAX_BROWSER_RESPONSE_BYTES: usize = 16 << 20;
+const MAX_PAIRED_COMMAND_BYTES: usize = 1024;
+const MAX_DAEMON_EVAL_BODY_BYTES: usize = 850;
 
 /// Whether `port` is inside the agent-browser stream-port range.
 fn port_in_range(port: u16) -> bool {
@@ -83,6 +87,93 @@ fn has_control_char(s: &str) -> bool {
 fn allowed_browser_api(method: &Method, rest: &str) -> bool {
     (method == Method::GET && rest == "status")
         || (method == Method::POST && rest == "command")
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum PaneOperation {
+    Cursor,
+    Selection,
+    InsertText,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PairedPaneCommand {
+    operation: PaneOperation,
+    x: Option<i32>,
+    y: Option<i32>,
+    text: Option<String>,
+}
+
+fn paired_pane_command_body(body: &[u8]) -> Option<Vec<u8>> {
+    if body.len() > MAX_PAIRED_COMMAND_BYTES {
+        return None;
+    }
+    let command: PairedPaneCommand = serde_json::from_slice(body).ok()?;
+    // `deny_unknown_fields` rejects extra and duplicate keys; the exact key
+    // set also rejects irrelevant known fields and explicit nulls.
+    let fields: serde_json::Map<String, serde_json::Value> = serde_json::from_slice(body).ok()?;
+    let script = match command.operation {
+        PaneOperation::Cursor if fields.len() == 3 && fields.contains_key("x") && fields.contains_key("y") => {
+            let (x, y) = (command.x?, command.y?);
+            if !(-100_000..=100_000).contains(&x) || !(-100_000..=100_000).contains(&y) {
+                return None;
+            }
+            cursor_probe_script(x, y)
+        }
+        PaneOperation::Selection if fields.len() == 1 => SELECTION_SCRIPT.to_owned(),
+        PaneOperation::InsertText if fields.len() == 2 && fields.contains_key("text") => {
+            let text = command.text?;
+            if text.encode_utf16().count() > 120 {
+                return None;
+            }
+            insert_text_script(&text)
+        }
+        _ => return None,
+    };
+    let daemon_body = serde_json::to_vec(&serde_json::json!({
+        "id": format!("pane-{}", uuid::Uuid::new_v4().simple()),
+        "action": "evaluate",
+        "script": script,
+    })).ok()?;
+    (daemon_body.len() <= MAX_DAEMON_EVAL_BODY_BYTES).then_some(daemon_body)
+}
+
+const SELECTION_SCRIPT: &str = concat!(
+    "(()=>{const s=window.getSelection?String(window.getSelection()):\"\";",
+    "if(s)return s;const a=document.activeElement;",
+    "return a&&(a.tagName===\"TEXTAREA\"||a.tagName===\"INPUT\")&&typeof a.selectionStart===\"number\"&&a.selectionEnd>a.selectionStart",
+    "?a.value.slice(a.selectionStart,a.selectionEnd):\"\"})()",
+);
+
+fn cursor_probe_script(x: i32, y: i32) -> String {
+    const TEMPLATE: &str = concat!(
+        "(()=>{const e=document.elementFromPoint($X,$Y);",
+        "if(!e)return\"default\";",
+        "const c=getComputedStyle(e).cursor;if(c&&c!==\"auto\")return c;",
+        "for(let n=e;n;n=n.parentElement)if(n.tagName===\"A\"&&n.hasAttribute(\"href\"))return\"pointer\";",
+        "if(e.isContentEditable||e.tagName===\"TEXTAREA\")return\"text\";",
+        "if(e.tagName===\"INPUT\")return/^(text|search|url|tel|email|password|number)$/.test(e.type)?\"text\":\"default\";",
+        "const r=document.caretRangeFromPoint?document.caretRangeFromPoint($X,$Y):null;",
+        "if(r&&r.startContainer.nodeType===3){",
+        "const p=r.startContainer.parentElement,l=p?p.getClientRects():[];",
+        "for(const b of l)if($X>=b.left&&$X<=b.right&&$Y>=b.top&&$Y<=b.bottom)return\"text\"}",
+        "return\"default\"})()",
+    );
+    TEMPLATE.replace("$X", &x.to_string()).replace("$Y", &y.to_string())
+}
+
+fn insert_text_script(text: &str) -> String {
+    let mut script = String::from(concat!(
+        "(()=>{const a=document.activeElement;if(!a)return false;",
+        "const t=a.tagName,k=a.isContentEditable||t===\"TEXTAREA\"||",
+        "t===\"INPUT\"&&!a.readOnly&&!a.disabled&&/^(text|search|url|tel|email|password|number)$/.test(a.type);",
+        "return k?document.execCommand(\"insertText\",false,",
+    ));
+    script.push_str(&serde_json::to_string(text).expect("a string serializes to JSON"));
+    script.push_str("):false})()");
+    script
 }
 
 // ── WebSocket proxy ─────────────────────────────────────────────────
@@ -229,7 +320,7 @@ fn tungstenite_to_axum(msg: TungMessage) -> Option<AxumMessage> {
 
 // ── HTTP forward ────────────────────────────────────────────────────
 
-/// Forward only the browser pane's status GET and command POST with a
+/// Forward only the browser pane's status GET and typed command POST with a
 /// minimal request carrying the verified session's listener credential.
 pub async fn http_forward<R: Runtime>(
     State(app): State<AppHandle<R>>,
@@ -245,6 +336,31 @@ pub async fn http_forward<R: Runtime>(
     if !port_in_range(port) {
         return (StatusCode::BAD_REQUEST, "port out of range").into_response();
     }
+    // Reject a percent-decoded CR/LF (or other control char) in the path before
+    // it reaches the raw request line — no header/request smuggling to the daemon.
+    if has_control_char(&rest) {
+        return (StatusCode::BAD_REQUEST, "invalid path").into_response();
+    }
+    if !allowed_browser_api(&method, &rest) {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    if uri.query().is_some() {
+        return (StatusCode::BAD_REQUEST, "browser proxy does not accept query parameters").into_response();
+    }
+    let daemon_body = if method == Method::POST {
+        let Some(body) = paired_pane_command_body(&body) else {
+            return (StatusCode::BAD_REQUEST, "invalid pane command").into_response();
+        };
+        body
+    } else if body.is_empty() {
+        Vec::new()
+    } else {
+        return (StatusCode::BAD_REQUEST, "status request must not have a body").into_response();
+    };
+    let mut daemon_headers = HeaderMap::new();
+    if method == Method::POST {
+        daemon_headers.insert(header::CONTENT_TYPE, "application/json".parse().unwrap());
+    }
     let Some(identity) = app.state::<AgentBrowserManager>()
         .verified_stream_identity_for_port(port).await else {
         return StatusCode::FORBIDDEN.into_response();
@@ -253,16 +369,7 @@ pub async fn http_forward<R: Runtime>(
         .subscribe_active_stream(identity).await else {
         return StatusCode::FORBIDDEN.into_response();
     };
-    // Reject a percent-decoded CR/LF (or other control char) in the path before
-    // it reaches the raw request line — no header/request smuggling to the
-    // daemon. (`uri.query()` stays percent-encoded, so it needs no such guard.)
-    if has_control_char(&rest) {
-        return (StatusCode::BAD_REQUEST, "invalid path").into_response();
-    }
-    if !allowed_browser_api(&method, &rest) {
-        return StatusCode::NOT_FOUND.into_response();
-    }
-    match forward(identity, authorization, &method, &rest, uri.query(), &headers, &body).await {
+    match forward(identity, authorization, &method, &rest, None, &daemon_headers, &daemon_body).await {
         Ok(resp) => resp,
         Err(()) => (StatusCode::BAD_GATEWAY, "daemon unreachable").into_response(),
     }
@@ -579,6 +686,50 @@ mod tests {
         assert!(!allowed_browser_api(&Method::GET, "../status"));
     }
 
+    #[test]
+    fn paired_pane_commands_reject_unknown_actions_and_fields() {
+        for body in [
+            br#"{"action":"confirm","confirmation_id":"c_1","approve":true}"#.as_slice(),
+            br#"{"action":"evaluate","script":"1+1"}"#,
+            br#"{"operation":"selection","action":"confirm"}"#,
+            br#"{"operation":"cursor","x":1,"y":2,"script":"1+1"}"#,
+            br#"{"operation":"cursor","x":1.5,"y":2}"#,
+            br#"{"operation":"cursor","x":100001,"y":2}"#,
+            br#"{"operation":"selection","operation":"cursor","x":1,"y":2}"#,
+        ] {
+            assert!(paired_pane_command_body(body).is_none(), "accepted {}", String::from_utf8_lossy(body));
+        }
+        let selection: serde_json::Value = serde_json::from_slice(
+            &paired_pane_command_body(br#"{"operation":"selection"}"#).unwrap(),
+        ).unwrap();
+        assert_eq!(selection["action"], "evaluate");
+        assert_eq!(selection["script"], SELECTION_SCRIPT);
+        assert!(selection["id"].as_str().unwrap().starts_with("pane-"));
+
+        let cursor: serde_json::Value = serde_json::from_slice(
+            &paired_pane_command_body(br#"{"operation":"cursor","x":13,"y":99}"#).unwrap(),
+        ).unwrap();
+        let script = cursor["script"].as_str().unwrap();
+        assert!(script.contains("document.elementFromPoint(13,99)"));
+        assert!(script.contains("if(13>=b.left&&13<=b.right&&99>=b.top&&99<=b.bottom)"));
+        assert!(!script.contains("$X"));
+        assert!(!script.contains("$Y"));
+
+        let control_text = "\0".repeat(120);
+        let oversized = serde_json::to_vec(&serde_json::json!({"operation":"insert_text","text":control_text})).unwrap();
+        assert!(paired_pane_command_body(&oversized).is_none());
+        let safe = serde_json::to_vec(&serde_json::json!({"operation":"insert_text","text":"\0".repeat(60)})).unwrap();
+        assert!(paired_pane_command_body(&safe).is_some());
+
+        let hostile_text = "\");window.pwned=true;//";
+        let input = serde_json::to_vec(&serde_json::json!({"operation":"insert_text","text":hostile_text})).unwrap();
+        let inserted: serde_json::Value = serde_json::from_slice(&paired_pane_command_body(&input).unwrap()).unwrap();
+        let literal = serde_json::to_string(hostile_text).unwrap();
+        assert!(inserted["script"].as_str().unwrap().contains(
+            &format!("document.execCommand(\"insertText\",false,{literal})")
+        ));
+    }
+
     async fn bind_test_daemon() -> TcpListener {
         // Keep the successful bind for the whole test. Only connect the proxy
         // to this listener, even if a real daemon already owns another port.
@@ -590,6 +741,101 @@ mod tests {
             }
         }
         panic!("no free loopback port in the browser daemon range");
+    }
+
+    #[tokio::test]
+    async fn paired_proxy_rejects_host_only_commands_before_daemon_connection() {
+        let app = tauri::test::mock_app();
+        let db = crate::database::DatabaseStore::new_in_memory();
+        db.web_remote_insert_session("phone", None, None, &auth::sha256_hex("phone"), true)
+            .unwrap();
+        app.manage(db);
+        let manager = crate::agent_browser::AgentBrowserManager::new();
+        app.manage(manager.clone());
+        let daemon = bind_test_daemon().await;
+        let port = daemon.local_addr().unwrap().port();
+        manager.allow_test_stream_session("browser-typed-command", port).await;
+        for body in [
+            br#"{"action":"confirm","confirmation_id":"c_1","approve":true}"#.as_slice(),
+            br#"{"action":"evaluate","script":"document.cookie"}"#,
+            br#"{"operation":"selection","action":"confirm"}"#,
+        ] {
+            let mut headers = HeaderMap::new();
+            headers.insert(header::AUTHORIZATION, "Bearer phone".parse().unwrap());
+            let response = http_forward(
+                State(app.handle().clone()),
+                Path((port, "command".to_owned())),
+                Method::POST,
+                "/api/command".parse().unwrap(),
+                headers,
+                Bytes::copy_from_slice(body),
+            ).await;
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+            assert!(tokio::time::timeout(Duration::from_millis(50), daemon.accept()).await.is_err(),
+                "rejected command opened a daemon connection");
+        }
+    }
+
+    #[tokio::test]
+    async fn paired_proxy_builds_each_known_pane_command_for_the_daemon() {
+        let app = tauri::test::mock_app();
+        let db = crate::database::DatabaseStore::new_in_memory();
+        db.web_remote_insert_session("phone", None, None, &auth::sha256_hex("phone"), true)
+            .unwrap();
+        app.manage(db);
+        let manager = crate::agent_browser::AgentBrowserManager::new();
+        app.manage(manager.clone());
+        let daemon = bind_test_daemon().await;
+        let port = daemon.local_addr().unwrap().port();
+        manager.allow_test_stream_session("browser-typed-command", port).await;
+        let upstream = tokio::spawn(async move {
+            let mut bodies = Vec::new();
+            for _ in 0..3 {
+                let (mut stream, _) = daemon.accept().await.unwrap();
+                let mut head = Vec::new();
+                while !head.ends_with(b"\r\n\r\n") {
+                    let mut byte = [0];
+                    stream.read_exact(&mut byte).await.unwrap();
+                    head.push(byte[0]);
+                    assert!(head.len() < 2048);
+                }
+                let header = String::from_utf8(head).unwrap();
+                let length: usize = header.lines()
+                    .find_map(|line| line.strip_prefix("Content-Length: "))
+                    .unwrap().trim().parse().unwrap();
+                let mut body = vec![0; length];
+                stream.read_exact(&mut body).await.unwrap();
+                stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 2\r\n\r\n{}")
+                    .await.unwrap();
+                bodies.push(body);
+            }
+            bodies
+        });
+        for input in [
+            br#"{"operation":"selection"}"#.as_slice(),
+            br#"{"operation":"cursor","x":13,"y":99}"#,
+            br#"{"operation":"insert_text","text":"hello"}"#,
+        ] {
+            let mut headers = HeaderMap::new();
+            headers.insert(header::AUTHORIZATION, "Bearer phone".parse().unwrap());
+            let response = http_forward(
+                State(app.handle().clone()),
+                Path((port, "command".to_owned())),
+                Method::POST,
+                "/api/command".parse().unwrap(),
+                headers,
+                Bytes::copy_from_slice(input),
+            ).await;
+            assert_eq!(response.status(), StatusCode::OK);
+        }
+        let bodies = upstream.await.unwrap();
+        let commands: Vec<serde_json::Value> = bodies.iter()
+            .map(|body| serde_json::from_slice(body).unwrap()).collect();
+        assert!(commands.iter().all(|command| command["action"] == "evaluate"
+            && command.get("operation").is_none()));
+        assert_eq!(commands[0]["script"], SELECTION_SCRIPT);
+        assert_eq!(commands[1]["script"], cursor_probe_script(13, 99));
+        assert_eq!(commands[2]["script"], insert_text_script("hello"));
     }
 
     #[tokio::test]
@@ -658,7 +904,7 @@ mod tests {
                         Method::POST,
                         "/api/command".parse().unwrap(),
                         headers,
-                        Bytes::from_static(br#"{"action":"stream_status"}"#),
+                        Bytes::from_static(br#"{"operation":"selection"}"#),
                     ).await
                 }
             });

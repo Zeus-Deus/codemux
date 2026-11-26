@@ -344,6 +344,23 @@ export function chunkString(text: string, size: number): string[] {
  *  worst-case expansion (2× JSON escaping for ASCII, 3 UTF-8 bytes per
  *  unit for CJK). */
 export const PASTE_CHUNK_SIZE = 120;
+const PASTE_EVAL_BODY_BUDGET = 800;
+
+/** Keep escaped control-text chunks within the daemon's single-peek request. */
+export function chunkPasteText(text: string): string[] {
+  const encoder = new TextEncoder();
+  const fits = (chunk: string) => encoder.encode(JSON.stringify({
+    id: `pane-${"f".repeat(32)}`,
+    action: "evaluate",
+    script: buildInsertTextScript(chunk),
+  })).length <= PASTE_EVAL_BODY_BUDGET;
+  const split = (chunk: string): string[] => {
+    if (fits(chunk)) return [chunk];
+    const halves = chunkString(chunk, Math.ceil(chunk.length / 2));
+    return halves.length > 1 ? halves.flatMap(split) : [chunk];
+  };
+  return chunkString(text, PASTE_CHUNK_SIZE).flatMap(split);
+}
 
 const TEXT_INPUT_TYPES = "text|search|url|tel|email|password|number";
 
@@ -425,19 +442,38 @@ export async function probeDaemon(httpBase: string, timeoutMs = 3000): Promise<b
 let evalSeq = 0;
 
 /**
- * Evaluate a script on the remote page via the daemon's HTTP command
- * relay. This is the same daemon socket the CLI/agent path uses, but
- * without a process spawn per call — cheap enough for hover-driven
- * cursor probes. Returns the unwrapped result, or `null` on failure.
+ * The paired proxy accepts only these pane operations. It builds the daemon
+ * command itself, so paired clients cannot submit arbitrary daemon actions.
  */
-export async function evalOnDaemon(httpBase: string, script: string, timeoutMs = 3000): Promise<unknown> {
+export type PaneCommand =
+  | { operation: "cursor"; x: number; y: number }
+  | { operation: "selection" }
+  | { operation: "insert_text"; text: string };
+
+function paneScript(command: PaneCommand): string {
+  switch (command.operation) {
+    case "cursor": return buildCursorProbeScript(command.x, command.y);
+    case "selection": return SELECTION_SCRIPT;
+    case "insert_text": return buildInsertTextScript(command.text);
+  }
+}
+
+/** Run a pane operation via the desktop bridge or the paired proxy. */
+export async function runPaneCommand(httpBase: string, command: PaneCommand, timeoutMs = 3000): Promise<unknown> {
   try {
+    const paired = /^\/proxy\/browser\/\d+$/.test(new URL(httpBase).pathname);
+    const request = command.operation === "cursor"
+      ? { operation: "cursor" as const, x: Math.round(command.x), y: Math.round(command.y) }
+      : command;
+    const body = paired
+      ? JSON.stringify(request)
+      : JSON.stringify({ id: `pane-${++evalSeq}`, action: "evaluate", script: paneScript(request) });
     const res = await fetchWithTimeout(
       `${httpBase}/api/command`,
       {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ id: `pane-${++evalSeq}`, action: "evaluate", script }),
+        body,
       },
       timeoutMs,
     );
