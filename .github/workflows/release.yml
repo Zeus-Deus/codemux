@@ -160,6 +160,7 @@ jobs:
             exit 1
           fi
           node scripts/test-agent-browser-listeners.mjs "$DEST"
+          node scripts/test-agent-browser-pipe.mjs "$DEST"
 
       # codemux-remote (the push-to-host binary bundled as
       # `binaries/codemux-remote-<triple>`) has no step of its own. tauri's
