@@ -280,20 +280,19 @@ pub enum ConnectCommand {
 
 #[derive(Subcommand)]
 pub enum RemoteCommand {
-    /// Mint a one-time pairing code for the web remote server and print a
-    /// scannable link + terminal QR. Requires remote access to be enabled in
-    /// Settings first. Handy over SSH: pair a phone/laptop without opening
-    /// the desktop GUI.
+    /// Request a one-time pairing code for the web remote server. Standalone
+    /// CLI callers currently lack owner authentication and are refused; use
+    /// desktop Settings. With a LAN listener, headless `serve` prints an
+    /// initial link at startup.
     Pair {
         /// Optional label for the paired device. Used as a fallback name if
         /// the connecting browser doesn't provide one of its own.
         #[arg(long)]
         name: Option<String>,
     },
-    /// Turn web remote access on (binds the server), optionally selecting which
-    /// interfaces to expose it on and the port. Prints the resulting status and
-    /// the recommended endpoint so you can immediately run `codemux remote pair`.
-    /// Requires the desktop app to be running.
+    /// Turn web remote access on and optionally select its scope and port.
+    /// Standalone CLI callers currently lack owner authentication and are
+    /// refused; use desktop Settings.
     Enable {
         /// Which interfaces to expose the server on: `all` (every interface),
         /// `tailscale` (tailnet + loopback only), or `loopback` (this machine
@@ -304,8 +303,9 @@ pub enum RemoteCommand {
         #[arg(long)]
         port: Option<u16>,
     },
-    /// Turn web remote access off — unbinds the server and severs every live
-    /// connection immediately. Requires the desktop app to be running.
+    /// Turn web remote access off and sever live connections. Standalone CLI
+    /// callers currently lack owner authentication and are refused; use
+    /// desktop Settings.
     Disable,
 }
 
@@ -1277,10 +1277,8 @@ pub(crate) fn print_pairing(data: &Value) {
     println!("device that can reach this machine — to pair it. One-time use.");
 }
 
-/// Print the outcome of `codemux remote enable`: the port + bind scope the
-/// server is now on, the recommended reachable endpoint, and a nudge toward
-/// `codemux remote pair`. Reads the `ControlEnableResult` JSON the
-/// `web_remote_enable` control command returns.
+/// Print the port, bind scope, and recommended endpoint from the
+/// `ControlEnableResult` returned by `web_remote_enable`.
 fn print_enable_result(data: &Value) {
     let status = &data["status"];
     let port = status["port"].as_u64().unwrap_or(0);
@@ -1321,7 +1319,7 @@ fn print_enable_result(data: &Value) {
         println!("               {endpoint_host} ({endpoint_kind}, {secure})");
     }
     println!();
-    println!("Run `codemux remote pair` to mint a pairing code for a phone or laptop.");
+    println!("Use desktop Settings to mint a pairing code for a phone or laptop.");
 }
 
 /// Render `text` to a compact terminal QR using the pure-Rust `qrcode`

@@ -42,12 +42,12 @@ printed at the end.
 | b | `CODEMUX_PASSWORD=… codemux login --email …` | headless sign-in against the API; `codemux whoami` reads the persisted session back; the mock recorded the signin POST |
 | c | `codemux connect` | unit file written with `Environment=CODEMUX_API_URL`, `systemctl --user is-active` = `active`, `is-enabled` = `enabled`, linger on, port 4377 bound, `/api/health` OK locally **and from another container** |
 | c2 | `curl http://localhost:4377/` | the release build really embeds the web UI (HTML + `/assets/` bundle), not just the pairing API |
-| d | `codemux remote pair` | the control socket is up, so a second SSH session can mint a pairing code against the running unit — and the pairing URL host is the container's eth0 IP, **not** `127.0.0.1` |
+| d | `codemux remote pair` and the service journal | a second SSH session cannot mint a pairing code without owner authentication; `serve` printed an initial link whose host is the container's eth0 IP, **not** `127.0.0.1` |
 | d2 | a second `codemux serve` | it exits non-zero with the mutual-exclusion message, **not** `Address already in use` — the guard keys off the control endpoint, so it only works if `serve` took it |
-| e | poll the mock's request log | relay mode really started iroh and registered headlessly: a `POST /api/devices` arrived with the session bearer, a 64-hex `nodeId`, a `deviceId`, `platform: linux`, and the host's name; the desktop's own `registration.registered` reads back true over the control socket |
+| e | poll the mock's request log | relay mode really started iroh and registered headlessly: a `POST /api/devices` arrived with the session bearer, a 64-hex `nodeId`, a `deviceId`, `platform: linux`, and the host's name; read-only `web_remote_status` reports the same registration over the control socket |
 | e1b | `/proc/<serve-pid>/environ` | every account-API call in the run went to the mock — the live process names it and never `api.codemux.org` |
 | e2 | `systemctl --user restart codemux.service` | a no-flag `serve` boot leaves the persisted settings row byte-identical: `relay_mode_enabled` stays true, port and scope are not reset |
-| e3 | `remote enable --port 4399` + restart | `serve` binds the *persisted* port with no `--port` anywhere, then restores 4377 |
+| e3 | `remote enable --port 4399` + restart | a standalone SSH caller cannot change the live listener; the refused change leaves port 4377 persisted and bound after restart |
 | f | `connect status`, `connect off`, re-`connect`, re-`install.sh` | status reports relay on, a device id, and `Codemux running: yes`; `off` removes the unit and really turns relay off (on disk too) without signing out; both `connect` and `install.sh` are idempotent |
 | g | `docker restart <target>` | after a cold boot with **nobody logged in**, linger brought the user manager back, the unit auto-started, 4377 is bound, and the box is still reachable cross-container |
 
@@ -232,7 +232,7 @@ pin each former symptom are:
 
 | former known issue | now asserted by |
 |---|---|
-| `codemux remote pair` could not reach the running unit | step d — a `Pairing link:` line, and its host is the container IP |
+| `serve` did not print an initial pairing link | step d — the service journal has a `Pairing link:` line with the container IP; a second SSH `codemux remote pair` is refused without owner authentication |
 | a second `serve` died on `Address already in use` | step d2 — non-zero exit with "already running on this machine", and *not* an address collision |
 | no `POST /api/devices` was ever sent | step e — the recorded request, with bearer, `nodeId` (64-hex), `deviceId`, `platform`, hostname |
 | `device_registered` stayed false | step e — read back over the control socket, and its `device_id`/`iroh_node_id` must match the ids the mock recorded |

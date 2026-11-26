@@ -1207,6 +1207,21 @@ fn serve_banner_names_desktop_settings_for_connector_administration() {
     let serve = Serve::start();
     let banner = serve.log();
     assert!(banner.contains("agent connector is off; enable it in desktop Settings"), "{banner}");
+    assert!(banner.contains("Restart serve to print a fresh startup pairing link"), "{banner}");
     assert!(!banner.contains("Run `codemux connector enable`"), "{banner}");
     assert!(!banner.contains("Run `codemux remote pair`"), "{banner}");
+}
+
+#[test]
+fn standalone_remote_cli_cannot_mint_pairing_or_change_listener() {
+    let serve = Serve::start();
+    let pair = serve.cli(&["remote", "pair"]);
+    assert_eq!(exit_code(&pair), 1, "{}", String::from_utf8_lossy(&pair.stderr));
+    assert!(String::from_utf8_lossy(&pair.stderr).contains("needs verified owner access"));
+
+    let other_port = free_loopback_port().to_string();
+    let enable = serve.cli(&["remote", "enable", "--port", &other_port]);
+    assert_eq!(exit_code(&enable), 1, "{}", String::from_utf8_lossy(&enable.stderr));
+    assert!(String::from_utf8_lossy(&enable.stderr).contains("needs verified owner access"));
+    assert_eq!(serve.ok(&["json", "web_remote_status"])["data"]["port"].as_u64(), Some(serve.port as u64));
 }

@@ -2422,11 +2422,9 @@ pub(crate) async fn dispatch_request_as<R: Runtime>(
         })(),
         // ── Web remote access ──
         //
-        // Mint a one-time web-remote pairing code from the terminal (the
-        // `codemux remote pair` CLI, typically over SSH). The control socket
-        // is same-machine + unauthenticated by design — over SSH you ARE on
-        // the machine — so this is the right transport for pairing without
-        // opening the desktop GUI. Reuses the exact token path + endpoint
+        // Mint a one-time web-remote pairing code through the owner gate.
+        // External socket peers have no owner proof and are refused before
+        // reaching this handler. Reuses the token path and endpoint
         // enumeration the Settings pane uses (`web_remote::control_pair`).
         "web_remote_pair" => {
             let name = request
@@ -2445,11 +2443,9 @@ pub(crate) async fn dispatch_request_as<R: Runtime>(
             serde_json::to_value(crate::web_remote::web_remote_status(app.clone()))
                 .map_err(|error| error.to_string())
         }
-        // Enable web remote access from the terminal (`codemux remote enable`),
-        // optionally selecting the bind scope and port. Shares the exact
-        // bind/rollback + state-emission paths the Settings pane uses; returns
-        // the resulting status plus the recommended endpoint so the caller can
-        // immediately run `codemux remote pair`.
+        // Enable web remote access through the owner gate, optionally
+        // selecting the bind scope and port. Shares the exact bind/rollback
+        // and state-emission paths the Settings pane uses.
         "web_remote_enable" => {
             let scope = request
                 .params
