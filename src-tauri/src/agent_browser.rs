@@ -12147,6 +12147,9 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn failed_mac_open_closes_its_late_published_daemon() {
+        use std::io::Read;
+        use std::os::unix::ffi::OsStrExt;
+
         let session = format!("browser-mac-late-{}", uuid::Uuid::new_v4().simple());
         let attempt = uuid::Uuid::new_v4().simple().to_string();
         let executable = std::env::current_exe().unwrap();
@@ -12163,7 +12166,7 @@ mod tests {
             .env("CODEMUX_BROWSER_SESSION", &session)
             .env("CODEMUX_BROWSER_OPEN_ATTEMPT", &attempt)
             .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
+            .stderr(std::process::Stdio::piped())
             .spawn().unwrap();
         let started = Instant::now();
         while browser_process_start(daemon.id(), &session, browser_owner_token()).is_none() {
@@ -12177,19 +12180,32 @@ mod tests {
         assert!(!pid_path.exists(), "fixture published its PID before rollback");
 
         std::fs::write(&release, b"go").unwrap();
-        rollback_failed_unix_stream_open(&session, None, &attempt);
-        let started = Instant::now();
-        let stopped = loop {
-            if daemon.try_wait().unwrap().is_some() { break true; }
-            if started.elapsed() >= Duration::from_secs(3) { break false; }
-            std::thread::sleep(Duration::from_millis(25));
-        };
-        if !stopped {
-            let _ = daemon.kill();
-            let _ = daemon.wait();
-        }
-        assert!(stopped, "failed macOS open left its late daemon running");
-        assert!(!pid_path.exists(), "close left the old daemon PID file");
+        // Unlike a detached daemon, this fixture is our direct child. Reap it
+        // while rollback waits for process exit, so macOS can confirm exit
+        // before the inode-guarded cleanup runs.
+        let status = std::thread::scope(|scope| {
+            let rollback = scope.spawn(|| rollback_failed_unix_stream_open(&session, None, &attempt));
+            let started = Instant::now();
+            let status = loop {
+                if let Some(status) = daemon.try_wait().unwrap() { break Some(status); }
+                if started.elapsed() >= Duration::from_secs(3) { break None; }
+                std::thread::sleep(Duration::from_millis(10));
+            };
+            if status.is_none() {
+                let _ = daemon.kill();
+                let _ = daemon.wait();
+            }
+            rollback.join().unwrap();
+            status
+        });
+        let mut child_stderr = String::new();
+        daemon.stderr.take().unwrap().read_to_string(&mut child_stderr).unwrap();
+        assert!(status.as_ref().is_some_and(|status| status.success()),
+            "failed macOS open did not close its late daemon (status: {status:?}, socket: {} bytes at {}): {child_stderr}",
+            socket_path.as_os_str().as_bytes().len(), socket_path.display());
+        assert!(!pid_path.exists(),
+            "close left the old daemon PID file (status: {status:?}, socket: {} bytes at {}): {child_stderr}",
+            socket_path.as_os_str().as_bytes().len(), socket_path.display());
         assert!(!stream_path.exists(), "close left the old stream file");
         assert!(!socket_path.exists(), "close left the old control socket");
         assert!(!session_pid_path(&session).unwrap().exists(), "close left the old Codemux record");
