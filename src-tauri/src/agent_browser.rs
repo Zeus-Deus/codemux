@@ -10969,6 +10969,7 @@ mod tests {
     #[tokio::test]
     async fn exited_unix_confirmation_peer_does_not_start_a_replacement() {
         let (manager, session, record, host_id) = preset_pending_fixture().await;
+        let verified = record.clone();
         let temp = tempfile::tempdir().unwrap();
         let socket = temp.path().join("exited.sock");
         let started = Instant::now();
@@ -10983,7 +10984,12 @@ mod tests {
         assert!(!temp.path().join("exited.sock").exists(), "decision dispatch must not start a daemon");
         assert!(manager.confirmation_recovery_required.lock().unwrap().get(&session).is_none());
         assert_eq!(manager.pending_confirmation(&session).await.unwrap().unwrap().id.as_deref(), Some(host_id.as_str()));
-        manager.close_locked(&session).await.unwrap();
+        assert!(manager.close_locked(&session).await.unwrap_err().contains("recovery"));
+        assert_eq!(manager.confirmation_recovery_required.lock().unwrap().get(&session)
+            .and_then(|guard| guard.daemon.as_ref()), Some(&verified));
+        assert!(manager.run_command_locked_with_outcome(&session, "open",
+            serde_json::json!({"url": "about:blank"}), None, None,
+        ).await.unwrap_err().contains("uncertain"));
         assert!(started.elapsed() < Duration::from_secs(3), "close remained blocked after a before-send failure");
     }
 
