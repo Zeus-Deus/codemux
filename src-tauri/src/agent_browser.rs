@@ -1255,6 +1255,29 @@ fn departed_browser_control_endpoint_absent(
 }
 
 #[cfg(windows)]
+fn departed_pinned_browser_control_endpoint_absent(
+    session: &str,
+    dir: &std::path::Path,
+    old: &BrowserPidRecord,
+) -> bool {
+    if !departed_retained_confirmation_record(old) {
+        return false;
+    }
+    let root = browser_record_root_from_daemon_dir(dir);
+    let Some(path) = session_pid_path_in(root, session) else { return false };
+    if read_browser_pid_record(&path).as_ref() != Some(old) {
+        return false;
+    }
+    let Some(legacy) = legacy_session_pid_path_in(root, session) else { return false };
+    let legacy_matches = match std::fs::symlink_metadata(&legacy) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => true,
+        Ok(_) => read_browser_pid_record(&legacy).as_ref() == Some(old),
+        Err(_) => false,
+    };
+    legacy_matches && departed_browser_control_endpoint_absent(session, dir, old)
+}
+
+#[cfg(windows)]
 fn departed_browser_listener_is_unrelated(
     old: &BrowserPidRecord,
     session: &str,
@@ -7508,13 +7531,9 @@ impl AgentBrowserManager {
         Ok(self.note_action_start(browser_id, action).await)
     }
 
-    /// Reset session state after a "close" action so the next command sees a
-    /// fresh daemon (and re-applies the default viewport). Called
-    /// unconditionally — even if the close reported an error the daemon
-    /// state is unknown at worst, and both consumers of `running` tolerate a
-    /// stale `false`: start_stream re-probes the socket, and a redundant
-    /// viewport apply on a still-live daemon is harmless right after the
-    /// agent chose to close it. The port allocation / map entry stays intact.
+    /// Reset session state only after a completed agent-facing close. A
+    /// failed close can leave a parked confirmation on the control daemon.
+    /// The port allocation / map entry stays intact.
     async fn note_close_finished(&self, browser_id: &str) {
         let mut sessions = self.sessions.lock().await;
         if let Some(s) = sessions.get_mut(browser_id) {
@@ -7541,7 +7560,21 @@ impl AgentBrowserManager {
         // a confirmation response may exit successfully before the action.
         let outcome = result.as_ref().map_or(BrowserActionOutcome::Failed, |(_, outcome)| *outcome);
         if action == "close" {
-            self.note_close_finished(browser_id).await;
+            if outcome == BrowserActionOutcome::Completed {
+                self.note_close_finished(browser_id).await;
+            } else if outcome == BrowserActionOutcome::ConfirmationPending
+                || result.as_ref().err().is_some_and(|error| error.may_have_launched) {
+                let mut sessions = self.sessions.lock().await;
+                if let Some(entry) = sessions.get_mut(browser_id) {
+                    // The close may have reached the daemon. A subsequent
+                    // action cannot use an old host token or assume that a
+                    // policy prompt still refers to the same parked action.
+                    self.guard_unresolved_confirmation(browser_id, entry);
+                    entry.fail_pending_screenshot("Browser close outcome is uncertain");
+                    entry.confirmation_pending = false;
+                    entry.pending_confirmation = None;
+                }
+            }
         } else {
             let details = result.as_ref().ok().and_then(|(result, _)| browser_result_confirmation_details(result));
             let _ = self.refresh_running_session(browser_id, session, outcome, details).await;
@@ -7876,6 +7909,10 @@ impl AgentBrowserManager {
             browser_id, &session, action, was_running, viewport_may_have_launched, &result,
         ).await;
 
+        if action == "close" {
+            self.require_confirmation_recovered(browser_id)?;
+        }
+
         result.map_err(|error| error.message)
     }
 
@@ -8124,8 +8161,13 @@ impl AgentBrowserManager {
                         || (record.native_start && process_start_time(record.pid)
                             .is_some_and(|start| start != record.start_time));
                     process_gone && recovery_dir.as_ref().is_some_and(|dir| {
-                        probe_browser_control_endpoint(&session_for_check, dir)
-                            == BrowserControlEndpointProbe::Absent
+                        let endpoint_absent = probe_browser_control_endpoint(&session_for_check, dir)
+                            == BrowserControlEndpointProbe::Absent;
+                        #[cfg(windows)]
+                        let endpoint_absent = endpoint_absent || departed_pinned_browser_control_endpoint_absent(
+                            &session_for_check, dir, &record,
+                        );
+                        endpoint_absent
                     })
                 }
                 None => confirmation_recovery_namespace_clear(&session_for_check)
@@ -10410,6 +10452,96 @@ mod tests {
         assert!(!manager.confirmation_recovery_required.lock().unwrap().contains_key(&session));
         assert!(record_path.exists(), "verified close keeps the Windows record");
         std::fs::remove_file(record_path).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn pinned_close_ignores_unrelated_listener_on_departed_daemon_port() {
+        use std::io::Write;
+
+        let manager = AgentBrowserManager::new();
+        let session = format!("confirmation-stale-port-{}", uuid::Uuid::new_v4().simple());
+        let stream_port = manager.allocate_port(&session).await.unwrap();
+        let old = test_browser_record(u32::MAX, 1, browser_owner_token().to_owned());
+        let dir = run_dir_for_session(&session).unwrap();
+        let record_path = session_pid_path(&session).unwrap();
+        write_browser_pid_record(&record_path, &old).unwrap();
+        let pid_path = dir.join(format!("{session}.pid"));
+        std::fs::write(&pid_path, old.pid.to_string()).unwrap();
+        let unrelated = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let port = unrelated.local_addr().unwrap().port();
+        let port_path = dir.join(format!("{session}.port"));
+        let mut port_file = clack_private_fs::create_new_file(&port_path).unwrap();
+        port_file.write_all(b"invalid").unwrap();
+        port_file.sync_all().unwrap();
+        drop(port_file);
+        manager.confirmation_recovery_required.lock().unwrap().insert(session.clone(),
+            BrowserConfirmationRecovery { daemon: Some(old.clone()), port: stream_port });
+
+        assert!(manager.close_locked(&session).await.unwrap_err().contains("recovery"));
+        assert!(manager.confirmation_recovery_required.lock().unwrap().contains_key(&session));
+        std::fs::write(&port_path, port.to_string()).unwrap();
+        assert_eq!(probe_browser_control_endpoint(&session, &dir), BrowserControlEndpointProbe::Reachable);
+        assert!(departed_pinned_browser_control_endpoint_absent(&session, &dir, &old));
+
+        manager.close_locked(&session).await.unwrap();
+        assert!(!manager.confirmation_recovery_required.lock().unwrap().contains_key(&session));
+        assert!(record_path.exists(), "Windows keeps the exact owner record");
+        assert!(std::net::TcpStream::connect(unrelated.local_addr().unwrap()).is_ok(),
+            "close must not stop the unrelated listener");
+        std::fs::remove_file(port_path).unwrap();
+        std::fs::remove_file(pid_path).unwrap();
+        std::fs::remove_file(record_path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn failed_agent_close_preserves_confirmation_and_screenshot_waiter_for_deny() {
+        for dispatched in [false, true] {
+            let (manager, session, record, host_id) = preset_pending_fixture().await;
+            let wait = manager.register_pending_screenshot(
+                &session, "close-failed-screenshot".into(), Instant::now(), Duration::from_secs(1),
+            ).await.unwrap();
+            let result = if dispatched {
+                Ok((BrowserAutomationResult {
+                    request_id: make_request_id(), browser_id: session.clone(),
+                    data: serde_json::Value::Null, message: None,
+                }, BrowserActionOutcome::Failed))
+            } else {
+                Err(BrowserActionFailure::before_launch("close was not sent".into()))
+            };
+            manager.reconcile_action_attempt(&session, &session, "close", true, false, &result).await;
+
+            assert_eq!(manager.pending_confirmation(&session).await.unwrap().unwrap().id.as_deref(),
+                Some(host_id.as_str()));
+            assert!(manager.sessions.lock().await.get(&session).unwrap().pending_screenshot.is_some());
+            assert!(!manager.confirmation_recovery_required.lock().unwrap().contains_key(&session));
+            manager.respond_confirmation_locked_with(&session, &host_id, false,
+                move |_session, _port, _pending, _upstream_id, approve| {
+                    assert!(!approve);
+                    Ok((record, BrowserConfirmationResponse::Resolved))
+                }).await.unwrap();
+            assert!(wait.reply.await.unwrap().unwrap_err().contains("denied"));
+        }
+    }
+
+    #[tokio::test]
+    async fn ambiguous_agent_close_pins_recovery_and_invalidates_old_confirmation() {
+        let (manager, session, record, host_id) = preset_pending_fixture().await;
+        let wait = manager.register_pending_screenshot(
+            &session, "close-uncertain-screenshot".into(), Instant::now(), Duration::from_secs(1),
+        ).await.unwrap();
+        let result = Err(BrowserActionFailure::after_launch("close reply was lost".into()));
+        manager.reconcile_action_attempt(&session, &session, "close", true, false, &result).await;
+
+        assert_eq!(manager.confirmation_recovery_required.lock().unwrap().get(&session)
+            .and_then(|guard| guard.daemon.as_ref()), Some(&record));
+        assert!(manager.pending_confirmation(&session).await.unwrap().is_none());
+        assert!(manager.sessions.lock().await.get(&session).unwrap().pending_screenshot.is_none());
+        assert!(wait.reply.await.unwrap().unwrap_err().contains("uncertain"));
+        assert!(manager.respond_confirmation_locked_with(&session, &host_id, false,
+            |_session, _port, _pending, _upstream_id, _approve| unreachable!(),
+        ).await.unwrap_err().contains("no pending confirmation"));
+        assert!(manager.require_confirmation_recovered(&session).unwrap_err().contains("uncertain"));
     }
 
     #[tokio::test]
