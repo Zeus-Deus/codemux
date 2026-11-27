@@ -970,8 +970,10 @@ pub async fn run_connect(opts: ConnectOptions) -> Result<(), String> {
     // not yet opened its control socket. Credential verification can take long
     // enough for a backend to start, so save nothing until ownership is checked
     // again. Never hold the blocking layout lock across the API await.
-    drop(require_stopped_connect_owner()?);
-    let db = crate::database::init_database()?;
+    let db = {
+        let _layout_lock = require_stopped_connect_owner()?;
+        crate::database::init_database()?
+    };
 
     // Step 1 — verify the account without writing it yet. Everything
     // downstream (relay registration, browser discovery) is account-scoped.

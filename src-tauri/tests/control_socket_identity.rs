@@ -305,7 +305,17 @@ fn pty_shell_scrubs_inherited_agent_identity() {
     let fixture = tempfile::tempdir().unwrap();
     let shell = fixture.path().join("capture-shell");
     let env_dump = fixture.path().join("env.txt");
-    std::fs::write(&shell, format!("#!/bin/sh\nenv > '{}'\nexec /bin/sh\n", env_dump.display())).unwrap();
+    let env_dump_partial = fixture.path().join("env.txt.partial");
+    std::fs::write(
+        &shell,
+        format!(
+            "#!/bin/sh\nenv > '{}' && mv '{}' '{}'\nexec /bin/sh\n",
+            env_dump_partial.display(),
+            env_dump_partial.display(),
+            env_dump.display(),
+        ),
+    )
+    .unwrap();
     std::fs::set_permissions(&shell, std::fs::Permissions::from_mode(0o700)).unwrap();
 
     let serve = Serve::start(&[
