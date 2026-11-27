@@ -6540,6 +6540,11 @@ impl AgentBrowserManager {
     fn retire_stream_allocation(
         &self, sessions: &mut HashMap<String, StreamSession>, session_key: &str,
     ) {
+        if sessions.get(session_key).is_some_and(|stream|
+            stream.confirmation_pending || stream.pending_confirmation.is_some()
+                || stream.pending_screenshot.is_some()) {
+            return;
+        }
         if let Some(stream) = sessions.remove(session_key) {
             if let Some(attempt) = stream.preset_navigation
                 .filter(|attempt| attempt.phase == PresetNavigationPhase::FailedAmbiguous)
@@ -6574,7 +6579,8 @@ impl AgentBrowserManager {
         // separate command admission checks.
         let recovery = self.confirmation_recovery_required.lock().unwrap().contains_key(browser_id);
         let pending = sessions.get(browser_id).is_some_and(|entry|
-            entry.confirmation_pending || entry.pending_confirmation.is_some());
+            entry.confirmation_pending || entry.pending_confirmation.is_some()
+                || entry.pending_screenshot.is_some());
         (recovery, pending)
     }
 
@@ -6847,7 +6853,7 @@ impl AgentBrowserManager {
 
     async fn clear_stale_running_stream_allocation(&self, session_key: &str, port: u16) {
         let mut sessions = self.sessions.lock().await;
-        if sessions.get(session_key).is_some_and(|s| s.port == port) {
+        if sessions.get(session_key).is_some_and(|entry| entry.port == port) {
             self.retire_stream_allocation(&mut sessions, session_key);
         }
     }
@@ -7162,6 +7168,7 @@ impl AgentBrowserManager {
                     entry.fail_pending_screenshot("Follow-up screenshot approval exceeded the request deadline");
                     if let Some(pending) = entry.pending_confirmation.as_mut() {
                         public_screenshot_expiry_at(pending, Instant::now());
+                        response = Ok(Some(pending.details.clone()));
                     }
                 }
             } else {
@@ -8259,6 +8266,27 @@ impl AgentBrowserManager {
         match ownership {
             Some(true) => Ok(()),
             Some(false) => {
+                let mut sessions = self.sessions.lock().await;
+                if let Some(entry) = sessions.get_mut(browser_id).filter(|entry| entry.port == port) {
+                    self.expire_confirmation_if_needed(browser_id, entry);
+                    let mut recovery = self.confirmation_recovery_required.lock().unwrap().contains_key(browser_id);
+                    if !recovery && entry.pending_screenshot.is_some()
+                        && !entry.confirmation_pending && entry.pending_confirmation.is_none() {
+                        self.guard_unresolved_screenshot(browser_id, entry);
+                        entry.fail_pending_screenshot("Browser stream listener was lost during screenshot recovery");
+                        recovery = true;
+                    }
+                    if recovery || entry.confirmation_pending || entry.pending_confirmation.is_some() {
+                        // A lost stream listener does not prove that the
+                        // separate control daemon released its parked action.
+                        entry.revoke_active_bridges();
+                        entry.running = false;
+                        entry.browser_ready = false;
+                        return Err(if recovery { Self::confirmation_recovery_error(browser_id) }
+                            else { format!("Browser confirmation is pending for session {session}") });
+                    }
+                }
+                drop(sessions);
                 self.clear_stale_running_stream_allocation(browser_id, port).await;
                 Err(format!("Browser stream port {port} is not owned by session {session}"))
             }
@@ -8318,6 +8346,19 @@ impl AgentBrowserManager {
         .await
         .map_err(|error| format!("Could not inspect browser session {session}: {error}"))??;
         if let Some(reason) = departed {
+            {
+                let mut sessions = self.sessions.lock().await;
+                if let Some(entry) = sessions.get_mut(browser_id).filter(|entry| entry.port == port) {
+                    self.expire_confirmation_if_needed(browser_id, entry);
+                    if entry.confirmation_pending || entry.pending_confirmation.is_some()
+                        || entry.pending_screenshot.is_some() {
+                        self.guard_unresolved_confirmation(browser_id, entry);
+                        entry.fail_pending_screenshot("Browser daemon exited before approval completed");
+                        entry.confirmation_pending = false;
+                        entry.pending_confirmation = None;
+                    }
+                }
+            }
             self.clear_stale_running_stream_allocation(browser_id, port).await;
             return Err(format!("Browser session {session} {reason}"));
         }
@@ -8397,6 +8438,7 @@ impl AgentBrowserManager {
             }
             // A dead socket or a live daemon without an attached browser
             // cannot satisfy the stream. Reopen it below.
+            self.require_no_pending_confirmation(browser_id).await?;
             self.sessions
                 .lock()
                 .await
@@ -14098,12 +14140,26 @@ mod tests {
             },
         ).await.unwrap().unwrap();
         assert_ne!(next.id.as_deref(), Some(first_id.as_str()));
+        let now_ms = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
+            .unwrap().as_millis() as u64;
+        assert!(next.expires_at_ms <= now_ms, "follow-up must be deny-only in the immediate response");
         assert!(wait.reply.await.unwrap().unwrap_err().contains("exceeded the request deadline"));
-        assert_eq!(manager.pending_confirmation(&session).await.unwrap().unwrap().id, next.id);
+        let stored = manager.pending_confirmation(&session).await.unwrap().unwrap();
+        assert_eq!(stored.id, next.id);
+        assert_eq!(stored.expires_at_ms, next.expires_at_ms);
         assert!(manager.sessions.lock().await.get(&session).unwrap().confirmation_pending);
         assert!(manager.confirmation_recovery_required.lock().unwrap().get(&session)
             .and_then(|guard| guard.daemon.as_ref()).is_some());
         assert!(manager.spawn_locked(&session).await.unwrap_err().contains("outcome is uncertain"));
+        let next_id = next.id.unwrap();
+        assert!(manager.respond_confirmation_locked_with(&session, &next_id, true,
+            |_, _, _, _, _| unreachable!("deny-only follow-up cannot approve"),
+        ).await.unwrap_err().contains("caller ended"));
+        let record = manager.confirmation_recovery_required.lock().unwrap()
+            .get(&session).unwrap().daemon.clone().unwrap();
+        assert!(manager.respond_confirmation_locked_with(&session, &next_id, false,
+            move |_, _, _, _, _| Ok((record, BrowserConfirmationResponse::Resolved)),
+        ).await.unwrap().is_none());
     }
 
     #[tokio::test]
@@ -14815,6 +14871,89 @@ mod tests {
         assert!(stream.running);
         assert!(stream.browser_ready);
         assert_eq!(stream.pid, Some(std::process::id()));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn missing_stream_listener_preserves_pending_control_confirmation() {
+        let manager = AgentBrowserManager::new();
+        let session = format!("browser-pending-listener-{}", uuid::Uuid::new_v4().simple());
+        let port = manager.allocate_port(&session).await.unwrap();
+        manager.allow_test_stream_session(&session, port).await;
+        let control_dir = run_dir_for_session(&session).unwrap();
+        let (_temp, mut daemon, record) = browser_identity_fixture_with_attempt_and_dir(
+            &session, browser_owner_token(), None, Some(&control_dir),
+        );
+        let daemon_pid_path = control_dir.join(format!("{session}.pid"));
+        std::fs::write(&daemon_pid_path, daemon.id().to_string()).unwrap();
+        write_session_pid(&session, &record).unwrap();
+        let socket_path = control_dir.join(format!("{session}.sock"));
+        let control = std::os::unix::net::UnixListener::bind(&socket_path).unwrap();
+        assert_eq!(probe_browser_control_endpoint(&session, &control_dir), BrowserControlEndpointProbe::Reachable);
+        manager.note_stream_open_confirmation_pending(&session, true, Some(record.clone()),
+            Some(BrowserConfirmationDetails {
+                id: Some("capture_1".into()), description: "Approve screenshot".into(),
+            })).await;
+        let wait = manager.register_pending_screenshot(
+            &session, "pending-listener".into(), Instant::now(), Duration::from_secs(1),
+        ).await.unwrap();
+        let prompt = manager.pending_confirmation(&session).await.unwrap().unwrap();
+
+        // Even a direct stale-allocation request must not discard a parked
+        // action or its original screenshot caller.
+        manager.clear_stale_running_stream_allocation(&session, port).await;
+        assert_eq!(manager.get_port(&session).await, Some(port));
+        assert_eq!(manager.pending_confirmation(&session).await.unwrap().unwrap().id, prompt.id);
+        assert!(manager.sessions.lock().await.get(&session).unwrap().pending_screenshot.is_some());
+        let error = manager.reconcile_existing_stream_listener(
+            &session, &session, port, Some(false),
+        ).await.unwrap_err();
+        assert!(error.contains("confirmation is pending"), "{error}");
+        assert!(manager.start_stream_locked(&session).await.unwrap_err().contains("confirmation is pending"));
+        assert!(manager.run_command_locked_with_outcome(&session, "open",
+            serde_json::json!({"url": "https://example.com"}), None, None,
+        ).await.unwrap_err().contains("confirmation is pending"));
+        assert!(daemon.try_wait().unwrap().is_none());
+        assert_eq!(manager.get_port(&session).await, Some(port));
+        assert_eq!(manager.pending_confirmation(&session).await.unwrap().unwrap().id, prompt.id);
+        assert!(manager.sessions.lock().await.get(&session).unwrap().pending_screenshot.is_some());
+
+        drop(wait.reply);
+        drop(control);
+        daemon.kill().unwrap();
+        daemon.wait().unwrap();
+        std::fs::remove_file(socket_path).unwrap();
+        std::fs::remove_file(daemon_pid_path).unwrap();
+        clear_session_pid(&session);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn departed_control_daemon_pins_pending_before_stream_retirement() {
+        let manager = AgentBrowserManager::new();
+        let session = format!("browser-pending-departed-{}", uuid::Uuid::new_v4().simple());
+        let port = manager.allocate_port(&session).await.unwrap();
+        let record = test_browser_record(u32::MAX, 1, browser_owner_token().to_owned());
+        {
+            let mut sessions = manager.sessions.lock().await;
+            let entry = sessions.get_mut(&session).unwrap();
+            entry.running = true;
+            entry.pid = Some(record.pid);
+            entry.pid_start_time = Some(record.start_time);
+            entry.confirmation_pending = true;
+            entry.pending_confirmation = Some(PendingBrowserConfirmation::new(
+                BrowserConfirmationDetails { id: Some("held".into()), description: "Approve action".into() },
+                Some(record.clone()),
+            ));
+        }
+        assert!(manager.reconcile_existing_stream_process(
+            &session, &session, port, record.pid, None, Some(false),
+        ).await.unwrap_err().contains("daemon exited"));
+        assert_eq!(manager.get_port(&session).await, None);
+        assert_eq!(manager.confirmation_recovery_required.lock().unwrap()
+            .get(&session).and_then(|guard| guard.daemon.as_ref()), Some(&record));
+        assert!(manager.require_no_pending_confirmation(&session).await.unwrap_err()
+            .contains("outcome is uncertain"));
     }
 
     #[cfg(unix)]
