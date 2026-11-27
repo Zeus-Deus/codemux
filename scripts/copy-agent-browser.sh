@@ -11,20 +11,24 @@ mkdir -p "$BINDIR"
 # Detect target triple
 TARGET="${CARGO_BUILD_TARGET:-$(rustc -vV | grep host | cut -d' ' -f2)}"
 
-# Map target triple to agent-browser binary name
+# agent-browser v0.44+ publishes native binaries as optional platform packages.
 case "$TARGET" in
-  x86_64-unknown-linux-gnu)  AB_BIN="agent-browser-linux-x64" ;;
-  aarch64-unknown-linux-gnu) AB_BIN="agent-browser-linux-arm64" ;;
-  x86_64-apple-darwin)       AB_BIN="agent-browser-darwin-x64" ;;
-  aarch64-apple-darwin)      AB_BIN="agent-browser-darwin-arm64" ;;
-  x86_64-pc-windows-msvc)    AB_BIN="agent-browser-win32-x64.exe" ;;
+  x86_64-unknown-linux-gnu)  AB_PACKAGE="cli-linux-x64-gnu" ;;
+  aarch64-unknown-linux-gnu) AB_PACKAGE="cli-linux-arm64-gnu" ;;
+  x86_64-apple-darwin)       AB_PACKAGE="cli-darwin-x64" ;;
+  aarch64-apple-darwin)      AB_PACKAGE="cli-darwin-arm64" ;;
+  x86_64-pc-windows-msvc)    AB_PACKAGE="cli-win32-x64-msvc" ;;
   *)
-    echo "[copy-agent-browser] Unknown target: $TARGET — skipping"
-    exit 0
+    echo "[copy-agent-browser] Unsupported target: $TARGET" >&2
+    exit 1
     ;;
 esac
 
-SRC="node_modules/agent-browser/bin/$AB_BIN"
+AB_BIN="agent-browser"
+case "$TARGET" in
+  *windows*) AB_BIN="${AB_BIN}.exe" ;;
+esac
+SRC="node_modules/@agent-browser/$AB_PACKAGE/bin/$AB_BIN"
 DST="$BINDIR/agent-browser-$TARGET"
 
 # Windows binaries need .exe extension
@@ -37,6 +41,7 @@ if [ -f "$SRC" ]; then
   chmod +x "$DST"
   echo "[copy-agent-browser] Copied $SRC → $DST"
 else
-  echo "[copy-agent-browser] WARNING: $SRC not found — agent-browser won't be bundled"
-  echo "[copy-agent-browser] Run 'npm install' first to download the binary"
+  echo "[copy-agent-browser] ERROR: $SRC not found — refusing to reuse a staged sidecar" >&2
+  echo "[copy-agent-browser] Run 'npm install' first to download the binary" >&2
+  exit 1
 fi

@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState, useCallback, memo } from "react";
-import { startBrowserStream, agentBrowserRun, activatePane, writeToPty } from "@/tauri/commands";
+import { startBrowserStream, ensureBrowserPresetNavigation, browserPresetNavigationStatus, browserStreamBridgeEndpoints, agentBrowserRun, agentBrowserPendingConfirmation, agentBrowserRespondConfirmation, activatePane, writeToPty, type BrowserPendingConfirmation } from "@/tauri/commands";
 import { selectActiveWorkspaceId, useAppStore } from "@/stores/app-store";
 import { useAgentChatStore } from "@/stores/agent-chat-store";
 import { toast } from "@/lib/toast";
@@ -33,15 +33,10 @@ import {
   nextClickState,
   mapToViewport,
   sanitizeCursor,
-  httpBaseFromStreamUrl,
   remoteBrowserEndpoints,
-  buildCursorProbeScript,
-  SELECTION_SCRIPT,
-  buildInsertTextScript,
-  chunkString,
-  PASTE_CHUNK_SIZE,
+  chunkPasteText,
   probeDaemon,
-  evalOnDaemon,
+  runPaneCommand,
 } from "./stream-protocol";
 import { isRemoteClient } from "@/components/remote/is-remote-client";
 import { markPaneReady } from "@/lib/perf/interaction-trace";
@@ -105,6 +100,57 @@ function RetryCountdown({ at }: { at: number }) {
   return <span className="tabular-nums">Retrying in {seconds}s</span>;
 }
 
+function ConfirmationCountdown({ at, now }: { at: number; now: number }) {
+  return <span className="tabular-nums">Expires in {Math.max(0, Math.ceil((at - now) / 1000))}s</span>;
+}
+
+interface PendingConfirmationState {
+  sessionId: string;
+  details: BrowserPendingConfirmation;
+  paneEpoch: number;
+}
+
+function PendingConfirmationNotice({
+  pending, busy, error, onApprove, onDeny,
+}: {
+  pending: PendingConfirmationState;
+  busy: boolean;
+  error: string | null;
+  onApprove: () => void;
+  onDeny: () => void;
+}) {
+  const expiresAt = pending.details.expires_at_ms;
+  const [now, setNow] = useState(() => Date.now());
+  useEffect(() => {
+    setNow(Date.now());
+    const id = setInterval(() => setNow(Date.now()), 1000);
+    const expiry = setTimeout(() => setNow(Date.now()), Math.max(0, expiresAt - Date.now()));
+    return () => {
+      clearInterval(id);
+      clearTimeout(expiry);
+    };
+  }, [expiresAt]);
+  const canRespond = !isRemoteClient() && !!pending.details.id;
+  return (
+    <div className="max-w-sm space-y-2 text-center" role="alert">
+      <p className="text-label font-medium text-foreground">Browser confirmation required</p>
+      <p className="break-words text-label text-muted-foreground">{pending.details.description}</p>
+      <p className="text-caption text-muted-foreground"><ConfirmationCountdown at={expiresAt} now={now} /></p>
+      {error && <p className="break-words text-label text-destructive">{error}</p>}
+      {canRespond ? (
+        <div className="flex items-center justify-center gap-2">
+          <Button size="sm" onClick={onApprove} disabled={busy || now >= expiresAt}>Approve browser action</Button>
+          <Button variant="outline" size="sm" onClick={onDeny} disabled={busy}>Deny</Button>
+        </div>
+      ) : (
+        <p className="text-label text-muted-foreground">
+          {isRemoteClient() ? "Approve or deny this request on the host device." : "This request cannot be approved here. Wait for it to expire and retry."}
+        </p>
+      )}
+    </div>
+  );
+}
+
 // Move-forwarding cadence (ms). Drags run tight for smooth text
 // selection; hover is calmer; inspector mode stays at the old 10/s to
 // avoid frame starvation from its in-page highlight handler.
@@ -128,6 +174,7 @@ const SLOW_RETRY_MS = 10000;
 // cheap WebSocket reconnect, so only a few starts retry on their own.
 // After that the pane waits for "Retry now".
 export const MAX_AUTO_START_RETRIES = 3;
+const PRESET_NAVIGATION_UNCONFIRMED_MESSAGE = "Preset navigation could not be confirmed. Check the page before retrying.";
 
 interface PendingMove {
   x: number;
@@ -157,6 +204,16 @@ export const BrowserPane = memo(function BrowserPane({ browserId, focused, visib
   fixedViewportRef.current = fixedViewport ?? browserViewportPresetSize(viewportPreset) ?? undefined;
   const [status, setStatus] = useState<BrowserStreamStatus>("starting");
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
+  const [pendingConfirmation, setPendingConfirmation] = useState<PendingConfirmationState | null>(null);
+  const pendingConfirmationRef = useRef(false);
+  const visibleConfirmationRef = useRef<PendingConfirmationState | null>(null);
+  const confirmationRevisionRef = useRef(0);
+  const retryPresetNavigationRef = useRef(false);
+  const presetErrorRef = useRef(false);
+  const [pendingPreset, setPendingPreset] = useState<{ sessionId: string; paneEpoch: number; kind: "preset" | "approval" } | null>(null);
+  const [confirmationBusy, setConfirmationBusy] = useState(false);
+  const confirmationBusyRef = useRef(false);
+  const [confirmationError, setConfirmationError] = useState<string | null>(null);
   // Bumping this re-runs the stream effect from the top: "Retry now".
   const [retryNonce, setRetryNonce] = useState(0);
   // When the slow reconnect loop will try next; null while not waiting.
@@ -214,12 +271,43 @@ export const BrowserPane = memo(function BrowserPane({ browserId, focused, visib
   // When backed by an agent session, use cli_session_name so that
   // user interactions and MCP tools operate on the same Chromium session.
   const effectiveSessionId = agentSession?.cli_session_name ?? browserId;
+  const streamSessionId = browserSession?.agent_session_name ?? browserId;
+  const paneIdentityRef = useRef({ browserId, effectiveSessionId, streamSessionId, epoch: 0 });
+  if (paneIdentityRef.current.browserId !== browserId || paneIdentityRef.current.effectiveSessionId !== effectiveSessionId
+      || paneIdentityRef.current.streamSessionId !== streamSessionId) {
+    paneIdentityRef.current = { browserId, effectiveSessionId, streamSessionId, epoch: paneIdentityRef.current.epoch + 1 };
+  }
+  const paneEpoch = paneIdentityRef.current.epoch;
+  const paneIsCurrent = () => paneIdentityRef.current.epoch === paneEpoch;
+  const currentPendingConfirmation = pendingConfirmation?.paneEpoch === paneEpoch ? pendingConfirmation : null;
+
+  useEffect(() => {
+    retryPresetNavigationRef.current = false;
+    presetErrorRef.current = false;
+    pendingConfirmationRef.current = false;
+    visibleConfirmationRef.current = null;
+    confirmationRevisionRef.current++;
+    confirmationBusyRef.current = false;
+    setPendingPreset(null);
+    setPendingConfirmation(null);
+    setConfirmationBusy(false);
+    setConfirmationError(null);
+    hasFrameRef.current = false;
+    lastFrameTimeRef.current = 0;
+    imgRef.current = null;
+    setHasFrame(false);
+    if (canvasRef.current) canvasRef.current.width = canvasRef.current.width;
+  }, [paneEpoch]);
 
   const [currentUrl, setCurrentUrl] = useState(
     () => agentSession?.current_url ?? browserSession?.current_url ?? "about:blank",
   );
   const currentUrlRef = useRef(currentUrl);
   currentUrlRef.current = currentUrl;
+
+  useEffect(() => {
+    setCurrentUrl(agentSession?.current_url ?? browserSession?.current_url ?? "about:blank");
+  }, [paneEpoch]);
 
   // Sync URL display from state changes (agent navigation, browserOpenUrl).
   // Does NOT re-navigate — the agent or CLI already performed the navigation.
@@ -319,21 +407,61 @@ export const BrowserPane = memo(function BrowserPane({ browserId, focused, visib
     let ws: WebSocket | null = null;
     let active = true;
     let slowRetryTimer: ReturnType<typeof setTimeout> | null = null;
+    let initialNavigationTimer: ReturnType<typeof setTimeout> | null = null;
+    let presetCheckScheduled = false;
 
     (async () => {
+      pendingConfirmationRef.current = false;
+      visibleConfirmationRef.current = null;
       setStatus("starting");
       setErrorMsg(null);
+      setPendingConfirmation(null);
+      setConfirmationError(null);
       setRetryAt(null);
       frameCountRef.current = 0;
 
-      const streamSessionId = browserSession?.agent_session_name ?? browserId;
+      const remoteClient = isRemoteClient();
+      const presetTargetUrl = () => useAppStore.getState().appState?.browser_sessions
+        .find((session) => session.browser_id === browserId)?.current_url ?? "about:blank";
 
       let streamUrl: string;
+      let desktopEndpoints: Awaited<ReturnType<typeof browserStreamBridgeEndpoints>> | null = null;
       try {
         streamUrl = await startBrowserStream(streamSessionId);
+        if (!remoteClient) {
+          desktopEndpoints = await browserStreamBridgeEndpoints(streamSessionId);
+        }
       } catch (err) {
-        if (!active) return;
+        if (!active || !paneIsCurrent()) return;
         console.error("[browser] startBrowserStream FAILED", err);
+        if (String(err).includes("Browser confirmation is pending")) {
+          pendingConfirmationRef.current = true;
+          const revision = confirmationRevisionRef.current;
+          const presetState = await browserPresetNavigationStatus(streamSessionId).catch(() => undefined);
+          if (!active || !paneIsCurrent() || confirmationBusyRef.current || revision !== confirmationRevisionRef.current) return;
+          if (presetState === "completed" || presetState === "failed" || presetState === null) {
+            // The approval settled while we read its status. A cached preset
+            // result may belong to an earlier action; reconnect first.
+            pendingConfirmationRef.current = false;
+            setPendingPreset(null);
+            setStatus("connecting");
+            slowRetryTimer = setTimeout(() => {
+              if (active && paneIsCurrent() && !pendingConfirmationRef.current) setRetryNonce((nonce) => nonce + 1);
+            }, 1500);
+            return;
+          }
+          if (presetState === "pending" || presetState === "approval_pending" || presetState === undefined) {
+            setPendingPreset({ sessionId: streamSessionId, paneEpoch, kind: presetState === "pending" ? "preset" : "approval" });
+          }
+          if (!remoteClient) {
+            const details = await agentBrowserPendingConfirmation(streamSessionId).catch(() => null);
+            if (!active || !paneIsCurrent() || confirmationBusyRef.current || revision !== confirmationRevisionRef.current) return;
+            if (details) showPendingConfirmation(streamSessionId, details);
+          }
+          setStatus("error");
+          setErrorMsg(remoteClient ? "Browser approval is waiting on the host device" : "Browser confirmation is pending");
+          return;
+        }
         setStatus("error");
         setErrorMsg(`Failed to start browser: ${err}`);
         // Same slow cadence as the reconnect loop: the daemon may come
@@ -347,26 +475,30 @@ export const BrowserPane = memo(function BrowserPane({ browserId, focused, visib
       }
 
       startFailuresRef.current = 0;
-      if (!active) return;
+      if (!active || !paneIsCurrent()) return;
 
       // The daemon serves HTTP on the same port as the stream WS —
       // used for the liveness probe, cursor probe, and clipboard bridge.
       //
-      // Desktop connects to the daemon's loopback socket directly. A remote
-      // (browser) client can't reach loopback, so it derives its WS + HTTP
-      // endpoints from the served origin's authenticated `/proxy/browser/<port>`
-      // routes instead (cookie rides along same-origin). Desktop path unchanged.
+      // Desktop uses an authenticated local bridge. Remote viewers use the
+      // paired web-remote origin's authenticated `/proxy/browser/<port>` routes.
       let connectUrl = streamUrl;
-      if (isRemoteClient()) {
+      if (remoteClient) {
         const endpoints = remoteBrowserEndpoints(streamUrl, window.location.origin);
-        if (endpoints) {
-          connectUrl = endpoints.wsUrl;
-          httpBaseRef.current = endpoints.httpBase;
-        } else {
-          httpBaseRef.current = httpBaseFromStreamUrl(streamUrl);
+        if (!endpoints) {
+          setStatus("error");
+          setErrorMsg("Invalid browser stream endpoint");
+          return;
         }
+        connectUrl = endpoints.wsUrl;
+        httpBaseRef.current = endpoints.httpBase;
+      } else if (desktopEndpoints) {
+        connectUrl = desktopEndpoints.ws_url;
+        httpBaseRef.current = desktopEndpoints.http_base;
       } else {
-        httpBaseRef.current = httpBaseFromStreamUrl(streamUrl);
+        setStatus("error");
+        setErrorMsg("Browser bridge unavailable");
+        return;
       }
 
       // Auto-reconnecting WebSocket — retries until screencast is live.
@@ -379,19 +511,54 @@ export const BrowserPane = memo(function BrowserPane({ browserId, focused, visib
       let retries = 0;
       const maxRetries = 15;
 
-      function connectWS() {
-        if (!active) return;
+      function scheduleReconnect(message = "Stream disconnected") {
+        if (pendingConfirmationRef.current) return;
+        retries++;
+        if (retries < maxRetries) {
+          if (statusRef.current === "live") {
+            setStatus("connecting");
+          }
+          setTimeout(connectWS, 1500);
+        } else {
+          setStatus("error");
+          setErrorMsg(message);
+          setRetryAt(Date.now() + SLOW_RETRY_MS);
+          slowRetryTimer = setTimeout(connectWS, SLOW_RETRY_MS);
+        }
+      }
+
+      async function connectWS() {
+        if (!active || !paneIsCurrent() || pendingConfirmationRef.current) return;
         setRetryAt(null);
         if (retries === 0) setStatus("connecting");
         else if (retries < maxRetries) setStatus("waiting");
         // Past the fast budget: stay in "error" while slow-retrying so
         // the pill/overlay keeps showing the disconnect honestly.
 
-        ws = new WebSocket(connectUrl);
-        wsRef.current = ws;
+        // A restarted daemon can reuse its old port while the bridge rotates
+        // its capability. Refresh on each scheduled reconnect so the pane
+        // cannot retry a revoked URL forever. The existing retry cadence
+        // bounds these IPC calls to 1.5s, then 10s.
+        if (!remoteClient && retries > 0) {
+          try {
+            const endpoints = await browserStreamBridgeEndpoints(streamSessionId);
+            if (!active || !paneIsCurrent()) return;
+            connectUrl = endpoints.ws_url;
+            httpBaseRef.current = endpoints.http_base;
+          } catch {
+            if (!active || !paneIsCurrent()) return;
+            scheduleReconnect("Browser bridge unavailable");
+            return;
+          }
+        }
 
-        ws.onopen = () => {
-          if (!active) return;
+        const socket = new WebSocket(connectUrl);
+        ws = socket;
+        wsRef.current = socket;
+
+        socket.onopen = () => {
+          if (!active || !paneIsCurrent() || wsRef.current !== socket) return;
+          presetCheckScheduled = false;
           setStatus("waiting");
 
           // Pinned viewport: ignore container dimensions entirely — the
@@ -421,10 +588,12 @@ export const BrowserPane = memo(function BrowserPane({ browserId, focused, visib
           }
         };
 
-        ws.onmessage = (event) => {
+        socket.onmessage = (event) => {
+          if (!active || !paneIsCurrent() || wsRef.current !== socket) return;
           try {
             const msg = JSON.parse(event.data);
             if (msg.type === "frame") {
+              if (pendingConfirmationRef.current) return;
               frameCountRef.current++;
               lastFrameTimeRef.current = Date.now();
               if (!hasFrameRef.current) {
@@ -438,21 +607,65 @@ export const BrowserPane = memo(function BrowserPane({ browserId, focused, visib
                     undefined,
                 });
               }
-              if (statusRef.current !== "live") {
-                setStatus("live");
-                // Skip navigation on reconnect — the agent's browser is already showing the right page.
-                const isReconnect = !!agentSessionRef.current;
-                if (!isReconnect) {
-                  // Navigate to pre-set URL when browser first goes live.
-                  // Delay 300ms to let browser process fully initialize for CDP commands.
-                  const targetUrl = currentUrlRef.current;
-                  if (targetUrl && targetUrl !== "about:blank") {
-                    setTimeout(() => {
-                      agentBrowserRun(effectiveSessionId, "open", { url: targetUrl })
-                        .then(() => setCurrentUrl(targetUrl))
-                        .catch(console.error);
-                    }, 300);
-                  }
+              if (statusRef.current !== "live" && !presetErrorRef.current) setStatus("live");
+              // The backend shares one preset result across pane remounts
+              // and serializes it with approval and daemon replacement.
+              if (!agentSessionRef.current && !presetCheckScheduled) {
+                // Navigate to pre-set URL when browser first goes live.
+                // Delay 300ms to let browser process fully initialize for CDP commands.
+                const targetUrl = presetTargetUrl();
+                if (targetUrl && targetUrl !== "about:blank") {
+                  presetCheckScheduled = true;
+                  initialNavigationTimer = setTimeout(() => {
+                    initialNavigationTimer = null;
+                    if (!active || !paneIsCurrent()) return;
+                    const latestTargetUrl = presetTargetUrl();
+                    if (!latestTargetUrl || latestTargetUrl === "about:blank") {
+                      presetCheckScheduled = false;
+                      return;
+                    }
+                    const retryFailed = retryPresetNavigationRef.current;
+                    retryPresetNavigationRef.current = false;
+                    void ensureBrowserPresetNavigation(effectiveSessionId, latestTargetUrl, retryFailed)
+                      .then(async (result) => {
+                        if (!active || !paneIsCurrent()) return;
+                        if (result === "completed") {
+                          presetErrorRef.current = false;
+                          if (!pendingConfirmationRef.current) {
+                            setStatus("live");
+                            setErrorMsg(null);
+                          }
+                        } else if (result === "pending") {
+                          setPendingPreset({ sessionId: effectiveSessionId, paneEpoch, kind: "preset" });
+                          if (!isRemoteClient()) {
+                            const revision = confirmationRevisionRef.current;
+                            const pending = await agentBrowserPendingConfirmation(effectiveSessionId).catch(() => null);
+                            if (!active || !paneIsCurrent() || confirmationBusyRef.current || revision !== confirmationRevisionRef.current) return;
+                            if (pending) {
+                              showPendingConfirmation(effectiveSessionId, pending);
+                              return;
+                            }
+                          }
+                          pendingConfirmationRef.current = true;
+                          wsRef.current?.close();
+                          setStatus("error");
+                          setErrorMsg(isRemoteClient()
+                            ? "Browser approval is waiting on the host device."
+                            : "Browser confirmation is pending.");
+                        } else {
+                          presetErrorRef.current = true;
+                          setStatus("error");
+                          setErrorMsg(PRESET_NAVIGATION_UNCONFIRMED_MESSAGE);
+                        }
+                      })
+                      .catch((error) => {
+                        if (!active || !paneIsCurrent()) return;
+                        console.error("[browser] preset navigation failed", error);
+                        presetErrorRef.current = true;
+                        setStatus("error");
+                        setErrorMsg("Could not verify preset navigation. Check the page, then retry if needed.");
+                      });
+                  }, 300);
                 }
               }
               retries = 0;
@@ -474,6 +687,7 @@ export const BrowserPane = memo(function BrowserPane({ browserId, focused, visib
               }
               const img = imgRef.current;
               img.onload = () => {
+                if (!active || !paneIsCurrent() || wsRef.current !== socket) return;
                 const frameAspect = img.naturalWidth / img.naturalHeight;
                 const canvasAspect = canvas.width / canvas.height;
 
@@ -510,7 +724,7 @@ export const BrowserPane = memo(function BrowserPane({ browserId, focused, visib
               // "Browser not launched" = daemon still starting, close to trigger retry.
               // Other errors (e.g. "Screencast already active") are benign — stay connected.
               if (errText.includes("not launched") && statusRef.current !== "live") {
-                ws?.close();
+                socket.close();
               }
             }
           } catch {
@@ -518,26 +732,15 @@ export const BrowserPane = memo(function BrowserPane({ browserId, focused, visib
           }
         };
 
-        ws.onerror = (ev) => {
-          console.error("[browser] ws ERROR", ev);
+        socket.onerror = (ev) => {
+          if (active && paneIsCurrent() && wsRef.current === socket) console.error("[browser] ws ERROR", ev);
         };
 
-        ws.onclose = () => {
-          if (!active) return;
+        socket.onclose = () => {
+          if (!active || !paneIsCurrent() || wsRef.current !== socket) return;
           // Auto-reconnect regardless of current status — handles both
           // initial connection failures and mid-stream disconnects.
-          retries++;
-          if (retries < maxRetries) {
-            if (statusRef.current === "live") {
-              setStatus("connecting");
-            }
-            setTimeout(connectWS, 1500);
-          } else {
-            setStatus("error");
-            setErrorMsg("Stream disconnected");
-            setRetryAt(Date.now() + SLOW_RETRY_MS);
-            slowRetryTimer = setTimeout(connectWS, SLOW_RETRY_MS);
-          }
+          scheduleReconnect();
         };
       }
 
@@ -552,14 +755,14 @@ export const BrowserPane = memo(function BrowserPane({ browserId, focused, visib
     // (daemon death, stale port, half-open socket after suspend).
     let probing = false;
     const livenessInterval = setInterval(() => {
-      if (!active || statusRef.current !== "live" || lastFrameTimeRef.current === 0) return;
+      if (!active || !paneIsCurrent() || statusRef.current !== "live" || lastFrameTimeRef.current === 0) return;
       if (Date.now() - lastFrameTimeRef.current <= QUIET_BEFORE_PROBE_MS) return;
       if (probing) return;
       probing = true;
       const base = httpBaseRef.current;
       (base ? probeDaemon(base, 3000) : Promise.resolve(false)).then((alive) => {
         probing = false;
-        if (!active || alive) return;
+        if (!active || !paneIsCurrent() || alive) return;
         if (wsRef.current?.readyState === WebSocket.OPEN) {
           console.warn("[browser] stream quiet and daemon unresponsive — reconnecting");
           wsRef.current.close();
@@ -571,23 +774,267 @@ export const BrowserPane = memo(function BrowserPane({ browserId, focused, visib
       active = false;
       clearInterval(livenessInterval);
       if (slowRetryTimer) clearTimeout(slowRetryTimer);
+      if (initialNavigationTimer) {
+        clearTimeout(initialNavigationTimer);
+      }
       // Close WebSocket on cleanup so the stream server's client count resets.
       // On StrictMode remount, the daemon is already running (*running = true),
       // so startBrowserStream returns instantly and a fresh WS connects.
       // This fresh connection triggers startScreencast with the browser launched.
       if (ws) {
         ws.close();
-        wsRef.current = null;
+        if (wsRef.current === ws) wsRef.current = null;
       }
     };
     // `reactiveStreamUrl` is included so a port re-allocation in the
     // backend (after a teardown/respawn cycle) tears down this WS and
     // reconnects against the fresh URL — the bug the old deps array missed.
-  }, [browserId, visible, browserSession?.agent_session_name, reactiveStreamUrl, retryNonce]);
+  }, [paneEpoch, visible, reactiveStreamUrl, retryNonce]);
 
-  const retryNow = () => {
+  const retryNow = (retryPreset = false) => {
+    if (retryPreset) {
+      retryPresetNavigationRef.current = true;
+      presetErrorRef.current = false;
+    }
+    pendingConfirmationRef.current = false;
+    visibleConfirmationRef.current = null;
     startFailuresRef.current = 0;
     setRetryNonce((n) => n + 1);
+  };
+
+  const showPendingConfirmation = (sessionId: string, details: BrowserPendingConfirmation) => {
+    if (!paneIsCurrent()) return;
+    confirmationRevisionRef.current++;
+    pendingConfirmationRef.current = true;
+    visibleConfirmationRef.current = { sessionId, details, paneEpoch };
+    wsRef.current?.close();
+    wsRef.current = null;
+    httpBaseRef.current = null;
+    setPendingConfirmation({ sessionId, details, paneEpoch });
+    setConfirmationError(null);
+    setErrorMsg(null);
+    setRetryAt(null);
+    setStatus("error");
+  };
+
+  useEffect(() => {
+    if (!visible || isRemoteClient()) return;
+    let active = true;
+    let checking = false;
+    const checkPending = async () => {
+      if (checking || confirmationBusyRef.current) return;
+      checking = true;
+      const revision = confirmationRevisionRef.current;
+      try {
+        const pending = await agentBrowserPendingConfirmation(effectiveSessionId);
+        if (!active || !paneIsCurrent() || confirmationBusyRef.current || revision !== confirmationRevisionRef.current) return;
+        const shown = visibleConfirmationRef.current;
+        if (pending) {
+          if (shown?.sessionId !== effectiveSessionId || shown.details.id !== pending.id
+              || shown.details.expires_at_ms !== pending.expires_at_ms) {
+            showPendingConfirmation(effectiveSessionId, pending);
+          }
+        } else if (shown?.sessionId === effectiveSessionId && !confirmationBusyRef.current) {
+          // Another host pane may have approved this preset. Let the preset
+          // status poll settle its result instead of treating the missing
+          // prompt as an expired action.
+          const presetState = await browserPresetNavigationStatus(effectiveSessionId).catch(() => undefined);
+          if (!active || !paneIsCurrent() || confirmationBusyRef.current || revision !== confirmationRevisionRef.current
+              || presetState === undefined) return;
+          confirmationRevisionRef.current++;
+          visibleConfirmationRef.current = null;
+          setPendingConfirmation(null);
+          setConfirmationError(null);
+          if (presetState === "pending" || presetState === "approval_pending") {
+            setPendingPreset({ sessionId: effectiveSessionId, paneEpoch, kind: presetState === "pending" ? "preset" : "approval" });
+            pendingConfirmationRef.current = true;
+            setErrorMsg("Waiting for browser approval to finish.");
+            setStatus("error");
+            return;
+          }
+          if (presetState === "completed" || presetState === "failed") {
+            setPendingPreset(null);
+            pendingConfirmationRef.current = false;
+            setRetryNonce((nonce) => nonce + 1);
+            return;
+          }
+          setPendingPreset(null);
+          presetErrorRef.current = true;
+          setErrorMsg("Browser confirmation is no longer pending. Retry to reconnect.");
+          setStatus("error");
+        }
+      } catch {
+        // The stream retry path reports backend failures to the pane.
+      } finally {
+        checking = false;
+      }
+    };
+    void checkPending();
+    const timer = setInterval(checkPending, 2000);
+    return () => {
+      active = false;
+      clearInterval(timer);
+    };
+  }, [visible, effectiveSessionId, paneEpoch]);
+
+  useEffect(() => {
+    if (!visible || !pendingPreset || pendingPreset.paneEpoch !== paneEpoch) return;
+    const sessionId = pendingPreset.sessionId;
+    let active = true;
+    let checking = false;
+    const checkPreset = async () => {
+      if (checking || confirmationBusyRef.current || !paneIsCurrent()) return;
+      checking = true;
+      const revision = confirmationRevisionRef.current;
+      try {
+        const state = await browserPresetNavigationStatus(sessionId);
+        if (!active || !paneIsCurrent() || confirmationBusyRef.current || revision !== confirmationRevisionRef.current) return;
+        if (state === "pending" || state === "approval_pending") {
+          const kind = state === "pending" ? "preset" : "approval";
+          if (pendingPreset.kind !== kind) setPendingPreset({ sessionId, paneEpoch, kind });
+          if (!isRemoteClient()) {
+            const details = await agentBrowserPendingConfirmation(sessionId).catch(() => null);
+            if (!active || !paneIsCurrent() || confirmationBusyRef.current || revision !== confirmationRevisionRef.current) return;
+            const shown = visibleConfirmationRef.current;
+            if (details && (shown?.details.id !== details.id
+                || shown?.details.expires_at_ms !== details.expires_at_ms)) {
+              showPendingConfirmation(sessionId, details);
+            }
+          }
+        } else {
+          confirmationRevisionRef.current++;
+          setPendingPreset(null);
+          pendingConfirmationRef.current = false;
+          visibleConfirmationRef.current = null;
+          setPendingConfirmation(null);
+          if (pendingPreset.kind === "preset" && state === "failed") {
+            presetErrorRef.current = true;
+            setStatus("error");
+            setErrorMsg(PRESET_NAVIGATION_UNCONFIRMED_MESSAGE);
+          } else {
+            presetErrorRef.current = false;
+            setRetryNonce((nonce) => nonce + 1);
+          }
+        }
+      } catch {
+        // Leave the request visible until the backend can report its state.
+      } finally {
+        checking = false;
+      }
+    };
+    void checkPreset();
+    const timer = setInterval(checkPreset, 2000);
+    return () => {
+      active = false;
+      clearInterval(timer);
+    };
+  }, [visible, pendingPreset, paneEpoch]);
+
+  const respondToConfirmation = async (approve: boolean) => {
+    const pending = pendingConfirmation;
+    if (!pending?.details.id || pending.paneEpoch !== paneEpoch || !paneIsCurrent() || confirmationBusy || isRemoteClient()) return;
+    const decisionRevision = ++confirmationRevisionRef.current;
+    confirmationBusyRef.current = true;
+    setConfirmationBusy(true);
+    setConfirmationError(null);
+    let reconnectAfterDecision = false;
+    try {
+      const followUp = await agentBrowserRespondConfirmation(pending.sessionId, pending.details.id, approve);
+      if (!paneIsCurrent() || decisionRevision !== confirmationRevisionRef.current) return;
+      if (followUp) {
+        showPendingConfirmation(pending.sessionId, followUp);
+        return;
+      }
+      setPendingPreset(null);
+      visibleConfirmationRef.current = null;
+      setPendingConfirmation(null);
+      if (approve) retryNow();
+      else setErrorMsg("Browser action denied");
+    } catch (err) {
+      if (!paneIsCurrent() || decisionRevision !== confirmationRevisionRef.current) return;
+      const message = String(err);
+      const reason = message.replace(/^Error: /, "");
+      const replayFailed = reason.startsWith("Browser action failed after confirmation:");
+      const staleDecision = [
+        "Browser session has no pending confirmation",
+        "Browser confirmation ID no longer matches this session",
+      ].includes(reason);
+      if (replayFailed) {
+        // The backend consumed this prompt before reporting the action error.
+        // A second status read may fail, but must not revive its decision UI.
+        confirmationRevisionRef.current++;
+        pendingConfirmationRef.current = false;
+        visibleConfirmationRef.current = null;
+        setPendingConfirmation(null);
+        setPendingPreset(null);
+        setConfirmationError(null);
+        setStatus("error");
+        setErrorMsg(message);
+        return;
+      }
+      try {
+        const current = await agentBrowserPendingConfirmation(pending.sessionId);
+        if (!paneIsCurrent() || decisionRevision !== confirmationRevisionRef.current) return;
+        if (!current) {
+          if (!staleDecision) {
+            confirmationRevisionRef.current++;
+            pendingConfirmationRef.current = false;
+            visibleConfirmationRef.current = null;
+            setPendingConfirmation(null);
+            setPendingPreset(null);
+            setConfirmationError(null);
+            setStatus("error");
+            setErrorMsg(message);
+            return;
+          }
+          const presetState = await browserPresetNavigationStatus(pending.sessionId).catch(() => undefined);
+          if (!paneIsCurrent() || decisionRevision !== confirmationRevisionRef.current) return;
+          if (presetState === "pending" || presetState === "approval_pending") {
+            confirmationRevisionRef.current++;
+            visibleConfirmationRef.current = null;
+            setPendingConfirmation(null);
+            setConfirmationError(null);
+            setPendingPreset({ sessionId: pending.sessionId, paneEpoch, kind: presetState === "pending" ? "preset" : "approval" });
+            pendingConfirmationRef.current = true;
+            setStatus("error");
+            setErrorMsg("Waiting for browser approval to finish.");
+            return;
+          }
+          if (presetState === "completed" || presetState === "failed") {
+            confirmationRevisionRef.current++;
+            visibleConfirmationRef.current = null;
+            setPendingConfirmation(null);
+            setPendingPreset(null);
+            reconnectAfterDecision = true;
+            return;
+          }
+          if (presetState === undefined) {
+            setConfirmationError(message);
+            return;
+          }
+          setPendingPreset(null);
+          presetErrorRef.current = true;
+          visibleConfirmationRef.current = null;
+          setPendingConfirmation(null);
+          setErrorMsg(message);
+          setStatus("error");
+          return;
+        }
+        if (current.id !== pending.details.id) {
+          showPendingConfirmation(pending.sessionId, current);
+          return;
+        }
+      } catch {
+        // Keep the prompt visible until its backend state can be checked.
+      }
+      setConfirmationError(message);
+    } finally {
+      if (paneIsCurrent()) {
+        confirmationBusyRef.current = false;
+        setConfirmationBusy(false);
+        if (reconnectAfterDecision) retryNow();
+      }
+    }
   };
 
   const copyErrorDetails = async () => {
@@ -688,7 +1135,7 @@ export const BrowserPane = memo(function BrowserPane({ browserId, focused, visib
     if (cursorBusyRef.current || now - lastCursorAtRef.current < CURSOR_PROBE_INTERVAL_MS) return;
     cursorBusyRef.current = true;
     lastCursorAtRef.current = now;
-    evalOnDaemon(base, buildCursorProbeScript(x, y), 1500)
+    runPaneCommand(base, { operation: "cursor", x, y }, 1500)
       .then((result) => {
         const canvas = canvasRef.current;
         if (canvas && !inspectorActiveRef.current) {
@@ -867,7 +1314,7 @@ export const BrowserPane = memo(function BrowserPane({ browserId, focused, visib
     const base = httpBaseRef.current;
     if (base) {
       try {
-        const sel = await evalOnDaemon(base, SELECTION_SCRIPT, 1000);
+        const sel = await runPaneCommand(base, { operation: "selection" }, 1000);
         if (typeof sel === "string" && sel.length > 0) {
           await navigator.clipboard.writeText(sel);
         }
@@ -898,9 +1345,9 @@ export const BrowserPane = memo(function BrowserPane({ browserId, focused, visib
     }
     // Chunked so each eval request fits the daemon's single-segment
     // HTTP read (see the page-scripts note in stream-protocol.ts).
-    const chunks = chunkString(text, PASTE_CHUNK_SIZE);
+    const chunks = chunkPasteText(text);
     for (let i = 0; i < chunks.length; i++) {
-      const result = await evalOnDaemon(base, buildInsertTextScript(chunks[i]), 3000);
+      const result = await runPaneCommand(base, { operation: "insert_text", text: chunks[i] }, 3000);
       const inserted = result === true || result === "true";
       if (!inserted) {
         // Focus isn't an editable element (or the daemon hiccuped) —
@@ -1044,6 +1491,7 @@ export const BrowserPane = memo(function BrowserPane({ browserId, focused, visib
           sessionId={effectiveSessionId}
           currentUrl={currentUrl}
           onUrlChange={setCurrentUrl}
+          onPendingConfirmation={showPendingConfirmation}
           loading={status === "starting" || status === "connecting"}
           inspectorActive={inspectorActive}
           onInspectorToggle={toggleInspector}
@@ -1067,7 +1515,15 @@ export const BrowserPane = memo(function BrowserPane({ browserId, focused, visib
             and surface a corner pill instead of blanking the pane. */}
         {status !== "live" && !hasFrame && (
           <div className="absolute inset-0 flex flex-col items-center justify-center bg-card z-10 px-4 text-center">
-            {status === "error" ? (
+            {currentPendingConfirmation ? (
+              <PendingConfirmationNotice
+                pending={currentPendingConfirmation}
+                busy={confirmationBusy}
+                error={confirmationError}
+                onApprove={() => respondToConfirmation(true)}
+                onDeny={() => respondToConfirmation(false)}
+              />
+            ) : status === "error" ? (
               <>
                 <Globe className="size-8 text-subtle-foreground mb-2" />
                 <p className="max-w-sm text-label text-destructive">{errorMsg || "Connection failed"}</p>
@@ -1077,7 +1533,7 @@ export const BrowserPane = memo(function BrowserPane({ browserId, focused, visib
                   </p>
                 )}
                 <div className="mt-3 flex items-center gap-2">
-                  <Button variant="outline" size="sm" onClick={retryNow}>
+                  <Button variant="outline" size="sm" onClick={() => retryNow(true)}>
                     <RotateCw className="size-3.5" />
                     Retry now
                   </Button>
@@ -1101,10 +1557,20 @@ export const BrowserPane = memo(function BrowserPane({ browserId, focused, visib
         )}
         {status !== "live" && hasFrame && (
           <div
-            className="absolute right-2 top-2 z-10 flex items-center gap-1.5 rounded-full border border-border bg-card/90 px-2.5 py-1 shadow-sm backdrop-blur-sm animate-in fade-in duration-250"
+            className={currentPendingConfirmation
+              ? "absolute right-2 top-2 z-10 rounded-md border border-border bg-card/95 p-3 shadow-sm backdrop-blur-sm"
+              : "absolute right-2 top-2 z-10 flex items-center gap-1.5 rounded-full border border-border bg-card/90 px-2.5 py-1 shadow-sm backdrop-blur-sm animate-in fade-in duration-250"}
             style={{ animationDelay: "400ms", animationFillMode: "backwards" }}
           >
-            {status === "error" ? (
+            {currentPendingConfirmation ? (
+              <PendingConfirmationNotice
+                pending={currentPendingConfirmation}
+                busy={confirmationBusy}
+                error={confirmationError}
+                onApprove={() => respondToConfirmation(true)}
+                onDeny={() => respondToConfirmation(false)}
+              />
+            ) : status === "error" ? (
               <>
                 <Globe className="size-3 text-destructive" />
                 <span className="text-label text-destructive">{errorMsg || "Stream disconnected"}</span>
@@ -1115,7 +1581,7 @@ export const BrowserPane = memo(function BrowserPane({ browserId, focused, visib
                 )}
                 <button
                   type="button"
-                  onClick={retryNow}
+                  onClick={() => retryNow(true)}
                   className="rounded-sm text-label font-medium text-foreground underline-offset-2 hover:underline"
                 >
                   Retry now

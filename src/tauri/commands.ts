@@ -1324,6 +1324,18 @@ export const agentBrowserSpawn = (browserId: string) =>
 export const agentBrowserRun = (browserId: string, action: string, params: unknown) =>
   invoke("agent_browser_run", { browserId, action, params });
 
+export interface BrowserPendingConfirmation {
+  id: string | null;
+  description: string;
+  expires_at_ms: number;
+}
+
+export const agentBrowserPendingConfirmation = (browserId: string) =>
+  invoke<BrowserPendingConfirmation | null>("agent_browser_pending_confirmation", { browserId });
+
+export const agentBrowserRespondConfirmation = (browserId: string, id: string, approve: boolean) =>
+  invoke<BrowserPendingConfirmation | null>("agent_browser_respond_confirmation", { browserId, id, approve });
+
 export const agentBrowserClose = (browserId: string) =>
   invoke("agent_browser_close", { browserId });
 
@@ -1332,6 +1344,23 @@ export const agentBrowserScreenshot = (browserId: string) =>
 
 export const startBrowserStream = (browserId: string) =>
   invoke<string>("start_browser_stream", { browserId });
+
+export type BrowserPresetNavigationResult = "completed" | "pending" | "failed";
+export type BrowserPresetNavigationStatus = BrowserPresetNavigationResult | "approval_pending";
+
+export const ensureBrowserPresetNavigation = (browserId: string, url: string, retryFailed = false) =>
+  invoke<BrowserPresetNavigationResult>("ensure_browser_preset_navigation", { browserId, url, retryFailed });
+
+export const browserPresetNavigationStatus = (browserId: string) =>
+  invoke<BrowserPresetNavigationStatus | null>("browser_preset_navigation_status", { browserId });
+
+export interface BrowserStreamBridgeEndpoints {
+  ws_url: string;
+  http_base: string;
+}
+
+export const browserStreamBridgeEndpoints = (browserId: string) =>
+  invoke<BrowserStreamBridgeEndpoints>("browser_stream_bridge_endpoints", { browserId });
 
 // ── Browser Data ──
 

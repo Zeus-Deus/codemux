@@ -12,7 +12,13 @@ import { BrowserPane } from "./BrowserPane";
 
 vi.mock("@/tauri/commands", () => ({
   startBrowserStream: vi.fn().mockResolvedValue("ws://localhost:9777"),
+  browserStreamBridgeEndpoints: vi.fn().mockResolvedValue({
+    ws_url: "ws://127.0.0.1:9777/private/browser/9777/ws",
+    http_base: "http://127.0.0.1:9777/private/browser/9777",
+  }),
   agentBrowserRun: vi.fn().mockResolvedValue(undefined),
+  agentBrowserPendingConfirmation: vi.fn().mockResolvedValue(null),
+  agentBrowserRespondConfirmation: vi.fn().mockResolvedValue(undefined),
   activatePane: vi.fn().mockResolvedValue(undefined),
   activateTab: vi.fn().mockResolvedValue(undefined),
   activateWorkspace: vi.fn().mockResolvedValue(undefined),

@@ -31,6 +31,7 @@ pub mod mcp_cleanup;
 pub mod mcp_server;
 pub mod mcp_connector;
 pub mod agent_browser;
+pub mod browser_stream_bridge;
 pub mod browser_viewport;
 pub mod cli;
 pub mod checkout_claims;
@@ -685,6 +686,7 @@ fn core_startup_plugin<R: tauri::Runtime>(
             app.manage(observability::load_observability_store());
             app.manage(session_adapters::AdapterState::new());
             app.manage(agent_browser::AgentBrowserManager::new_with_cleanup());
+            app.manage(browser_stream_bridge::BrowserStreamBridge::default());
             Ok(())
         })
         .build()
@@ -2996,9 +2998,14 @@ fn build_core_app<R: tauri::Runtime>(
             commands::browser_set_loading_state,
             commands::agent_browser_spawn,
             commands::agent_browser_run,
+            commands::agent_browser_pending_confirmation,
+            commands::agent_browser_respond_confirmation,
             commands::agent_browser_close,
             commands::agent_browser_screenshot,
             commands::start_browser_stream,
+            commands::ensure_browser_preset_navigation,
+            commands::browser_preset_navigation_status,
+            commands::browser_stream_bridge_endpoints,
             commands::get_browser_data_size,
             commands::clear_browser_cookies,
             commands::clear_all_browser_data,
