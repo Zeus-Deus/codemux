@@ -96,7 +96,10 @@ export function UpdatesSection() {
   const appPending = app.available;
   const total = plan.items.length + (appPending ? 1 : 0);
   const restartRequired = Object.values(known).some(helperNeedsRestart);
-  const statusUnavailable = hostIds.some((id) => !!known[hostKey(id)]?.error);
+  const statusUnavailable = hostIds.some((id) => {
+    const state = known[hostKey(id)];
+    return !!state?.error || (!!state?.helperVersion && !state.runningVersion && state.serveAlive !== false);
+  });
   const restartNotice = (current: Partial<Record<MachineKey, MachineState>>) => {
     const devices = hosts.filter((host) => helperNeedsRestart(current[hostKey(host.id)]));
     if (devices.length === 0) return "Running chats weren't interrupted.";

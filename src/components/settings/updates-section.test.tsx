@@ -163,6 +163,20 @@ describe("UpdatesSection", () => {
     expect(screen.getByRole("button", { name: "Restart required" })).toBeDisabled();
   });
 
+  it("shows unavailable status when the agent inventory succeeds but the running service version is unknown", async () => {
+    invoke.mockImplementation(async (cmd: string) => {
+      if (cmd === "provider_updates_local") return [];
+      if (cmd === "provider_updates_device") {
+        return { host_id: 2, helper_version: "0.24.0", running_version: null, serve_alive: null, app_version: "0.24.0", providers: [], error: null };
+      }
+      throw new Error(`unexpected ${cmd}`);
+    });
+
+    render(<UpdatesSection />);
+    expect(await screen.findByText("v0.24.0 installed · running version unavailable")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Status unavailable" })).toBeDisabled();
+  });
+
   it("shows the running version when another helper update is available", async () => {
     invoke.mockImplementation(async (cmd: string) => {
       if (cmd === "provider_updates_local") return [];
