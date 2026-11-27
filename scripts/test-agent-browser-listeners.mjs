@@ -33,9 +33,9 @@ async function wire(target, request, terminator) {
     socket.on('connect', () => socket.write(request));
     socket.on('data', (data) => {
       result += data.toString();
-      if (result.includes(terminator)) finish();
+      if (terminator && result.includes(terminator)) finish();
     });
-    socket.on('end', () => finish(new Error(`Listener closed early: ${result}`)));
+    socket.on('end', () => finish(terminator ? new Error(`Listener closed early: ${result}`) : undefined));
   });
 }
 
@@ -124,7 +124,11 @@ try {
   const command = (token) => wire(streamTarget, httpRequest(a.port, 'POST', '/api/command', token, commandBody), '\r\n\r\n');
   assert.match(await command(), /^HTTP\/1\.1 403 /);
   assert.match(await command(b.token), /^HTTP\/1\.1 403 /);
-  assert.match(await command(a.token), /^HTTP\/1\.1 200 /);
+  const commandResponse = await wire(streamTarget,
+    httpRequest(a.port, 'POST', '/api/command', a.token, commandBody), null);
+  assert.match(commandResponse, /^HTTP\/1\.1 200 /);
+  const commandResult = JSON.parse(commandResponse.split('\r\n\r\n', 2)[1]);
+  assert.equal(commandResult.success, true);
   assert.match(await wire(streamTarget, httpRequest(a.port, 'OPTIONS', '/api/command'), '\r\n\r\n'), /^HTTP\/1\.1 403 /);
 
   const websocket = (token, origin) => wire(streamTarget, wsRequest(a.port, token, origin), '\r\n\r\n');
@@ -147,7 +151,9 @@ try {
   const daemonCommand = async (command) => JSON.parse(await wire(a.daemonTarget,
     `${JSON.stringify({ ...command, codemuxToken: a.token })}\n`, '\n'));
   const pending = await daemonCommand({ id: 'screenshot-1', action: 'screenshot' });
-  assert.equal(pending.data.confirmation_id, 'screenshot-1');
+  const confirmationId = pending.data.confirmation_id;
+  assert.match(confirmationId, /^[a-f0-9-]{36}$/);
+  assert.notEqual(confirmationId, 'screenshot-1');
   for (const decision of [
     { id: 'decision-1', action: 'confirm' },
     { id: 'decision-2', action: 'confirm', confirmationId: 'wrong' },
@@ -157,7 +163,7 @@ try {
     assert.equal(rejected.success, false);
     assert.match(rejected.error, /Confirmation ID/);
   }
-  const denied = await daemonCommand({ id: 'decision-4', action: 'deny', confirmationId: 'screenshot-1' });
+  const denied = await daemonCommand({ id: 'decision-4', action: 'deny', confirmationId });
   assert.equal(denied.data.denied, true);
 
   console.log('Browser WS, HTTP API, and daemon listeners enforce tokens; wrong confirmation IDs preserve the pending command.');

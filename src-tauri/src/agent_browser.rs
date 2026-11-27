@@ -2015,11 +2015,30 @@ fn browser_listener_token_from_environ(entries: &[std::ffi::OsString]) -> Option
     Some(std::str::from_utf8(token).ok()?.to_owned())
 }
 
-/// Recover a previous launch's token only while its private PID record and
-/// native process identity still agree. An unreadable process environment
-/// leaves the previous daemon untouched by the authenticated close path.
 #[cfg(all(unix, any(test, target_os = "linux", target_os = "macos")))]
-fn verified_browser_listener_token_from_process(record: &BrowserPidRecord, session: &str) -> Option<String> {
+#[derive(Debug, PartialEq, Eq)]
+enum BrowserListenerAuth {
+    Token(String),
+    Legacy,
+}
+
+#[cfg(all(unix, any(test, target_os = "linux", target_os = "macos")))]
+fn browser_listener_auth_from_environ(entries: &[std::ffi::OsString]) -> Option<BrowserListenerAuth> {
+    if let Some(token) = browser_listener_token_from_environ(entries) {
+        return Some(BrowserListenerAuth::Token(token));
+    }
+    use std::os::unix::ffi::OsStrExt;
+    // The caller already verified the owner and session entries. A missing
+    // secret identifies the pre-auth build; a malformed one never does.
+    (!entries.iter().any(|entry| entry.as_bytes().starts_with(b"CODEMUX_BROWSER_SECRET")))
+        .then_some(BrowserListenerAuth::Legacy)
+}
+
+/// Classify a previous launch only while its private PID record and native
+/// process identity agree. A daemon without a secret is legacy only when its
+/// owner and session environment values are readable.
+#[cfg(all(unix, any(test, target_os = "linux", target_os = "macos")))]
+fn verified_browser_listener_auth_from_process(record: &BrowserPidRecord, session: &str) -> Option<BrowserListenerAuth> {
     use std::os::unix::ffi::OsStrExt;
     use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System, UpdateKind};
 
@@ -2054,22 +2073,30 @@ fn verified_browser_listener_token_from_process(record: &BrowserPidRecord, sessi
     {
         return None;
     }
-    let token = browser_listener_token_from_environ(entries)?;
-    (process_start_time(record.pid) == Some(record.start_time)).then_some(token)
+    let auth = browser_listener_auth_from_environ(entries)?;
+    (process_start_time(record.pid) == Some(record.start_time)).then_some(auth)
 }
 
 #[cfg(all(unix, any(test, target_os = "linux", target_os = "macos")))]
-fn browser_listener_token_for_close(record: &BrowserPidRecord, session: &str) -> Option<String> {
+fn browser_listener_auth_for_close(record: &BrowserPidRecord, session: &str) -> Option<BrowserListenerAuth> {
     if !browser_process_matches(record, session) {
         return None;
     }
     if record.token == browser_owner_token() {
-        return Some(hex_token(&browser_listener_token_bytes(session)));
+        return Some(BrowserListenerAuth::Token(hex_token(&browser_listener_token_bytes(session))));
     }
     if !previous_app_has_exited(record) {
         return None;
     }
-    verified_browser_listener_token_from_process(record, session)
+    verified_browser_listener_auth_from_process(record, session)
+}
+
+#[cfg(all(unix, any(test, target_os = "linux", target_os = "macos")))]
+fn browser_listener_token_for_close(record: &BrowserPidRecord, session: &str) -> Option<String> {
+    match browser_listener_auth_for_close(record, session)? {
+        BrowserListenerAuth::Token(token) => Some(token),
+        BrowserListenerAuth::Legacy => None,
+    }
 }
 
 fn owned_browser_pid(session: &str, pid: u32) -> Option<BrowserPidRecord> {
@@ -2420,7 +2447,7 @@ fn stop_owned_browser_daemon(session: &str, record: &BrowserPidRecord, bin: &str
                     .map(|dir| dir.join(format!("{session}.sock")))
                     .ok_or_else(|| "Browser control path is unavailable".to_string())
                     .and_then(|path| close_verified_unix_browser_peer(
-                        &path, record.pid, deadline, &token,
+                        &path, record.pid, deadline, BrowserCloseCredential::Token(&token),
                         || browser_process_matches(record, session)
                             && (record.token == browser_owner_token()
                                 || browser_record_matches_control_dir(record, session)),
@@ -2538,6 +2565,13 @@ fn connect_unix_browser_control_until(
     Ok(socket.into())
 }
 
+#[cfg(all(unix, any(test, target_os = "linux", target_os = "macos")))]
+enum BrowserCloseCredential<'a> {
+    Token(&'a str),
+    #[cfg(target_os = "macos")]
+    VerifiedLegacy,
+}
+
 /// Send close on the connection whose kernel-reported peer is the verified
 /// daemon. Resolving the socket again through the CLI could reach a process
 /// that replaced the listener after the ownership check.
@@ -2546,7 +2580,7 @@ fn close_verified_unix_browser_peer(
     socket_path: &std::path::Path,
     expected_pid: u32,
     deadline: Instant,
-    listener_token: &str,
+    credential: BrowserCloseCredential<'_>,
     still_owned: impl FnOnce() -> bool,
     on_verified_peer: impl FnOnce(),
 ) -> Result<(), String> {
@@ -2567,8 +2601,15 @@ fn close_verified_unix_browser_peer(
     let mut request = serde_json::json!({
         "id": uuid::Uuid::new_v4().simple().to_string(),
         "action": "close",
-        "codemuxToken": listener_token,
-    }).to_string();
+    });
+    match credential {
+        BrowserCloseCredential::Token(token) => {
+            request["codemuxToken"] = serde_json::Value::String(token.to_owned());
+        }
+        #[cfg(target_os = "macos")]
+        BrowserCloseCredential::VerifiedLegacy => {}
+    }
+    let mut request = request.to_string();
     request.push('\n');
     stream.write_all(request.as_bytes()).map_err(|_| "Browser close request failed".to_string())?;
 
@@ -2801,15 +2842,17 @@ fn close_verified_browser_pid_until(record: &BrowserPidRecord, session: &str, de
     let dir = run_dir_for_session(session);
     let mut files = None;
     let socket = dir.as_ref().map(|dir| dir.join(format!("{session}.sock")));
-    let token = browser_listener_token_for_close(record, session)
-        .ok_or_else(|| "Verified browser listener token is unavailable".to_string());
-    let result = token.and_then(|token| {
+    let auth = browser_listener_auth_for_close(record, session)
+        .ok_or_else(|| "Verified browser listener identity is unavailable".to_string());
+    let result = auth.and_then(|auth| {
+        let credential = match &auth {
+            BrowserListenerAuth::Token(token) => BrowserCloseCredential::Token(token),
+            BrowserListenerAuth::Legacy => BrowserCloseCredential::VerifiedLegacy,
+        };
         socket.ok_or_else(|| "Browser control path is unavailable".to_string())
             .and_then(|path| close_verified_unix_browser_peer(
-                &path, record.pid, deadline, &token,
-                || browser_process_matches(record, session)
-                    && (record.token == browser_owner_token()
-                        || browser_record_matches_control_dir(record, session)),
+                &path, record.pid, deadline, credential,
+                || browser_listener_auth_for_close(record, session).as_ref() == Some(&auth),
                 || files = dir.as_ref().and_then(|dir| capture_closed_browser_files(dir, session, record)),
             ))
     });
@@ -3468,7 +3511,11 @@ fn stop_previous_browser_daemon_before_stream(session: &str, bin: &str) -> Resul
                 return Err(format!("Browser session {session} belongs to another running or unverified app instance"));
             }
             stop_owned_browser_daemon(session, &record, bin);
-            if pid_alive(pid) {
+            #[cfg(target_os = "macos")]
+            let still_running = !macos_browser_process_exited(&record);
+            #[cfg(not(target_os = "macos"))]
+            let still_running = pid_alive(pid);
+            if still_running {
                 return Err(format!("Could not stop browser session {session}"));
             }
         }
@@ -3495,7 +3542,11 @@ fn stop_previous_app_browser_daemon(session: &str, bin: &str) -> Result<(), Stri
         return Err(format!("Browser session {session} belongs to another running app"));
     }
     stop_owned_browser_daemon(session, &record, bin);
-    if pid_alive(pid) {
+    #[cfg(target_os = "macos")]
+    let still_running = !macos_browser_process_exited(&record);
+    #[cfg(not(target_os = "macos"))]
+    let still_running = pid_alive(pid);
+    if still_running {
         return Err(format!("Could not stop previous browser session {session}"));
     }
     Ok(())
@@ -13871,7 +13922,8 @@ mod tests {
         let mut command = std::process::Command::new(&binary);
         command.args(["-c", "while :; do sleep 1; done"])
             .env("CODEMUX_BROWSER_OWNER", token)
-            .env("CODEMUX_BROWSER_SESSION", session);
+            .env("CODEMUX_BROWSER_SESSION", session)
+            .env_remove("CODEMUX_BROWSER_SECRET");
         if let Some(control_dir) = control_dir {
             command.env("AGENT_BROWSER_SOCKET_DIR", control_dir);
         } else {
@@ -13924,6 +13976,11 @@ mod tests {
         assert!(browser_listener_token_from_environ(&[entry(&"b".repeat(63))]).is_none());
         assert!(browser_listener_token_from_environ(&[entry(&"g".repeat(64))]).is_none());
         assert!(browser_listener_token_from_environ(&[entry(&valid), entry(&valid)]).is_none());
+        assert_eq!(browser_listener_auth_from_environ(&[]), Some(BrowserListenerAuth::Legacy));
+        assert_eq!(browser_listener_auth_from_environ(&[entry(&valid)]),
+            Some(BrowserListenerAuth::Token(valid.clone())));
+        assert!(browser_listener_auth_from_environ(&[entry(&"b".repeat(63))]).is_none());
+        assert!(browser_listener_auth_from_environ(&[entry(&valid), entry(&valid)]).is_none());
     }
 
     #[cfg(unix)]
@@ -13958,6 +14015,8 @@ mod tests {
             std::thread::sleep(Duration::from_millis(25));
         };
         assert!(browser_listener_token_for_close(&prior_record, &session).is_none());
+        assert!(browser_listener_auth_for_close(&prior_record, &session).is_none(),
+            "a still-running prior app must retain its daemon");
         prior_app.kill().unwrap();
         prior_app.wait().unwrap();
         assert!(previous_app_has_exited(&prior_record));
@@ -13987,8 +14046,22 @@ mod tests {
         std::fs::write(&pid_path, bad.id().to_string()).unwrap();
         write_session_pid(&session, &bad_record).unwrap();
         assert!(browser_listener_token_for_close(&bad_record, &session).is_none());
+        assert!(browser_listener_auth_for_close(&bad_record, &session).is_none(),
+            "a malformed secret must not be treated as a legacy daemon");
         bad.kill().unwrap();
         bad.wait().unwrap();
+
+        let (_legacy_temp, mut legacy, mut legacy_record) =
+            browser_identity_fixture_with_attempt(&session, &prior_owner, None);
+        legacy_record.owner_pid = prior_record.owner_pid;
+        legacy_record.owner_start_time = prior_record.owner_start_time;
+        std::fs::write(&pid_path, legacy.id().to_string()).unwrap();
+        write_session_pid(&session, &legacy_record).unwrap();
+        assert_eq!(browser_listener_auth_for_close(&legacy_record, &session),
+            Some(BrowserListenerAuth::Legacy));
+        assert!(browser_listener_token_for_close(&legacy_record, &session).is_none());
+        legacy.kill().unwrap();
+        legacy.wait().unwrap();
         std::fs::remove_file(pid_path).unwrap();
         clear_session_pid(&session);
     }
@@ -14126,12 +14199,12 @@ mod tests {
             .expect("could not recover secret from verified prior sidecar process");
         assert!(recovered == known_secret, "recovered secret differed from prior sidecar");
         assert!(close_verified_unix_browser_peer(
-            &socket, record.pid, Instant::now() + Duration::from_secs(3), &"c".repeat(64),
+            &socket, record.pid, Instant::now() + Duration::from_secs(3), BrowserCloseCredential::Token(&"c".repeat(64)),
             || browser_process_matches(&record, &session), || {},
         ).is_err(), "sidecar accepted a wrong close token");
         #[cfg(target_os = "linux")]
         close_verified_unix_browser_peer(
-            &socket, record.pid, Instant::now() + Duration::from_secs(3), &recovered,
+            &socket, record.pid, Instant::now() + Duration::from_secs(3), BrowserCloseCredential::Token(&recovered),
             || browser_process_matches(&record, &session), || {},
         ).expect("sidecar rejected the recovered close token");
         #[cfg(target_os = "macos")]
@@ -14175,9 +14248,9 @@ mod tests {
 
         let deadline = || Instant::now() + Duration::from_secs(2);
         let listener_token = "a".repeat(64);
-        assert!(close_verified_unix_browser_peer(&socket, std::process::id() + 1, deadline(), &listener_token, || true, || {}).is_err());
-        assert!(close_verified_unix_browser_peer(&socket, std::process::id(), deadline(), &listener_token, || false, || {}).is_err());
-        close_verified_unix_browser_peer(&socket, std::process::id(), deadline(), &listener_token, || true, || {}).unwrap();
+        assert!(close_verified_unix_browser_peer(&socket, std::process::id() + 1, deadline(), BrowserCloseCredential::Token(&listener_token), || true, || {}).is_err());
+        assert!(close_verified_unix_browser_peer(&socket, std::process::id(), deadline(), BrowserCloseCredential::Token(&listener_token), || false, || {}).is_err());
+        close_verified_unix_browser_peer(&socket, std::process::id(), deadline(), BrowserCloseCredential::Token(&listener_token), || true, || {}).unwrap();
         let requests = server.join().unwrap();
         assert_eq!(requests.len(), 1);
         assert_eq!(requests[0]["action"], "close");
@@ -14205,7 +14278,7 @@ mod tests {
 
         let started = Instant::now();
         let result = close_verified_unix_browser_peer(
-            &socket, std::process::id(), started + Duration::from_millis(250), &"b".repeat(64), || true, || {},
+            &socket, std::process::id(), started + Duration::from_millis(250), BrowserCloseCredential::Token(&"b".repeat(64)), || true, || {},
         );
         assert!(result.is_err());
         assert!(started.elapsed() < Duration::from_secs(1));
@@ -14241,7 +14314,7 @@ mod tests {
 
         let mut files = None;
         close_verified_unix_browser_peer(
-            &socket_path, std::process::id(), Instant::now() + Duration::from_secs(10), &"c".repeat(64),
+            &socket_path, std::process::id(), Instant::now() + Duration::from_secs(10), BrowserCloseCredential::Token(&"c".repeat(64)),
             || true,
             || {
                 ready_rx.recv_timeout(Duration::from_secs(5)).unwrap();
@@ -14377,6 +14450,114 @@ mod tests {
         assert!(!cleanup_closed_browser_files(dir.path(), session, &record, &files, || true));
         assert!(dir.path().join(format!("{session}.pid")).exists());
         assert!(path.exists());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_legacy_daemon_fixture() {
+        use std::io::{BufRead, Write};
+        use std::os::unix::net::UnixListener;
+
+        let Ok(session) = std::env::var("CODEMUX_TEST_LEGACY_DAEMON_SESSION") else { return };
+        let dir = run_dir_for_session(&session).unwrap();
+        std::fs::write(dir.join(format!("{session}.pid")), std::process::id().to_string()).unwrap();
+        std::fs::write(dir.join(format!("{session}.stream")), "43210").unwrap();
+        let listener = UnixListener::bind(dir.join(format!("{session}.sock"))).unwrap();
+        loop {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+            let mut line = String::new();
+            std::io::BufReader::new(&stream).read_line(&mut line).unwrap();
+            if line.is_empty() { continue; }
+            let request: serde_json::Value = serde_json::from_str(&line).unwrap();
+            if request["action"] != "close" {
+                stream.write_all(b"{\"success\":true}\n").unwrap();
+                continue;
+            }
+            assert!(request.get("codemuxToken").is_none(), "legacy close sent a listener token");
+            stream.write_all(b"{\"success\":true}\n").unwrap();
+            std::process::exit(0);
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_reclaims_verified_legacy_daemon_without_a_secret() {
+        use std::io::Read;
+        use std::os::unix::net::UnixStream;
+
+        let session = format!("browser-mac-legacy-{}", uuid::Uuid::new_v4().simple());
+        let old_owner = uuid::Uuid::new_v4().simple().to_string();
+        let mut prior_app = std::process::Command::new(which::which("sleep").unwrap())
+            .arg("30").spawn().unwrap();
+        let owner_pid = prior_app.id();
+        let started = Instant::now();
+        let owner_start_time = loop {
+            if let Some(start) = process_start_time(owner_pid) { break start; }
+            assert!(started.elapsed() < Duration::from_secs(3), "prior app identity unavailable");
+            std::thread::sleep(Duration::from_millis(25));
+        };
+        let executable = std::env::current_exe().unwrap();
+        let temp = tempfile::tempdir_in(executable.parent().unwrap()).unwrap();
+        let daemon_binary = temp.path().join("agent-browser");
+        std::fs::hard_link(executable, &daemon_binary).unwrap();
+        let mut daemon = std::process::Command::new(&daemon_binary)
+            .args(["--exact", "agent_browser::tests::macos_legacy_daemon_fixture", "--nocapture"])
+            .env("CODEMUX_TEST_LEGACY_DAEMON_SESSION", &session)
+            .env("CODEMUX_BROWSER_OWNER", &old_owner)
+            .env("CODEMUX_BROWSER_SESSION", &session)
+            .env_remove("CODEMUX_BROWSER_SECRET")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::piped())
+            .spawn().unwrap();
+        let dir = run_dir_for_session(&session).unwrap();
+        let socket = dir.join(format!("{session}.sock"));
+        let started = Instant::now();
+        while read_daemon_pid_file(&dir.join(format!("{session}.pid"))) != Some(daemon.id())
+            || UnixStream::connect(&socket).is_err() {
+            assert!(daemon.try_wait().unwrap().is_none(), "legacy fixture exited before listening");
+            assert!(started.elapsed() < Duration::from_secs(3), "legacy fixture did not listen");
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        let record = BrowserPidRecord {
+            pid: daemon.id(),
+            start_time: process_start_time(daemon.id()).unwrap(),
+            token: old_owner,
+            owner_pid,
+            owner_start_time,
+            native_start: true,
+        };
+        write_session_pid(&session, &record).unwrap();
+        assert!(browser_listener_auth_for_close(&record, &session).is_none(),
+            "a live previous app must protect its daemon");
+        prior_app.kill().unwrap();
+        prior_app.wait().unwrap();
+        assert_eq!(browser_listener_auth_for_close(&record, &session), Some(BrowserListenerAuth::Legacy));
+
+        let (result, status) = std::thread::scope(|scope| {
+            let reclaim = scope.spawn(|| stop_previous_browser_daemon_before_stream(
+                &session, daemon_binary.to_str().unwrap()));
+            let started = Instant::now();
+            let status = loop {
+                if let Some(status) = daemon.try_wait().unwrap() { break Some(status); }
+                if started.elapsed() >= Duration::from_secs(5) { break None; }
+                std::thread::sleep(Duration::from_millis(10));
+            };
+            (reclaim.join().unwrap(), status)
+        });
+        if status.is_none() {
+            let _ = daemon.kill();
+            let _ = daemon.wait();
+        }
+        let mut stderr = String::new();
+        daemon.stderr.take().unwrap().read_to_string(&mut stderr).unwrap();
+        assert!(status.as_ref().is_some_and(std::process::ExitStatus::success),
+            "legacy fixture did not exit after close: {status:?}: {stderr}");
+        assert!(result.is_ok(), "legacy daemon could not be reclaimed: {result:?}");
+        assert!(!dir.join(format!("{session}.pid")).exists());
+        assert!(!dir.join(format!("{session}.stream")).exists());
+        assert!(!socket.exists());
+        assert!(!session_pid_path(&session).unwrap().exists());
     }
 
     #[cfg(target_os = "macos")]
