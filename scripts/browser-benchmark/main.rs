@@ -11,6 +11,8 @@
 mod agent_browser;
 #[path = "../../src-tauri/src/browser_viewport.rs"]
 mod browser_viewport;
+#[path = "../../src-tauri/src/os_input.rs"]
+mod os_input;
 #[path = "../../src-tauri/src/stream_input.rs"]
 mod stream_input;
 

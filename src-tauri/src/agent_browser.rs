@@ -8490,8 +8490,9 @@ impl AgentBrowserManager {
         {
             let _ = had_failed_attempts;
             if let Some((dir, record, files)) = closing_files {
+                let cleanup_session = session.clone();
                 let _ = tokio::task::spawn_blocking(move || {
-                    cleanup_closed_browser_files(&dir, &session, &record, &files, || {
+                    cleanup_closed_browser_files(&dir, &cleanup_session, &record, &files, || {
                         macos_browser_process_exited(&record)
                     })
                 })
