@@ -6216,8 +6216,12 @@ fn browser_close_policy_denial(result: &BrowserAutomationResult) -> Option<&str>
     let data = &result.data;
     let error = data.get("error")?.as_str()?;
     (data.get("success").and_then(serde_json::Value::as_bool) == Some(false)
-        && error.starts_with("Action 'close' denied by policy: "))
+        && browser_close_policy_denial_error(error))
         .then_some(error)
+}
+
+fn browser_close_policy_denial_error(error: &str) -> bool {
+    error.starts_with("Action 'close' denied by policy: ")
 }
 
 fn browser_action_completed(status_success: bool, stdout: &str) -> bool {
@@ -7182,6 +7186,13 @@ impl AgentBrowserManager {
                     }
                 }
                 Ok((record, decision @ BrowserConfirmationResponse::FollowUp(_))) => Ok((record, decision)),
+                Ok((record, BrowserConfirmationResponse::ConsumedFailure(error)))
+                    if pending.daemon.as_ref() == Some(&record)
+                        && record.token == browser_owner_token()
+                        && browser_close_policy_denial_error(&error) =>
+                {
+                    Ok((record, BrowserConfirmationResponse::ConsumedFailure(error)))
+                }
                 Ok((record, _)) => Err(BrowserConfirmationFailure::MaybeApplied(
                     "Browser close confirmation did not report a completed close".into(), Some(record),
                 )),
@@ -10818,6 +10829,55 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
+    async fn approved_close_replay_policy_denial_keeps_live_session_available() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        let launcher = temp.path().join("agent-browser");
+        std::fs::write(&launcher,
+            "#!/bin/sh\nprintf '%s\\n' '{\"success\":true,\"data\":{\"confirmation_required\":true,\"confirmation_id\":\"close_1\",\"action\":\"close\"}}'\n",
+        ).unwrap();
+        std::fs::set_permissions(&launcher, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let session = format!("close-replay-deny-{}", uuid::Uuid::new_v4().simple());
+        let dir = run_dir_for_session(&session).unwrap();
+        let (_daemon_bin, mut daemon, record) = browser_identity_fixture_with_attempt_and_dir(
+            &session, browser_owner_token(), None, Some(&dir),
+        );
+        let pid_path = dir.join(format!("{session}.pid"));
+        std::fs::write(&pid_path, daemon.id().to_string()).unwrap();
+        write_session_pid(&session, &record).unwrap();
+        let manager = AgentBrowserManager::new();
+        manager.allocate_port(&session).await.unwrap();
+        *manager.test_browser_binary.lock().unwrap() = Some(launcher.to_string_lossy().into_owned());
+
+        assert!(manager.run_command(&session, "close", serde_json::Value::Null).await
+            .unwrap_err().contains("confirmation is pending"));
+        let host_id = manager.pending_confirmation(&session).await.unwrap().unwrap().id.unwrap();
+        let expected = record.clone();
+        let error = manager.respond_confirmation_locked_with(&session, &host_id, true,
+            move |_session, _port, pending, upstream_id, approve| {
+                assert!(approve && pending.closes_browser);
+                assert_eq!(upstream_id, "close_1");
+                let reply = br#"{"success":true,"data":{"confirmed":true,"result":{"success":false,"error":"Action 'close' denied by policy: changed rule"}}}"#;
+                let decision = browser_confirmation_output(reply, true, true).unwrap();
+                Ok((record, decision))
+            }).await.unwrap_err();
+        assert!(error.contains("Action 'close' denied by policy: changed rule"), "{error}");
+        assert!(!manager.confirmation_recovery_required.lock().unwrap().contains_key(&session));
+        assert!(manager.pending_confirmation(&session).await.unwrap().is_none());
+        let sessions = manager.sessions.lock().await;
+        let entry = sessions.get(&session).unwrap();
+        assert!(entry.running && entry.pid == Some(expected.pid));
+        drop(sessions);
+        assert_eq!(live_owned_browser_record(&session), Some(expected));
+        daemon.kill().unwrap();
+        daemon.wait().unwrap();
+        std::fs::remove_file(pid_path).unwrap();
+        clear_session_pid(&session);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
     async fn approved_agent_close_confirmation_retires_only_after_verified_departure() {
         use std::os::unix::fs::PermissionsExt;
         use std::os::unix::net::UnixListener;
@@ -10884,6 +10944,19 @@ mod tests {
         assert!(manager.respond_confirmation_locked_with(&session, &host_id, true,
             move |_session, _port, _pending, _upstream_id, _approve| {
                 Ok((record, BrowserConfirmationResponse::Resolved))
+            }).await.unwrap_err().contains("completed close"));
+        assert!(manager.confirmation_recovery_required.lock().unwrap().contains_key(&session));
+        assert!(manager.pending_confirmation(&session).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn approved_close_replay_non_policy_failure_requires_recovery() {
+        let (manager, session, record, host_id) = preset_pending_fixture().await;
+        manager.sessions.lock().await.get_mut(&session).unwrap()
+            .pending_confirmation.as_mut().unwrap().closes_browser = true;
+        assert!(manager.respond_confirmation_locked_with(&session, &host_id, true,
+            move |_session, _port, _pending, _upstream_id, _approve| {
+                Ok((record, BrowserConfirmationResponse::ConsumedFailure("close failed".into())))
             }).await.unwrap_err().contains("completed close"));
         assert!(manager.confirmation_recovery_required.lock().unwrap().contains_key(&session));
         assert!(manager.pending_confirmation(&session).await.unwrap().is_none());
