@@ -310,6 +310,7 @@ struct PendingBrowserConfirmation {
     details: BrowserPendingConfirmation,
     upstream_id: Option<String>,
     daemon: Option<BrowserPidRecord>,
+    closes_browser: bool,
     expires_at: Instant,
     decision_in_flight: bool,
     screenshot_caller_ended: bool,
@@ -363,6 +364,7 @@ impl PendingBrowserConfirmation {
             },
             upstream_id,
             daemon,
+            closes_browser: false,
             expires_at: Instant::now() + ttl,
             decision_in_flight: false,
             screenshot_caller_ended: false,
@@ -4088,7 +4090,8 @@ fn preset_phase_for_confirmation(
         return PresetNavigationPhase::Failed;
     }
     match decision {
-        BrowserConfirmationResponse::Resolved | BrowserConfirmationResponse::ResolvedPath(_) => PresetNavigationPhase::Completed,
+        BrowserConfirmationResponse::Resolved | BrowserConfirmationResponse::ResolvedClosed
+        | BrowserConfirmationResponse::ResolvedPath(_) => PresetNavigationPhase::Completed,
         BrowserConfirmationResponse::FollowUp(_) => PresetNavigationPhase::Pending,
         BrowserConfirmationResponse::ConsumedFailure(_) => PresetNavigationPhase::Failed,
     }
@@ -4649,7 +4652,7 @@ fn build_agent_browser_argv_groups(
 ) -> Result<Vec<Vec<String>>, String> {
     let s = session.to_string();
     let groups: Vec<Vec<String>> = match action {
-        "close" => vec![vec!["close".into(), "--session".into(), s]],
+        "close" => vec![vec!["close".into(), "--json".into(), "--session".into(), s]],
         "open_url" | "open" => {
             let url = params
                 .get("url")
@@ -5708,7 +5711,7 @@ fn build_agent_browser_command(binary: &str, session: &str, action: &str, params
                 s = session,
             )
         }
-        "close" => format!("{} close --session {}", bin, session),
+        "close" => format!("{} close --json --session {}", bin, session),
         "screenshot" => format!("{} screenshot --session {}", bin, session),
         "snapshot" | "accessibility_snapshot" => {
             format!("{} snapshot -i --session {}", bin, session)
@@ -5871,6 +5874,7 @@ fn browser_result_confirmation_details(result: &BrowserAutomationResult) -> Opti
 #[derive(Debug, PartialEq, Eq)]
 enum BrowserConfirmationResponse {
     Resolved,
+    ResolvedClosed,
     ResolvedPath(String),
     FollowUp(BrowserConfirmationDetails),
     ConsumedFailure(String),
@@ -5928,6 +5932,9 @@ fn browser_confirmation_response(
     }
     Some(match data.get("result").and_then(browser_json_confirmation) {
         Some(details) => BrowserConfirmationResponse::FollowUp(details),
+        None if data.pointer("/result/data/closed").and_then(|value| value.as_bool()) == Some(true) => {
+            BrowserConfirmationResponse::ResolvedClosed
+        }
         None => match data.pointer("/result/data/path").and_then(|value| value.as_str()) {
             Some(path) => BrowserConfirmationResponse::ResolvedPath(path.to_owned()),
             None => BrowserConfirmationResponse::Resolved,
@@ -6120,6 +6127,11 @@ fn run_browser_confirmation_decision(
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     let decision = browser_confirmation_output(&output.stdout, output.status.success(), approve)
         .map_err(|error| BrowserConfirmationFailure::MaybeApplied(error, Some(current.clone())))?;
+    // A confirmed close deliberately shuts down the daemon before the reply
+    // can be observed. The caller verifies departure before retiring state.
+    if approve && pending.closes_browser && matches!(&decision, BrowserConfirmationResponse::ResolvedClosed) {
+        return Ok((current, decision));
+    }
     let after = live_owned_browser_record(session)
         .ok_or_else(|| BrowserConfirmationFailure::MaybeApplied(
             "Could not verify browser daemon after confirmation".to_string(), Some(current.clone())))?;
@@ -6128,6 +6140,33 @@ fn run_browser_confirmation_decision(
             "Browser daemon changed while confirmation was processed".into(), Some(current)));
     }
     Ok((after, decision))
+}
+
+fn confirmed_browser_close_departed(
+    session: &str, dir: &std::path::Path, record: &BrowserPidRecord, deadline: Instant,
+) -> bool {
+    loop {
+        #[cfg(target_os = "macos")]
+        let process_gone = macos_browser_process_exited(record);
+        #[cfg(not(target_os = "macos"))]
+        let process_gone = process_exit_confirmed(record.pid)
+            || process_start_time(record.pid).is_some_and(|start| start != record.start_time);
+        if process_gone {
+            let endpoint_absent = probe_browser_control_endpoint(session, dir)
+                == BrowserControlEndpointProbe::Absent;
+            #[cfg(windows)]
+            let endpoint_absent = endpoint_absent || departed_pinned_browser_control_endpoint_absent(
+                session, dir, record,
+            );
+            if endpoint_absent {
+                return true;
+            }
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -6166,6 +6205,19 @@ fn browser_action_outcome(status_success: bool, stdout: &str) -> BrowserActionOu
             value.get("success").and_then(|value| value.as_bool()) == Some(false)
         });
     if failed { BrowserActionOutcome::Failed } else { BrowserActionOutcome::Completed }
+}
+
+fn browser_close_completed_response(result: &BrowserAutomationResult) -> bool {
+    result.data.get("success").and_then(serde_json::Value::as_bool) == Some(true)
+        && result.data.pointer("/data/closed").and_then(serde_json::Value::as_bool) == Some(true)
+}
+
+fn browser_close_policy_denial(result: &BrowserAutomationResult) -> Option<&str> {
+    let data = &result.data;
+    let error = data.get("error")?.as_str()?;
+    (data.get("success").and_then(serde_json::Value::as_bool) == Some(false)
+        && error.starts_with("Action 'close' denied by policy: "))
+        .then_some(error)
 }
 
 fn browser_action_completed(status_success: bool, stdout: &str) -> bool {
@@ -7085,6 +7137,11 @@ impl AgentBrowserManager {
             let (pending, upstream_id) = pending.begin_decision(id)?;
             (entry.port, pending, upstream_id)
         };
+        let close_dir = if approve && pending.closes_browser {
+            run_dir_for_session(&session)
+        } else {
+            None
+        };
         let pending_for_command = pending.clone();
         let session_for_command = session.clone();
         let result = tokio::task::spawn_blocking(move || {
@@ -7096,6 +7153,43 @@ impl AgentBrowserManager {
         }).await.map_err(|error| BrowserConfirmationFailure::MaybeApplied(
             format!("Browser confirmation task failed: {error}"), None))
             .and_then(|result| result);
+        let result = if approve && pending.closes_browser {
+            match result {
+                Ok((record, BrowserConfirmationResponse::ResolvedClosed)) => {
+                    if pending.daemon.as_ref() != Some(&record) || record.token != browser_owner_token() {
+                        Err(BrowserConfirmationFailure::MaybeApplied(
+                            "Browser daemon changed before close completed".into(), Some(record),
+                        ))
+                    } else {
+                        let check_session = session.clone();
+                        let check_record = record.clone();
+                        let departed = if let Some(dir) = close_dir {
+                            tokio::task::spawn_blocking(move || {
+                                confirmed_browser_close_departed(
+                                    &check_session, &dir, &check_record, Instant::now() + CLOSE_TIMEOUT,
+                                )
+                            }).await.unwrap_or(false)
+                        } else {
+                            false
+                        };
+                        if departed {
+                            Ok((record, BrowserConfirmationResponse::ResolvedClosed))
+                        } else {
+                            Err(BrowserConfirmationFailure::MaybeApplied(
+                                "Browser close confirmation did not verify daemon departure".into(), Some(record),
+                            ))
+                        }
+                    }
+                }
+                Ok((record, decision @ BrowserConfirmationResponse::FollowUp(_))) => Ok((record, decision)),
+                Ok((record, _)) => Err(BrowserConfirmationFailure::MaybeApplied(
+                    "Browser close confirmation did not report a completed close".into(), Some(record),
+                )),
+                Err(error) => Err(error),
+            }
+        } else {
+            result
+        };
         let mut sessions = self.sessions.lock().await;
         let entry = sessions.get_mut(browser_id).ok_or("Browser session closed during confirmation")?;
         if entry.pending_confirmation.as_ref().is_none_or(|current| current.daemon != pending.daemon || current.details.id.as_deref() != Some(id)) {
@@ -7153,9 +7247,14 @@ impl AgentBrowserManager {
                 return Err(error.into_message());
             }
         };
+        if approve && pending.closes_browser && matches!(&decision, BrowserConfirmationResponse::ResolvedClosed) {
+            Self::finish_closed_browser_entry(entry);
+            return Ok(None);
+        }
         let record_pid = record.pid;
         let record_start = record.start_time;
-        let recovered = matches!(&decision, BrowserConfirmationResponse::Resolved | BrowserConfirmationResponse::ResolvedPath(_))
+        let recovered = matches!(&decision, BrowserConfirmationResponse::Resolved
+            | BrowserConfirmationResponse::ResolvedClosed | BrowserConfirmationResponse::ResolvedPath(_))
             && pending.daemon.as_ref() == Some(&record)
             && record.token == browser_owner_token()
             && self.confirmation_recovery_required.lock().unwrap().get(browser_id)
@@ -7233,12 +7332,15 @@ impl AgentBrowserManager {
     ) -> Result<Option<BrowserPendingConfirmation>, String> {
         let screenshot_caller_ended = entry.pending_confirmation.as_ref()
             .is_some_and(|pending| pending.screenshot_caller_ended);
+        let closes_browser = entry.pending_confirmation.as_ref()
+            .is_some_and(|pending| pending.closes_browser);
         entry.revoke_active_bridges();
         entry.browser_ready = false;
         entry.running = true;
         refresh_stream_session_identity(entry, &record);
         match decision {
-            BrowserConfirmationResponse::Resolved | BrowserConfirmationResponse::ResolvedPath(_) => {
+            BrowserConfirmationResponse::Resolved | BrowserConfirmationResponse::ResolvedClosed
+            | BrowserConfirmationResponse::ResolvedPath(_) => {
                 entry.confirmation_pending = false;
                 entry.pending_confirmation = None;
                 Ok(None)
@@ -7246,6 +7348,7 @@ impl AgentBrowserManager {
             BrowserConfirmationResponse::FollowUp(details) => {
                 let mut next = PendingBrowserConfirmation::new(details, Some(record));
                 next.screenshot_caller_ended = screenshot_caller_ended;
+                next.closes_browser = closes_browser;
                 let public = next.details.clone();
                 entry.confirmation_pending = true;
                 entry.pending_confirmation = Some(next);
@@ -7536,18 +7639,32 @@ impl AgentBrowserManager {
     /// Reset session state only after a completed agent-facing close. A
     /// pre-dispatch failure can leave a parked confirmation on the daemon.
     /// The port allocation / map entry stays intact.
+    fn finish_closed_browser_entry(entry: &mut StreamSession) {
+        entry.fail_pending_screenshot("Browser closed before screenshot approval completed");
+        entry.running = false;
+        entry.browser_ready = false;
+        entry.confirmation_pending = false;
+        entry.pending_confirmation = None;
+        entry.pid = None;
+        entry.pid_start_time = None;
+        entry.stream_generation = 0;
+        entry.preset_navigation = None;
+    }
+
     async fn note_close_finished(&self, browser_id: &str) {
         let mut sessions = self.sessions.lock().await;
-        if let Some(s) = sessions.get_mut(browser_id) {
-            s.fail_pending_screenshot("Browser closed before screenshot approval completed");
-            s.running = false;
-            s.browser_ready = false;
-            s.confirmation_pending = false;
-            s.pending_confirmation = None;
-            s.pid = None;
-            s.pid_start_time = None;
-            s.stream_generation = 0;
-            s.preset_navigation = None;
+        if let Some(entry) = sessions.get_mut(browser_id) {
+            Self::finish_closed_browser_entry(entry);
+        }
+    }
+
+    async fn guard_uncertain_close(&self, browser_id: &str) {
+        let mut sessions = self.sessions.lock().await;
+        if let Some(entry) = sessions.get_mut(browser_id) {
+            self.guard_unresolved_confirmation(browser_id, entry);
+            entry.fail_pending_screenshot("Browser close outcome is uncertain");
+            entry.confirmation_pending = false;
+            entry.pending_confirmation = None;
         }
     }
 
@@ -7560,23 +7677,40 @@ impl AgentBrowserManager {
     ) {
         // A JSON error may be returned as a payload after a failed exit, and
         // a confirmation response may exit successfully before the action.
-        let outcome = result.as_ref().map_or(BrowserActionOutcome::Failed, |(_, outcome)| *outcome);
         if action == "close" {
-            if outcome == BrowserActionOutcome::Completed {
-                self.note_close_finished(browser_id).await;
-            } else if result.is_ok()
-                || result.as_ref().err().is_some_and(|error| error.may_have_launched) {
-                let mut sessions = self.sessions.lock().await;
-                if let Some(entry) = sessions.get_mut(browser_id) {
-                    // Even a structured failure can follow partial close.
-                    // The old host token may no longer name the parked action.
-                    self.guard_unresolved_confirmation(browser_id, entry);
-                    entry.fail_pending_screenshot("Browser close outcome is uncertain");
-                    entry.confirmation_pending = false;
-                    entry.pending_confirmation = None;
+            match result {
+                Ok((response, BrowserActionOutcome::Completed)) if browser_close_completed_response(response) => {
+                    self.note_close_finished(browser_id).await;
                 }
+                Ok((response, BrowserActionOutcome::Failed)) if browser_close_policy_denial(response).is_some() => {}
+                Ok((response, BrowserActionOutcome::ConfirmationPending)) => {
+                    let details = browser_result_confirmation_details(response);
+                    let verified = if details.as_ref().and_then(|details| details.id.as_ref()).is_some() {
+                        if self.refresh_running_session(browser_id, session, BrowserActionOutcome::ConfirmationPending, details)
+                            .await.is_ok() {
+                            let mut sessions = self.sessions.lock().await;
+                            if let Some(pending) = sessions.get_mut(browser_id)
+                                .and_then(|entry| entry.pending_confirmation.as_mut()) {
+                                pending.closes_browser = pending.daemon.is_some();
+                                pending.closes_browser
+                            } else {
+                                false
+                            }
+                        } else {
+                            false
+                        }
+                    } else {
+                        false
+                    };
+                    if !verified {
+                        self.guard_uncertain_close(browser_id).await;
+                    }
+                }
+                Err(error) if !error.may_have_launched => {}
+                _ => self.guard_uncertain_close(browser_id).await,
             }
         } else {
+            let outcome = result.as_ref().map_or(BrowserActionOutcome::Failed, |(_, outcome)| *outcome);
             let details = result.as_ref().ok().and_then(|(result, _)| browser_result_confirmation_details(result));
             let _ = self.refresh_running_session(browser_id, session, outcome, details).await;
         }
@@ -7828,31 +7962,15 @@ impl AgentBrowserManager {
     ) -> Result<(BrowserAutomationResult, BrowserActionOutcome), String> {
         let session = session_name(browser_id).to_string();
         let (recovery_required, pending) = self.confirmation_state_after_expiry(browser_id).await;
-        if action == "close" && recovery_required {
-            // Agent-facing close is normally a CLI action. An uncertain
-            // confirmation needs the same verified teardown as pane close.
-            self.close_locked(browser_id).await?;
-            self.require_confirmation_recovered(browser_id)?;
-            return Ok((BrowserAutomationResult {
-                request_id: make_request_id(),
-                browser_id: browser_id.to_owned(),
-                data: serde_json::json!({ "result": "Browser closed", "success": true }),
-                message: Some("Browser closed".into()),
-            }, BrowserActionOutcome::Completed));
+        if recovery_required {
+            return Err(Self::confirmation_recovery_error(browser_id));
         }
-        if action != "close" {
-            if recovery_required {
-                return Err(Self::confirmation_recovery_error(browser_id));
-            }
-            if pending {
-                return Err(format!("Browser confirmation is pending for session {session}"));
-            }
+        if pending {
+            return Err(format!("Browser confirmation is pending for session {session}"));
         }
         #[cfg(not(windows))]
         self.settle_provisional_session(browser_id, &session, None).await;
-        if action != "close" {
-            self.require_no_pending_confirmation(browser_id).await?;
-        }
+        self.require_no_pending_confirmation(browser_id).await?;
         let port = self.allocate_port(browser_id).await?;
         let browser_binary = self.browser_binary()?;
         // Reject an invalid requested action before a configured viewport
@@ -7912,8 +8030,17 @@ impl AgentBrowserManager {
 
         if action == "close" {
             self.require_confirmation_recovered(browser_id)?;
-            if result.as_ref().is_ok_and(|(_, outcome)| *outcome == BrowserActionOutcome::Failed) {
-                return Err("Browser close was rejected".into());
+            if let Ok((response, outcome)) = &result {
+                match outcome {
+                    BrowserActionOutcome::Completed => {}
+                    BrowserActionOutcome::ConfirmationPending => {
+                        return Err(format!("Browser confirmation is pending for session {session}"));
+                    }
+                    BrowserActionOutcome::Failed => {
+                        return Err(browser_close_policy_denial(response)
+                            .unwrap_or("Browser close failed").to_owned());
+                    }
+                }
             }
         }
 
@@ -10403,9 +10530,7 @@ mod tests {
         assert!(manager.confirmation_recovery_required.lock().unwrap().contains_key(&session));
         child.kill().unwrap();
         child.wait().unwrap();
-        let (_, outcome) = manager.run_command_locked_with_outcome(&session, "close",
-            serde_json::Value::Null, None, None).await.unwrap();
-        assert_eq!(outcome, BrowserActionOutcome::Completed);
+        manager.close_locked(&session).await.unwrap();
         assert!(!manager.confirmation_recovery_required.lock().unwrap().contains_key(&session));
     }
 
@@ -10553,24 +10678,26 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let launcher = temp.path().join("agent-browser");
         std::fs::write(&launcher,
-            "#!/bin/sh\nprintf '%s\\n' \"$1\" > \"$0.called\"\nprintf '%s\\n' '{\"success\":false,\"error\":\"close failed\"}'\nexit 1\n",
+            "#!/bin/sh\nprintf '%s\\n' \"$*\" > \"$0.called\"\nprintf '%s\\n' '{\"success\":false,\"error\":\"close failed\"}'\nexit 1\n",
         ).unwrap();
         std::fs::set_permissions(&launcher, std::fs::Permissions::from_mode(0o700)).unwrap();
-        let (manager, session, record, _host_id) = preset_pending_fixture().await;
+        let manager = AgentBrowserManager::new();
+        let session = format!("close-rejected-{}", uuid::Uuid::new_v4().simple());
+        manager.allocate_port(&session).await.unwrap();
         *manager.test_browser_binary.lock().unwrap() = Some(launcher.to_string_lossy().into_owned());
         assert!(manager.run_command(&session, "close", serde_json::Value::Null).await
             .unwrap_err().contains("uncertain"));
-        assert_eq!(std::fs::read_to_string(temp.path().join("agent-browser.called")).unwrap().trim(), "close");
-        assert_eq!(manager.confirmation_recovery_required.lock().unwrap().get(&session)
-            .and_then(|guard| guard.daemon.as_ref()), Some(&record));
-        assert!(manager.pending_confirmation(&session).await.unwrap().is_none());
+        assert!(std::fs::read_to_string(temp.path().join("agent-browser.called")).unwrap()
+            .contains("close --json --session"));
+        assert!(manager.confirmation_recovery_required.lock().unwrap().contains_key(&session));
 
-        // A missing launcher cannot send a close. That prompt remains safe
-        // for Deny through the public command path.
+        // An already parked action must not receive a second close command.
+        std::fs::remove_file(temp.path().join("agent-browser.called")).unwrap();
         let (manager, session, record, host_id) = preset_pending_fixture().await;
-        *manager.test_browser_binary.lock().unwrap() = Some(temp.path().join("missing-browser").to_string_lossy().into_owned());
+        *manager.test_browser_binary.lock().unwrap() = Some(launcher.to_string_lossy().into_owned());
         assert!(manager.run_command(&session, "close", serde_json::Value::Null).await
-            .unwrap_err().contains("launcher is unavailable"));
+            .unwrap_err().contains("confirmation is pending"));
+        assert!(!temp.path().join("agent-browser.called").exists());
         assert_eq!(manager.pending_confirmation(&session).await.unwrap().unwrap().id.as_deref(),
             Some(host_id.as_str()));
         manager.respond_confirmation_locked_with(&session, &host_id, false,
@@ -10578,6 +10705,188 @@ mod tests {
                 assert!(!approve);
                 Ok((record, BrowserConfirmationResponse::Resolved))
             }).await.unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn policy_denied_agent_close_keeps_session_available() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        let launcher = temp.path().join("agent-browser");
+        std::fs::write(&launcher,
+            "#!/bin/sh\ncat <<'JSON'\n{\"success\":false,\"error\":\"Action 'close' denied by policy: forbidden\"}\nJSON\nexit 1\n",
+        ).unwrap();
+        std::fs::set_permissions(&launcher, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let session = format!("close-policy-deny-{}", uuid::Uuid::new_v4().simple());
+        let dir = run_dir_for_session(&session).unwrap();
+        let (_daemon_bin, mut daemon, record) = browser_identity_fixture_with_attempt_and_dir(
+            &session, browser_owner_token(), None, Some(&dir),
+        );
+        let pid_path = dir.join(format!("{session}.pid"));
+        std::fs::write(&pid_path, daemon.id().to_string()).unwrap();
+        write_session_pid(&session, &record).unwrap();
+        let manager = AgentBrowserManager::new();
+        manager.allocate_port(&session).await.unwrap();
+        manager.sessions.lock().await.get_mut(&session).unwrap().running = true;
+        *manager.test_browser_binary.lock().unwrap() = Some(launcher.to_string_lossy().into_owned());
+
+        assert!(manager.run_command(&session, "close", serde_json::Value::Null).await
+            .unwrap_err().contains("denied by policy"));
+        assert!(!manager.confirmation_recovery_required.lock().unwrap().contains_key(&session));
+        assert!(manager.sessions.lock().await.get(&session).unwrap().running);
+        daemon.kill().unwrap();
+        daemon.wait().unwrap();
+        std::fs::remove_file(pid_path).unwrap();
+        clear_session_pid(&session);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn agent_close_requires_closed_ack_before_resetting_session() {
+        use std::os::unix::fs::PermissionsExt;
+
+        for closed in [false, true] {
+            let temp = tempfile::tempdir().unwrap();
+            let launcher = temp.path().join("agent-browser");
+            let reply = serde_json::json!({"success":true, "data":{"closed":closed}});
+            std::fs::write(&launcher, format!("#!/bin/sh\ncat <<'JSON'\n{reply}\nJSON\n")).unwrap();
+            std::fs::set_permissions(&launcher, std::fs::Permissions::from_mode(0o700)).unwrap();
+            let manager = AgentBrowserManager::new();
+            let session = format!("close-ack-{closed}-{}", uuid::Uuid::new_v4().simple());
+            manager.allocate_port(&session).await.unwrap();
+            manager.sessions.lock().await.get_mut(&session).unwrap().running = true;
+            *manager.test_browser_binary.lock().unwrap() = Some(launcher.to_string_lossy().into_owned());
+
+            let result = manager.run_command(&session, "close", serde_json::Value::Null).await;
+            if closed {
+                assert!(result.is_ok());
+                assert!(!manager.sessions.lock().await.get(&session).unwrap().running);
+                assert!(!manager.confirmation_recovery_required.lock().unwrap().contains_key(&session));
+            } else {
+                assert!(result.unwrap_err().contains("uncertain"));
+                assert!(manager.confirmation_recovery_required.lock().unwrap().contains_key(&session));
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn policy_pending_agent_close_publishes_verified_prompt() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        let launcher = temp.path().join("agent-browser");
+        std::fs::write(&launcher,
+            "#!/bin/sh\nprintf '%s\\n' '{\"success\":true,\"data\":{\"confirmation_required\":true,\"confirmation_id\":\"close_1\",\"action\":\"close\"}}'\n",
+        ).unwrap();
+        std::fs::set_permissions(&launcher, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let session = format!("close-policy-pending-{}", uuid::Uuid::new_v4().simple());
+        let dir = run_dir_for_session(&session).unwrap();
+        let (_daemon_bin, mut daemon, record) = browser_identity_fixture_with_attempt_and_dir(
+            &session, browser_owner_token(), None, Some(&dir),
+        );
+        let pid_path = dir.join(format!("{session}.pid"));
+        std::fs::write(&pid_path, daemon.id().to_string()).unwrap();
+        write_session_pid(&session, &record).unwrap();
+        assert_eq!(live_owned_browser_record(&session), Some(record.clone()));
+        let manager = AgentBrowserManager::new();
+        manager.allocate_port(&session).await.unwrap();
+        *manager.test_browser_binary.lock().unwrap() = Some(launcher.to_string_lossy().into_owned());
+
+        assert!(manager.run_command(&session, "close", serde_json::Value::Null).await
+            .unwrap_err().contains("confirmation is pending"));
+        let prompt = manager.pending_confirmation(&session).await.unwrap().unwrap();
+        let host_id = prompt.id.unwrap();
+        assert_ne!(host_id, "close_1");
+        let pending = manager.sessions.lock().await.get(&session).unwrap().pending_confirmation.clone().unwrap();
+        assert_eq!(pending.upstream_id.as_deref(), Some("close_1"));
+        assert_eq!(pending.daemon.as_ref(), Some(&record));
+        assert!(pending.closes_browser);
+        assert!(!manager.confirmation_recovery_required.lock().unwrap().contains_key(&session));
+        manager.respond_confirmation_locked_with(&session, &host_id, false,
+            move |_session, _port, _pending, upstream_id, approve| {
+                assert_eq!(upstream_id, "close_1");
+                assert!(!approve);
+                Ok((record, BrowserConfirmationResponse::Resolved))
+            }).await.unwrap();
+        daemon.kill().unwrap();
+        daemon.wait().unwrap();
+        std::fs::remove_file(pid_path).unwrap();
+        clear_session_pid(&session);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn approved_agent_close_confirmation_retires_only_after_verified_departure() {
+        use std::os::unix::fs::PermissionsExt;
+        use std::os::unix::net::UnixListener;
+
+        let temp = tempfile::tempdir().unwrap();
+        let launcher = temp.path().join("agent-browser");
+        std::fs::write(&launcher,
+            "#!/bin/sh\nprintf '%s\\n' '{\"success\":true,\"data\":{\"confirmation_required\":true,\"confirmation_id\":\"close_1\",\"action\":\"close\"}}'\n",
+        ).unwrap();
+        std::fs::set_permissions(&launcher, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let session = format!("close-approved-{}", uuid::Uuid::new_v4().simple());
+        let dir = run_dir_for_session(&session).unwrap();
+        let socket_path = dir.join(format!("{session}.sock"));
+        let listener = UnixListener::bind(&socket_path).unwrap();
+        let (_daemon_bin, mut daemon, record) = browser_identity_fixture_with_attempt_and_dir(
+            &session, browser_owner_token(), None, Some(&dir),
+        );
+        let pid_path = dir.join(format!("{session}.pid"));
+        std::fs::write(&pid_path, daemon.id().to_string()).unwrap();
+        write_session_pid(&session, &record).unwrap();
+        let manager = AgentBrowserManager::new();
+        manager.allocate_port(&session).await.unwrap();
+        *manager.test_browser_binary.lock().unwrap() = Some(launcher.to_string_lossy().into_owned());
+
+        assert!(manager.run_command(&session, "close", serde_json::Value::Null).await
+            .unwrap_err().contains("confirmation is pending"));
+        let host_id = manager.pending_confirmation(&session).await.unwrap().unwrap().id.unwrap();
+        let (send, receive) = std::sync::mpsc::channel();
+        let reaper = tokio::task::spawn_blocking(move || {
+            receive.recv_timeout(Duration::from_secs(3)).unwrap();
+            daemon.kill().unwrap();
+            daemon.wait().unwrap();
+        });
+        let expected = record.clone();
+        assert!(manager.respond_confirmation_locked_with(&session, &host_id, true,
+            move |_session, _port, pending, upstream_id, approve| {
+                assert!(approve && pending.closes_browser);
+                assert_eq!(upstream_id, "close_1");
+                drop(listener);
+                send.send(()).unwrap();
+                let reply = br#"{"success":true,"data":{"confirmed":true,"result":{"success":true,"data":{"closed":true}}}}"#;
+                let decision = browser_confirmation_output(reply, true, true).unwrap();
+                Ok((record, decision))
+            }).await.unwrap().is_none());
+        reaper.await.unwrap();
+        {
+            let sessions = manager.sessions.lock().await;
+            let entry = sessions.get(&session).unwrap();
+            assert!(!entry.running && !entry.browser_ready && !entry.confirmation_pending);
+            assert!(entry.pending_confirmation.is_none() && entry.pid.is_none());
+        }
+        assert!(!manager.confirmation_recovery_required.lock().unwrap().contains_key(&session));
+        assert!(confirmed_browser_close_departed(&session, &dir, &expected, Instant::now()));
+        std::fs::remove_file(pid_path).unwrap();
+        std::fs::remove_file(socket_path).unwrap();
+        clear_session_pid(&session);
+    }
+
+    #[tokio::test]
+    async fn approved_agent_close_without_closed_ack_requires_recovery() {
+        let (manager, session, record, host_id) = preset_pending_fixture().await;
+        manager.sessions.lock().await.get_mut(&session).unwrap()
+            .pending_confirmation.as_mut().unwrap().closes_browser = true;
+        assert!(manager.respond_confirmation_locked_with(&session, &host_id, true,
+            move |_session, _port, _pending, _upstream_id, _approve| {
+                Ok((record, BrowserConfirmationResponse::Resolved))
+            }).await.unwrap_err().contains("completed close"));
+        assert!(manager.confirmation_recovery_required.lock().unwrap().contains_key(&session));
+        assert!(manager.pending_confirmation(&session).await.unwrap().is_none());
     }
 
     #[tokio::test]
@@ -13972,6 +14281,10 @@ mod tests {
             &serde_json::json!({"success":true,"data":{"confirmed":true,"result":{"success":true,"data":{"url":"about:blank"}}}}),
             true,
         ), Some(BrowserConfirmationResponse::Resolved));
+        assert_eq!(browser_confirmation_response(
+            &serde_json::json!({"success":true,"data":{"confirmed":true,"result":{"success":true,"data":{"closed":true}}}}),
+            true,
+        ), Some(BrowserConfirmationResponse::ResolvedClosed));
         assert_eq!(browser_confirmation_response(
             &serde_json::json!({"success":true,"data":{"confirmed":true,"result":{"success":false,"error":"navigation failed"}}}),
             true,
