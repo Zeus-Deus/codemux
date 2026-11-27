@@ -101,6 +101,11 @@ describe("PlatformPluginsSection", () => {
     expect(within(dialog).getByRole("alert").textContent).toContain("Git URL installs are temporarily paused");
     expect(called("install")).toEqual([]);
 
+    fireEvent.change(source, { target: { value: "relative/plugin" } });
+    fireEvent.click(within(dialog).getByRole("button", { name: "Add and review" }));
+    expect(within(dialog).getByRole("alert").textContent).toBe("Use an absolute folder path on this computer.");
+    expect(called("install")).toEqual([]);
+
     fireEvent.change(source, { target: { value: "/plugins/realm" } });
     fireEvent.click(within(dialog).getByRole("button", { name: "Add and review" }));
     await waitFor(() => expect(called("install")).toEqual([{ source: { kind: "local", directory: "/plugins/realm" } }]));

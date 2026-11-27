@@ -104,7 +104,7 @@ export function InstallPlatformPluginDialog({
   const submit = async () => {
     const parsed = parsePluginSourceInput(source);
     if (!parsed.ok) {
-      setError(parsed.message);
+      setError("Use an absolute folder path on this computer.");
       return;
     }
     if (parsed.source.kind === "git") {
