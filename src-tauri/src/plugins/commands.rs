@@ -479,6 +479,7 @@ pub async fn plugins_preview_install<R: Runtime>(
     source: InstallSource,
 ) -> Result<InstallPreview, String> {
     gui(&app)?;
+    super::require_bounded_network_git_install()?;
     let root = root()?;
     let catalog = state.catalog_fresh(&app, false).await.catalog;
     tauri::async_runtime::spawn_blocking(move || plan_for(&root, &catalog, &source).map(|p| p.preview))
@@ -498,6 +499,7 @@ pub async fn plugins_install<R: Runtime>(
     enable: bool,
 ) -> Result<InstallPreview, String> {
     gui(&app)?;
+    super::require_bounded_network_git_install()?;
     let _one = state.installing.lock().await;
     let root = root()?;
     let catalog = state.catalog_fresh(&app, false).await.catalog;

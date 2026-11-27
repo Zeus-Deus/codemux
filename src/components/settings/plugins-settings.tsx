@@ -15,7 +15,7 @@ import { reportFailure } from "@/lib/toast";
 import { pluginsRemove, pluginsRevealRoot, type InstallSource } from "@/contrib/ipc";
 import { useConfirm } from "@/components/ui/confirm-dialog";
 import { useUIStore } from "@/stores/ui-store";
-import { PluginCatalog, usePluginInstaller } from "./plugin-install";
+import { NETWORK_GIT_INSTALLS_PAUSED, PluginCatalog, usePluginInstaller } from "./plugin-install";
 import {
   setPluginEnabled,
   beginInstallationChange,
@@ -127,6 +127,7 @@ function folderIdOf(record: PluginRecord): string {
 interface RowActions {
   openSettings: (id: string) => void;
   update: (source: InstallSource) => void;
+  updatePaused: boolean;
   remove: (record: PluginRecord) => void;
   hasSettings: boolean;
   setup: { id: string; source: SetupSource } | null;
@@ -202,7 +203,7 @@ function PluginRow({ record, actions }: { record: PluginRecord; actions: RowActi
                 </DropdownMenuItem>
               )}
               {record.origin && folderIdOf(record) === record.id && (
-                <DropdownMenuItem onSelect={() => actions.update({ kind: "update", id: record.id })}>
+                <DropdownMenuItem disabled={actions.updatePaused} onSelect={() => actions.update({ kind: "update", id: record.id })}>
                   Update…
                 </DropdownMenuItem>
               )}
@@ -273,6 +274,7 @@ export function PluginsSettings({ onOpenSettings }: { onOpenSettings?: (pluginId
   const rowActions = (record: PluginRecord): RowActions => ({
     openSettings: (id) => onOpenSettings?.(id),
     update: installer.installFrom,
+    updatePaused: NETWORK_GIT_INSTALLS_PAUSED,
     remove: (r) => void remove(r),
     hasSettings: settingsPages.has(record.id) && !!onOpenSettings,
     setup: setupSourceOf(settingsPages.get(record.id) ?? []),
@@ -312,7 +314,7 @@ export function PluginsSettings({ onOpenSettings }: { onOpenSettings?: (pluginId
         className="mb-4"
       />
       <div className="mb-7 flex flex-wrap items-center gap-2" data-plugins-actions>
-        <Button size="sm" variant="outline" disabled={disabledByEnv} onClick={installer.promptUrl}>
+        <Button size="sm" variant="outline" disabled={disabledByEnv || NETWORK_GIT_INSTALLS_PAUSED} onClick={installer.promptUrl}>
           <Github />
           Install from GitHub URL…
         </Button>
@@ -332,6 +334,11 @@ export function PluginsSettings({ onOpenSettings }: { onOpenSettings?: (pluginId
       {disabledByEnv && (
         <p className="mb-4 rounded-md border border-hairline bg-surface-1 px-4 py-3 text-body-sm text-muted-foreground" role="status">
           Plugins disabled by environment (CODEMUX_DISABLE_PLUGINS).
+        </p>
+      )}
+      {NETWORK_GIT_INSTALLS_PAUSED && !disabledByEnv && (
+        <p className="mb-4 rounded-md border border-hairline bg-surface-1 px-4 py-3 text-body-sm text-muted-foreground" role="status">
+          Network Git plugin installs and updates are temporarily paused. Add a reviewed plugin from a local folder using Open plugins folder.
         </p>
       )}
       {paused && !disabledByEnv && (
