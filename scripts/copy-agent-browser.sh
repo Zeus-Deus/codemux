@@ -48,8 +48,9 @@ if [ "$(git -C "$SOURCE_DIR" rev-parse HEAD)" != "$SOURCE_COMMIT" ]; then
   echo "Browser sidecar source commit mismatch" >&2
   exit 1
 fi
-git -C "$SOURCE_DIR" apply --check "$PATCH"
-git -C "$SOURCE_DIR" apply "$PATCH"
+# The confirmation hunk uses zero context; the source checkout is pinned above.
+git -C "$SOURCE_DIR" apply --unidiff-zero --index --check "$PATCH"
+git -C "$SOURCE_DIR" apply --unidiff-zero --index "$PATCH"
 
 TMPDIR="${CODEMUX_BROWSER_BUILD_TMPDIR:-${TMPDIR:-$BUILD_ROOT}}" \
   CARGO_TARGET_DIR="$BUILD_ROOT/target" \

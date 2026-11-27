@@ -1,7 +1,7 @@
 // Exercises the real patched sidecar listeners without launching Chromium.
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
-import { mkdtemp, readFile, rm, chmod } from 'node:fs/promises';
+import { mkdtemp, readFile, writeFile, rm, chmod } from 'node:fs/promises';
 import { createServer, connect } from 'node:net';
 import { tmpdir } from 'node:os';
 import { resolve, join } from 'node:path';
@@ -76,6 +76,8 @@ async function waitForFile(path, child) {
 
 const directory = await mkdtemp(join(process.platform === 'win32' ? tmpdir() : '/var/tmp', 'cmx-ab-auth-'));
 if (process.platform !== 'win32') await chmod(directory, 0o700);
+const policyPath = join(directory, 'policy.json');
+await writeFile(policyPath, '{"confirm":["screenshot"]}');
 const children = [];
 
 try {
@@ -90,6 +92,7 @@ try {
         AGENT_BROWSER_SESSION: name,
         AGENT_BROWSER_SOCKET_DIR: directory,
         AGENT_BROWSER_STREAM_PORT: String(requestedPort),
+        ...(name === 'auth-a' ? { AGENT_BROWSER_ACTION_POLICY: policyPath } : {}),
         CODEMUX_BROWSER_SECRET: token,
       },
       stdio: ['ignore', 'ignore', 'pipe'],
@@ -141,7 +144,23 @@ try {
   const authorized = JSON.parse(await daemonRequest(a.token));
   assert.equal(authorized.success, true);
 
-  console.log('Browser WS, HTTP API, and daemon command listeners reject missing, wrong, and cross-session tokens; correct tokens pass.');
+  const daemonCommand = async (command) => JSON.parse(await wire(a.daemonTarget,
+    `${JSON.stringify({ ...command, codemuxToken: a.token })}\n`, '\n'));
+  const pending = await daemonCommand({ id: 'screenshot-1', action: 'screenshot' });
+  assert.equal(pending.data.confirmation_id, 'screenshot-1');
+  for (const decision of [
+    { id: 'decision-1', action: 'confirm' },
+    { id: 'decision-2', action: 'confirm', confirmationId: 'wrong' },
+    { id: 'decision-3', action: 'deny', confirmationId: 'wrong' },
+  ]) {
+    const rejected = await daemonCommand(decision);
+    assert.equal(rejected.success, false);
+    assert.match(rejected.error, /Confirmation ID/);
+  }
+  const denied = await daemonCommand({ id: 'decision-4', action: 'deny', confirmationId: 'screenshot-1' });
+  assert.equal(denied.data.denied, true);
+
+  console.log('Browser WS, HTTP API, and daemon listeners enforce tokens; wrong confirmation IDs preserve the pending command.');
 } finally {
   await Promise.all(children.map(async (child) => {
     if (child.exitCode !== null) return;
