@@ -88,6 +88,36 @@ afterEach(() => {
 });
 
 describe("PlatformPluginsSection", () => {
+  it("pauses Git refresh actions while keeping local source checks available", () => {
+    const gitSource = { kind: "git" as const, url: "https://github.com/example/plugin.git" };
+    const git = installation({
+      installationId: "inst-git",
+      manifest: manifest({ id: "example.git", name: "Git Plugin" }),
+      source: gitSource,
+    });
+    const local = installation({
+      installationId: "inst-local",
+      manifest: manifest({ id: "example.local", name: "Local Plugin" }),
+    });
+    const localFix = installation({
+      installationId: "inst-fix",
+      manifest: manifest({ id: "example.fix", name: "Local Fix" }),
+      source: { kind: "local", directory: "/plugins/fix" },
+      recovery: { activeSource: "local-repair", upstreamSource: gitSource },
+    });
+    show([git, local, localFix], { recoverySupported: true });
+
+    expect((within(editor()).getByRole("button", { name: "Check for changes" }) as HTMLButtonElement).disabled).toBe(true);
+    expect(within(editor()).getByText(/Network Git update checks are temporarily paused/)).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: "Local Plugin" }));
+    expect((within(editor()).getByRole("button", { name: "Check for changes" }) as HTMLButtonElement).disabled).toBe(false);
+    expect(within(editor()).queryByText(/Network Git update checks are temporarily paused/)).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: "Local Fix" }));
+    expect((within(editor()).getByRole("button", { name: "Check publisher for updates" }) as HTMLButtonElement).disabled).toBe(true);
+    expect(within(editor()).getByText(/Network Git update checks are temporarily paused/)).toBeTruthy();
+    expect(called("refresh")).toEqual([]);
+  });
+
   it("explains the Git install pause before calling the host and keeps local folders available", async () => {
     respond = (method) => method === "install" ? installation() : undefined;
     show([]);
