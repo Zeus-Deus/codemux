@@ -29,6 +29,7 @@ import {
   PROVIDER_LABELS,
   buildPlan,
   helperIsOutdated,
+  helperNeedsRestart,
   hostKey,
   itemKey,
   useUpdateAll,
@@ -94,18 +95,31 @@ export function UpdatesSection() {
   const showLoading = useDelayedPending(loading);
   const appPending = app.available;
   const total = plan.items.length + (appPending ? 1 : 0);
+  const restartRequired = Object.values(known).some(helperNeedsRestart);
+  const statusUnavailable = hostIds.some((id) => {
+    const state = known[hostKey(id)];
+    return !!state?.error || (!!state?.helperVersion && !state.runningVersion && state.serveAlive !== false);
+  });
+  const restartNotice = (current: Partial<Record<MachineKey, MachineState>>) => {
+    const devices = hosts.filter((host) => helperNeedsRestart(current[hostKey(host.id)]));
+    if (devices.length === 0) return "Running chats weren't interrupted.";
+    if (devices.length === 1) {
+      return `Running chats weren't interrupted. After sessions on ${devices[0].name} finish, restart its Codemux headless service to use the new helper.`;
+    }
+    return `Running chats weren't interrupted. After sessions on ${devices.map((host) => host.name).join(", ")} finish, restart each device's Codemux headless service to use the new helper.`;
+  };
 
   const start = async (approved: UpdatePlan) => {
     setConfirming(null);
     const result = approved.items.length ? await runPlan(approved) : { updated: 0, failed: [] };
     const label = (n: number) => `${n} update${n === 1 ? "" : "s"}`;
     if (result.failed.length) {
-      toast.warning(`${result.failed.length} of ${approved.items.length} updates failed`, {
+      toast.warning(`${result.updated} updated, ${result.failed.length} failed`, {
         description: result.failed.map((f) => `${names[f.machine] ?? f.machine} · ${f.label}: ${f.reason}`).join("\n"),
       });
     } else if (result.updated) {
       toast.success(`${label(result.updated)} installed`, {
-        description: "Running chats weren't interrupted. Restart Codemux when it suits you so every agent uses its new version.",
+        description: restartNotice(useUpdateAll.getState().machines),
       });
     }
     // Last, because it restarts the app.
@@ -136,7 +150,7 @@ export function UpdatesSection() {
               onClick={() => setConfirming(plan)}
             >
               {running && <Spinner className="size-3.5" aria-hidden />}
-              {running ? "Updating…" : total ? `Update all (${total})` : "Up to date"}
+              {running ? "Updating…" : total ? `Update all (${total})` : restartRequired ? "Restart required" : statusUnavailable ? "Status unavailable" : "Up to date"}
             </Button>
           </>
         }
@@ -145,8 +159,8 @@ export function UpdatesSection() {
       {summary && !running && (
         <p role="status" className="-mt-3 mb-6 text-body-sm text-muted-foreground">
           {summary.failed.length
-            ? `${summary.updated} updated, ${summary.failed.length} failed. Failed items show why below.`
-            : `${summary.updated} updated. Running chats weren't interrupted; restart Codemux when it suits you to use the new versions.`}
+            ? `${summary.updated} updated, ${summary.failed.length} failed. See details below.`
+            : `${summary.updated} updated. ${restartNotice(machines)}`}
         </p>
       )}
 
@@ -167,6 +181,12 @@ export function UpdatesSection() {
             <SettingsCard className="p-0">
               <ul className="divide-y divide-border/40">
                 <HelperRow machine={key} state={state} />
+                {state?.error && state.helperVersion && (
+                  <li className="flex items-center gap-2 px-4 py-3 text-label text-destructive" role="alert">
+                    <CircleAlert className="size-4 shrink-0" aria-hidden />
+                    <span>Status check failed: {state.error}. Showing last known status.</span>
+                  </li>
+                )}
                 {state?.helperVersion && <ProviderRows machine={key} state={state} />}
               </ul>
             </SettingsCard>
@@ -254,7 +274,7 @@ function Row({
           title={tone === "error" && typeof detail === "string" ? detail : undefined}
           className={cn(
             "text-label",
-            tone === "error" ? "line-clamp-2 break-words" : "truncate",
+            tone === "error" || tone === "done" ? "line-clamp-2 break-words" : "truncate",
             tone === "available" && "text-foreground",
             tone === "error" && "text-destructive",
             tone === "done" && "text-success",
@@ -302,7 +322,7 @@ function ProviderRows({ machine, state }: { machine: MachineKey; state: MachineS
   if (state.providers.length === 0) {
     return (
       <li className="px-4 py-3 text-body-sm text-subtle-foreground">
-        {state.error && machine === LOCAL ? state.error : "No coding agents installed."}
+        {state.error ? machine === LOCAL ? state.error : "Coding agent status unavailable." : "No coding agents installed."}
       </li>
     );
   }
@@ -394,16 +414,23 @@ function HelperRow({ machine, state }: { machine: MachineKey; state: MachineStat
     );
   }
   const outdated = helperIsOutdated(state);
+  const restartRequired = helperNeedsRestart(state);
   const detail =
     item?.phase === "failed"
       ? { text: item.message ?? "Update failed", tone: "error" as const }
-      : item?.phase === "updated"
-        ? { text: `v${state.helperVersion}`, tone: "done" as const }
-        : outdated
-          ? { text: `v${state.helperVersion} → v${state.appVersion}`, tone: "available" as const }
-          : { text: `v${state.helperVersion} · up to date`, tone: "muted" as const };
+      : outdated
+          ? { text: `v${state.helperVersion} → v${state.appVersion}${restartRequired ? ` · v${state.runningVersion} running · Restart required` : ""}`, tone: "available" as const }
+          : restartRequired
+            ? { text: `v${state.helperVersion} installed · v${state.runningVersion} running · Restart required`, tone: "error" as const }
+            : state.serveAlive === false
+              ? { text: `v${state.helperVersion} installed · service stopped`, tone: "muted" as const }
+              : item?.phase === "updated" && !state.runningVersion
+                ? { text: `v${state.helperVersion}${item.message ? ` · ${item.message}` : ""}`, tone: "done" as const }
+                : !state.runningVersion
+                  ? { text: `v${state.helperVersion} installed · running version unavailable`, tone: "muted" as const }
+                  : { text: `v${state.helperVersion} · up to date`, tone: "muted" as const };
   return (
-    <Row icon={icon} title="Codemux" detail={detail.text} tone={detail.tone}>
+    <Row icon={restartRequired ? <CircleAlert className="size-4 text-destructive" aria-hidden /> : icon} title="Codemux" detail={detail.text} tone={detail.tone}>
       {item && item.phase !== "failed" ? (
         <ProgressBadge item={item} />
       ) : outdated ? (

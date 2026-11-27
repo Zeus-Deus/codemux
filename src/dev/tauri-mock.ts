@@ -4772,16 +4772,17 @@ const mockLocalProviders: MockProviderReport[] = [
   mockReport("cursor", "2026.09.28-6e1f2a4", "2026.09.28-6e1f2a4", "Omarchy system package", false, "This provider is owned by the system. Run `omarchy update` in a terminal, then restart Codemux."),
   mockReport("opencode", "1.18.35", "1.18.35", "Omarchy · mise"),
 ];
-const mockDeviceProviders = new Map<number, { helper: string; providers: MockProviderReport[] }>([
-  [2, { helper: "0.23.2", providers: [
+const mockDeviceProviders = new Map<number, { helper: string; running: string; providers: MockProviderReport[] }>([
+  [2, { helper: "0.23.2", running: "0.23.2", providers: [
     mockReport("claude", "2.3.9", "2.3.14", "Claude updater"),
     mockReport("codex", "0.161.0", "0.163.0", "npm"),
     mockReport("opencode", "1.18.30", "1.18.35", "npm"),
   ] }],
-  [3, { helper: "0.24.0", providers: [
+  [3, { helper: "0.24.0", running: "0.24.0", providers: [
     mockReport("codex", "0.163.0", "0.163.0", "npm"),
   ] }],
 ]);
+const mockDeviceRefreshFailures = new Set<number>();
 
 const mockHostStatus = new Map<number, HostStatusView>([
   [1, {
@@ -6067,17 +6068,20 @@ const handlers: Record<string, Handler> = {
     if (new URLSearchParams(location.search).get("providerUpdate") === "error") throw new Error("Update failed: the package registry could not be reached. Check your connection and try again.");
     return { provider: a.provider, installed_version: "0.158.0", latest_version: "0.158.0", available: false, manager: "Omarchy · mise", can_update: true, message: null };
   },
-  // Settings → Updates. Synthetic per-machine inventories; `?updateAll=fail`
-  // makes one device update fail so the partial-failure summary shows.
+  // Settings → Updates. `?updateAll=doubleFail` makes an installer fail and
+  // its subsequent status check lose the connection.
   provider_updates_local: () => mockLocalProviders.map((p) => ({ ...p })),
   provider_updates_device: (a) => {
     const hostId = Number(a.hostId);
     const host = mockHosts.find((h) => h.id === hostId);
+    if (mockDeviceRefreshFailures.has(hostId)) {
+      return { host_id: hostId, helper_version: null, running_version: null, serve_alive: null, app_version: "0.24.0", providers: null, error: "SSH connection timed out" };
+    }
     if (!host || hostId === 1) {
-      return { host_id: hostId, helper_version: null, app_version: "0.24.0", providers: null, error: `couldn't connect to ${host?.name ?? "the device"} over SSH` };
+      return { host_id: hostId, helper_version: null, running_version: null, serve_alive: null, app_version: "0.24.0", providers: null, error: `couldn't connect to ${host?.name ?? "the device"} over SSH` };
     }
     const device = mockDeviceProviders.get(hostId)!;
-    return { host_id: hostId, helper_version: device.helper, app_version: "0.24.0", providers: device.providers.map((p) => ({ ...p })), error: null };
+    return { host_id: hostId, helper_version: device.helper, running_version: device.running, serve_alive: true, app_version: "0.24.0", providers: device.providers.map((p) => ({ ...p })), error: null };
   },
   provider_update_local: async (a) => {
     await new Promise((resolve) => setTimeout(resolve, 1600));
@@ -6087,7 +6091,9 @@ const handlers: Record<string, Handler> = {
   },
   provider_update_device: async (a) => {
     await new Promise((resolve) => setTimeout(resolve, 1600));
-    if (new URLSearchParams(location.search).get("updateAll") === "fail" && a.provider === "opencode") {
+    const scenario = new URLSearchParams(location.search).get("updateAll");
+    if ((scenario === "fail" || scenario === "doubleFail") && a.provider === "opencode") {
+      if (scenario === "doubleFail") mockDeviceRefreshFailures.add(Number(a.hostId));
       throw new Error("npm exited with exit status: 1: EACCES: permission denied, rename '/usr/lib/node_modules/opencode-ai'");
     }
     const device = mockDeviceProviders.get(Number(a.hostId))!;
@@ -6100,7 +6106,13 @@ const handlers: Record<string, Handler> = {
     const device = mockDeviceProviders.get(Number(a.hostId))!;
     const from = device.helper;
     device.helper = "0.24.0";
-    return { host_id: a.hostId, status: "upgraded", from, to: "0.24.0", message: null };
+    return {
+      host_id: a.hostId,
+      status: "upgraded",
+      from,
+      to: "0.24.0",
+      message: "An already running headless service keeps its previous version until restarted.",
+    };
   },
   // Opens the sign-in terminal tab like the backend, then treats the
   // sign-in as done: the next probe (Re-check, window focus, or a send)

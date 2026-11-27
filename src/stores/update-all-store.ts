@@ -22,6 +22,8 @@ export const hostKey = (id: number): MachineKey => `host:${id}`;
 export interface DeviceProvidersReport {
   host_id: number;
   helper_version: string | null;
+  running_version: string | null;
+  serve_alive: boolean | null;
   app_version: string;
   providers: ProviderUpdateReport[] | null;
   error: string | null;
@@ -39,8 +41,12 @@ export interface MachineState {
   loading: boolean;
   checkedAt?: number;
   providers: ProviderUpdateReport[];
+  /** The latest device check, separate from versions and agent rows kept for display. */
+  latestCheck?: { helperVersion: string | null; providerInventoryFresh: boolean };
   /** Devices only: the helper's version and this desktop's. */
   helperVersion?: string | null;
+  runningVersion?: string | null;
+  serveAlive?: boolean | null;
   appVersion?: string;
   error?: string | null;
 }
@@ -103,6 +109,10 @@ export function helperIsOutdated(state: MachineState | undefined): boolean {
   return !!state?.helperVersion && !!state.appVersion && isOlderVersion(state.helperVersion, state.appVersion);
 }
 
+export function helperNeedsRestart(state: MachineState | undefined): boolean {
+  return !!state?.helperVersion && !!state.runningVersion && state.helperVersion !== state.runningVersion;
+}
+
 /**
  * What "Update all" would do with what is known now. Pure, so the confirm
  * dialog and the run agree and the decision is testable.
@@ -112,12 +122,19 @@ export function buildPlan(machines: Record<string, MachineState>, names: Record<
   const skipped: SkippedItem[] = [];
   for (const [key, state] of Object.entries(machines) as [MachineKey, MachineState][]) {
     const name = names[key] ?? key;
-    if (key !== LOCAL && state.error && !state.helperVersion) {
-      skipped.push({ machine: key, label: name, reason: state.error });
-      continue;
-    }
-    if (key !== LOCAL && helperIsOutdated(state)) {
-      items.push({ machine: key, item: "helper", label: "Codemux" });
+    if (key !== LOCAL) {
+      const checkedVersion = state.latestCheck ? state.latestCheck.helperVersion : state.error ? null : state.helperVersion;
+      const helperOutdated = !!checkedVersion && !!state.appVersion && isOlderVersion(checkedVersion, state.appVersion);
+      if (helperOutdated) items.push({ machine: key, item: "helper", label: "Codemux" });
+      const inventoryFresh = state.latestCheck
+        ? !!state.latestCheck.helperVersion && state.latestCheck.providerInventoryFresh
+        : !state.error;
+      if (!inventoryFresh) {
+        // An older helper can be reached but cannot list agents. Upgrade it
+        // first; the post-install check will discover them for this run.
+        if (!helperOutdated) skipped.push({ machine: key, label: name, reason: state.error ?? "Couldn't check device agents" });
+        continue;
+      }
     }
     for (const report of state.providers) {
       if (!report.available) continue;
@@ -145,6 +162,7 @@ interface Store {
 }
 
 export const useUpdateAll = create<Store>((set, get) => {
+  const deviceRefreshGeneration = new Map<MachineKey, number>();
   const patchMachine = (key: MachineKey, value: Partial<MachineState>) =>
     set((s) => ({
       machines: { ...s.machines, [key]: { providers: [], loading: false, ...s.machines[key], ...value } },
@@ -193,21 +211,36 @@ export const useUpdateAll = create<Store>((set, get) => {
 
     async refreshDevice(hostId, force = false) {
       const key = hostKey(hostId);
-      if (get().machines[key]?.loading) return;
+      if (get().machines[key]?.loading && !force) return;
+      // An explicit check or post-install refresh supersedes an older read.
+      // Its response must not restore the pre-install helper version.
+      const generation = (deviceRefreshGeneration.get(key) ?? 0) + 1;
+      deviceRefreshGeneration.set(key, generation);
+      const isLatest = () => deviceRefreshGeneration.get(key) === generation;
       patchMachine(key, { loading: true });
       try {
         const report = await invoke<DeviceProvidersReport>("provider_updates_device", { hostId, force });
-        patchMachine(key, {
-          providers: report.providers ?? [],
-          helperVersion: report.helper_version,
-          appVersion: report.app_version,
-          error: report.error,
-          checkedAt: Date.now(),
-        });
+        if (isLatest()) {
+          const previous = get().machines[key];
+          patchMachine(key, {
+            // A failed or partial check must not erase the last usable rows.
+            providers: report.providers ?? previous?.providers ?? [],
+            latestCheck: { helperVersion: report.helper_version, providerInventoryFresh: report.providers !== null && !report.error },
+            helperVersion: report.helper_version ?? previous?.helperVersion ?? null,
+            runningVersion: report.helper_version ? report.running_version : previous?.runningVersion ?? null,
+            serveAlive: report.helper_version ? report.serve_alive : previous?.serveAlive ?? null,
+            appVersion: report.app_version,
+            error: report.error,
+            checkedAt: report.error ? previous?.checkedAt : Date.now(),
+          });
+        }
       } catch (error) {
-        patchMachine(key, { error: String(error), helperVersion: null });
+        if (isLatest()) patchMachine(key, {
+          latestCheck: { helperVersion: null, providerInventoryFresh: false },
+          error: String(error),
+        });
       } finally {
-        patchMachine(key, { loading: false });
+        if (isLatest()) patchMachine(key, { loading: false });
       }
     },
 
@@ -226,13 +259,27 @@ export const useUpdateAll = create<Store>((set, get) => {
           if (result.status === "skipped") throw new Error(result.message ?? "The device couldn't be updated");
           patchItem(key, { phase: "updated", message: result.message ?? undefined });
           patchMachine(machine, { helperVersion: result.to ?? get().machines[machine]?.appVersion });
+          // A newly installed helper can report the version of an older
+          // daemon, including when the previous helper could not. Refresh
+          // for both a single-row update and Update all.
+          await get().refreshDevice(hostId, true);
         } else if (machine === LOCAL) {
           replaceReport(machine, await invoke<ProviderUpdateReport>("provider_update_local", { provider: item }));
           patchItem(key, { phase: "updated" });
         } else {
           const hostId = Number(machine.slice(5));
-          replaceReport(machine, await invoke<ProviderUpdateReport>("provider_update_device", { hostId, provider: item }));
-          patchItem(key, { phase: "updated" });
+          let updated = false;
+          try {
+            replaceReport(machine, await invoke<ProviderUpdateReport>("provider_update_device", { hostId, provider: item }));
+            patchItem(key, { phase: "updated" });
+            updated = true;
+          } catch (error) {
+            patchItem(key, { phase: "failed", message: error instanceof Error ? error.message : String(error) });
+          }
+          // The provider command may upgrade the helper before its installer
+          // fails. Its outcome stays visible while this status read runs.
+          await get().refreshDevice(hostId, true);
+          return updated;
         }
         return true;
       } catch (error) {
@@ -258,9 +305,19 @@ export const useUpdateAll = create<Store>((set, get) => {
             if (ordered[0]?.item === "helper" && (await get().updateOne(machine, "helper"))) {
               updated++;
               ordered.shift();
-              // An older helper couldn't list the device's agents. Now it can,
-              // so the same run picks up whatever it finds out of date.
-              await get().refreshDevice(Number(machine.slice(5)), true);
+              const refreshed = get().machines[machine];
+              if (refreshed?.latestCheck?.providerInventoryFresh === false) {
+                // The display may still hold agent rows from an earlier check.
+                // Do not run those installers after an unsuccessful re-check.
+                const reason = refreshed.error ?? "Couldn't check device agents after the helper update";
+                failed.push({ machine, label: "Agent discovery", reason });
+                for (const rest of ordered) {
+                  patchItem(itemKey(machine, rest.item), { phase: "failed", message: reason });
+                }
+                return;
+              }
+              // The helper refresh in updateOne can discover providers an
+              // older helper could not list, so include them in this run.
               const planned = new Set(ordered.map((p) => p.item));
               for (const report of get().machines[machine]?.providers ?? []) {
                 if (report.available && report.can_update && !planned.has(report.provider)) {

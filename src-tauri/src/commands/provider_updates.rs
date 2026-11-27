@@ -664,8 +664,12 @@ pub async fn provider_update_local(provider: ProviderKind) -> Result<ProviderUpd
 #[derive(Clone, Debug, Serialize)]
 pub struct DeviceProviders {
     pub host_id: i64,
-    /// The device's `codemux-remote` version, or None when unreachable.
+    /// The installed `codemux-remote` version, or None when unreachable.
     pub helper_version: Option<String>,
+    /// Version reported by the running headless service, if it answered.
+    pub running_version: Option<String>,
+    /// Whether `serve status` found a live daemon. None for older helpers.
+    pub serve_alive: Option<bool>,
     /// This desktop's version: the helper is current when not older.
     pub app_version: String,
     /// None when the helper predates `providers` or the device is offline.
@@ -715,6 +719,8 @@ fn parse_device_report(host_id: i64, stdout: &str) -> DeviceProviders {
     let mut report = DeviceProviders {
         host_id,
         helper_version: None,
+        running_version: None,
+        serve_alive: None,
         app_version: env!("CARGO_PKG_VERSION").into(),
         providers: None,
         error: None,
@@ -725,6 +731,9 @@ fn parse_device_report(host_id: i64, stdout: &str) -> DeviceProviders {
         };
         if value["name"] == "codemux-remote" {
             report.helper_version = value["version"].as_str().map(Into::into);
+        } else if let Some(alive) = value["alive"].as_bool() {
+            report.serve_alive = Some(alive);
+            report.running_version = value["running_version"].as_str().map(Into::into);
         } else if let Some(list) = value.get("providers") {
             report.providers = serde_json::from_value(list.clone()).ok();
         }
@@ -750,7 +759,7 @@ pub async fn provider_updates_device<R: tauri::Runtime>(
         let force = if force.unwrap_or(false) { " --force" } else { "" };
         // An older helper has no `providers`; report its version anyway.
         let script = device_script(&format!(
-            "version; \"$CMR\" providers check{force} 2>/dev/null || true"
+            "version; \"$CMR\" serve status 2>/dev/null || true; \"$CMR\" providers check{force} 2>/dev/null || true"
         ));
         match crate::ssh::exec::run_remote(&host.ssh_target, &script, Duration::from_secs(180))
             .await
@@ -759,6 +768,8 @@ pub async fn provider_updates_device<R: tauri::Runtime>(
             Err(error) => Ok(DeviceProviders {
                 host_id,
                 helper_version: None,
+                running_version: None,
+                serve_alive: None,
                 app_version: env!("CARGO_PKG_VERSION").into(),
                 providers: None,
                 error: Some(error),
@@ -805,7 +816,7 @@ pub async fn provider_update_device<R: tauri::Runtime>(
 }
 
 /// Bring a device's `codemux-remote` up to this build. Same gentle path as
-/// the background upgrader: the `serve` daemon restarts only when idle.
+/// the background upgrader: a running `serve` daemon is not restarted.
 #[tauri::command]
 pub async fn device_helper_update<R: tauri::Runtime>(
     app: tauri::AppHandle<R>,
@@ -824,18 +835,15 @@ pub async fn device_helper_update<R: tauri::Runtime>(
                 to: None,
                 message: None,
             },
-            UpgradeOutcome::Upgraded {
-                from,
-                to,
-                deferred_restart,
-            } => DeviceHelperUpdate {
+            UpgradeOutcome::Upgraded { from, to } => DeviceHelperUpdate {
                 host_id,
                 status: "upgraded".into(),
                 from: Some(from),
                 to: Some(to),
-                message: deferred_restart.map(|n| {
-                    format!("{n} running session(s) keep the old version until they finish")
-                }),
+                message: Some(
+                    "An already running headless service keeps its previous version until restarted."
+                        .into(),
+                ),
             },
             UpgradeOutcome::NotAttempted { reason } => DeviceHelperUpdate {
                 host_id,
@@ -1101,9 +1109,11 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn device_reports_tolerate_banners_and_older_helpers() {
-        let out = "Welcome to the box\n{\"name\":\"codemux-remote\",\"version\":\"0.24.0\",\"protocol_version\":3}\n{\"providers\":[{\"provider\":\"codex\",\"installed_version\":\"0.1.0\",\"latest_version\":\"0.2.0\",\"available\":true,\"manager\":\"Omarchy · mise\",\"can_update\":true,\"message\":null}]}\n";
+        let out = "Welcome to the box\n{\"name\":\"codemux-remote\",\"version\":\"0.24.0\",\"protocol_version\":3}\n{\"alive\":true,\"running_version\":\"0.23.0\",\"live_terminals\":2}\n{\"providers\":[{\"provider\":\"codex\",\"installed_version\":\"0.1.0\",\"latest_version\":\"0.2.0\",\"available\":true,\"manager\":\"Omarchy · mise\",\"can_update\":true,\"message\":null}]}\n";
         let report = parse_device_report(7, out);
         assert_eq!(report.helper_version.as_deref(), Some("0.24.0"));
+        assert_eq!(report.running_version.as_deref(), Some("0.23.0"));
+        assert_eq!(report.serve_alive, Some(true));
         let providers = report.providers.unwrap();
         assert_eq!(providers[0].provider, ProviderKind::Codex);
         assert!(providers[0].available && report.error.is_none());
@@ -1112,7 +1122,21 @@ mod tests {
         // for an update instead of claiming the device has no agents.
         let old = parse_device_report(7, "{\"name\":\"codemux-remote\",\"version\":\"0.20.0\"}\n");
         assert_eq!(old.helper_version.as_deref(), Some("0.20.0"));
+        assert_eq!(old.running_version, None);
+        assert_eq!(old.serve_alive, None);
         assert!(old.providers.is_none() && old.error.unwrap().contains("Update Codemux"));
+        let stopped = parse_device_report(
+            7,
+            "{\"name\":\"codemux-remote\",\"version\":\"0.24.0\"}\n{\"alive\":false,\"running_version\":null}\n{\"providers\":[]}\n",
+        );
+        assert_eq!(stopped.serve_alive, Some(false));
+        assert_eq!(stopped.running_version, None);
+        let unknown = parse_device_report(
+            7,
+            "{\"name\":\"codemux-remote\",\"version\":\"0.24.0\"}\n{\"alive\":null,\"running_version\":null}\n{\"providers\":[]}\n",
+        );
+        assert_eq!(unknown.serve_alive, None);
+        assert_eq!(unknown.running_version, None);
         assert!(parse_device_report(7, "").error.unwrap().contains("isn't set up"));
     }
 
