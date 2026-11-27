@@ -429,6 +429,7 @@ mod tests {
             pid: 1,
             start_time: 10,
             generation: 1,
+            listener_token: [0; 32],
         };
         let token = issue_token(&mut targets, "browser-a".into(), identity);
         assert_eq!(
@@ -452,6 +453,7 @@ mod tests {
             pid: 1,
             start_time: 10,
             generation: 1,
+            listener_token: [0; 32],
         };
         let replacement = BrowserStreamIdentity {
             generation: 2,

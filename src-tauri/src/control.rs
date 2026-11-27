@@ -1681,6 +1681,29 @@ pub(crate) async fn dispatch_request_as<R: Runtime>(
 
             let params = request.params.get("action").cloned().unwrap_or(Value::Null);
 
+            // A read-only status query must use an existing session. The
+            // shared command path below allocates one and may create a pane.
+            if action_kind == "viewport_status" {
+                let cli_session_name = if !workspace_id.is_empty() {
+                    state.snapshot().agent_browser_sessions.iter()
+                        .find(|session| session.workspace_id.0 == workspace_id)
+                        .map(|session| session.cli_session_name.clone())
+                        .ok_or_else(|| format!("Browser session for workspace {workspace_id} is not streaming"))
+                } else {
+                    Ok(resolve_browser_id(&app, "default"))
+                };
+                let result = match cli_session_name {
+                    Ok(session) => match agent_browser.verified_stream_identity(&session).await {
+                        Ok(identity) => crate::stream_input::get_viewport(identity)
+                            .await
+                            .map(|(width, height)| serde_json::json!({ "viewport_width": width, "viewport_height": height })),
+                        Err(error) => Err(error),
+                    },
+                    Err(error) => Err(error),
+                };
+                return control_response(result);
+            }
+
             // Resolve the CLI session name to use for agent-browser commands.
             let cli_session_name = if !workspace_id.is_empty() {
                 // Allocate the stream port keyed by `cli_session_name`
@@ -2976,6 +2999,33 @@ mod tests {
         let unnamed = local(None, crate::agent_control::ControlAccess::ReadOnly);
         let refused = dispatch_request_as(app.handle(), &unnamed, request("web_remote_disable", serde_json::json!({}))).await;
         assert!(refused.error.as_deref().unwrap().starts_with("access_denied: "), "narrowing applies to the owner too");
+    }
+
+    #[tokio::test]
+    async fn read_only_viewport_status_does_not_create_a_browser_session_or_pane() {
+        use tauri::Manager;
+
+        let app = tauri::test::mock_app();
+        let state = AppStateStore::default();
+        let root = tempfile::tempdir().unwrap();
+        let workspace_id = state.create_empty_workspace_at_path(root.path().to_path_buf()).0;
+        app.manage(state);
+        app.manage(crate::agent_browser::AgentBrowserManager::default());
+        app.manage(crate::observability::ObservabilityStore::default());
+        let read_only = local(Some("reader"), crate::agent_control::ControlAccess::ReadOnly);
+        let before = app.state::<AppStateStore>().snapshot();
+        for params in [
+            serde_json::json!({ "workspace_id": workspace_id, "action": { "kind": "viewport_status" } }),
+            serde_json::json!({ "action": { "kind": "viewport_status" } }),
+        ] {
+            let response = dispatch_request_as(app.handle(), &read_only, request("browser_automation", params)).await;
+            assert!(!response.ok, "an unstarted browser has no viewport");
+            let after = app.state::<AppStateStore>().snapshot();
+            assert!(after.agent_browser_sessions.is_empty());
+            assert!(after.browser_sessions.is_empty());
+            assert_eq!(serde_json::to_value(&after.workspaces).unwrap(),
+                serde_json::to_value(&before.workspaces).unwrap(), "viewport query changed the pane tree");
+        }
     }
 
     #[tokio::test]

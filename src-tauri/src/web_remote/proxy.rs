@@ -229,10 +229,10 @@ pub(super) async fn ws_proxy<R: Runtime>(
 /// `port`. Both directions await each send, so a slow peer stalls the reader
 /// on the other side (TCP backpressure) instead of buffering unboundedly.
 pub(crate) async fn bridge_ws(client: WebSocket, identity: BrowserStreamIdentity) {
-    let port = identity.port;
-    let url = format!("ws://127.0.0.1:{port}");
     let daemon = match crate::agent_browser::connect_verified_stream_peer(identity).await {
-        Ok(stream) => tokio_tungstenite::client_async(&url, stream).await,
+        Ok(stream) => tokio_tungstenite::client_async(
+            crate::agent_browser::authenticated_stream_request(identity), stream,
+        ).await,
         Err(_) => {
             let mut client = client;
             let _ = client.send(AxumMessage::Close(None)).await;
@@ -321,7 +321,7 @@ fn tungstenite_to_axum(msg: TungMessage) -> Option<AxumMessage> {
 // ── HTTP forward ────────────────────────────────────────────────────
 
 /// Forward only the browser pane's status GET and typed command POST with a
-/// minimal, credential-free request.
+/// minimal request carrying the verified session's listener credential.
 pub async fn http_forward<R: Runtime>(
     State(app): State<AppHandle<R>>,
     Path((port, rest)): Path<(u16, String)>,
@@ -396,11 +396,12 @@ pub(crate) async fn forward(
     // trusted, authenticated proxy supplies its own loopback origin instead
     // of forwarding the remote client's origin or credentials.
     let mut head = format!(
-        "{} {} HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nOrigin: http://127.0.0.1:{}\r\n",
+        "{} {} HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nOrigin: http://127.0.0.1:{}\r\nX-Codemux-Browser-Token: {}\r\n",
         method.as_str(),
         target,
         port,
-        port
+        port,
+        identity.listener_token_header(),
     );
     if !body.is_empty() {
         if let Some(ct) = headers.get(header::CONTENT_TYPE).and_then(|v| v.to_str().ok()) {
@@ -873,6 +874,8 @@ mod tests {
         let request = server.await.unwrap();
         assert!(request.contains(&format!("Host: 127.0.0.1:{port}\r\n")));
         assert!(request.contains(&format!("Origin: http://127.0.0.1:{port}\r\n")));
+        let token = crate::agent_browser::current_process_stream_identity(port).listener_token_header();
+        assert!(request.contains(&format!("X-Codemux-Browser-Token: {token}\r\n")));
         assert!(!request.contains("session=private"));
         assert!(!request.contains("Bearer private"));
     }

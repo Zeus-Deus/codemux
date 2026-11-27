@@ -157,9 +157,9 @@ jobs:
             echo "::error::copy-agent-browser.sh did not produce a non-empty binary at $DEST"
             echo "::error::Target: $TARGET"
             ls -la src-tauri/binaries/ || true
-            ls -la node_modules/agent-browser/bin/ || true
             exit 1
           fi
+          node scripts/test-agent-browser-listeners.mjs "$DEST"
 
       # codemux-remote (the push-to-host binary bundled as
       # `binaries/codemux-remote-<triple>`) has no step of its own. tauri's

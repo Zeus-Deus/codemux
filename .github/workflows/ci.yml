@@ -351,6 +351,11 @@ jobs:
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
 
+      - name: Select native Perl for MSVC dependencies
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: ./scripts/windows-native-perl.ps1
+
       - name: Rust cache
         uses: Swatinem/rust-cache@v2
         with:
@@ -403,33 +408,13 @@ jobs:
       - name: Stage agent-browser sidecar binary
         shell: bash
         run: |
-          # tauri-build validates `externalBin` at compile time, so even
-          # `cargo check` fails if src-tauri/binaries/agent-browser-<target>
-          # does not exist. Our existing copy-agent-browser.sh maps the host
-          # target triple to the upstream npm package's pre-built binary.
-          #
-          # Git Bash is preinstalled on windows-latest, so `shell: bash`
-          # works on both platforms without needing a second .ps1 script.
-          bash scripts/copy-agent-browser.sh || true
-
-          # Fallback: if the copy script couldn't find the upstream binary
-          # (e.g. agent-browser's postinstall was skipped on a particular
-          # platform — see upstream issue #549), drop a zero-byte placeholder
-          # at the expected path so tauri-build's externalBin check passes.
-          # CI's job is to verify type-correctness and run unit tests, not
-          # to produce a distributable installer — an empty placeholder is
-          # sufficient for `cargo check` / `cargo test`.
+          bash scripts/copy-agent-browser.sh
           TARGET="${CARGO_BUILD_TARGET:-$(rustc -vV | grep host | cut -d' ' -f2)}"
-          mkdir -p src-tauri/binaries
           case "$TARGET" in
             *windows*) DEST="src-tauri/binaries/agent-browser-$TARGET.exe" ;;
             *)         DEST="src-tauri/binaries/agent-browser-$TARGET" ;;
           esac
-          if [ ! -f "$DEST" ]; then
-            echo "[ci] Real agent-browser binary not found at $DEST — creating placeholder"
-            touch "$DEST"
-            chmod +x "$DEST" 2>/dev/null || true
-          fi
+          node scripts/test-agent-browser-listeners.mjs "$DEST"
 
       - name: Stage codemux-remote binary (placeholder for cargo test)
         shell: bash
@@ -440,7 +425,7 @@ jobs:
           # binary (it ships in the .deb/.rpm/AppImage). In ci.yml we
           # only need cargo check / cargo test to succeed — a zero-byte
           # placeholder satisfies the glob without spending the time to
-          # cross-compile. Same pattern as the agent-browser stage above.
+          # cross-compile.
           TARGET="${CARGO_BUILD_TARGET:-$(rustc -vV | grep host | cut -d' ' -f2)}"
           mkdir -p src-tauri/binaries
           case "$TARGET" in
@@ -613,10 +598,34 @@ jobs:
   # conclude as "skipped" (and a skipped matrix job never expands its matrix
   # names), so require this check rather than the individual jobs.
   # ---------------------------------------------------------------------------
+  browser-sidecar-macos:
+    needs: changes
+    if: needs.changes.outputs.rust == 'true'
+    runs-on: macos-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+      - name: Setup Node
+        uses: actions/setup-node@v5
+        with:
+          node-version: 22
+      - name: Build and test authenticated browser sidecar
+        shell: bash
+        run: |
+          bash scripts/copy-agent-browser.sh
+          TARGET="$(rustc -vV | awk '/^host:/ {print $2}')"
+          node scripts/test-agent-browser-listeners.mjs "src-tauri/binaries/agent-browser-$TARGET"
+          cargo test -j 2 --locked --manifest-path scripts/browser-benchmark/Cargo.toml --bin browser-benchmark failed_mac_open_closes_its_late_published_daemon -- --test-threads=1
+          CODEMUX_TEST_BROWSER_SIDECAR_BIN="$PWD/src-tauri/binaries/agent-browser-$TARGET" \
+            cargo test -j 2 --locked --manifest-path scripts/browser-benchmark/Cargo.toml --bin browser-benchmark real_sidecar_prior_launch_token_recovery_and_close -- --ignored --test-threads=1
+
   ci-gate:
     name: ci-gate
     if: always()
-    needs: [changes, web-checks, iroh-wasm, rust]
+    needs: [changes, web-checks, iroh-wasm, rust, browser-sidecar-macos]
     runs-on: ubuntu-latest
     timeout-minutes: 5
 

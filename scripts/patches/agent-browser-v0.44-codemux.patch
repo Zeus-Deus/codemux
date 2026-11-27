@@ -1,0 +1,298 @@
+diff --git a/cli/src/codemux_auth.rs b/cli/src/codemux_auth.rs
+new file mode 100644
+index 0000000..719543c
+--- /dev/null
++++ b/cli/src/codemux_auth.rs
+@@ -0,0 +1,33 @@
++//! Codemux's private sidecar protocol. A token is supplied only through the
++//! parent process environment and never persisted in a session URL or file.
++
++use std::sync::OnceLock;
++
++pub const HEADER: &str = "x-codemux-browser-token";
++pub const FIELD: &str = "codemuxToken";
++pub const BUILD_VERSION: &str = concat!(env!("CARGO_PKG_VERSION"), "+codemux.1");
++
++pub fn expected_token() -> Option<&'static str> {
++    static TOKEN: OnceLock<Option<String>> = OnceLock::new();
++    TOKEN
++        .get_or_init(|| {
++            let token = std::env::var("CODEMUX_BROWSER_SECRET").ok()?;
++            (token.len() == 64 && token.bytes().all(|byte| byte.is_ascii_hexdigit()))
++                .then_some(token)
++        })
++        .as_deref()
++}
++
++pub fn token_matches(candidate: Option<&str>) -> bool {
++    let (Some(expected), Some(candidate)) = (expected_token(), candidate) else {
++        return false;
++    };
++    if expected.len() != candidate.len() {
++        return false;
++    }
++    expected
++        .bytes()
++        .zip(candidate.bytes())
++        .fold(0u8, |difference, (left, right)| difference | (left ^ right))
++        == 0
++}
+diff --git a/cli/src/connection.rs b/cli/src/connection.rs
+index 9ed53cd..40e8f4a 100644
+--- a/cli/src/connection.rs
++++ b/cli/src/connection.rs
+@@ -862 +862 @@ fn daemon_version_matches(session: &str) -> bool {
+-        Ok(v) => v.trim() == env!("CARGO_PKG_VERSION"),
++        Ok(v) => v.trim() == crate::codemux_auth::BUILD_VERSION,
+@@ -1068,7 +1068 @@ fn ensure_daemon_locked(session: &str, opts: &DaemonOptions) -> Result<DaemonRes
+-            eprintln!(
+-                "{} Daemon version mismatch detected, restarting...",
+-                crate::color::warning_indicator()
+-            );
+-            stop_existing_daemon_for_restart(session);
+-            restarted = true;
+-            // Fall through to spawn a new daemon below
++            return Err("Existing browser daemon is unverified; refusing to adopt it".into());
+@@ -1438 +1432,11 @@ fn send_command_once(cmd: &Value, session: &str) -> Result<Response, SendError>
+-    let mut json_str = serde_json::to_string(cmd).map_err(|e| SendError::NotSent(e.to_string()))?;
++    if !daemon_version_matches(session) {
++        return Err(SendError::NotSent(
++            "Failed to connect: authenticated browser daemon version is unavailable".into(),
++        ));
++    }
++    let token = crate::codemux_auth::expected_token()
++        .ok_or_else(|| SendError::NotSent("Codemux browser token is missing".into()))?;
++    let mut authenticated = cmd.clone();
++    authenticated[crate::codemux_auth::FIELD] = Value::String(token.to_owned());
++    let mut json_str = serde_json::to_string(&authenticated)
++        .map_err(|e| SendError::NotSent(e.to_string()))?;
+diff --git a/cli/src/main.rs b/cli/src/main.rs
+index 32a3d80..2e44178 100644
+--- a/cli/src/main.rs
++++ b/cli/src/main.rs
+@@ -4,0 +5 @@ mod color;
++mod codemux_auth;
+diff --git a/cli/src/native/actions.rs b/cli/src/native/actions.rs
+index aad976c..6b70830 100644
+--- a/cli/src/native/actions.rs
++++ b/cli/src/native/actions.rs
+@@ -78,0 +79 @@ pub struct PendingConfirmation {
++    confirmation_id: String,
+@@ -2877,0 +2879 @@ fn park_unconfirmed_flow_write(
++    let confirmation_id = uuid::Uuid::new_v4().to_string();
+@@ -2878,0 +2881 @@ fn park_unconfirmed_flow_write(
++        confirmation_id: confirmation_id.clone(),
+@@ -2889 +2892 @@ fn park_unconfirmed_flow_write(
+-            "confirmation_id": id,
++            "confirmation_id": confirmation_id,
+@@ -3340,0 +3344 @@ async fn execute_command_inner(cmd: &Value, state: &mut DaemonState) -> Value {
++            let confirmation_id = uuid::Uuid::new_v4().to_string();
+@@ -3341,0 +3346 @@ async fn execute_command_inner(cmd: &Value, state: &mut DaemonState) -> Value {
++                confirmation_id: confirmation_id.clone(),
+@@ -3352 +3357 @@ async fn execute_command_inner(cmd: &Value, state: &mut DaemonState) -> Value {
+-                    "confirmation_id": id,
++                    "confirmation_id": confirmation_id,
+@@ -3368,0 +3374 @@ async fn execute_command_inner(cmd: &Value, state: &mut DaemonState) -> Value {
++                    let confirmation_id = uuid::Uuid::new_v4().to_string();
+@@ -3369,0 +3376 @@ async fn execute_command_inner(cmd: &Value, state: &mut DaemonState) -> Value {
++                        confirmation_id: confirmation_id.clone(),
+@@ -3380 +3387 @@ async fn execute_command_inner(cmd: &Value, state: &mut DaemonState) -> Value {
+-                            "confirmation_id": id,
++                            "confirmation_id": confirmation_id,
+@@ -15682 +15689,4 @@ async fn handle_auth_login(cmd: &Value, state: &mut DaemonState) -> Result<Value
+-async fn handle_confirm(_cmd: &Value, state: &mut DaemonState) -> Result<Value, String> {
++fn take_matching_confirmation(
++    cmd: &Value,
++    state: &mut DaemonState,
++) -> Result<PendingConfirmation, String> {
+@@ -15685 +15695 @@ async fn handle_confirm(_cmd: &Value, state: &mut DaemonState) -> Result<Value,
+-        .take()
++        .as_ref()
+@@ -15686,0 +15697,13 @@ async fn handle_confirm(_cmd: &Value, state: &mut DaemonState) -> Result<Value,
++    if cmd.get("confirmationId").and_then(Value::as_str)
++        != Some(pending.confirmation_id.as_str())
++    {
++        return Err("Confirmation ID does not match the pending request".into());
++    }
++    state
++        .pending_confirmation
++        .take()
++        .ok_or("No pending confirmation".into())
++}
++
++async fn handle_confirm(cmd: &Value, state: &mut DaemonState) -> Result<Value, String> {
++    let pending = take_matching_confirmation(cmd, state)?;
+@@ -15727,5 +15750,2 @@ fn confirmation_replay_command(cmd: &Value) -> Value {
+-async fn handle_deny(_cmd: &Value, state: &mut DaemonState) -> Result<Value, String> {
+-    let pending = state
+-        .pending_confirmation
+-        .take()
+-        .ok_or("No pending confirmation")?;
++async fn handle_deny(cmd: &Value, state: &mut DaemonState) -> Result<Value, String> {
++    let pending = take_matching_confirmation(cmd, state)?;
+@@ -20853,0 +20874,53 @@ mod tests {
++    #[tokio::test]
++    async fn stale_confirmation_ids_leave_the_pending_action_untouched() {
++        let (_env, mut state) = isolated_state();
++        let dir = tempfile::tempdir().unwrap();
++        let policy_path = dir.path().join("policy.json");
++        fs::write(&policy_path, r#"{"confirm":["close"]}"#).unwrap();
++        state.policy = Some(ActionPolicy::load(policy_path.to_str().unwrap()).unwrap());
++
++        let first = execute_command(&json!({ "id": "first", "action": "close" }), &mut state).await;
++        assert_eq!(first["id"], "first", "{first}");
++        let first_id = first["data"]["confirmation_id"].as_str().unwrap().to_owned();
++        assert_ne!(first_id, "first");
++        for decision in [
++            json!({ "id": "d1", "action": "confirm" }),
++            json!({ "id": "d2", "action": "confirm", "confirmationId": "wrong" }),
++            json!({ "id": "d3", "action": "deny", "confirmationId": "wrong" }),
++        ] {
++            let response = execute_command(&decision, &mut state).await;
++            assert_eq!(response["success"], false, "{response}");
++            assert_eq!(
++                state.pending_confirmation.as_ref().unwrap().confirmation_id,
++                first_id
++            );
++        }
++        let denied = execute_command(
++            &json!({ "id": "d4", "action": "deny", "confirmationId": first_id }),
++            &mut state,
++        ).await;
++        assert_eq!(denied["data"]["denied"], true, "{denied}");
++        assert!(state.pending_confirmation.is_none());
++
++        let second =
++            execute_command(&json!({ "id": "second", "action": "close" }), &mut state).await;
++        assert_eq!(second["id"], "second", "{second}");
++        let second_id = second["data"]["confirmation_id"].as_str().unwrap().to_owned();
++        assert_ne!(second_id, first_id);
++        let stale = execute_command(
++            &json!({ "id": "d5", "action": "deny", "confirmationId": first_id }),
++            &mut state,
++        ).await;
++        assert_eq!(stale["success"], false, "{stale}");
++        assert_eq!(
++            state.pending_confirmation.as_ref().unwrap().confirmation_id,
++            second_id
++        );
++        let confirmed = execute_command(
++            &json!({ "id": "d6", "action": "confirm", "confirmationId": second_id }),
++            &mut state,
++        ).await;
++        assert_eq!(confirmed["data"]["confirmed"], true, "{confirmed}");
++        assert!(state.pending_confirmation.is_none());
++    }
++
+@@ -20925 +20998,2 @@ mod tests {
+-        let _ = execute_command(&json!({ "id": "c", "action": "confirm" }), &mut state).await;
++        let confirmation_id = parked["data"]["confirmation_id"].as_str().unwrap();
++        let _ = execute_command(&json!({ "id": "c", "action": "confirm", "confirmationId": confirmation_id }), &mut state).await;
+@@ -20963,0 +21038,2 @@ mod tests {
++        let first_id = first["data"]["confirmation_id"].as_str().unwrap().to_owned();
++        assert_eq!(state.pending_confirmation.as_ref().unwrap().confirmation_id, first_id);
+@@ -20966 +21042 @@ mod tests {
+-            &json!({ "id": "policy-plugin-confirm-2", "action": "confirm" }),
++            &json!({ "id": "policy-plugin-confirm-2", "action": "confirm", "confirmationId": first_id }),
+@@ -20982,0 +21059,16 @@ mod tests {
++        let follow_up_id = second["data"]["result"]["data"]["confirmation_id"].as_str().unwrap().to_owned();
++        assert_ne!(follow_up_id, first_id, "replayed commands must receive a new prompt ID");
++        for action in ["confirm", "deny"] {
++            let stale = execute_command(
++                &json!({ "id": format!("stale-{action}"), "action": action, "confirmationId": first_id }),
++                &mut state,
++            ).await;
++            assert_eq!(stale["success"], false, "{stale}");
++            assert_eq!(state.pending_confirmation.as_ref().unwrap().confirmation_id, follow_up_id);
++        }
++        let denied = execute_command(
++            &json!({ "id": "follow-up-deny", "action": "deny", "confirmationId": follow_up_id }),
++            &mut state,
++        ).await;
++        assert_eq!(denied["data"]["denied"], true, "{denied}");
++        assert!(state.pending_confirmation.is_none());
+@@ -23519,0 +23612,2 @@ printf '%s' '{"protocol":"agent-browser.plugin.v1","success":true,"browser":{"cd
++        let confirmation_id = resp["data"]["confirmation_id"].as_str().unwrap();
++        assert_eq!(state.pending_confirmation.as_ref().unwrap().confirmation_id, confirmation_id);
+@@ -23521 +23615 @@ printf '%s' '{"protocol":"agent-browser.plugin.v1","success":true,"browser":{"cd
+-            execute_command(&json!({ "id": "c1", "action": "confirm" }), &mut state).await;
++            execute_command(&json!({ "id": "c1", "action": "confirm", "confirmationId": confirmation_id }), &mut state).await;
+@@ -23890 +23984,2 @@ printf '%s' '{"protocol":"agent-browser.plugin.v1","success":true,"browser":{"cd
+-        let done = execute_command(&json!({ "id": "c", "action": "confirm" }), &mut state).await;
++        let confirmation_id = ask["data"]["confirmation_id"].as_str().unwrap();
++        let done = execute_command(&json!({ "id": "c", "action": "confirm", "confirmationId": confirmation_id }), &mut state).await;
+@@ -24225,0 +24321,2 @@ printf '%s' '{"protocol":"agent-browser.plugin.v1","success":true,"browser":{"cd
++        assert_eq!(state.pending_confirmation.as_ref().unwrap().confirmation_id,
++            resp["data"]["confirmation_id"].as_str().unwrap());
+@@ -26713,0 +26811 @@ printf '%s' '{"protocol":"agent-browser.plugin.v1","success":true,"browser":{"cd
++        let confirmation_id = parked["data"]["confirmation_id"].as_str().unwrap();
+@@ -26715 +26813 @@ printf '%s' '{"protocol":"agent-browser.plugin.v1","success":true,"browser":{"cd
+-            execute_command(&json!({ "id": "2", "action": "confirm" }), &mut state).await;
++            execute_command(&json!({ "id": "2", "action": "confirm", "confirmationId": confirmation_id }), &mut state).await;
+diff --git a/cli/src/native/daemon.rs b/cli/src/native/daemon.rs
+index 875bfed..f2737f1 100644
+--- a/cli/src/native/daemon.rs
++++ b/cli/src/native/daemon.rs
+@@ -33,0 +34,4 @@ pub async fn run_daemon(session: &str) {
++    if crate::codemux_auth::expected_token().is_none() {
++        eprintln!("Codemux browser token is missing");
++        process::exit(1);
++    }
+@@ -118 +122 @@ pub async fn run_daemon(session: &str) {
+-    let _ = fs::write(&version_path, env!("CARGO_PKG_VERSION"));
++    let _ = fs::write(&version_path, crate::codemux_auth::BUILD_VERSION);
+@@ -672 +676 @@ async fn handle_connection<S>(
+-                let cmd: Value = match serde_json::from_str(trimmed) {
++                let mut cmd: Value = match serde_json::from_str(trimmed) {
+@@ -685,0 +690,12 @@ async fn handle_connection<S>(
++                if !crate::codemux_auth::token_matches(
++                    cmd.get(crate::codemux_auth::FIELD).and_then(Value::as_str),
++                ) {
++                    let _ = writer
++                        .write_all(b"{\"success\":false,\"error\":\"Unauthorized\"}\n")
++                        .await;
++                    continue;
++                }
++                if let Some(fields) = cmd.as_object_mut() {
++                    fields.remove(crate::codemux_auth::FIELD);
++                }
++
+diff --git a/cli/src/native/stream/http.rs b/cli/src/native/stream/http.rs
+index aadb1cf..0ebfa48 100644
+--- a/cli/src/native/stream/http.rs
++++ b/cli/src/native/stream/http.rs
+@@ -74,0 +75,3 @@ fn is_authorized_api_request(method: &str, request: &str) -> bool {
++    if !crate::codemux_auth::token_matches(request_header_value(request, crate::codemux_auth::HEADER)) {
++        return false;
++    }
+@@ -133 +136 @@ pub(super) async fn handle_http_request(
+-            "Origin or Referer does not match Host header.",
++            "Unauthorized browser API request.",
+@@ -322,0 +326,3 @@ pub(super) async fn relay_command_to_daemon(
++    let token = crate::codemux_auth::expected_token()
++        .ok_or_else(|| "Codemux browser token is missing".to_string())?;
++    cmd[crate::codemux_auth::FIELD] = Value::String(token.to_owned());
+diff --git a/cli/src/native/stream/websocket.rs b/cli/src/native/stream/websocket.rs
+index dc33b95..ebba3c8 100644
+--- a/cli/src/native/stream/websocket.rs
++++ b/cli/src/native/stream/websocket.rs
+@@ -303,0 +304,12 @@ async fn handle_ws_client(
++            let token = req
++                .headers()
++                .get(crate::codemux_auth::HEADER)
++                .and_then(|value| value.to_str().ok());
++            if !crate::codemux_auth::token_matches(token) {
++                let mut reject =
++                    tokio_tungstenite::tungstenite::handshake::server::ErrorResponse::new(Some(
++                        "Unauthorized browser stream".to_string(),
++                    ));
++                *reject.status_mut() = tokio_tungstenite::tungstenite::http::StatusCode::FORBIDDEN;
++                return Err(reject);
++            }
+diff --git a/cli/src/output.rs b/cli/src/output.rs
+index 5323fc7..80f0140 100644
+--- a/cli/src/output.rs
++++ b/cli/src/output.rs
+@@ -5374 +5374 @@ pub fn print_version() {
+-    println!("agent-browser {}", env!("CARGO_PKG_VERSION"));
++    println!("agent-browser {}", crate::codemux_auth::BUILD_VERSION);
