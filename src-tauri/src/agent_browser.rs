@@ -387,6 +387,18 @@ impl PendingBrowserConfirmation {
     }
 }
 
+fn public_screenshot_expiry_at(pending: &mut PendingBrowserConfirmation, latest: Instant) {
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .min(u64::MAX as u128) as u64;
+    let remaining_ms = latest.saturating_duration_since(Instant::now()).as_millis()
+        .min(u64::MAX as u128) as u64;
+    pending.details.expires_at_ms = pending.details.expires_at_ms
+        .min(now_ms.saturating_add(remaining_ms));
+}
+
 fn screenshot_prompt_has_replay_budget(
     pending: &PendingBrowserConfirmation, deadline: Instant, replay_budget: Duration,
 ) -> bool {
@@ -2107,7 +2119,17 @@ fn browser_control_endpoint_ready(session: &str, dir: &std::path::Path) -> bool 
 }
 
 /// When a confirmation had no pinned PID, only an empty control namespace
-/// can prove a later launch cannot reconnect to that uncertain daemon.
+/// can prove a later launch cannot reconnect to that uncertain daemon. The
+/// departed Windows owner record is retained for guarded close retries.
+#[cfg(windows)]
+fn departed_retained_confirmation_record(record: &BrowserPidRecord) -> bool {
+    record.native_start && record.token == browser_owner_token()
+        && current_app_process_identity().is_some_and(|owner|
+            (record.owner_pid, record.owner_start_time) == owner)
+        && (process_exit_confirmed(record.pid) || process_start_time(record.pid)
+            .is_some_and(|start| start != record.start_time))
+}
+
 fn confirmation_recovery_namespace_clear(session: &str) -> bool {
     if validate_session_name(session).is_err() {
         return false;
@@ -2136,11 +2158,25 @@ fn confirmation_recovery_namespace_clear(session: &str) -> bool {
         vec![root]
     };
     !roots.is_empty() && roots.iter().all(|root| {
-        let record_absent = [session_pid_path_in(root, session), legacy_session_pid_path_in(root, session)]
-            .into_iter().all(|path| path.is_some_and(|path| matches!(
-                std::fs::symlink_metadata(path),
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound
-            )));
+        let current_record = session_pid_path_in(root, session);
+        let legacy_record = legacy_session_pid_path_in(root, session);
+        let absent = |path: &std::path::Path| matches!(
+            std::fs::symlink_metadata(path),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound
+        );
+        let record_absent = current_record.as_ref().is_some_and(|path| {
+            if absent(path) {
+                true
+            } else {
+                // Windows deliberately retains the current owner's record
+                // after close. It cannot keep an unpinned guard forever once
+                // that exact process and the control namespace are gone.
+                #[cfg(windows)]
+                { read_browser_pid_record(path).as_ref().is_some_and(departed_retained_confirmation_record) }
+                #[cfg(not(windows))]
+                { false }
+            }
+        }) && legacy_record.as_ref().is_some_and(|path| absent(path));
         if !record_absent {
             return false;
         }
@@ -6713,19 +6749,40 @@ impl AgentBrowserManager {
         }
     }
 
+    fn confirmation_recovery_error(browser_id: &str) -> String {
+        format!(
+            "Browser confirmation outcome is uncertain for session {}; close the session before retrying",
+            session_name(browser_id),
+        )
+    }
+
     fn require_confirmation_recovered(&self, browser_id: &str) -> Result<(), String> {
         if self.confirmation_recovery_required.lock().unwrap().contains_key(browser_id) {
-            return Err(format!(
-                "Browser confirmation outcome is uncertain for session {}; close the session before retrying",
-                session_name(browser_id),
-            ));
+            return Err(Self::confirmation_recovery_error(browser_id));
         }
         Ok(())
     }
 
+    async fn confirmation_state_after_expiry(&self, browser_id: &str) -> (bool, bool) {
+        let mut sessions = self.sessions.lock().await;
+        if let Some(entry) = sessions.get_mut(browser_id) {
+            self.expire_confirmation_if_needed(browser_id, entry);
+        }
+        // Keep this check under the session lock. Prompt polling may turn a
+        // pending token into a recovery guard, but must not pass between two
+        // separate command admission checks.
+        let recovery = self.confirmation_recovery_required.lock().unwrap().contains_key(browser_id);
+        let pending = sessions.get(browser_id).is_some_and(|entry|
+            entry.confirmation_pending || entry.pending_confirmation.is_some());
+        (recovery, pending)
+    }
+
     async fn require_no_pending_confirmation(&self, browser_id: &str) -> Result<(), String> {
-        if self.sessions.lock().await.get(browser_id).is_some_and(|entry|
-            entry.confirmation_pending || entry.pending_confirmation.is_some()) {
+        let (recovery, pending) = self.confirmation_state_after_expiry(browser_id).await;
+        if recovery {
+            return Err(Self::confirmation_recovery_error(browser_id));
+        }
+        if pending {
             return Err(format!("Browser confirmation is pending for session {}", session_name(browser_id)));
         }
         Ok(())
@@ -7048,10 +7105,12 @@ impl AgentBrowserManager {
             .ok_or("Browser screenshot approval was not retained")?;
         let deadline = started_at + SCREENSHOT_TOTAL_TIMEOUT;
         if !screenshot_prompt_has_replay_budget(pending, deadline, replay_budget) {
+            public_screenshot_expiry_at(pending, Instant::now());
             self.guard_unresolved_screenshot(browser_id, entry);
             return Err("Browser screenshot approval exceeded the request deadline".into());
         }
         pending.screenshot_dispatch_deadline = Some(deadline - replay_budget);
+        public_screenshot_expiry_at(pending, deadline - replay_budget);
         let prompt_id = pending.details.id.clone().ok_or("Browser screenshot approval has no host ID")?;
         let daemon = pending.daemon.clone().ok_or("Browser screenshot approval has no verified daemon")?;
         entry.fail_pending_screenshot("A newer screenshot request replaced this capture");
@@ -7077,6 +7136,9 @@ impl AgentBrowserManager {
                 if entry.pending_screenshot.as_ref().is_some_and(|capture| capture.request_id == wait.request_id) {
                     self.guard_unresolved_screenshot(browser_id, entry);
                     entry.fail_pending_screenshot("Browser screenshot request ended before approval completed");
+                    if let Some(pending) = entry.pending_confirmation.as_mut() {
+                        public_screenshot_expiry_at(pending, Instant::now());
+                    }
                 }
             }
         }
@@ -7122,10 +7184,21 @@ impl AgentBrowserManager {
 
     pub async fn pending_confirmation(&self, browser_id: &str) -> Result<Option<BrowserPendingConfirmation>, String> {
         validate_session_name(session_name(browser_id))?;
-        self.clear_expired_confirmation(browser_id).await;
-        Ok(self.sessions.lock().await.get(browser_id)
-            .and_then(|entry| entry.pending_confirmation.as_ref())
-            .map(|pending| pending.details.clone()))
+        let mut sessions = self.sessions.lock().await;
+        let Some(entry) = sessions.get_mut(browser_id) else { return Ok(None) };
+        self.expire_confirmation_if_needed(browser_id, entry);
+        let abandoned_capture = entry.pending_confirmation.as_ref().is_some_and(|pending|
+            !pending.decision_in_flight && (entry.pending_screenshot.as_ref().is_some_and(|capture|
+                capture.reply.is_closed()) || pending.screenshot_dispatch_deadline
+                    .is_some_and(|latest| Instant::now() >= latest)));
+        if abandoned_capture {
+            self.guard_unresolved_screenshot(browser_id, entry);
+            entry.fail_pending_screenshot("Browser screenshot approval can no longer reach its caller");
+            if let Some(pending) = entry.pending_confirmation.as_mut() {
+                public_screenshot_expiry_at(pending, Instant::now());
+            }
+        }
+        Ok(entry.pending_confirmation.as_ref().map(|pending| pending.details.clone()))
     }
 
     pub async fn respond_confirmation(&self, browser_id: &str, id: &str, approve: bool) -> Result<Option<BrowserPendingConfirmation>, String> {
@@ -7171,6 +7244,9 @@ impl AgentBrowserManager {
             if screenshot_budget_exhausted {
                 self.guard_unresolved_screenshot(browser_id, entry);
                 entry.fail_pending_screenshot("Browser screenshot approval exceeded the request deadline");
+                if let Some(pending) = entry.pending_confirmation.as_mut() {
+                    public_screenshot_expiry_at(pending, Instant::now());
+                }
                 return Err("Browser screenshot approval exceeded the request deadline; deny the pending approval or close the session".into());
             }
             let pending = entry.pending_confirmation.as_mut().ok_or("Browser session has no pending confirmation")?;
@@ -7273,6 +7349,7 @@ impl AgentBrowserManager {
                     let pending = entry.pending_confirmation.as_mut()?;
                     screenshot_prompt_has_replay_budget(pending, deadline, replay_budget).then(|| {
                         pending.screenshot_dispatch_deadline = Some(deadline - replay_budget);
+                        public_screenshot_expiry_at(pending, deadline - replay_budget);
                         pending.details.clone()
                     })
                 });
@@ -7282,6 +7359,9 @@ impl AgentBrowserManager {
                 } else {
                     self.guard_unresolved_screenshot(browser_id, entry);
                     entry.fail_pending_screenshot("Follow-up screenshot approval exceeded the request deadline");
+                    if let Some(pending) = entry.pending_confirmation.as_mut() {
+                        public_screenshot_expiry_at(pending, Instant::now());
+                    }
                 }
             } else {
                 let result = if !approve {
@@ -7487,8 +7567,6 @@ impl AgentBrowserManager {
 
     async fn spawn_locked(&self, browser_id: &str) -> Result<(), String> {
         let session = session_name(browser_id).to_string();
-        self.clear_expired_confirmation(browser_id).await;
-        self.require_confirmation_recovered(browser_id)?;
         self.require_no_pending_confirmation(browser_id).await?;
         #[cfg(not(windows))]
         self.settle_provisional_session(browser_id, &session, None).await;
@@ -7755,8 +7833,6 @@ impl AgentBrowserManager {
         let browser_id = browser_id.to_owned();
         let action = action.to_owned();
         run_detached_browser_lifecycle(session, async move {
-            manager.clear_expired_confirmation(&browser_id).await;
-            manager.require_confirmation_recovered(&browser_id)?;
             manager.require_no_pending_confirmation(&browser_id).await?;
             match action.as_str() {
                 "click_at" | "type_at" | "scroll_at" | "key_press" | "drag" => {
@@ -7825,8 +7901,10 @@ impl AgentBrowserManager {
     async fn ensure_preset_navigation_locked(
         &self, browser_id: &str, url: String, retry_failed: bool,
     ) -> Result<BrowserPresetNavigationStatus, String> {
-        self.clear_expired_confirmation(browser_id).await;
-        self.require_confirmation_recovered(browser_id)?;
+        let (recovery, _) = self.confirmation_state_after_expiry(browser_id).await;
+        if recovery {
+            return Err(Self::confirmation_recovery_error(browser_id));
+        }
         {
             let mut sessions = self.sessions.lock().await;
             if let Some(stream) = sessions.get_mut(browser_id) {
@@ -7911,8 +7989,7 @@ impl AgentBrowserManager {
         expected_identity: Option<BrowserStreamIdentity>,
     ) -> Result<(BrowserAutomationResult, BrowserActionOutcome), String> {
         let session = session_name(browser_id).to_string();
-        self.clear_expired_confirmation(browser_id).await;
-        let recovery_required = self.confirmation_recovery_required.lock().unwrap().contains_key(browser_id);
+        let (recovery_required, pending) = self.confirmation_state_after_expiry(browser_id).await;
         if action == "close" && recovery_required {
             // Agent-facing close is normally a CLI action. An uncertain
             // confirmation needs the same verified teardown as pane close.
@@ -7926,12 +8003,17 @@ impl AgentBrowserManager {
             }, BrowserActionOutcome::Completed));
         }
         if action != "close" {
-            self.require_confirmation_recovered(browser_id)?;
+            if recovery_required {
+                return Err(Self::confirmation_recovery_error(browser_id));
+            }
+            if pending {
+                return Err(format!("Browser confirmation is pending for session {session}"));
+            }
         }
         #[cfg(not(windows))]
         self.settle_provisional_session(browser_id, &session, None).await;
-        if action != "close" && self.sessions.lock().await.get(browser_id).is_some_and(|entry| entry.confirmation_pending) {
-            return Err(format!("Browser confirmation is pending for session {session}"));
+        if action != "close" {
+            self.require_no_pending_confirmation(browser_id).await?;
         }
         let port = self.allocate_port(browser_id).await?;
         let browser_binary = self.browser_binary()?;
@@ -8054,8 +8136,6 @@ impl AgentBrowserManager {
     }
 
     async fn get_screenshot_locked(&self, browser_id: &str, started_at: Instant) -> Result<ScreenshotResult, String> {
-        self.clear_expired_confirmation(browser_id).await;
-        self.require_confirmation_recovered(browser_id)?;
         self.require_no_pending_confirmation(browser_id).await?;
         let session = session_name(browser_id).to_string();
         let port = self.allocate_port(browser_id).await?;
@@ -8453,8 +8533,10 @@ impl AgentBrowserManager {
 
     async fn start_stream_locked(&self, browser_id: &str) -> Result<String, String> {
         let session = session_name(browser_id).to_string();
-        self.clear_expired_confirmation(browser_id).await;
-        self.require_confirmation_recovered(browser_id)?;
+        let (recovery, _) = self.confirmation_state_after_expiry(browser_id).await;
+        if recovery {
+            return Err(Self::confirmation_recovery_error(browser_id));
+        }
         #[cfg(not(windows))]
         self.settle_provisional_session(browser_id, &session, None).await;
 
@@ -8535,6 +8617,7 @@ impl AgentBrowserManager {
 
         // A previous daemon for this session must be stopped before we assign
         // a new stream port. Only a verified Codemux-owned daemon is eligible.
+        self.require_no_pending_confirmation(browser_id).await?;
         let bin = {
             let session_for_close = session.clone();
             tokio::task::spawn_blocking(move || -> Result<String, String> {
@@ -10483,6 +10566,43 @@ mod tests {
         std::fs::remove_file(pid_path).unwrap();
         manager.close_locked(&session).await.unwrap();
         assert!(!manager.confirmation_recovery_required.lock().unwrap().contains_key(&session));
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn expired_unpinned_prompt_close_accepts_departed_windows_owner_record() {
+        let manager = AgentBrowserManager::new();
+        let session = format!("confirmation-unpinned-win-{}", uuid::Uuid::new_v4().simple());
+        let port = manager.allocate_port(&session).await.unwrap();
+        let mut pending = PendingBrowserConfirmation::new(BrowserConfirmationDetails {
+            id: Some("expired".into()), description: "Approve action".into(),
+        }, None);
+        pending.expires_at = Instant::now() - Duration::from_millis(1);
+        {
+            let mut sessions = manager.sessions.lock().await;
+            let entry = sessions.get_mut(&session).unwrap();
+            entry.confirmation_pending = true;
+            entry.pending_confirmation = Some(pending);
+        }
+        assert!(manager.pending_confirmation(&session).await.unwrap().is_none());
+        assert_eq!(manager.confirmation_recovery_required.lock().unwrap()
+            .get(&session), Some(&BrowserConfirmationRecovery { daemon: None, port }));
+
+        let record = test_browser_record(u32::MAX, 1, browser_owner_token().to_owned());
+        let record_path = session_pid_path(&session).unwrap();
+        let mut foreign = record.clone();
+        foreign.token = "other-app".into();
+        write_browser_pid_record(&record_path, &foreign).unwrap();
+        assert!(manager.close_locked(&session).await.unwrap_err().contains("recovery"));
+        assert!(record_path.exists(), "an unverified close must retain the owner record");
+
+        // Test builds skip process shutdown. The retained record can release
+        // unpinned recovery once it belongs to this app and its PID has gone.
+        write_browser_pid_record(&record_path, &record).unwrap();
+        manager.close_locked(&session).await.unwrap();
+        assert!(!manager.confirmation_recovery_required.lock().unwrap().contains_key(&session));
+        assert!(record_path.exists(), "verified close keeps the Windows record");
+        std::fs::remove_file(record_path).unwrap();
     }
 
     #[tokio::test]
@@ -14279,6 +14399,72 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn slow_capture_advertises_only_its_safe_approval_window() {
+        let manager = AgentBrowserManager::new();
+        let session = format!("screenshot-public-expiry-{}", uuid::Uuid::new_v4().simple());
+        manager.allow_test_stream_session(&session, 9223).await;
+        let record = test_browser_record(std::process::id(), process_start_time(std::process::id()).unwrap(),
+            browser_owner_token().to_owned());
+        let pending = PendingBrowserConfirmation::new(BrowserConfirmationDetails {
+            id: Some("capture_1".into()), description: "Approve screenshot".into(),
+        }, Some(record));
+        let internal_expiry = pending.expires_at;
+        {
+            let mut sessions = manager.sessions.lock().await;
+            let entry = sessions.get_mut(&session).unwrap();
+            entry.confirmation_pending = true;
+            entry.pending_confirmation = Some(pending);
+        }
+        let started_at = Instant::now() - (SCREENSHOT_TOTAL_TIMEOUT - Duration::from_secs(3));
+        let _wait = manager.register_pending_screenshot(
+            &session, "slow-capture".into(), started_at, Duration::from_secs(1),
+        ).await.unwrap();
+        let public = manager.pending_confirmation(&session).await.unwrap().unwrap();
+        let now_ms = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
+            .unwrap().as_millis() as u64;
+        assert!(public.expires_at_ms <= now_ms + 2_100,
+            "approval must stop before replay consumes the remaining caller time");
+        assert_eq!(manager.sessions.lock().await.get(&session).unwrap()
+            .pending_confirmation.as_ref().unwrap().expires_at, internal_expiry);
+    }
+
+    #[tokio::test]
+    async fn canceled_screenshot_caller_poll_expires_approval_but_keeps_deny() {
+        let manager = AgentBrowserManager::new();
+        let session = format!("screenshot-cancel-poll-{}", uuid::Uuid::new_v4().simple());
+        manager.allow_test_stream_session(&session, 9223).await;
+        let record = test_browser_record(std::process::id(), process_start_time(std::process::id()).unwrap(),
+            browser_owner_token().to_owned());
+        let pending = PendingBrowserConfirmation::new(BrowserConfirmationDetails {
+            id: Some("capture_1".into()), description: "Approve screenshot".into(),
+        }, Some(record.clone()));
+        {
+            let mut sessions = manager.sessions.lock().await;
+            let entry = sessions.get_mut(&session).unwrap();
+            entry.confirmation_pending = true;
+            entry.pending_confirmation = Some(pending);
+        }
+        let wait = manager.register_pending_screenshot(
+            &session, "cancelled-capture".into(), Instant::now(), Duration::from_secs(1),
+        ).await.unwrap();
+        drop(wait.reply);
+        let public = manager.pending_confirmation(&session).await.unwrap().unwrap();
+        let now_ms = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
+            .unwrap().as_millis() as u64;
+        assert!(public.expires_at_ms <= now_ms);
+        assert!(manager.confirmation_recovery_required.lock().unwrap().contains_key(&session));
+        assert!(manager.sessions.lock().await.get(&session).unwrap().pending_screenshot.is_none());
+        let id = public.id.unwrap();
+        assert!(manager.respond_confirmation_locked_with(&session, &id, true,
+            |_, _, _, _, _| unreachable!("cancelled capture cannot approve"),
+        ).await.unwrap_err().contains("caller ended"));
+        assert!(manager.respond_confirmation_locked_with(&session, &id, false,
+            move |_, _, _, _, _| Ok((record, BrowserConfirmationResponse::Resolved)),
+        ).await.unwrap().is_none());
+        assert!(!manager.confirmation_recovery_required.lock().unwrap().contains_key(&session));
+    }
+
+    #[tokio::test]
     async fn screenshot_prompt_poll_expiry_keeps_daemon_blocked_before_caller_timeout() {
         let manager = AgentBrowserManager::new();
         let session = format!("screenshot-prompt-expiry-{}", uuid::Uuid::new_v4().simple());
@@ -14387,7 +14573,11 @@ mod tests {
         assert!(manager.register_pending_screenshot(
             &session, "slow-capture".into(), started_at, screenshot_replay_budget(),
         ).await.unwrap_err().contains("exceeded the request deadline"));
-        assert_eq!(manager.pending_confirmation(&session).await.unwrap().unwrap().id, host_id);
+        let public = manager.pending_confirmation(&session).await.unwrap().unwrap();
+        assert_eq!(public.id, host_id);
+        let now_ms = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
+            .unwrap().as_millis() as u64;
+        assert!(public.expires_at_ms <= now_ms);
         assert_eq!(manager.confirmation_recovery_required.lock().unwrap().get(&session)
             .and_then(|guard| guard.daemon.as_ref()), Some(&record));
         assert!(manager.spawn_locked(&session).await.unwrap_err().contains("outcome is uncertain"));
@@ -14824,6 +15014,39 @@ mod tests {
         let entry = sessions.get(&session).unwrap();
         assert!(!entry.confirmation_pending);
         assert!(entry.pending_confirmation.is_none());
+    }
+
+    #[tokio::test]
+    async fn prompt_poll_expiry_and_command_admission_share_one_state() {
+        for _ in 0.. 16 {
+            let manager = AgentBrowserManager::new();
+            let session = format!("browser-confirm-race-{}", uuid::Uuid::new_v4().simple());
+            manager.allocate_port(&session).await.unwrap();
+            let mut pending = PendingBrowserConfirmation::new(BrowserConfirmationDetails {
+                id: Some("expired".into()), description: "Approve action".into(),
+            }, None);
+            pending.expires_at = Instant::now() - Duration::from_millis(1);
+            {
+                let mut sessions = manager.sessions.lock().await;
+                let entry = sessions.get_mut(&session).unwrap();
+                entry.confirmation_pending = true;
+                entry.pending_confirmation = Some(pending);
+            }
+            let sessions = manager.sessions.lock().await;
+            let command_manager = manager.clone();
+            let command_session = session.clone();
+            let command = tokio::spawn(async move {
+                command_manager.require_no_pending_confirmation(&command_session).await
+            });
+            let poll_manager = manager.clone();
+            let poll_session = session.clone();
+            let poll = tokio::spawn(async move { poll_manager.pending_confirmation(&poll_session).await });
+            tokio::task::yield_now().await;
+            drop(sessions);
+            assert!(command.await.unwrap().unwrap_err().contains("outcome is uncertain"));
+            assert!(poll.await.unwrap().unwrap().is_none());
+            assert!(manager.confirmation_recovery_required.lock().unwrap().contains_key(&session));
+        }
     }
 
     #[tokio::test]

@@ -100,12 +100,7 @@ function RetryCountdown({ at }: { at: number }) {
   return <span className="tabular-nums">Retrying in {seconds}s</span>;
 }
 
-function ConfirmationCountdown({ at }: { at: number }) {
-  const [now, setNow] = useState(() => Date.now());
-  useEffect(() => {
-    const id = setInterval(() => setNow(Date.now()), 1000);
-    return () => clearInterval(id);
-  }, []);
+function ConfirmationCountdown({ at, now }: { at: number; now: number }) {
   return <span className="tabular-nums">Expires in {Math.max(0, Math.ceil((at - now) / 1000))}s</span>;
 }
 
@@ -124,16 +119,27 @@ function PendingConfirmationNotice({
   onApprove: () => void;
   onDeny: () => void;
 }) {
+  const expiresAt = pending.details.expires_at_ms;
+  const [now, setNow] = useState(() => Date.now());
+  useEffect(() => {
+    setNow(Date.now());
+    const id = setInterval(() => setNow(Date.now()), 1000);
+    const expiry = setTimeout(() => setNow(Date.now()), Math.max(0, expiresAt - Date.now()));
+    return () => {
+      clearInterval(id);
+      clearTimeout(expiry);
+    };
+  }, [expiresAt]);
   const canRespond = !isRemoteClient() && !!pending.details.id;
   return (
     <div className="max-w-sm space-y-2 text-center" role="alert">
       <p className="text-label font-medium text-foreground">Browser confirmation required</p>
       <p className="break-words text-label text-muted-foreground">{pending.details.description}</p>
-      <p className="text-caption text-muted-foreground"><ConfirmationCountdown at={pending.details.expires_at_ms} /></p>
+      <p className="text-caption text-muted-foreground"><ConfirmationCountdown at={expiresAt} now={now} /></p>
       {error && <p className="break-words text-label text-destructive">{error}</p>}
       {canRespond ? (
         <div className="flex items-center justify-center gap-2">
-          <Button size="sm" onClick={onApprove} disabled={busy}>Approve browser action</Button>
+          <Button size="sm" onClick={onApprove} disabled={busy || now >= expiresAt}>Approve browser action</Button>
           <Button variant="outline" size="sm" onClick={onDeny} disabled={busy}>Deny</Button>
         </div>
       ) : (
@@ -824,7 +830,8 @@ export const BrowserPane = memo(function BrowserPane({ browserId, focused, visib
         if (!active || !paneIsCurrent() || confirmationBusyRef.current || revision !== confirmationRevisionRef.current) return;
         const shown = visibleConfirmationRef.current;
         if (pending) {
-          if (shown?.sessionId !== effectiveSessionId || shown.details.id !== pending.id) {
+          if (shown?.sessionId !== effectiveSessionId || shown.details.id !== pending.id
+              || shown.details.expires_at_ms !== pending.expires_at_ms) {
             showPendingConfirmation(effectiveSessionId, pending);
           }
         } else if (shown?.sessionId === effectiveSessionId && !confirmationBusyRef.current) {
@@ -888,7 +895,9 @@ export const BrowserPane = memo(function BrowserPane({ browserId, focused, visib
           if (!isRemoteClient()) {
             const details = await agentBrowserPendingConfirmation(sessionId).catch(() => null);
             if (!active || !paneIsCurrent() || confirmationBusyRef.current || revision !== confirmationRevisionRef.current) return;
-            if (details && visibleConfirmationRef.current?.details.id !== details.id) {
+            const shown = visibleConfirmationRef.current;
+            if (details && (shown?.details.id !== details.id
+                || shown?.details.expires_at_ms !== details.expires_at_ms)) {
               showPendingConfirmation(sessionId, details);
             }
           }
