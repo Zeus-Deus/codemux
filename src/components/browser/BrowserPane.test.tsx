@@ -811,6 +811,35 @@ describe("BrowserPane start failures", () => {
     expect(mocks.agentBrowserRespondConfirmation).not.toHaveBeenCalled();
   });
 
+  it("updates a prompt's public expiry and keeps Deny available after approval expires", async () => {
+    vi.useFakeTimers();
+    mocks.startBrowserStream.mockRejectedValue("Browser confirmation is pending for session browser-1");
+    let expiresAt = Date.now() + 60_000;
+    mocks.agentBrowserPendingConfirmation.mockImplementation(async () => ({
+      id: "c_screenshot",
+      description: "Approve screenshot",
+      expires_at_ms: expiresAt,
+    }));
+    renderPane();
+    await act(async () => {});
+    const approve = screen.getByRole("button", { name: "Approve browser action" });
+    const deny = screen.getByRole("button", { name: "Deny" });
+    expect(approve).toBeEnabled();
+
+    expiresAt = Date.now() + 3_000;
+    await act(async () => { await vi.advanceTimersByTimeAsync(2_000); });
+    expect(approve).toBeEnabled();
+    expect(screen.getByText("Expires in 1s")).toBeInTheDocument();
+
+    await act(async () => { await vi.advanceTimersByTimeAsync(1_000); });
+    expect(approve).toBeDisabled();
+    expect(deny).toBeEnabled();
+    fireEvent.click(approve);
+    expect(mocks.agentBrowserRespondConfirmation).not.toHaveBeenCalled();
+    await act(async () => { fireEvent.click(deny); });
+    expect(mocks.agentBrowserRespondConfirmation).toHaveBeenCalledWith("browser-1", "c_screenshot", false);
+  });
+
   it("keeps an in-flight prompt visible past its deadline and shows the next approval", async () => {
     vi.useFakeTimers();
     mocks.startBrowserStream.mockRejectedValue("Browser confirmation is pending for session browser-1");
