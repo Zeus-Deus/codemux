@@ -4839,6 +4839,7 @@ fn build_agent_browser_argv_groups(
 ) -> Result<Vec<Vec<String>>, String> {
     let s = session.to_string();
     let groups: Vec<Vec<String>> = match action {
+        "close" => vec![vec!["close".into(), "--session".into(), s]],
         "open_url" | "open" => {
             let url = params
                 .get("url")
@@ -5899,6 +5900,7 @@ fn build_agent_browser_command(binary: &str, session: &str, action: &str, params
                 s = session,
             )
         }
+        "close" => format!("{} close --session {}", bin, session),
         "screenshot" => format!("{} screenshot --session {}", bin, session),
         "snapshot" | "accessibility_snapshot" => {
             format!("{} snapshot -i --session {}", bin, session)
@@ -7733,7 +7735,7 @@ impl AgentBrowserManager {
     }
 
     /// Reset session state only after a completed agent-facing close. A
-    /// failed close can leave a parked confirmation on the control daemon.
+    /// pre-dispatch failure can leave a parked confirmation on the daemon.
     /// The port allocation / map entry stays intact.
     async fn note_close_finished(&self, browser_id: &str) {
         let mut sessions = self.sessions.lock().await;
@@ -7763,13 +7765,12 @@ impl AgentBrowserManager {
         if action == "close" {
             if outcome == BrowserActionOutcome::Completed {
                 self.note_close_finished(browser_id).await;
-            } else if outcome == BrowserActionOutcome::ConfirmationPending
+            } else if result.is_ok()
                 || result.as_ref().err().is_some_and(|error| error.may_have_launched) {
                 let mut sessions = self.sessions.lock().await;
                 if let Some(entry) = sessions.get_mut(browser_id) {
-                    // The close may have reached the daemon. A subsequent
-                    // action cannot use an old host token or assume that a
-                    // policy prompt still refers to the same parked action.
+                    // Even a structured failure can follow partial close.
+                    // The old host token may no longer name the parked action.
                     self.guard_unresolved_confirmation(browser_id, entry);
                     entry.fail_pending_screenshot("Browser close outcome is uncertain");
                     entry.confirmation_pending = false;
@@ -8114,6 +8115,9 @@ impl AgentBrowserManager {
 
         if action == "close" {
             self.require_confirmation_recovered(browser_id)?;
+            if result.as_ref().is_ok_and(|(_, outcome)| *outcome == BrowserActionOutcome::Failed) {
+                return Err("Browser close was rejected".into());
+            }
         }
 
         result.map_err(|error| error.message)
@@ -8207,8 +8211,8 @@ impl AgentBrowserManager {
     /// Atomic teardown for a session. Ordered so each step's failure
     /// leaves the system in a recoverable state:
     ///
-    ///   1. Pop the session from the map under the lock — no other caller
-    ///      can find it after this point, even if subsequent steps stall.
+    ///   1. Pin any pending approval for recovery, then pop the session from
+    ///      the map under the lock so later callers cannot reuse it.
     ///   2. Verify the daemon's process marker, session, and start time.
     ///   3. Close the verified daemon using the platform's bound process or
     ///      control peer, with a Linux pidfd fallback when necessary.
@@ -8230,9 +8234,16 @@ impl AgentBrowserManager {
     async fn close_locked(&self, browser_id: &str) -> Result<(), String> {
         let session = session_name(browser_id).to_string();
 
-        // Step 1: pop the session under the lock so nothing else races us.
+        // Step 1: pin a pending approval before retiring its session state.
         let (removed, recovery) = {
             let mut sessions = self.sessions.lock().await;
+            if let Some(entry) = sessions.get_mut(browser_id) {
+                if entry.confirmation_pending || entry.pending_confirmation.is_some()
+                    || entry.pending_screenshot.is_some()
+                {
+                    self.guard_unresolved_confirmation(browser_id, entry);
+                }
+            }
             let removed = sessions.remove(browser_id);
             self.ambiguous_presets.lock().unwrap().remove(browser_id);
             let recovery = self.confirmation_recovery_required.lock().unwrap().get(browser_id).cloned();
@@ -10730,33 +10741,78 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn failed_agent_close_preserves_confirmation_and_screenshot_waiter_for_deny() {
-        for dispatched in [false, true] {
-            let (manager, session, record, host_id) = preset_pending_fixture().await;
-            let wait = manager.register_pending_screenshot(
-                &session, "close-failed-screenshot".into(), Instant::now(), Duration::from_secs(1),
-            ).await.unwrap();
-            let result = if dispatched {
-                Ok((BrowserAutomationResult {
-                    request_id: make_request_id(), browser_id: session.clone(),
-                    data: serde_json::Value::Null, message: None,
-                }, BrowserActionOutcome::Failed))
-            } else {
-                Err(BrowserActionFailure::before_launch("close was not sent".into()))
-            };
-            manager.reconcile_action_attempt(&session, &session, "close", true, false, &result).await;
+    async fn before_dispatch_agent_close_preserves_confirmation_and_screenshot_waiter_for_deny() {
+        let (manager, session, record, host_id) = preset_pending_fixture().await;
+        let wait = manager.register_pending_screenshot(
+            &session, "close-failed-screenshot".into(), Instant::now(), Duration::from_secs(1),
+        ).await.unwrap();
+        let result = Err(BrowserActionFailure::before_launch("close was not sent".into()));
+        manager.reconcile_action_attempt(&session, &session, "close", true, false, &result).await;
 
-            assert_eq!(manager.pending_confirmation(&session).await.unwrap().unwrap().id.as_deref(),
-                Some(host_id.as_str()));
-            assert!(manager.sessions.lock().await.get(&session).unwrap().pending_screenshot.is_some());
-            assert!(!manager.confirmation_recovery_required.lock().unwrap().contains_key(&session));
-            manager.respond_confirmation_locked_with(&session, &host_id, false,
-                move |_session, _port, _pending, _upstream_id, approve| {
-                    assert!(!approve);
-                    Ok((record, BrowserConfirmationResponse::Resolved))
-                }).await.unwrap();
-            assert!(wait.reply.await.unwrap().unwrap_err().contains("denied"));
-        }
+        assert_eq!(manager.pending_confirmation(&session).await.unwrap().unwrap().id.as_deref(),
+            Some(host_id.as_str()));
+        assert!(manager.sessions.lock().await.get(&session).unwrap().pending_screenshot.is_some());
+        assert!(!manager.confirmation_recovery_required.lock().unwrap().contains_key(&session));
+        manager.respond_confirmation_locked_with(&session, &host_id, false,
+            move |_session, _port, _pending, _upstream_id, approve| {
+                assert!(!approve);
+                Ok((record, BrowserConfirmationResponse::Resolved))
+            }).await.unwrap();
+        assert!(wait.reply.await.unwrap().unwrap_err().contains("denied"));
+    }
+
+    #[tokio::test]
+    async fn pane_close_with_live_pending_daemon_requires_recovery() {
+        let (manager, session, record, _host_id) = preset_pending_fixture().await;
+        let wait = manager.register_pending_screenshot(
+            &session, "pane-close-screenshot".into(), Instant::now(), Duration::from_secs(1),
+        ).await.unwrap();
+        assert_eq!(record.pid, std::process::id(), "test owner must stay alive through close");
+
+        assert!(manager.close_locked(&session).await.unwrap_err().contains("recovery"));
+        assert_eq!(manager.confirmation_recovery_required.lock().unwrap().get(&session)
+            .and_then(|guard| guard.daemon.as_ref()), Some(&record));
+        assert!(manager.sessions.lock().await.get(&session).is_none());
+        assert!(tokio::time::timeout(Duration::from_secs(1), wait.reply).await.unwrap().is_err());
+        assert!(manager.run_command_locked_with_outcome(&session, "open",
+            serde_json::json!({"url": "about:blank"}), None, None,
+        ).await.unwrap_err().contains("uncertain"));
+        assert!(manager.start_stream_locked(&session).await.unwrap_err().contains("uncertain"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn real_agent_close_dispatch_rejection_requires_recovery() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        let launcher = temp.path().join("agent-browser");
+        std::fs::write(&launcher,
+            "#!/bin/sh\nprintf '%s\\n' \"$1\" > \"$0.called\"\nprintf '%s\\n' '{\"success\":false,\"error\":\"close failed\"}'\nexit 1\n",
+        ).unwrap();
+        std::fs::set_permissions(&launcher, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let (manager, session, record, _host_id) = preset_pending_fixture().await;
+        *manager.test_browser_binary.lock().unwrap() = Some(launcher.to_string_lossy().into_owned());
+        assert!(manager.run_command(&session, "close", serde_json::Value::Null).await
+            .unwrap_err().contains("uncertain"));
+        assert_eq!(std::fs::read_to_string(temp.path().join("agent-browser.called")).unwrap().trim(), "close");
+        assert_eq!(manager.confirmation_recovery_required.lock().unwrap().get(&session)
+            .and_then(|guard| guard.daemon.as_ref()), Some(&record));
+        assert!(manager.pending_confirmation(&session).await.unwrap().is_none());
+
+        // A missing launcher cannot send a close. That prompt remains safe
+        // for Deny through the public command path.
+        let (manager, session, record, host_id) = preset_pending_fixture().await;
+        *manager.test_browser_binary.lock().unwrap() = Some(temp.path().join("missing-browser").to_string_lossy().into_owned());
+        assert!(manager.run_command(&session, "close", serde_json::Value::Null).await
+            .unwrap_err().contains("launcher is unavailable"));
+        assert_eq!(manager.pending_confirmation(&session).await.unwrap().unwrap().id.as_deref(),
+            Some(host_id.as_str()));
+        manager.respond_confirmation_locked_with(&session, &host_id, false,
+            move |_session, _port, _pending, _upstream_id, approve| {
+                assert!(!approve);
+                Ok((record, BrowserConfirmationResponse::Resolved))
+            }).await.unwrap();
     }
 
     #[tokio::test]
