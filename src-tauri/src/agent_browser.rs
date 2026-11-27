@@ -312,6 +312,8 @@ struct PendingBrowserConfirmation {
     daemon: Option<BrowserPidRecord>,
     expires_at: Instant,
     decision_in_flight: bool,
+    screenshot_caller_ended: bool,
+    screenshot_dispatch_deadline: Option<Instant>,
 }
 
 struct PendingScreenshotCapture {
@@ -363,6 +365,8 @@ impl PendingBrowserConfirmation {
             daemon,
             expires_at: Instant::now() + ttl,
             decision_in_flight: false,
+            screenshot_caller_ended: false,
+            screenshot_dispatch_deadline: None,
         }
     }
 
@@ -386,6 +390,10 @@ fn screenshot_prompt_has_replay_budget(
     // The original caller may run out of time before the daemon's pending
     // confirmation expires. Its budget must never shorten the host guard.
     pending.expires_at.min(deadline).saturating_duration_since(Instant::now()) >= replay_budget
+}
+
+fn screenshot_approval_dispatch_expired(pending: &PendingBrowserConfirmation, approve: bool) -> bool {
+    approve && pending.screenshot_dispatch_deadline.is_some_and(|latest| Instant::now() >= latest)
 }
 
 /// Default stream port for the browser screencast WebSocket.
@@ -5017,6 +5025,7 @@ fn run_agent_browser_native_with_status_expected(
         discard_stderr,
         remaining,
         record.clone(),
+        None,
     );
     finish_browser_command_with_status(result, session, bin, &record, started_here, retained.as_ref())
 }
@@ -5078,12 +5087,50 @@ fn run_agent_browser_native_with_record(
     discard_stderr: bool,
     remaining: Duration,
     record: BrowserPidRecord,
+    screenshot_dispatch_deadline: Option<Instant>,
 ) -> std::io::Result<std::process::Output> {
     if remaining.is_zero() {
         return Err(std::io::Error::new(std::io::ErrorKind::TimedOut, "Browser command startup timed out"));
     }
-    let mut relay = VerifiedBrowserRelay::new(bin, session, record, remaining)?;
-    run_agent_browser_native_raw(bin, argv, session, stream_port, discard_stderr, remaining, &mut relay)
+    let mut relay = VerifiedBrowserRelay::new(bin, session, record, remaining, screenshot_dispatch_deadline)?;
+    let result = run_agent_browser_native_raw(bin, argv, session, stream_port, discard_stderr, remaining,
+        screenshot_dispatch_deadline, &mut relay);
+    if relay.approval_send_state.load(Ordering::Acquire) == RELAY_APPROVAL_EXPIRED_BEFORE_SEND {
+        return Err(std::io::Error::new(std::io::ErrorKind::TimedOut, BrowserApprovalDispatchExpired));
+    }
+    result
+}
+
+#[cfg(target_os = "windows")]
+#[derive(Debug)]
+struct BrowserApprovalDispatchExpired;
+
+#[cfg(target_os = "windows")]
+impl std::fmt::Display for BrowserApprovalDispatchExpired {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("Browser screenshot approval exceeded the request deadline before dispatch")
+    }
+}
+
+#[cfg(target_os = "windows")]
+impl std::error::Error for BrowserApprovalDispatchExpired {}
+
+#[cfg(target_os = "windows")]
+const RELAY_APPROVAL_NOT_SENT: u8 = 0;
+#[cfg(target_os = "windows")]
+const RELAY_APPROVAL_WRITE_ATTEMPTED: u8 = 1;
+#[cfg(target_os = "windows")]
+const RELAY_APPROVAL_EXPIRED_BEFORE_SEND: u8 = 2;
+
+#[cfg(target_os = "windows")]
+fn expire_relay_approval_before_send(state: &std::sync::atomic::AtomicU8) -> std::io::Error {
+    match state.compare_exchange(RELAY_APPROVAL_NOT_SENT, RELAY_APPROVAL_EXPIRED_BEFORE_SEND,
+        Ordering::AcqRel, Ordering::Acquire) {
+        Ok(_) | Err(RELAY_APPROVAL_EXPIRED_BEFORE_SEND) =>
+            std::io::Error::new(std::io::ErrorKind::TimedOut, BrowserApprovalDispatchExpired),
+        Err(_) => std::io::Error::new(std::io::ErrorKind::TimedOut,
+            "Browser approval deadline elapsed after an upstream write may have begun"),
+    }
 }
 
 /// Spawn the native CLI using the relay's private control directory.
@@ -5095,6 +5142,7 @@ fn run_agent_browser_native_raw(
     stream_port: u16,
     discard_stderr: bool,
     timeout: Duration,
+    screenshot_dispatch_deadline: Option<Instant>,
     relay: &mut VerifiedBrowserRelay,
 ) -> std::io::Result<std::process::Output> {
     let program = native_browser_program(bin)?;
@@ -5115,6 +5163,9 @@ fn run_agent_browser_native_raw(
         cmd.stderr(std::process::Stdio::null());
     } else {
         cmd.stderr(std::process::Stdio::piped());
+    }
+    if screenshot_dispatch_deadline.is_some_and(|latest| Instant::now() >= latest) {
+        return Err(std::io::Error::new(std::io::ErrorKind::TimedOut, BrowserApprovalDispatchExpired));
     }
     // Hard timeout + kill so a wedged agent-browser.exe can't block the
     // calling task forever (issue #96).
@@ -5303,6 +5354,7 @@ struct VerifiedBrowserRelay {
     port_guard: Option<std::fs::File>,
     directory_guard: Option<clack_private_fs::PrivateDirectory>,
     expected_cli_pid: std::sync::Arc<std::sync::atomic::AtomicU32>,
+    approval_send_state: std::sync::Arc<std::sync::atomic::AtomicU8>,
     _cli_process: Option<std::os::windows::io::OwnedHandle>,
     stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
     worker: Option<std::thread::JoinHandle<()>>,
@@ -5334,7 +5386,8 @@ fn bind_exclusive_browser_relay_listener(port: u16) -> std::io::Result<std::net:
 
 #[cfg(windows)]
 impl VerifiedBrowserRelay {
-    fn new(bin: &str, session: &str, record: BrowserPidRecord, timeout: Duration) -> std::io::Result<Self> {
+    fn new(bin: &str, session: &str, record: BrowserPidRecord, timeout: Duration,
+        screenshot_dispatch_deadline: Option<Instant>) -> std::io::Result<Self> {
         use std::io::{Read, Write};
         use std::os::windows::fs::OpenOptionsExt;
         use windows_sys::Win32::Storage::FileSystem::FILE_SHARE_READ;
@@ -5384,8 +5437,10 @@ impl VerifiedBrowserRelay {
 
         let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let expected_cli_pid = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let approval_send_state = std::sync::Arc::new(std::sync::atomic::AtomicU8::new(RELAY_APPROVAL_NOT_SENT));
         let worker_stop = stop.clone();
         let worker_cli_pid = expected_cli_pid.clone();
+        let worker_send_state = approval_send_state.clone();
         let session = session.to_owned();
         let worker = std::thread::spawn(move || {
             while !worker_stop.load(Ordering::Acquire) {
@@ -5404,8 +5459,10 @@ impl VerifiedBrowserRelay {
                         }
                         let session = session.clone();
                         let record = record.clone();
+                        let send_state = worker_send_state.clone();
                         std::thread::spawn(move || {
-                            if relay_browser_command(&mut client, &session, &record, expected_pid, timeout).is_err() {
+                            if relay_browser_command(&mut client, &session, &record, expected_pid, timeout,
+                                screenshot_dispatch_deadline, &send_state).is_err() {
                                 let _ = client.set_write_timeout(Some(Duration::from_secs(1)));
                                 let _ = client.write_all(b"{\"success\":false,\"error\":\"Browser control peer verification failed\"}\n");
                             }
@@ -5418,7 +5475,7 @@ impl VerifiedBrowserRelay {
                 }
             }
         });
-        Ok(Self { directory, cli_session, port, _listener_guard: listener_guard, port_guard: Some(port_guard), directory_guard: Some(directory_guard), expected_cli_pid, _cli_process: None, stop, worker: Some(worker) })
+        Ok(Self { directory, cli_session, port, _listener_guard: listener_guard, port_guard: Some(port_guard), directory_guard: Some(directory_guard), expected_cli_pid, approval_send_state, _cli_process: None, stop, worker: Some(worker) })
     }
 
     fn register_cli(&mut self, child: &std::process::Child) -> std::io::Result<()> {
@@ -5465,6 +5522,9 @@ fn write_browser_control_with_deadline(
             return Err(std::io::Error::new(std::io::ErrorKind::TimedOut, "Browser control write timed out"));
         }
         stream.set_write_timeout(Some(remaining.min(Duration::from_secs(5))))?;
+        if Instant::now() >= deadline {
+            return Err(std::io::Error::new(std::io::ErrorKind::TimedOut, "Browser control write timed out"));
+        }
         let written = stream.write(bytes)?;
         if written == 0 {
             return Err(std::io::Error::from(std::io::ErrorKind::WriteZero));
@@ -5481,6 +5541,8 @@ fn relay_browser_command(
     record: &BrowserPidRecord,
     expected_cli_pid: u32,
     timeout: Duration,
+    screenshot_dispatch_deadline: Option<Instant>,
+    approval_send_state: &std::sync::atomic::AtomicU8,
 ) -> std::io::Result<()> {
     use std::io::{BufRead, BufReader, Read};
     const MAX_REQUEST_BYTES: usize = 4 * 1024 * 1024;
@@ -5515,8 +5577,26 @@ fn relay_browser_command(
             break;
         }
     }
+    if screenshot_dispatch_deadline.is_some_and(|latest| Instant::now() >= latest) {
+        return Err(expire_relay_approval_before_send(approval_send_state));
+    }
     let (mut upstream, _process) = connect_verified_browser_control(session, record)?;
-    write_browser_control_with_deadline(&mut upstream, &request, Instant::now() + Duration::from_secs(5))?;
+    let mut write_deadline = Instant::now() + Duration::from_secs(5);
+    if let Some(latest) = screenshot_dispatch_deadline {
+        if Instant::now() >= latest {
+            return Err(expire_relay_approval_before_send(approval_send_state));
+        }
+        write_deadline = write_deadline.min(latest);
+        match approval_send_state.compare_exchange(RELAY_APPROVAL_NOT_SENT, RELAY_APPROVAL_WRITE_ATTEMPTED,
+            Ordering::AcqRel, Ordering::Acquire) {
+            Ok(_) => {}
+            Err(RELAY_APPROVAL_EXPIRED_BEFORE_SEND) => {
+                return Err(std::io::Error::new(std::io::ErrorKind::TimedOut, BrowserApprovalDispatchExpired));
+            }
+            Err(_) => return Err(std::io::Error::other("Browser approval already dispatched")),
+        }
+    }
+    write_browser_control_with_deadline(&mut upstream, &request, write_deadline)?;
     let response_deadline = Instant::now() + timeout;
     let mut reader = BufReader::new(upstream);
     let mut response_bytes = 0usize;
@@ -5829,6 +5909,7 @@ fn send_verified_unix_browser_confirmation(
     id: &str,
     approve: bool,
     deadline: Instant,
+    screenshot_dispatch_deadline: Option<Instant>,
     still_owned: impl FnOnce() -> bool,
 ) -> Result<BrowserConfirmationResponse, BrowserConfirmationFailure> {
     use std::io::{Read, Write};
@@ -5846,6 +5927,10 @@ fn send_verified_unix_browser_confirmation(
     let request = browser_confirmation_control_request(id, approve);
     let mut written = 0;
     while written < request.len() {
+        if written == 0 && approve && screenshot_dispatch_deadline
+            .is_some_and(|latest| Instant::now() >= latest) {
+            return Err(before_send("Browser screenshot approval exceeded the request deadline before dispatch"));
+        }
         let remaining = deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
             return Err(if written == 0 {
@@ -5911,6 +5996,10 @@ fn run_browser_confirmation_decision(
     id: &str,
     approve: bool,
 ) -> Result<(BrowserPidRecord, BrowserConfirmationResponse), BrowserConfirmationFailure> {
+    if screenshot_approval_dispatch_expired(pending, approve) {
+        return Err(BrowserConfirmationFailure::BeforeSend(
+            "Browser screenshot approval exceeded the request deadline before dispatch".into()));
+    }
     require_owned_browser_session(session).map_err(BrowserConfirmationFailure::BeforeSend)?;
     let current = live_owned_browser_record(session)
         .ok_or_else(|| BrowserConfirmationFailure::BeforeSend(
@@ -5925,9 +6014,17 @@ fn run_browser_confirmation_decision(
         let bin = resolve_binary().map_err(BrowserConfirmationFailure::BeforeSend)?;
         let action = if approve { "confirm" } else { "deny" };
         let argv = vec![action.to_owned(), id.to_owned(), "--json".into(), "--session".into(), session.to_owned()];
-        run_agent_browser_native_with_record(&bin, &argv, session, port, false, ACTION_TIMEOUT, current.clone())
-            .map_err(|error| BrowserConfirmationFailure::MaybeApplied(
-                format!("Browser confirmation failed: {error}"), Some(current.clone())))?
+        run_agent_browser_native_with_record(&bin, &argv, session, port, false, ACTION_TIMEOUT,
+            current.clone(), if approve { pending.screenshot_dispatch_deadline } else { None })
+            .map_err(|error| {
+                if error.get_ref().is_some_and(|source|
+                    source.downcast_ref::<BrowserApprovalDispatchExpired>().is_some()) {
+                    BrowserConfirmationFailure::BeforeSend(error.to_string())
+                } else {
+                    BrowserConfirmationFailure::MaybeApplied(
+                        format!("Browser confirmation failed: {error}"), Some(current.clone()))
+                }
+            })?
     };
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     let decision = {
@@ -5938,6 +6035,7 @@ fn run_browser_confirmation_decision(
         let socket = dir.join(format!("{session}.sock"));
         send_verified_unix_browser_confirmation(
             &socket, &current, id, approve, Instant::now() + ACTION_TIMEOUT,
+            pending.screenshot_dispatch_deadline,
             || live_owned_browser_record(session).as_ref() == Some(&current),
         )?
     };
@@ -5950,6 +6048,10 @@ fn run_browser_confirmation_decision(
             .map_err(BrowserConfirmationFailure::BeforeSend)?;
         command.args([action, id, "--json", "--session", session])
             .env("AGENT_BROWSER_STREAM_PORT", port.to_string());
+        if screenshot_approval_dispatch_expired(pending, approve) {
+            return Err(BrowserConfirmationFailure::BeforeSend(
+                "Browser screenshot approval exceeded the request deadline before dispatch".into()));
+        }
         output_capture_with_timeout(command, ACTION_TIMEOUT)
             .map_err(|error| BrowserConfirmationFailure::MaybeApplied(
                 format!("Browser confirmation failed: {error}"), Some(current.clone())))?
@@ -6696,16 +6798,11 @@ impl AgentBrowserManager {
     async fn clear_expired_confirmation(&self, browser_id: &str) {
         let mut sessions = self.sessions.lock().await;
         if let Some(entry) = sessions.get_mut(browser_id) {
-            if entry.pending_confirmation.as_ref().is_some_and(|pending|
-                !pending.decision_in_flight && Instant::now() >= pending.expires_at) {
-                entry.fail_pending_screenshot("Browser screenshot approval expired");
-                entry.confirmation_pending = false;
-                entry.pending_confirmation = None;
-            }
+            self.expire_confirmation_if_needed(browser_id, entry);
         }
     }
 
-    fn guard_unresolved_screenshot(&self, browser_id: &str, entry: &mut StreamSession) {
+    fn guard_unresolved_confirmation(&self, browser_id: &str, entry: &mut StreamSession) {
         let daemon = entry.pending_confirmation.as_ref().and_then(|pending| pending.daemon.clone())
             .or_else(|| entry.pending_screenshot.as_ref().map(|capture| capture.daemon.clone()));
         self.confirmation_recovery_required.lock().unwrap()
@@ -6716,13 +6813,38 @@ impl AgentBrowserManager {
         entry.browser_ready = false;
     }
 
+    fn guard_unresolved_screenshot(&self, browser_id: &str, entry: &mut StreamSession) {
+        if let Some(pending) = entry.pending_confirmation.as_mut() {
+            pending.screenshot_caller_ended = true;
+        }
+        self.guard_unresolved_confirmation(browser_id, entry);
+    }
+
+    fn expire_confirmation_if_needed(&self, browser_id: &str, entry: &mut StreamSession) {
+        let expired = entry.pending_confirmation.as_ref().is_some_and(|pending|
+            !pending.decision_in_flight && Instant::now() >= pending.expires_at);
+        if !expired {
+            return;
+        }
+        // The daemon does not expire its parked action with the host token.
+        // Retire the visible prompt, but keep its verified peer blocked until
+        // a verified resolution or close proves it cannot be replayed.
+        self.guard_unresolved_confirmation(browser_id, entry);
+        if let Some(id) = entry.pending_confirmation.as_ref().and_then(|pending| pending.details.id.clone()) {
+            mark_uncertain_preset_confirmation(entry, &id);
+        }
+        entry.fail_pending_screenshot("Browser screenshot approval expired");
+        entry.confirmation_pending = false;
+        entry.pending_confirmation = None;
+    }
+
     async fn register_pending_screenshot(
         &self, browser_id: &str, request_id: String, started_at: Instant,
         replay_budget: Duration,
     ) -> Result<ScreenshotWait, String> {
         let mut sessions = self.sessions.lock().await;
         let entry = sessions.get_mut(browser_id).ok_or("Browser session closed during screenshot capture")?;
-        let pending = entry.pending_confirmation.as_ref()
+        let pending = entry.pending_confirmation.as_mut()
             .filter(|_| entry.confirmation_pending)
             .ok_or("Browser screenshot approval was not retained")?;
         let deadline = started_at + SCREENSHOT_TOTAL_TIMEOUT;
@@ -6730,6 +6852,7 @@ impl AgentBrowserManager {
             self.guard_unresolved_screenshot(browser_id, entry);
             return Err("Browser screenshot approval exceeded the request deadline".into());
         }
+        pending.screenshot_dispatch_deadline = Some(deadline - replay_budget);
         let prompt_id = pending.details.id.clone().ok_or("Browser screenshot approval has no host ID")?;
         let daemon = pending.daemon.clone().ok_or("Browser screenshot approval has no verified daemon")?;
         entry.fail_pending_screenshot("A newer screenshot request replaced this capture");
@@ -6838,11 +6961,18 @@ impl AgentBrowserManager {
         let (port, pending, upstream_id) = {
             let mut sessions = self.sessions.lock().await;
             let entry = sessions.get_mut(browser_id).ok_or("Browser session has no pending confirmation")?;
-            if entry.pending_confirmation.as_ref().is_some_and(|pending|
-                !pending.decision_in_flight && Instant::now() >= pending.expires_at) {
-                entry.fail_pending_screenshot("Browser screenshot approval expired");
-                entry.confirmation_pending = false;
-                entry.pending_confirmation = None;
+            self.expire_confirmation_if_needed(browser_id, entry);
+            if approve && entry.pending_confirmation.as_ref().is_some_and(|pending|
+                pending.details.id.as_deref() == Some(id) && pending.screenshot_caller_ended) {
+                return Err("Browser screenshot caller ended; deny the pending approval or close the session".into());
+            }
+            let screenshot_budget_exhausted = approve && entry.pending_screenshot.as_ref().is_some_and(|capture|
+                capture.prompt_id == id && (capture.reply.is_closed()
+                    || capture.deadline.saturating_duration_since(Instant::now()) < capture.replay_budget));
+            if screenshot_budget_exhausted {
+                self.guard_unresolved_screenshot(browser_id, entry);
+                entry.fail_pending_screenshot("Browser screenshot approval exceeded the request deadline");
+                return Err("Browser screenshot approval exceeded the request deadline; deny the pending approval or close the session".into());
             }
             let pending = entry.pending_confirmation.as_mut().ok_or("Browser session has no pending confirmation")?;
             let (pending, upstream_id) = pending.begin_decision(id)?;
@@ -6851,6 +6981,10 @@ impl AgentBrowserManager {
         let pending_for_command = pending.clone();
         let session_for_command = session.clone();
         let result = tokio::task::spawn_blocking(move || {
+            if screenshot_approval_dispatch_expired(&pending_for_command, approve) {
+                return Err(BrowserConfirmationFailure::BeforeSend(
+                    "Browser screenshot approval exceeded the request deadline before dispatch".into()));
+            }
             decide(session_for_command, port, pending_for_command, upstream_id, approve)
         }).await.map_err(|error| BrowserConfirmationFailure::MaybeApplied(
             format!("Browser confirmation task failed: {error}"), None))
@@ -6902,6 +7036,12 @@ impl AgentBrowserManager {
                     entry.pending_confirmation = None;
                 } else {
                     entry.pending_confirmation.as_mut().unwrap().decision_in_flight = false;
+                    if approve && entry.pending_screenshot.as_ref().is_some_and(|capture|
+                        capture.prompt_id == id && (capture.reply.is_closed()
+                            || screenshot_approval_dispatch_expired(&pending, true))) {
+                        self.guard_unresolved_screenshot(browser_id, entry);
+                        entry.fail_pending_screenshot("Browser screenshot approval exceeded the request deadline");
+                    }
                 }
                 return Err(error.into_message());
             }
@@ -6931,9 +7071,11 @@ impl AgentBrowserManager {
                 let budget = entry.pending_screenshot.as_ref().map(|capture|
                     (capture.deadline, capture.replay_budget));
                 let next = budget.and_then(|(deadline, replay_budget)| {
-                    let pending = entry.pending_confirmation.as_ref()?;
-                    screenshot_prompt_has_replay_budget(pending, deadline, replay_budget)
-                        .then(|| pending.details.clone())
+                    let pending = entry.pending_confirmation.as_mut()?;
+                    screenshot_prompt_has_replay_budget(pending, deadline, replay_budget).then(|| {
+                        pending.screenshot_dispatch_deadline = Some(deadline - replay_budget);
+                        pending.details.clone()
+                    })
                 });
                 if let Some(next) = next.filter(|prompt| prompt.id.is_some()) {
                     entry.pending_screenshot.as_mut().unwrap().prompt_id = next.id.clone().unwrap();
@@ -6977,6 +7119,8 @@ impl AgentBrowserManager {
         record: BrowserPidRecord,
         decision: BrowserConfirmationResponse,
     ) -> Result<Option<BrowserPendingConfirmation>, String> {
+        let screenshot_caller_ended = entry.pending_confirmation.as_ref()
+            .is_some_and(|pending| pending.screenshot_caller_ended);
         entry.revoke_active_bridges();
         entry.browser_ready = false;
         entry.running = true;
@@ -6988,7 +7132,8 @@ impl AgentBrowserManager {
                 Ok(None)
             }
             BrowserConfirmationResponse::FollowUp(details) => {
-                let next = PendingBrowserConfirmation::new(details, Some(record));
+                let mut next = PendingBrowserConfirmation::new(details, Some(record));
+                next.screenshot_caller_ended = screenshot_caller_ended;
                 let public = next.details.clone();
                 entry.confirmation_pending = true;
                 entry.pending_confirmation = Some(next);
@@ -7142,8 +7287,8 @@ impl AgentBrowserManager {
 
     async fn spawn_locked(&self, browser_id: &str) -> Result<(), String> {
         let session = session_name(browser_id).to_string();
-        self.require_confirmation_recovered(browser_id)?;
         self.clear_expired_confirmation(browser_id).await;
+        self.require_confirmation_recovered(browser_id)?;
         self.require_no_pending_confirmation(browser_id).await?;
         #[cfg(not(windows))]
         self.settle_provisional_session(browser_id, &session, None).await;
@@ -7409,8 +7554,8 @@ impl AgentBrowserManager {
         let browser_id = browser_id.to_owned();
         let action = action.to_owned();
         run_detached_browser_lifecycle(session, async move {
-            manager.require_confirmation_recovered(&browser_id)?;
             manager.clear_expired_confirmation(&browser_id).await;
+            manager.require_confirmation_recovered(&browser_id)?;
             manager.require_no_pending_confirmation(&browser_id).await?;
             match action.as_str() {
                 "click_at" | "type_at" | "scroll_at" | "key_press" | "drag" => {
@@ -7478,8 +7623,8 @@ impl AgentBrowserManager {
     async fn ensure_preset_navigation_locked(
         &self, browser_id: &str, url: String, retry_failed: bool,
     ) -> Result<BrowserPresetNavigationStatus, String> {
-        self.require_confirmation_recovered(browser_id)?;
         self.clear_expired_confirmation(browser_id).await;
+        self.require_confirmation_recovered(browser_id)?;
         {
             let mut sessions = self.sessions.lock().await;
             if let Some(stream) = sessions.get_mut(browser_id) {
@@ -7563,6 +7708,7 @@ impl AgentBrowserManager {
         expected_identity: Option<BrowserStreamIdentity>,
     ) -> Result<(BrowserAutomationResult, BrowserActionOutcome), String> {
         let session = session_name(browser_id).to_string();
+        self.clear_expired_confirmation(browser_id).await;
         let recovery_required = self.confirmation_recovery_required.lock().unwrap().contains_key(browser_id);
         if action == "close" && recovery_required {
             // Agent-facing close is normally a CLI action. An uncertain
@@ -7579,7 +7725,6 @@ impl AgentBrowserManager {
         if action != "close" {
             self.require_confirmation_recovered(browser_id)?;
         }
-        self.clear_expired_confirmation(browser_id).await;
         #[cfg(not(windows))]
         self.settle_provisional_session(browser_id, &session, None).await;
         if action != "close" && self.sessions.lock().await.get(browser_id).is_some_and(|entry| entry.confirmation_pending) {
@@ -7706,8 +7851,8 @@ impl AgentBrowserManager {
     }
 
     async fn get_screenshot_locked(&self, browser_id: &str, started_at: Instant) -> Result<ScreenshotResult, String> {
-        self.require_confirmation_recovered(browser_id)?;
         self.clear_expired_confirmation(browser_id).await;
+        self.require_confirmation_recovered(browser_id)?;
         self.require_no_pending_confirmation(browser_id).await?;
         let session = session_name(browser_id).to_string();
         let port = self.allocate_port(browser_id).await?;
@@ -8105,8 +8250,8 @@ impl AgentBrowserManager {
 
     async fn start_stream_locked(&self, browser_id: &str) -> Result<String, String> {
         let session = session_name(browser_id).to_string();
-        self.require_confirmation_recovered(browser_id)?;
         self.clear_expired_confirmation(browser_id).await;
+        self.require_confirmation_recovered(browser_id)?;
         #[cfg(not(windows))]
         self.settle_provisional_session(browser_id, &session, None).await;
 
@@ -8249,6 +8394,7 @@ impl AgentBrowserManager {
                         false,
                         OPEN_TIMEOUT.saturating_sub(started.elapsed()),
                         record.clone(),
+                        None,
                     ),
                     log_file,
                     &session,
@@ -9391,6 +9537,33 @@ mod tests {
         assert_eq!(peer_pid, Some(child_pid));
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn delayed_windows_screenshot_relay_expires_before_upstream_write() {
+        use std::io::Write;
+
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let mut cli = std::net::TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (mut relay, _) = listener.accept().unwrap();
+        assert_eq!(connected_tcp_peer_pid(&relay), Some(std::process::id()));
+        let record = test_browser_record(std::process::id(), 1, browser_owner_token().to_owned());
+        let send_state = std::sync::atomic::AtomicU8::new(RELAY_APPROVAL_NOT_SENT);
+        let latest = Instant::now() + Duration::from_millis(50);
+        std::thread::sleep(Duration::from_millis(70));
+        cli.write_all(b"{\"id\":\"late\",\"action\":\"confirm\"}\n").unwrap();
+        let error = relay_browser_command(&mut relay, "delayed-relay-test", &record,
+            std::process::id(), Duration::from_secs(2), Some(latest), &send_state).unwrap_err();
+        assert!(error.get_ref().is_some_and(|source|
+            source.downcast_ref::<BrowserApprovalDispatchExpired>().is_some()));
+        assert_eq!(send_state.load(Ordering::Acquire), RELAY_APPROVAL_EXPIRED_BEFORE_SEND);
+
+        let maybe_applied = std::sync::atomic::AtomicU8::new(RELAY_APPROVAL_WRITE_ATTEMPTED);
+        let error = expire_relay_approval_before_send(&maybe_applied);
+        assert!(!error.get_ref().is_some_and(|source|
+            source.downcast_ref::<BrowserApprovalDispatchExpired>().is_some()));
+        assert_eq!(maybe_applied.load(Ordering::Acquire), RELAY_APPROVAL_WRITE_ATTEMPTED);
+    }
+
     #[cfg(unix)]
     #[test]
     fn live_control_socket_without_pid_is_rejected() {
@@ -10126,7 +10299,7 @@ mod tests {
         for approve in [true, false] {
             let result = send_verified_unix_browser_confirmation(
                 &socket, &current, "upstream-prompt", approve,
-                Instant::now() + Duration::from_secs(2), || true,
+                Instant::now() + Duration::from_secs(2), None, || true,
             );
             assert!(matches!(result, Ok(BrowserConfirmationResponse::Resolved)));
         }
@@ -10157,10 +10330,38 @@ mod tests {
         let wrong = test_browser_record(std::process::id() + 1, 1, browser_owner_token().to_owned());
         let result = send_verified_unix_browser_confirmation(
             &socket, &wrong, "upstream-prompt", true,
-            Instant::now() + Duration::from_secs(2), || true,
+            Instant::now() + Duration::from_secs(2), None, || true,
         );
         assert!(matches!(result, Err(BrowserConfirmationFailure::BeforeSend(_))));
         assert_eq!(server.join().unwrap(), 0, "no decision bytes may reach an unverified peer");
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn unix_screenshot_approval_rechecks_budget_after_peer_verification() {
+        use std::io::Read;
+        use std::os::unix::net::UnixListener;
+
+        let temp = tempfile::tempdir().unwrap();
+        let socket = temp.path().join("control.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+            let mut bytes = [0u8; 8];
+            stream.read(&mut bytes).unwrap()
+        });
+        let record = test_browser_record(std::process::id(), 1, browser_owner_token().to_owned());
+        let latest_dispatch = Instant::now() + Duration::from_millis(50);
+        let result = send_verified_unix_browser_confirmation(
+            &socket, &record, "upstream-prompt", true,
+            Instant::now() + Duration::from_secs(2), Some(latest_dispatch), || {
+                std::thread::sleep(Duration::from_millis(70));
+                true
+            },
+        );
+        assert!(matches!(result, Err(BrowserConfirmationFailure::BeforeSend(_))));
+        assert_eq!(server.join().unwrap(), 0, "late approval must not write decision bytes");
     }
 
     #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -10174,7 +10375,7 @@ mod tests {
             move |_session, _port, _pending, upstream_id, approve| {
                 send_verified_unix_browser_confirmation(
                     &socket, &record, &upstream_id, approve,
-                    Instant::now() + Duration::from_secs(2), || true,
+                    Instant::now() + Duration::from_secs(2), None, || true,
                 ).map(|decision| (record, decision))
             }).await.unwrap_err();
         assert!(error.contains("socket is unavailable"), "{error}");
@@ -10207,7 +10408,7 @@ mod tests {
             move |_session, _port, _pending, upstream_id, approve| {
                 send_verified_unix_browser_confirmation(
                     &socket, &record, &upstream_id, approve,
-                    Instant::now() + Duration::from_secs(2), || true,
+                    Instant::now() + Duration::from_secs(2), None, || true,
                 ).map(|decision| (record, decision))
             }).await.unwrap_err();
         assert!(error.contains("ended early"), "{error}");
@@ -13561,6 +13762,92 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn screenshot_prompt_poll_expiry_keeps_daemon_blocked_before_caller_timeout() {
+        let manager = AgentBrowserManager::new();
+        let session = format!("screenshot-prompt-expiry-{}", uuid::Uuid::new_v4().simple());
+        manager.allow_test_stream_session(&session, 9223).await;
+        let identity = current_process_stream_identity(9223);
+        let record = test_browser_record(identity.pid, identity.start_time, browser_owner_token().to_owned());
+        let pending = PendingBrowserConfirmation::new(BrowserConfirmationDetails {
+            id: Some("capture_1".into()), description: "Approve screenshot".into(),
+        }, Some(record.clone()));
+        {
+            let mut sessions = manager.sessions.lock().await;
+            let entry = sessions.get_mut(&session).unwrap();
+            entry.browser_ready = false;
+            entry.confirmation_pending = true;
+            entry.pending_confirmation = Some(pending);
+        }
+        let started_at = Instant::now();
+        let wait = manager.register_pending_screenshot(
+            &session, "capture-before-prompt-expiry".into(), started_at, Duration::from_millis(20),
+        ).await.unwrap();
+        {
+            let mut sessions = manager.sessions.lock().await;
+            sessions.get_mut(&session).unwrap().pending_confirmation.as_mut().unwrap().expires_at =
+                Instant::now() - Duration::from_millis(1);
+        }
+
+        assert!(manager.pending_confirmation(&session).await.unwrap().is_none());
+        assert!(wait.reply.await.unwrap().unwrap_err().contains("approval expired"));
+        assert_eq!(manager.confirmation_recovery_required.lock().unwrap().get(&session)
+            .and_then(|guard| guard.daemon.as_ref()), Some(&record));
+        assert!(manager.get_screenshot_locked(&session, started_at).await.unwrap_err()
+            .contains("outcome is uncertain"));
+    }
+
+    #[tokio::test]
+    async fn late_screenshot_approval_never_dispatches_or_replays_on_second_click() {
+        let manager = AgentBrowserManager::new();
+        let session = format!("screenshot-late-approval-{}", uuid::Uuid::new_v4().simple());
+        manager.allow_test_stream_session(&session, 9223).await;
+        let identity = current_process_stream_identity(9223);
+        let record = test_browser_record(identity.pid, identity.start_time, browser_owner_token().to_owned());
+        let pending = PendingBrowserConfirmation::new(BrowserConfirmationDetails {
+            id: Some("capture_1".into()), description: "Approve screenshot".into(),
+        }, Some(record.clone()));
+        let host_id = pending.details.id.clone().unwrap();
+        {
+            let mut sessions = manager.sessions.lock().await;
+            let entry = sessions.get_mut(&session).unwrap();
+            entry.browser_ready = false;
+            entry.confirmation_pending = true;
+            entry.pending_confirmation = Some(pending);
+        }
+        let started_at = Instant::now() - (SCREENSHOT_TOTAL_TIMEOUT - Duration::from_millis(300));
+        let wait = manager.register_pending_screenshot(
+            &session, "late-approval".into(), started_at, Duration::from_millis(100),
+        ).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(220)).await;
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let first_calls = calls.clone();
+        let error = manager.respond_confirmation_locked_with(&session, &host_id, true,
+            move |_, _, _, _, _| {
+                first_calls.fetch_add(1, Ordering::SeqCst);
+                unreachable!("late screenshot approval must not reach the daemon")
+            },
+        ).await.unwrap_err();
+        assert!(error.contains("exceeded the request deadline"), "{error}");
+        assert!(wait.reply.await.unwrap().unwrap_err().contains("exceeded the request deadline"));
+        let second_calls = calls.clone();
+        assert!(manager.respond_confirmation_locked_with(&session, &host_id, true,
+            move |_, _, _, _, _| {
+                second_calls.fetch_add(1, Ordering::SeqCst);
+                unreachable!("second approval must not reach the daemon")
+            },
+        ).await.unwrap_err().contains("caller ended"));
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        assert_eq!(manager.pending_confirmation(&session).await.unwrap().unwrap().id.as_deref(), Some(host_id.as_str()));
+        assert_eq!(manager.confirmation_recovery_required.lock().unwrap().get(&session)
+            .and_then(|guard| guard.daemon.as_ref()), Some(&record));
+
+        assert!(manager.respond_confirmation_locked_with(&session, &host_id, false,
+            move |_, _, _, _, _| Ok((record, BrowserConfirmationResponse::Resolved)),
+        ).await.unwrap().is_none());
+        assert!(manager.confirmation_recovery_required.lock().unwrap().get(&session).is_none());
+    }
+
+    #[tokio::test]
     async fn slow_screenshot_capture_without_replay_budget_keeps_daemon_confirmation_blocked() {
         let manager = AgentBrowserManager::new();
         let session = format!("screenshot-no-budget-{}", uuid::Uuid::new_v4().simple());
@@ -13611,12 +13898,14 @@ mod tests {
         let wait = manager.register_pending_screenshot(
             &session, "follow-up-capture".into(), started_at, Duration::from_millis(20),
         ).await.unwrap();
-        tokio::time::sleep(Duration::from_millis(320)).await;
 
         let next = manager.respond_confirmation_locked_with(&session, &first_id, true,
-            move |_, _, _, _, _| Ok((record.clone(), BrowserConfirmationResponse::FollowUp(
-                BrowserConfirmationDetails { id: Some("capture_2".into()), description: "Approve another step".into() },
-            ))),
+            move |_, _, _, _, _| {
+                std::thread::sleep(Duration::from_millis(320));
+                Ok((record.clone(), BrowserConfirmationResponse::FollowUp(
+                    BrowserConfirmationDetails { id: Some("capture_2".into()), description: "Approve another step".into() },
+                )))
+            },
         ).await.unwrap().unwrap();
         assert_ne!(next.id.as_deref(), Some(first_id.as_str()));
         assert!(wait.reply.await.unwrap().unwrap_err().contains("exceeded the request deadline"));
@@ -13625,6 +13914,49 @@ mod tests {
         assert!(manager.confirmation_recovery_required.lock().unwrap().get(&session)
             .and_then(|guard| guard.daemon.as_ref()).is_some());
         assert!(manager.spawn_locked(&session).await.unwrap_err().contains("outcome is uncertain"));
+    }
+
+    #[tokio::test]
+    async fn screenshot_timeout_during_decision_keeps_follow_up_non_approvable() {
+        let manager = AgentBrowserManager::new();
+        let session = format!("screenshot-inflight-timeout-{}", uuid::Uuid::new_v4().simple());
+        manager.allow_test_stream_session(&session, 9223).await;
+        let identity = current_process_stream_identity(9223);
+        let record = test_browser_record(identity.pid, identity.start_time, browser_owner_token().to_owned());
+        let pending = PendingBrowserConfirmation::new(BrowserConfirmationDetails {
+            id: Some("capture_1".into()), description: "Approve screenshot".into(),
+        }, Some(record.clone()));
+        let first_id = pending.details.id.clone().unwrap();
+        {
+            let mut sessions = manager.sessions.lock().await;
+            let entry = sessions.get_mut(&session).unwrap();
+            entry.browser_ready = false;
+            entry.confirmation_pending = true;
+            entry.pending_confirmation = Some(pending);
+        }
+        let started_at = Instant::now() - (SCREENSHOT_TOTAL_TIMEOUT - Duration::from_millis(700));
+        let wait = manager.register_pending_screenshot(
+            &session, "inflight-capture".into(), started_at, Duration::from_millis(20),
+        ).await.unwrap();
+        let waiter = tokio::spawn({
+            let manager = manager.clone();
+            let session = session.clone();
+            async move { manager.await_pending_screenshot(&session, wait, started_at).await }
+        });
+        let next = manager.respond_confirmation_locked_with(&session, &first_id, true,
+            move |_, _, _, _, _| {
+                std::thread::sleep(Duration::from_millis(800));
+                Ok((record, BrowserConfirmationResponse::FollowUp(BrowserConfirmationDetails {
+                    id: Some("capture_2".into()), description: "Approve another step".into(),
+                })))
+            },
+        ).await.unwrap().unwrap();
+        assert!(waiter.await.unwrap().unwrap_err().contains("Timed out waiting"));
+        let next_id = next.id.unwrap();
+        assert!(manager.respond_confirmation_locked_with(&session, &next_id, true,
+            |_, _, _, _, _| unreachable!("expired screenshot follow-up must not reach the daemon"),
+        ).await.unwrap_err().contains("caller ended"));
+        assert!(manager.confirmation_recovery_required.lock().unwrap().contains_key(&session));
     }
 
     #[cfg(unix)]
@@ -13936,7 +14268,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn pending_confirmation_rejects_other_ids_and_clears_on_expiry() {
+    async fn pending_confirmation_expiry_blocks_the_first_follow_on_command() {
         let manager = AgentBrowserManager::new();
         let session = format!("browser-confirm-id-{}", uuid::Uuid::new_v4().simple());
         manager.allocate_port(&session).await.unwrap();
@@ -13968,11 +14300,40 @@ mod tests {
             let mut sessions = manager.sessions.lock().await;
             sessions.get_mut(&session).unwrap().pending_confirmation.as_mut().unwrap().expires_at = Instant::now() - Duration::from_millis(1);
         }
+        assert!(manager.spawn_locked(&session).await.unwrap_err().contains("outcome is uncertain"));
         assert!(manager.pending_confirmation(&session).await.unwrap().is_none());
+        assert!(manager.confirmation_recovery_required.lock().unwrap().contains_key(&session));
         let sessions = manager.sessions.lock().await;
         let entry = sessions.get(&session).unwrap();
         assert!(!entry.confirmation_pending);
         assert!(entry.pending_confirmation.is_none());
+    }
+
+    #[tokio::test]
+    async fn expired_confirmation_decision_pins_recovery_without_dispatch() {
+        let manager = AgentBrowserManager::new();
+        let session = format!("browser-expired-decision-{}", uuid::Uuid::new_v4().simple());
+        manager.allow_test_stream_session(&session, 9223).await;
+        let identity = current_process_stream_identity(9223);
+        let record = test_browser_record(identity.pid, identity.start_time, browser_owner_token().to_owned());
+        let mut pending = PendingBrowserConfirmation::new(BrowserConfirmationDetails {
+            id: Some("expired_1".into()), description: "Approve action".into(),
+        }, Some(record.clone()));
+        let host_id = pending.details.id.clone().unwrap();
+        pending.expires_at = Instant::now() - Duration::from_millis(1);
+        {
+            let mut sessions = manager.sessions.lock().await;
+            let entry = sessions.get_mut(&session).unwrap();
+            entry.browser_ready = false;
+            entry.confirmation_pending = true;
+            entry.pending_confirmation = Some(pending);
+        }
+        assert!(manager.respond_confirmation_locked_with(&session, &host_id, true,
+            |_, _, _, _, _| unreachable!("expired approval must not reach the daemon"),
+        ).await.unwrap_err().contains("no pending confirmation"));
+        assert_eq!(manager.confirmation_recovery_required.lock().unwrap().get(&session)
+            .and_then(|guard| guard.daemon.as_ref()), Some(&record));
+        assert!(manager.sessions.lock().await.get(&session).unwrap().pending_confirmation.is_none());
     }
 
     #[tokio::test]
