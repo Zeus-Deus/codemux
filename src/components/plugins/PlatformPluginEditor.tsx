@@ -200,6 +200,7 @@ export function PlatformPluginEditor({
   const review = () => onDialog({ kind: "review", installationId: id });
   const lifecycle = usePluginLifecycle(installation, recoverySupported, review);
   const working = toggleBusy || lifecycle.busy;
+  const gitRefreshPaused = (installation.recovery?.upstreamSource ?? installation.source).kind === "git";
 
   return (
     <div data-platform-plugin-editor={id}>
@@ -273,11 +274,16 @@ export function PlatformPluginEditor({
                 </p>
                 <p className="font-mono text-label break-all text-muted-foreground">{pluginSourceLabel(installation.source)}</p>
               </div>
-              <Button size="sm" variant="outline" disabled={working} onClick={() => void lifecycle.refresh()}>
+              <Button size="sm" variant="outline" disabled={working || gitRefreshPaused} onClick={() => void lifecycle.refresh()}>
                 <RefreshCw />
                 {recovery.runningLocalFix ? "Check publisher for updates" : "Check for changes"}
               </Button>
             </div>
+            {gitRefreshPaused ? (
+              <p className="mt-2 text-body-sm text-muted-foreground">
+                Network Git update checks are temporarily paused. Local plugin folders can still be checked.
+              </p>
+            ) : null}
           </DetailSection>
           <DetailSection title="Manage">
             <div className="grid gap-3">

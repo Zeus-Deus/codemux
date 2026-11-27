@@ -32,6 +32,9 @@ import { SubsectionHeader } from "./settings-primitives";
 export const FULL_ACCESS_WARNING =
   "This plugin runs with full access to Codemux, your projects and your files. Only install plugins you trust.";
 
+/** Keep these controls closed while native acquisition lacks a hard byte budget. */
+export const NETWORK_GIT_INSTALLS_PAUSED = true;
+
 const TIER_LABEL: Record<PluginTier, string> = { official: "Official", unverified: "Unverified", local: "Local" };
 
 function shortSha(sha: string): string {
@@ -310,7 +313,7 @@ export function PluginCatalog({ onInstall }: { onInstall: (source: InstallSource
                 <Button
                   size="sm"
                   variant="outline"
-                  disabled={installed}
+                  disabled={installed || NETWORK_GIT_INSTALLS_PAUSED}
                   onClick={() => onInstall({ kind: "catalog", id: p.id })}
                 >
                   {installed ? "Installed" : "Install"}

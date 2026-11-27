@@ -85,6 +85,7 @@ function FactList({ rows }: { rows: ReadonlyArray<{ label: string; value: string
 }
 
 const failureText = (error: unknown) => pluginFailure(error).message;
+const GIT_INSTALL_PAUSED = "Git URL installs are temporarily paused. Choose a local plugin folder.";
 
 // ── install ───────────────────────────────────────────────────────────
 
@@ -103,7 +104,11 @@ export function InstallPlatformPluginDialog({
   const submit = async () => {
     const parsed = parsePluginSourceInput(source);
     if (!parsed.ok) {
-      setError(parsed.message);
+      setError("Use an absolute folder path on this computer.");
+      return;
+    }
+    if (parsed.source.kind === "git") {
+      setError(GIT_INSTALL_PAUSED);
       return;
     }
     setInstalling(true);
@@ -139,7 +144,7 @@ export function InstallPlatformPluginDialog({
               id={`${id}-source`}
               autoFocus
               spellCheck={false}
-              placeholder="/path/to/plugin or https://github.com/owner/plugin.git#v1.0.0"
+              placeholder="/path/to/plugin"
               value={source}
               onChange={(event) => {
                 setSource(event.target.value);
@@ -152,7 +157,7 @@ export function InstallPlatformPluginDialog({
               </p>
             ) : (
               <p className="text-body-sm text-muted-foreground">
-                A folder on this computer, or an https Git URL. Add #tag or #commit to pin a version.
+                Use an absolute folder path on this computer. Git URL installs are temporarily paused.
               </p>
             )}
           </div>

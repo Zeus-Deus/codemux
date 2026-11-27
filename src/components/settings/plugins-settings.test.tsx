@@ -1,9 +1,10 @@
 /// <reference types="@testing-library/jest-dom/vitest" />
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { act, cleanup, render, screen } from "@testing-library/react";
+import { act, cleanup, render, screen, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { registry } from "@/contrib/registry";
 import { usePluginsStore } from "@/contrib/plugins-store";
+import { pluginsCatalog } from "@/contrib/ipc";
 import type { PluginSetupStatus } from "@/contrib/plugin";
 import { SETTINGS_PAGES_AREA } from "@/sdk/areas";
 
@@ -41,6 +42,50 @@ function setup(status?: { get: () => PluginSetupStatus | null; subscribe: (fn: (
 }
 
 describe("plugin rows", () => {
+  it("explains the network Git pause and disables Git-backed install and update controls", async () => {
+    vi.mocked(pluginsCatalog).mockResolvedValueOnce({
+      catalog: {
+        schemaVersion: 1,
+        revision: 1,
+        plugins: [{
+          id: "catalog-plugin",
+          name: "Catalog plugin",
+          description: "Example",
+          tier: "official",
+          repo: "https://github.com/example/plugin",
+          sha: "a".repeat(40),
+          screenshots: [],
+        }],
+        blocked: [],
+      },
+      fetchedAt: null,
+      error: null,
+    });
+    usePluginsStore.setState({
+      records: {
+        git: {
+          id: "git",
+          name: "Git plugin",
+          kind: "disk",
+          status: "disabled",
+          tier: "unverified",
+          file: "/plugins/git/plugin.js",
+          origin: { source: "git", repo: "https://github.com/example/plugin", sha: "a".repeat(40) },
+        },
+      },
+    });
+
+    render(<PluginsSettings />);
+    expect(screen.getByText(/Network Git plugin installs and updates are temporarily paused/)).toBeVisible();
+    expect(screen.getByRole("button", { name: "Install from GitHub URL…" })).toBeDisabled();
+    expect(screen.getByRole("button", { name: "Open plugins folder" })).toBeEnabled();
+    const catalogRow = (await screen.findByText("Catalog plugin")).closest("[data-catalog-row]");
+    if (!(catalogRow instanceof HTMLElement)) throw new Error("catalog row missing");
+    expect(within(catalogRow).getByRole("button", { name: "Install" })).toBeDisabled();
+    await userEvent.setup().click(screen.getByRole("button", { name: "Git plugin actions" }));
+    expect(screen.getByRole("menuitem", { name: "Update…" })).toHaveAttribute("data-disabled");
+  });
+
   it("shows a visible Settings action only for plugins with a settings page", async () => {
     setup();
     const onOpenSettings = vi.fn();
