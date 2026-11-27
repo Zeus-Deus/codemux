@@ -88,6 +88,24 @@ afterEach(() => {
 });
 
 describe("PlatformPluginsSection", () => {
+  it("explains the Git install pause before calling the host and keeps local folders available", async () => {
+    respond = (method) => method === "install" ? installation() : undefined;
+    show([]);
+    expect(screen.getByText(/No isolated plugins yet.*Git URL installs are temporarily paused/)).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: "Add plugin…" }));
+    const dialog = await screen.findByRole("dialog");
+    expect(within(dialog).getByText(/Use an absolute folder path.*Git URL installs are temporarily paused/)).toBeTruthy();
+    const source = within(dialog).getByLabelText("Source");
+    fireEvent.change(source, { target: { value: "https://github.com/example/plugin.git" } });
+    fireEvent.click(within(dialog).getByRole("button", { name: "Add and review" }));
+    expect(within(dialog).getByRole("alert").textContent).toContain("Git URL installs are temporarily paused");
+    expect(called("install")).toEqual([]);
+
+    fireEvent.change(source, { target: { value: "/plugins/realm" } });
+    fireEvent.click(within(dialog).getByRole("button", { name: "Add and review" }));
+    await waitFor(() => expect(called("install")).toEqual([{ source: { kind: "local", directory: "/plugins/realm" } }]));
+  });
+
   it("selects the installation requested by a Details link and consumes the request", () => {
     useUIStore.getState().openPluginSettings("inst-board");
     show(lineup());

@@ -172,7 +172,7 @@ export function PlatformPluginsSection() {
       ) : installations.length === 0 ? (
         catalogue === null ? null : (
           <p className="text-body-sm text-muted-foreground">
-            No isolated plugins yet. Add one from a folder on this computer or an https Git URL.
+            No isolated plugins yet. Add one from a folder on this computer. Git URL installs are temporarily paused.
           </p>
         )
       ) : (
