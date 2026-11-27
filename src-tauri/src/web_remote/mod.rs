@@ -118,6 +118,11 @@ pub struct WebRemoteConfig {
     /// `serve`, and `connect` turn it on explicitly. Legacy configs load `true`.
     #[serde(default = "legacy_lan_enabled")]
     pub lan_enabled: bool,
+    /// Remembers an explicit LAN-off choice after relay mode is turned off.
+    /// A fresh config also has `lan_enabled = false`, but a first `serve` or
+    /// `connect` should open its listener unless the user chose otherwise.
+    #[serde(default)]
+    pub lan_explicitly_disabled: bool,
     pub port: u16,
     pub require_approval: bool,
     /// Which interfaces to bind: `all` (0.0.0.0) | `tailscale` | `loopback`.
@@ -157,6 +162,7 @@ impl Default for WebRemoteConfig {
         Self {
             enabled: false,
             lan_enabled: false,
+            lan_explicitly_disabled: false,
             port: DEFAULT_PORT,
             require_approval: false,
             bind_scope: default_bind_scope(),
@@ -436,9 +442,8 @@ pub(crate) fn mint_pairing(shared: &Arc<Shared>, suggested_name: Option<String>)
     }
 }
 
-/// Result of the owner-gated `web_remote_pair` control command: a freshly
-/// minted pairing token plus the recommended endpoint's full pairing URL,
-/// which the headless startup banner can print as a link and QR.
+/// Result of trusted pairing: a freshly minted pairing token plus the
+/// recommended endpoint's full pairing URL.
 #[derive(Debug, Clone, Serialize)]
 pub struct ControlPairing {
     /// Full URL a browser opens to auto-pair, on the recommended endpoint:
@@ -476,7 +481,7 @@ pub(crate) fn control_pair_from(
     // way in is switched off (e.g. a relay-only setup).
     if !lan_enabled {
         return Err(
-            "Access on your network is off — turn on \"On my network\" in Settings, or run `codemux remote enable`"
+            "Access on your network is off — turn on \"On my network\" in Settings"
                 .to_string(),
         );
     }
@@ -512,9 +517,8 @@ pub(crate) fn control_pair_from(
     })
 }
 
-/// Mint a pairing token for a trusted owner path. Reuses the shared
-/// [`mint_pairing`] token path and endpoint enumeration, so the headless
-/// startup banner and GUI use the same code underneath.
+/// Mint a pairing token through a trusted in-app call. Reuses the shared
+/// [`mint_pairing`] token path and endpoint enumeration.
 pub fn control_pair<R: Runtime>(
     app: &AppHandle<R>,
     suggested_name: Option<String>,
@@ -552,7 +556,7 @@ pub struct ControlEnableResult {
 
 /// Validate an enable request's scope and fold it (plus the port) into `cfg`,
 /// flipping `enabled` and the LAN listener (`lan_enabled`) on. Callers that
-/// may keep a relay-only setup decide that first (see [`keeps_relay_only`]).
+/// may keep the LAN listener off decide that first (see [`keeps_lan_disabled`]).
 /// Pure so the config side of [`control_enable`] is
 /// unit-testable without an `AppHandle`. On an unknown scope it returns a clear
 /// error and leaves `cfg` untouched (nothing is persisted).
@@ -568,6 +572,7 @@ fn apply_enable_request(
     }
     cfg.enabled = true;
     cfg.lan_enabled = true;
+    cfg.lan_explicitly_disabled = false;
     if let Some(p) = port {
         cfg.port = p;
     }
@@ -577,22 +582,24 @@ fn apply_enable_request(
     Ok(())
 }
 
-/// Whether a `codemux serve` / `codemux connect` request keeps a relay-only
-/// setup relay-only instead of switching the LAN listener on.
+/// Whether a `codemux serve` / `codemux connect` request keeps the LAN
+/// listener off instead of opening it.
 ///
-/// Relay-only is an explicit choice — relay mode on, "On my network" off — and
-/// it survives the kill switch: a user who set it up and then turned remote
-/// access off has still chosen that nothing listens on their network. So it is
-/// kept whether `enabled` is on or off. Anything else opens the listener (a
-/// fresh config has both switches off, so a first run still does), and so do
-/// explicit `--scope` / `--port` flags. `codemux remote enable` never asks.
+/// A relay-only setup already proves that the user chose LAN off, including
+/// configs written before `lan_explicitly_disabled` existed. The persisted bit
+/// keeps that choice after relay mode is turned off. A fresh config has both
+/// switches and the bit off, so its first run still opens the listener.
+/// Explicit `--scope` / `--port` flags also open it.
 ///
-/// Callers must pass the relay and LAN switches as persisted **before** the
-/// request changed anything — `connect` and `serve --relay` turn relay mode on
-/// first, which would otherwise make a fresh config look relay-only. Pure so
-/// it is unit-testable.
-pub fn keeps_relay_only(relay_mode_enabled: bool, lan_enabled: bool, has_lan_flags: bool) -> bool {
-    !has_lan_flags && relay_mode_enabled && !lan_enabled
+/// Callers must pass the switches as persisted **before** the request changes
+/// anything — `connect` and `serve --relay` turn relay mode on first.
+pub fn keeps_lan_disabled(
+    relay_mode_enabled: bool,
+    lan_enabled: bool,
+    lan_explicitly_disabled: bool,
+    has_lan_flags: bool,
+) -> bool {
+    !has_lan_flags && !lan_enabled && (relay_mode_enabled || lan_explicitly_disabled)
 }
 
 /// The recommended reachable endpoint for `port`: the single `recommended` pick
@@ -630,24 +637,24 @@ pub async fn control_enable<R: Runtime>(
 
 /// [`control_enable`] for `codemux serve` and `codemux connect`, which bring
 /// remote access up as the user configured it rather than to open the LAN
-/// listener. `keep_relay_only` is the caller's [`keeps_relay_only`] decision,
+/// listener. `keep_lan_disabled` is the caller's [`keeps_lan_disabled`] decision,
 /// taken on the config as it was before the request touched it: when set (and
-/// no `scope`/`port` is passed) remote access comes on relay-only and nothing
-/// listens on the network. Otherwise this is exactly [`control_enable`].
+/// no `scope`/`port` is passed) nothing listens on the network. The relay runs
+/// only if its own switch is on. Otherwise this is exactly [`control_enable`].
 pub async fn control_enable_as_configured<R: Runtime>(
     app: &AppHandle<R>,
     scope: Option<String>,
     port: Option<u16>,
-    keep_relay_only: bool,
+    keep_lan_disabled: bool,
 ) -> Result<ControlEnableResult, String> {
-    enable_request(app, scope, port, keep_relay_only).await
+    enable_request(app, scope, port, keep_lan_disabled).await
 }
 
 async fn enable_request<R: Runtime>(
     app: &AppHandle<R>,
     scope: Option<String>,
     port: Option<u16>,
-    keep_relay_only: bool,
+    keep_lan_disabled: bool,
 ) -> Result<ControlEnableResult, String> {
     let shared = app.state::<WebRemoteState>().shared();
     // Decide against the persisted config, never against the pre-boot default:
@@ -658,11 +665,11 @@ async fn enable_request<R: Runtime>(
     // open it, so a relay-only setup takes the off → on path below.
     let already_enabled = lan_wanted(&shared.config.lock().unwrap());
     let already_bound = shared.runtime.lock().unwrap().is_some();
-    let relay_only = keep_relay_only && scope.is_none() && port.is_none();
+    let lan_disabled = keep_lan_disabled && scope.is_none() && port.is_none();
 
-    let (status, already_running) = if relay_only {
-        // Relay-only, kept as configured: make sure the relay is up (a no-op
-        // for the listener, which stays off).
+    let (status, already_running) = if lan_disabled {
+        // Keep the listener off as configured. The relay starts if its own
+        // switch is still on; after disconnect, neither transport starts.
         let relay_was_up = shared.iroh.is_running();
         (enable_core(app, &shared).await?, relay_was_up)
     } else if already_enabled {
@@ -727,6 +734,7 @@ async fn enable_request<R: Runtime>(
                     let mut cfg = shared.config.lock().unwrap();
                     cfg.enabled = previous.enabled;
                     cfg.lan_enabled = previous.lan_enabled;
+                    cfg.lan_explicitly_disabled = previous.lan_explicitly_disabled;
                     cfg.port = previous.port;
                     cfg.bind_scope = previous.bind_scope;
                 }
@@ -880,6 +888,15 @@ fn persist_config<R: Runtime>(app: &AppHandle<R>, shared: &Arc<Shared>) {
 /// See [`Shared::config_hydrated`].
 pub(crate) fn ensure_config_hydrated<R: Runtime>(app: &AppHandle<R>, shared: &Arc<Shared>) {
     hydrate_config_from(shared, &app.state::<crate::database::DatabaseStore>());
+}
+
+/// Snapshot the hydrated settings for headless startup before CLI flags change
+/// them. The live status omits the persisted LAN-off intent bit.
+pub(crate) fn config_snapshot<R: Runtime>(app: &AppHandle<R>) -> WebRemoteConfig {
+    let shared = app.state::<WebRemoteState>().shared();
+    ensure_config_hydrated(app, &shared);
+    let config = shared.config.lock().unwrap().clone();
+    config
 }
 
 /// [`ensure_config_hydrated`] against a `DatabaseStore` directly, so the
@@ -1367,6 +1384,7 @@ pub fn e2e_autostart<R: Runtime>(app: &AppHandle<R>) {
             let mut cfg = shared.config.lock().unwrap();
             cfg.enabled = true;
             cfg.lan_enabled = true;
+            cfg.lan_explicitly_disabled = false;
             cfg.port = port;
             // Deterministic pairing for the harness: approval off.
             cfg.require_approval = false;
@@ -1569,10 +1587,14 @@ fn apply_config_change(cfg: &mut WebRemoteConfig, change: ConfigChange) -> bool 
     }
     // The two transport switches start/stop their own transport only.
     if let Some(r) = change.relay_mode_enabled {
+        if cfg.relay_mode_enabled && !r && !cfg.lan_enabled {
+            cfg.lan_explicitly_disabled = true;
+        }
         cfg.relay_mode_enabled = r;
     }
     if let Some(l) = change.lan_enabled {
         cfg.lan_enabled = l;
+        cfg.lan_explicitly_disabled = !l;
     }
     cfg.port != old_port || cfg.bind_scope != old_scope
 }
@@ -1844,6 +1866,7 @@ mod tests {
         let cfg = WebRemoteConfig {
             enabled: true,
             lan_enabled: true,
+            lan_explicitly_disabled: false,
             port: 5000,
             require_approval: true,
             bind_scope: BIND_SCOPE_TAILSCALE.to_string(),
@@ -1857,6 +1880,7 @@ mod tests {
         assert_eq!(back.port, cfg.port);
         assert_eq!(back.require_approval, cfg.require_approval);
         assert_eq!(back.bind_scope, cfg.bind_scope);
+        assert_eq!(back.lan_explicitly_disabled, cfg.lan_explicitly_disabled);
     }
 
     #[test]
@@ -1899,6 +1923,7 @@ mod tests {
         let cfg = WebRemoteConfig {
             enabled: true,
             lan_enabled: true,
+            lan_explicitly_disabled: false,
             port: 4377,
             require_approval: false,
             bind_scope: BIND_SCOPE_ALL.to_string(),
@@ -2542,6 +2567,7 @@ mod tests {
         let legacy = r#"{"enabled":true,"port":4377,"require_approval":false,"bind_scope":"all","relay_mode_enabled":true}"#;
         let cfg: WebRemoteConfig = serde_json::from_str(legacy).unwrap();
         assert!(cfg.lan_enabled);
+        assert!(!cfg.lan_explicitly_disabled);
         // A fresh config opens nothing on the network until asked to.
         assert!(!WebRemoteConfig::default().lan_enabled);
     }
@@ -2552,23 +2578,27 @@ mod tests {
         // turns that way in back on after a relay-only setup.
         let mut cfg = WebRemoteConfig {
             lan_enabled: false,
+            lan_explicitly_disabled: true,
             ..WebRemoteConfig::default()
         };
         apply_enable_request(&mut cfg, None, None).unwrap();
         assert!(cfg.enabled && cfg.lan_enabled);
+        assert!(!cfg.lan_explicitly_disabled);
     }
 
     #[test]
-    fn serve_and_connect_keep_a_relay_only_setup_without_lan_flags() {
-        // (relay_mode_enabled, lan_enabled, has_lan_flags), as persisted
-        // before the request.
-        assert!(keeps_relay_only(true, false, false), "relay-only is kept");
-        assert!(!keeps_relay_only(true, false, true), "a --scope/--port flag opens it");
+    fn serve_and_connect_keep_an_explicit_lan_off_choice_without_lan_flags() {
+        // (relay_mode_enabled, lan_enabled, lan_explicitly_disabled,
+        // has_lan_flags), as persisted before the request.
+        assert!(keeps_lan_disabled(true, false, false, false), "legacy relay-only is kept");
+        assert!(!keeps_lan_disabled(true, false, false, true), "a --scope/--port flag opens it");
+        assert!(keeps_lan_disabled(false, false, true, false), "LAN-off survives relay-off");
+        assert!(!keeps_lan_disabled(false, false, true, true));
         // A fresh config has both switches off: a first run opens the listener
         // (the relay intent `connect` / `serve --relay` add comes after).
-        assert!(!keeps_relay_only(false, false, false));
-        assert!(!keeps_relay_only(true, true, false), "an on listener stays on");
-        assert!(!keeps_relay_only(false, true, false));
+        assert!(!keeps_lan_disabled(false, false, false, false));
+        assert!(!keeps_lan_disabled(true, true, false, false), "an on listener stays on");
+        assert!(!keeps_lan_disabled(false, true, true, false));
         // The kill switch is not an input: relay-only set up and then switched
         // off is still relay-only (see the `enabled`-less signature).
     }
@@ -2599,6 +2629,24 @@ mod tests {
         };
         assert!(!apply_config_change(&mut cfg, toggles), "switches never rebind");
         assert!(!cfg.lan_enabled && cfg.relay_mode_enabled && cfg.require_approval);
+        assert!(cfg.lan_explicitly_disabled);
+
+        apply_config_change(&mut cfg, ConfigChange {
+            lan_enabled: Some(true),
+            ..ConfigChange::default()
+        });
+        assert!(cfg.lan_enabled && !cfg.lan_explicitly_disabled);
+
+        let mut legacy_relay_only = WebRemoteConfig {
+            enabled: true,
+            relay_mode_enabled: true,
+            ..WebRemoteConfig::default()
+        };
+        apply_config_change(&mut legacy_relay_only, ConfigChange {
+            relay_mode_enabled: Some(false),
+            ..ConfigChange::default()
+        });
+        assert!(legacy_relay_only.lan_explicitly_disabled);
 
         let same_port = ConfigChange {
             port: Some(cfg.port),

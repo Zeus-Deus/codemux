@@ -15,7 +15,7 @@ use std::os::unix::fs::{DirBuilderExt, FileTypeExt};
 use std::os::unix::net::UnixListener;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Output, Stdio};
-use std::sync::{Arc, Mutex};
+use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio_tungstenite::tungstenite::Message;
 
@@ -348,6 +348,116 @@ fn thread_status(state: &str, extra: Value) -> Value {
 /// The registry tool a scripted request called, if it is a `tool_call`.
 fn tool_name(request: &Value) -> Option<&str> {
     (request["command"] == "tool_call").then(|| request["params"]["name"].as_str()).flatten()
+}
+
+#[test]
+fn connect_refuses_a_running_backend_before_account_login() {
+    let app = FakeApp::start(|_| ok_reply(json!({})));
+    let output = app.cli(&["connect"]);
+    assert_eq!(exit_code(&output), 1, "{}", String::from_utf8_lossy(&output.stderr));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("desktop Settings"), "{stderr}");
+    assert!(stderr.contains("stop the instance"), "{stderr}");
+    assert!(!stderr.contains("For an account with no password"), "login must not run: {stderr}");
+    assert!(app.requests().is_empty(), "the refusal needs no socket Admin call");
+}
+
+#[test]
+fn connect_refuses_a_layout_owner_without_a_control_socket_before_account_login() {
+    let root = tempfile::tempdir().unwrap();
+    let lock_path = layout_path(root.path()).with_extension("lock");
+    std::fs::create_dir_all(lock_path.parent().unwrap()).unwrap();
+    let lock = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&lock_path)
+        .unwrap();
+    lock.try_lock().unwrap();
+
+    let output = cli_in(root.path(), &["connect"]);
+    assert_eq!(exit_code(&output), 1, "{}", String::from_utf8_lossy(&output.stderr));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("desktop Settings"), "{stderr}");
+    assert!(!stderr.contains("For an account with no password"), "login must not run: {stderr}");
+    assert!(!root.path().join("run").join(SOCKET).exists(), "the fixture has no control endpoint");
+}
+
+#[test]
+fn connect_does_not_save_account_if_a_backend_starts_during_sign_in() {
+    let root = tempfile::tempdir().unwrap();
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let api_url = format!("http://{}", listener.local_addr().unwrap());
+    let (request_tx, request_rx) = mpsc::channel();
+    let (reply_tx, reply_rx) = mpsc::channel();
+    let api = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let mut reader = BufReader::new(stream.try_clone().unwrap());
+        let mut first_line = String::new();
+        reader.read_line(&mut first_line).unwrap();
+        assert!(first_line.starts_with("POST /api/auth/desktop/signin "), "{first_line}");
+        loop {
+            let mut line = String::new();
+            assert!(reader.read_line(&mut line).unwrap() > 0, "sign-in request ended before its headers");
+            if line == "\r\n" {
+                break;
+            }
+        }
+        request_tx.send(()).unwrap();
+        reply_rx.recv_timeout(Duration::from_secs(30)).unwrap();
+        let body = r#"{"token":"new-race-token","expiresAt":"2099-01-01T00:00:00Z","user":{"id":"race-user","email":"race@example.com","name":null,"image":null}}"#;
+        write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+        stream.flush().unwrap();
+    });
+
+    let mut command = Command::new(CODEMUX);
+    isolate(&mut command, root.path());
+    let mut child = command
+        .env("CODEMUX_API_URL", api_url)
+        .env("CODEMUX_PASSWORD", "race-password")
+        .args(["connect", "--email", "race@example.com"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    request_rx.recv_timeout(Duration::from_secs(30)).expect("connect reached credential verification");
+
+    // The first ownership check has finished, while the API response is held.
+    // A backend takes the layout now, before connect may save the account.
+    let lock_path = layout_path(root.path()).with_extension("lock");
+    let lock = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&lock_path)
+        .unwrap();
+    lock.try_lock().expect("connect does not hold a blocking lock across the API await");
+    reply_tx.send(()).unwrap();
+    api.join().unwrap();
+
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while child.try_wait().unwrap().is_none() {
+        if Instant::now() >= deadline {
+            child.kill().unwrap();
+            panic!("connect did not finish after ownership changed");
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let output = child.wait_with_output().unwrap();
+    drop(lock);
+    assert_eq!(exit_code(&output), 1, "{}", String::from_utf8_lossy(&output.stderr));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("desktop Settings"), "{stderr}");
+
+    let account = cli_in(root.path(), &["login", "--status"]);
+    assert_eq!(exit_code(&account), 1);
+    assert!(String::from_utf8_lossy(&account.stderr).contains("Not signed in"));
+    let remote = cli_in(root.path(), &["connect", "status"]);
+    assert_eq!(exit_code(&remote), 0, "{}", String::from_utf8_lossy(&remote.stderr));
+    let status = String::from_utf8_lossy(&remote.stdout);
+    assert!(status.contains("Enabled:      no"), "{status}");
+    assert!(status.contains("Relay mode:   off"), "{status}");
 }
 
 // ── Without an app ────────────────────────────────────────────────────────
@@ -1195,6 +1305,7 @@ fn connector_admin_commands_are_refused_to_standalone_cli() {
         vec!["connector", "pending", "--json"],
         vec!["connector", "issue", "--label", "itest-bot", "--json"],
         vec!["connector", "revoke", "itest-bot", "--json"],
+        vec!["connector", "revoke", "--all", "--json"],
     ] {
         let refused = serve.cli(&args);
         assert_eq!(exit_code(&refused), 1, "{}: {}", args.join(" "), String::from_utf8_lossy(&refused.stdout));
@@ -1217,11 +1328,13 @@ fn standalone_remote_cli_cannot_mint_pairing_or_change_listener() {
     let serve = Serve::start();
     let pair = serve.cli(&["remote", "pair"]);
     assert_eq!(exit_code(&pair), 1, "{}", String::from_utf8_lossy(&pair.stderr));
-    assert!(String::from_utf8_lossy(&pair.stderr).contains("needs verified owner access"));
+    let pair_error = String::from_utf8_lossy(&pair.stderr);
+    assert!(pair_error.contains("admin_refused") && pair_error.contains("Settings"), "{pair_error}");
 
     let other_port = free_loopback_port().to_string();
     let enable = serve.cli(&["remote", "enable", "--port", &other_port]);
     assert_eq!(exit_code(&enable), 1, "{}", String::from_utf8_lossy(&enable.stderr));
-    assert!(String::from_utf8_lossy(&enable.stderr).contains("needs verified owner access"));
+    let enable_error = String::from_utf8_lossy(&enable.stderr);
+    assert!(enable_error.contains("admin_refused") && enable_error.contains("Settings"), "{enable_error}");
     assert_eq!(serve.ok(&["json", "web_remote_status"])["data"]["port"].as_u64(), Some(serve.port as u64));
 }

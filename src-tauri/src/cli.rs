@@ -79,7 +79,8 @@ pub enum CommandSet {
         #[command(subcommand)]
         command: thread::ThreadCommand,
     },
-    /// Run the network door that assistants on other devices sign in to
+    /// Network connector administration is temporarily unavailable via CLI;
+    /// use Settings in the desktop app
     Connector {
         #[command(subcommand)]
         command: connector::ConnectorCommand,
@@ -119,7 +120,7 @@ pub enum CommandSet {
         #[command(subcommand)]
         command: IssueCommand,
     },
-    /// Web remote-access operations
+    /// Web remote management via CLI is temporarily unavailable; use Settings
     Remote {
         #[command(subcommand)]
         command: RemoteCommand,
@@ -175,12 +176,12 @@ pub enum CommandSet {
     },
     /// Set this machine up for remote access in one command: sign in, turn on
     /// from-anywhere (relay) access, and install a background service so
-    /// Codemux stays reachable after you log out. Safe to re-run — it reports
-    /// the steps that were already done instead of undoing them.
+    /// Codemux stays reachable after you log out. Run it while no backend owns
+    /// this machine's configuration.
     ///
-    /// With a Codemux instance already running here it drives that instance
-    /// over the control socket instead of installing a service (two backends
-    /// on one machine would fight over the port and the database).
+    /// If a desktop or manually started server is running, change access in
+    /// desktop Settings or stop that server before running this command.
+    /// `connect off` can stop a managed headless service itself.
     Connect {
         #[command(subcommand)]
         command: Option<ConnectCommand>,
@@ -1130,9 +1131,8 @@ async fn run_control_cli(cli: Cli) -> Result<Exit, String> {
             crate::auth::cli_login::run_login(email, token, status).await?;
             Ok(Exit::Done)
         }
-        // `connect` is local for the same reason `login` is — it exists to set
-        // up a machine that has nothing running yet. It reaches for the control
-        // socket only when it detects a live instance (see `web_remote::connect`).
+        // `connect` sets up an idle machine. It checks backend ownership before
+        // credential verification and again before saving account and relay state.
         Some(CommandSet::Connect {
             command,
             email,

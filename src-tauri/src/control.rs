@@ -861,7 +861,12 @@ where
             Ok(envelope) => {
                 let caller = crate::control_identity::resolve_socket_caller(envelope.client, peer_pid);
                 let request = envelope.request;
-                if !may_park(&request) {
+                if socket_admin_request(&request) {
+                    control_response(Err(crate::agent_control::ControlError::new(
+                        crate::agent_control::ErrorCode::AdminRefused,
+                        "Administrative socket commands are disabled until socket callers can be independently authenticated; use the app's Settings when available",
+                    ).to_string()))
+                } else if !may_park(&request) {
                     dispatch_request_as(&app, &caller, request).await
                 } else {
                     let work = dispatch_request_as(&app, &caller, request);
@@ -1203,6 +1208,31 @@ fn registry_caller(caller: &SocketCaller) -> Result<crate::agent_control::Contro
     }
 }
 
+/// A same-user process can escape process-tree classification. Until the
+/// socket has an independent owner proof, it cannot grant administrative
+/// authority, including through a registry tool nested in `tool_call`.
+fn socket_admin_request(request: &ControlRequest) -> bool {
+    use crate::agent_control::Access;
+
+    if crate::control_identity::command_access(&request.command, &request.params) == Access::Admin {
+        return true;
+    }
+    let (tool, arguments) = if request.command == "tool_call" {
+        (request.params.get("name").and_then(Value::as_str), request.params.get("arguments"))
+    } else if crate::agent_control::registry::is_socket_alias(&request.command) {
+        (Some(request.command.as_str()), Some(&request.params))
+    } else {
+        (None, None)
+    };
+    tool.is_some_and(|name| {
+        crate::agent_control::registry::lookup(name).is_some_and(|(_, spec)| spec.access() == Access::Admin)
+            || (name == "worktree_create"
+                && arguments
+                    .and_then(|args| args.get("agent_preset_id"))
+                    .is_some_and(|preset| !preset.is_null()))
+    })
+}
+
 /// Absent or null params read as `{}`.
 fn params_object(params: &Value) -> Value {
     if params.is_null() { serde_json::json!({}) } else { params.clone() }
@@ -1241,7 +1271,10 @@ fn tools_list(caller: &crate::agent_control::ControlCaller, params: &Value) -> R
         crate::agent_control::ControlError::new(crate::agent_control::ErrorCode::InvalidArguments, error.to_string()).to_string()
     })?;
     Ok(serde_json::json!({
-        "tools": crate::agent_control::registry::tools_for(caller),
+        "tools": crate::agent_control::registry::tools_for(caller).into_iter().filter(|tool| {
+            crate::agent_control::registry::lookup(tool.name)
+                .is_some_and(|(_, spec)| spec.access() != crate::agent_control::Access::Admin)
+        }).collect::<Vec<_>>(),
         "caller": { "principal": caller.principal, "access": caller.access },
     }))
 }
@@ -1264,8 +1297,9 @@ fn control_response(result: Result<Value, String>) -> ControlResponse {
 }
 
 /// Runs a request for `caller`: the access gate (`command_access` then
-/// `SocketCaller::permits`), then the command's handler.
-pub(crate) async fn dispatch_request_as<R: Runtime>(
+/// `SocketCaller::permits`), then the command's handler. The socket entrypoint
+/// withholds Admin requests before reaching this dispatcher.
+async fn dispatch_request_as<R: Runtime>(
     app: &AppHandle<R>,
     caller: &SocketCaller,
     request: ControlRequest,
@@ -2796,6 +2830,39 @@ mod tests {
         !response.ok && response.error.as_deref().is_some_and(|error| error.starts_with(&format!("{code}: ")))
     }
 
+    #[test]
+    fn socket_admin_gate_classifies_direct_and_nested_commands() {
+        for (command, params) in [
+            ("web_remote_enable", serde_json::json!({"scope":"all"})),
+            ("agent_connector_approve", serde_json::json!({"request_id":"x"})),
+            ("automation_create", serde_json::json!({})),
+            ("create_worktree_workspace", serde_json::json!({"agent_preset_id":"p"})),
+        ] {
+            assert!(socket_admin_request(&request(command, params)), "{command}");
+        }
+        // A registry tool's own class must be consulted even though the
+        // outer `tool_call` command is classified as a read.
+        for (name, _, _) in crate::agent_control::registry::outside_tool_index() {
+            let nested = request("tool_call", serde_json::json!({"name":name}));
+            let expected = crate::agent_control::registry::lookup(name)
+                .is_some_and(|(_, spec)| spec.access() == crate::agent_control::Access::Admin);
+            assert_eq!(socket_admin_request(&nested), expected, "{name}");
+        }
+        assert!(socket_admin_request(&request("tool_call", serde_json::json!({
+            "name": "worktree_create", "arguments": {"agent_preset_id": "p"}
+        }))));
+        assert!(!socket_admin_request(&request("tool_call", serde_json::json!({
+            "name": "worktree_create", "arguments": {"branch": "feature"}
+        }))));
+        for (command, params) in [
+            ("status", serde_json::json!({})),
+            ("notify", serde_json::json!({"message":"hi"})),
+            ("tool_call", serde_json::json!({"name":"thread_list"})),
+        ] {
+            assert!(!socket_admin_request(&request(command, params)), "{command}");
+        }
+    }
+
     #[tokio::test]
     async fn agent_processes_are_refused_connector_administration() {
         let app = tauri::test::mock_app();
@@ -3081,6 +3148,38 @@ mod tests {
             .unwrap()
             .expect("the connection is open");
         serde_json::from_str(&line).unwrap()
+    }
+
+    #[tokio::test]
+    async fn socket_admin_is_refused_for_a_verified_same_user_peer() {
+        let app = tauri::test::mock_app();
+        app.manage(AppStateStore::default());
+        let (client, server) = tokio::io::duplex(4096);
+        let served = tokio::spawn(handle_client(app.handle().clone(), server, Some(std::process::id())));
+        let (reader, mut writer) = tokio::io::split(client);
+        let mut replies = BufReader::new(reader).lines();
+        for command in ["web_remote_disable", "agent_connector_revoke_all"] {
+            let line = serde_json::json!({"command":command,"params":{}});
+            writer.write_all(format!("{line}\n").as_bytes()).await.unwrap();
+            assert!(refused_with(&reply(&mut replies).await, "admin_refused"), "{command}");
+        }
+        let preset = serde_json::json!({
+            "command":"tool_call",
+            "params":{"name":"worktree_create","arguments":{"agent_preset_id":"p"}}
+        });
+        writer.write_all(format!("{preset}\n").as_bytes()).await.unwrap();
+        assert!(refused_with(&reply(&mut replies).await, "admin_refused"));
+        let ordinary = serde_json::json!({
+            "command":"tool_call",
+            "params":{"name":"worktree_create","arguments":{"repo_path":"relative","branch":"feature"}}
+        });
+        writer.write_all(format!("{ordinary}\n").as_bytes()).await.unwrap();
+        let ordinary = reply(&mut replies).await;
+        assert!(ordinary.ok, "ordinary worktree creation reaches its own validation: {:?}", ordinary.error);
+        writer.write_all(b"{\"command\":\"status\",\"params\":{}}\n").await.unwrap();
+        assert!(reply(&mut replies).await.ok, "the socket still serves ordinary reads");
+        drop((writer, replies));
+        assert_eq!(served.await.unwrap(), Ok(()));
     }
 
     #[tokio::test]

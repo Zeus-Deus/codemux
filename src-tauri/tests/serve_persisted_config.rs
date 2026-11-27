@@ -18,8 +18,8 @@
 //!   2. `relay_mode_enabled` stays `true` in both the live status and the
 //!      settings row, and the relay runtime actually started (iroh node id
 //!      present, registration loop ran),
-//!   3. the control server is listening, and a real `web_remote_pair` control
-//!      round-trip — the `codemux remote pair` path — succeeds,
+//!   3. the control server is listening, refuses socket pairing, and the
+//!      trusted in-app path can still mint a pairing token,
 //!   4. a subsequent plain enable (no relay argument) still does not modify
 //!      the persisted `relay_mode_enabled` — the `enable_core`-level guard.
 //!
@@ -214,15 +214,14 @@ fn serve_honours_persisted_config_and_never_clobbers_relay_mode() {
         "registration should have reached the sign-in check (i.e. the loop is live)"
     );
 
-    // ── 3. The control server is listening: `codemux remote pair` and
-    //    `codemux connect status` from another SSH session work against a
-    //    running serve, and the GUI's boot-time guard sees this instance. ──
+    // ── 3. The control server is listening, but socket pairing is withheld
+    //    until the caller has independent owner proof. The trusted app path
+    //    can still mint a token from the persisted configuration. ──
     assert!(
         codemux_lib::control::control_server_is_running(),
         "serve must hold the machine's control endpoint (mutual exclusion + CLI)"
     );
-    // Speak as the owner explicitly: a test run from an in-app chat inherits
-    // that chat's agent identity, which this admin command would refuse.
+    // Even an unnamed same-user socket caller cannot administer pairing.
     let pair = tauri::async_runtime::block_on(send_control_request_as(
         ControlRequest {
             command: "web_remote_pair".to_string(),
@@ -231,13 +230,15 @@ fn serve_honours_persisted_config_and_never_clobbers_relay_mode() {
         None,
     ))
     .expect("control round-trip should reach the running serve instance");
-    assert!(pair.ok, "web_remote_pair failed: {:?}", pair.error);
-    let token = pair.data.as_ref().and_then(|d| d["token"].as_str());
+    assert!(!pair.ok, "socket pairing unexpectedly succeeded");
     assert!(
-        token.is_some_and(|t| !t.is_empty()),
-        "the control pair round-trip should mint a token: {:?}",
-        pair.data
+        pair.error.as_deref().is_some_and(|error| error.contains("admin_refused")),
+        "unexpected socket refusal: {:?}",
+        pair.error
     );
+    let pairing = web_remote::control_pair(&handle, Some("Phone".to_string()))
+        .expect("trusted in-app pairing should use the persisted configuration");
+    assert!(!pairing.token.is_empty(), "trusted pairing should mint a token");
 
     // ── 4. `enable_core`-level guard: an enable that carries no relay argument
     //    must not rewrite the persisted relay flag. (Before the fix this is the

@@ -5,8 +5,8 @@
 //! server, state restore, background loops, and the web-remote config
 //! hydration — because nothing else will: Tauri only runs `setup` from an
 //! event loop, and serve never enters one) with no display attached, binds the
-//! web-remote server through the **same** shared enable path the GUI and the
-//! `codemux remote enable` CLI use, prints a scannable pairing QR + link, and
+//! web-remote server through the **same** shared enable path the GUI uses,
+//! prints a scannable pairing QR + link, and
 //! then blocks until SIGINT / SIGTERM. This is the away-from-home SSH flow:
 //! expose the desktop's UI to a phone or laptop without a desktop session.
 //!
@@ -74,7 +74,7 @@ impl ShutdownAdmission {
 }
 
 /// Options parsed from `codemux serve [--scope …] [--port N] [--relay]`.
-/// Flag semantics mirror `codemux remote enable` exactly.
+/// Explicit flags override the persisted remote-access settings.
 #[derive(Debug, Clone)]
 pub struct ServeOptions {
     /// Bind scope: `all` | `tailscale` | `loopback`. `None` = fall back to the
@@ -104,8 +104,8 @@ pub fn run_serve(opts: ServeOptions) -> Result<(), String> {
     //    The lock also covers startup before the socket is listening.
     if crate::control::control_server_is_running() {
         return Err(
-            "Codemux is already running on this machine (GUI or serve) — stop it first, \
-             or use `codemux remote enable` to control the running instance."
+            "Codemux is already running on this machine (GUI or serve). Stop it first, \
+             or change remote access in desktop Settings."
                 .to_string(),
         );
     }
@@ -120,10 +120,9 @@ pub fn run_serve(opts: ServeOptions) -> Result<(), String> {
     //    web_remote restore_on_boot, every background loop) on MockRuntime.
     //    `build_headless_app` runs the Tauri `setup` hook explicitly — Tauri
     //    itself only runs it from the event loop, which serve never enters —
-    //    so the control server is listening (mutual exclusion in both
-    //    directions, read-only CLI status calls,
-    //    `web_remote_set_relay`) and the persisted web-remote config is
-    //    hydrated before the enable below merges the CLI flags into it.
+    //    so the control server is listening for read-only status calls and
+    //    mutual exclusion. The persisted web-remote config is hydrated before
+    //    the enable below merges the CLI flags into it.
     let app = match crate::build_headless_app() {
         Ok(app) => app,
         Err(e) => return Err(format!("failed to boot the headless backend: {e}")),
@@ -152,36 +151,42 @@ pub fn run_serve(opts: ServeOptions) -> Result<(), String> {
         // 4. Startup banner + pairing code. Relay-only has no pairing link:
         //    nothing listens on the network for it to point at.
         print_banner(&handle, &result);
-        let relay_only = !result.status.lan_enabled;
-        if relay_only {
+        let pairing_ready = if !result.status.lan_enabled && result.status.relay_mode_enabled {
             println!();
             println!(
                 "Open https://app.codemux.org in a browser signed into your Codemux account \
                  and pick this machine."
             );
+            false
+        } else if !result.status.lan_enabled {
+            println!();
+            println!("No remote transport is enabled. Stop this server and use desktop Settings to change access.");
+            false
         } else {
             match web_remote::control_pair(&handle, None) {
                 Ok(pairing) => {
                     let value = serde_json::to_value(&pairing).unwrap_or(serde_json::Value::Null);
                     crate::cli::print_pairing(&value);
+                    true
                 }
                 Err(e) => {
-                    // Shouldn't happen once the server is enabled. Keep serving;
-                    // pairing can be managed in desktop Settings.
+                    // Keep serving even if the trusted startup pairing call fails.
                     eprintln!(
                         "[codemux serve] could not mint a pairing code: {e} \
-                         (the server is still running — stop it to manage pairing in desktop Settings)"
+                         (the server is still running; stop it and use desktop Settings to manage pairing)"
                     );
+                    false
                 }
             }
-        }
+        };
         // The outside-assistant connector is independent of web remote and
         // was restored (or not) by setup; report it for relay-only too.
         let connector = crate::mcp_connector::agent_connector_status(handle.clone()).ok();
         if let Some(line) = connector.as_ref().and_then(connector_line) {
             println!("  {line}");
         }
-        print_footer(relay_only, connector.is_some_and(|status| status.enabled));
+        print_footer(pairing_ready, result.status.relay_mode_enabled && !result.status.lan_enabled,
+            connector.is_some_and(|status| status.enabled));
 
         // 5. Keep-alive: block until SIGINT / SIGTERM. Still no `app.run()` —
         //    `MockRuntime::run` is an infinite polling loop with no windowing
@@ -282,18 +287,18 @@ pub async fn serve_startup<R: tauri::Runtime>(
 ) -> Result<web_remote::ControlEnableResult, String> {
     // `restore_on_boot` may already have bound the server (GUI mode); under
     // serve it only hydrates, and `control_enable` handles both (`already_running`).
-    let persisted = web_remote::web_remote_status(handle.clone());
-    // Decide relay-only on the switches as persisted, BEFORE `--relay` below
-    // turns relay mode on (which would make a fresh config look relay-only).
-    // An explicit relay-only setup stays relay-only even with the kill switch
-    // off, and then keeps its persisted scope too — the first-run `all`
-    // default below exists to open a listener.
-    let keep_relay_only = web_remote::keeps_relay_only(
+    let persisted = web_remote::config_snapshot(handle);
+    // Decide whether LAN stays off from the persisted switches BEFORE `--relay`
+    // below turns relay mode on (which would make a fresh config look
+    // relay-only). The choice survives the kill switch and a later relay-off.
+    // The first-run `all` default below exists to open a listener.
+    let keep_lan_disabled = web_remote::keeps_lan_disabled(
         persisted.relay_mode_enabled,
         persisted.lan_enabled,
+        persisted.lan_explicitly_disabled,
         opts.scope.is_some() || opts.port.is_some(),
     );
-    let scope = if keep_relay_only {
+    let scope = if keep_lan_disabled {
         None
     } else {
         resolve_scope(opts.scope.clone(), persisted.enabled)
@@ -312,10 +317,10 @@ pub async fn serve_startup<R: tauri::Runtime>(
         }
     }
 
-    // As configured, not "open the listener": a relay-only setup (the user
-    // switched "On my network" off) must not come back listening on the LAN
-    // after a restart. Explicit `--scope` / `--port` still turn it on.
-    web_remote::control_enable_as_configured(handle, scope, opts.port, keep_relay_only)
+    // A saved LAN-off choice must not come back listening on the network after
+    // a restart, even if relay mode was turned off. Explicit `--scope` /
+    // `--port` still turn the listener on.
+    web_remote::control_enable_as_configured(handle, scope, opts.port, keep_lan_disabled)
         .await
         .map_err(|e| format!("could not enable the web-remote server: {e}"))
 }
@@ -341,13 +346,17 @@ fn print_banner<R: tauri::Runtime>(
         println!("Codemux headless server started.");
     }
     if !result.status.lan_enabled {
-        // An explicit relay-only setup, kept as configured: there is no port
-        // or scope to report, and no address to list.
-        println!("  Mode:         relay only — nothing listens on your network");
-        println!(
-            "  Relay:        {}",
-            if result.status.relay_running { "up" } else { "starting" }
-        );
+        // There is no listener address to report. Relay may also be off after
+        // a relay-only setup was disconnected while its unit remained installed.
+        if result.status.relay_mode_enabled {
+            println!("  Mode:         relay only — nothing listens on your network");
+            println!(
+                "  Relay:        {}",
+                if result.status.relay_running { "up" } else { "starting" }
+            );
+        } else {
+            println!("  Mode:         no remote transport enabled");
+        }
         return;
     }
     println!("  Port:         {port}");
@@ -363,8 +372,7 @@ fn print_banner<R: tauri::Runtime>(
         return;
     }
 
-    // Enumerate the reachable endpoints (the same list the Settings pane and
-    // `codemux remote enable` surface).
+    // Enumerate the reachable endpoints (the same list as the Settings pane).
     let endpoints = web_remote::web_remote_list_endpoints(handle.clone());
     if !endpoints.is_empty() {
         println!("  Reachable at:");
@@ -394,18 +402,21 @@ fn connector_line(status: &crate::mcp_connector::ConnectorStatus) -> Option<Stri
     })
 }
 
-/// Print the closing lines with the supported administration path and stop hint.
-fn print_footer(relay_only: bool, connector_enabled: bool) {
+/// Print the closing lines with the supported management path and stop hint.
+fn print_footer(pairing_ready: bool, relay_only: bool, connector_enabled: bool) {
     println!();
+    if pairing_ready {
+        println!("Use the pairing code above to connect from a browser.");
+    }
     if relay_only {
         println!("Remote Access is using the saved relay setting; stop serve to change its network scope in desktop Settings.");
-    } else {
+    } else if pairing_ready {
         println!("Foreground serve prints a fresh pairing link when restarted; this disconnects active sessions.");
-        println!("Stop serve to manage pairing and Remote Access in desktop Settings.");
     }
     if !connector_enabled {
         println!("The agent connector is off; enable it in desktop Settings before starting headless serve.");
     }
+    println!("Stop this server and use desktop Settings to change pairing, network, or connector access.");
     println!("Account-mode / hosted access continues to work if it was configured.");
     println!("Press Ctrl-C (or send SIGTERM) to stop the server.");
 }

@@ -269,6 +269,8 @@ Use **Revoke** in Settings. Revoking also stops that assistant's calls in progre
 
 Run `codemux serve` on the server. A bot on the same server or over SSH can use the [read-only local setup](#on-this-computer). If the network door was already enabled and configured, authenticated remote assistants can continue using it. A fresh headless server currently has no supported way to enable or administer that door: the CLI has no independent owner proof, and the server has no Settings UI.
 
+For a managed headless service, `codemux connect off` stops the service and saves relay and LAN access as off. If the service cannot be removed, it reports that separately after saving the off settings.
+
 ## The end-to-end flow
 
 These are the tool calls for an authenticated network assistant, in order. Every tool takes explicit ids: an outside assistant has no current workspace or thread. A standalone local socket process can use the read steps but cannot run the mutations.

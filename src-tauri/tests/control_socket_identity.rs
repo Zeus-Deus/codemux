@@ -23,6 +23,8 @@ const CODEMUX: &str = env!("CARGO_BIN_EXE_codemux");
 const SOCKET: &str = if cfg!(debug_assertions) { "codemux-dev.sock" } else { "codemux.sock" };
 const AGENT_PROCESS: &str = "CODEMUX_AGENT_PROCESS";
 const PROVIDER_ORIGIN: &str = "CODEMUX_MCP_PROVIDER_ORIGIN";
+const IDENTITY_VARS: [&str; 4] =
+    [AGENT_PROCESS, "CODEMUX_MCP_GATEWAY_URL", "CODEMUX_MCP_GATEWAY_TOKEN", PROVIDER_ORIGIN];
 
 /// A `codemux serve` child, stopped (SIGTERM, then kill) when dropped.
 struct Serve {
@@ -294,6 +296,45 @@ fn inherited_identity_cannot_authorize_an_external_cli() {
     assert_eq!(error_code(&admin), "admin_refused", "{admin}");
     let create = serve.json("create_workspace", &json!({ "path": project }).to_string(), &[]);
     assert_eq!(error_code(&create), "access_denied", "{create}");
+}
+
+#[test]
+fn pty_shell_scrubs_inherited_agent_identity() {
+    // The app starts its initial terminal through its trusted startup path.
+    // The external socket cannot create a workspace or write to a PTY.
+    let fixture = tempfile::tempdir().unwrap();
+    let shell = fixture.path().join("capture-shell");
+    let env_dump = fixture.path().join("env.txt");
+    let env_dump_partial = fixture.path().join("env.txt.partial");
+    std::fs::write(
+        &shell,
+        format!(
+            "#!/bin/sh\nenv > '{}' && mv '{}' '{}'\nexec /bin/sh\n",
+            env_dump_partial.display(),
+            env_dump_partial.display(),
+            env_dump.display(),
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&shell, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+    let serve = Serve::start(&[
+        (AGENT_PROCESS, "1"),
+        (PROVIDER_ORIGIN, "1"),
+        ("CODEMUX_MCP_GATEWAY_URL", "http://127.0.0.1:1/mcp"),
+        ("CODEMUX_MCP_GATEWAY_TOKEN", "inherited"),
+        ("SHELL", shell.to_str().unwrap()),
+    ]);
+    let deadline = Instant::now() + Duration::from_secs(60);
+    while !env_dump.exists() {
+        assert!(Instant::now() < deadline, "the startup terminal never ran:\n{}", serve.log());
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    let env = std::fs::read_to_string(&env_dump).unwrap();
+    for key in IDENTITY_VARS {
+        assert!(!env.lines().any(|line| line.starts_with(&format!("{key}="))), "{key} reached the terminal");
+    }
+    assert!(env.contains("CODEMUX_SESSION_ID="), "the dump is the terminal's env");
 }
 
 /// An unverified CLI cannot start a project's setup script, even if it

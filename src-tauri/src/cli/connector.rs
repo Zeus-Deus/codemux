@@ -1,10 +1,10 @@
-//! `codemux connector …`: run the network door (the OAuth `/mcp` connector)
-//! from a shell: turn it on or off, mint labelled tokens for headless
-//! assistants, approve sign-ins and revoke access.
+//! `codemux connector …`: commands for the network door (the OAuth `/mcp`
+//! connector). Socket administration is suspended until callers can prove
+//! owner identity independently; configure it in desktop Settings.
 //!
-//! These are admin socket commands, not registry tools: the owner at full
-//! access runs them, and the socket refuses them to agent processes. A token
-//! is never taken as an argument, so it never lands in shell history.
+//! These are admin socket commands, not registry tools. The socket currently
+//! refuses them to every caller. A token is never taken as an argument, so it
+//! never lands in shell history.
 
 use super::args::{self, AccessArg, OutputArgs};
 use super::door::{code, Door};
@@ -16,14 +16,12 @@ use serde_json::{json, Value};
 
 #[derive(Subcommand)]
 pub enum ConnectorCommand {
-    /// Show whether the network door is on, where it listens, and how many
-    /// assistants are connected or waiting to sign in.
+    /// Unavailable via CLI; view network status in desktop Settings.
     Status {
         #[command(flatten)]
         out: OutputArgs,
     },
-    /// Turn the network door on. The public origin stays unless --origin or
-    /// --no-origin is given.
+    /// Unavailable via CLI; turn on network access in desktop Settings.
     Enable {
         /// Listen on this loopback port.
         #[arg(long, value_name = "PORT")]
@@ -37,14 +35,12 @@ pub enum ConnectorCommand {
         #[command(flatten)]
         out: OutputArgs,
     },
-    /// Turn the network door off. Sign-ins and tokens are kept;
-    /// `codemux connector revoke --all` ends them.
+    /// Unavailable via CLI; turn off network access in desktop Settings.
     Disable {
         #[command(flatten)]
         out: OutputArgs,
     },
-    /// Mint a labelled token for a headless assistant. It is shown once.
-    /// Issuing again for a label replaces that label's token.
+    /// Unavailable via CLI; issue a token in desktop Settings.
     Issue {
         /// A name for the assistant, e.g. hermes-bot.
         #[arg(long, value_name = "LABEL")]
@@ -58,12 +54,12 @@ pub enum ConnectorCommand {
         #[command(flatten)]
         out: OutputArgs,
     },
-    /// List connected assistants and tokens.
+    /// Unavailable via CLI; list assistants in desktop Settings.
     List {
         #[command(flatten)]
         out: OutputArgs,
     },
-    /// Revoke a token by its label, or a connected assistant by its id.
+    /// Unavailable via CLI; revoke access in desktop Settings.
     Revoke {
         /// A token label or a client id from `codemux connector list`.
         #[arg(required_unless_present = "all", conflicts_with = "all")]
@@ -74,12 +70,12 @@ pub enum ConnectorCommand {
         #[command(flatten)]
         out: OutputArgs,
     },
-    /// List sign-ins waiting for approval.
+    /// Unavailable via CLI; view pending sign-ins in desktop Settings.
     Pending {
         #[command(flatten)]
         out: OutputArgs,
     },
-    /// Approve a pending sign-in. Approve only a sign-in you just started.
+    /// Unavailable via CLI; approve a pending sign-in in desktop Settings.
     Approve {
         /// The sign-in's id from `codemux connector pending`.
         id: String,
@@ -89,7 +85,7 @@ pub enum ConnectorCommand {
         #[command(flatten)]
         out: OutputArgs,
     },
-    /// Deny a pending sign-in.
+    /// Unavailable via CLI; deny a pending sign-in in desktop Settings.
     Deny {
         /// The sign-in's id from `codemux connector pending`.
         id: String,

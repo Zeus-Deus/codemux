@@ -142,8 +142,12 @@ fn boot() -> World {
         .canonicalize()
         .unwrap();
     // The socket path must fit `sun_path`, so it gets a short dir of its own.
-    let runtime = tempfile::Builder::new().prefix("oac-").tempdir().unwrap().keep();
-    std::fs::set_permissions(&runtime, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let runtime = tempfile::Builder::new()
+        .prefix("oac-")
+        .permissions(std::fs::Permissions::from_mode(0o700))
+        .tempdir()
+        .unwrap()
+        .keep();
     assert_eq!(std::fs::metadata(&runtime).unwrap().permissions().mode() & 0o777, 0o700);
     let bin = root.join("bin");
     let home = root.join("home");
@@ -1187,7 +1191,8 @@ fn token_revoked_mid_wait_ends_the_wait_with_grant_revoked() {
         door.call("thread_wait", probe.clone()).err().is_some_and(|error| error.code == "wait_budget_exhausted")
     });
     let revoked_at = Instant::now();
-    mcp_connector::agent_connector_revoke(w.handle.clone(), issued.client_id).expect("trusted app revokes the grant");
+    mcp_connector::agent_connector_revoke(w.handle.clone(), issued.client_id)
+        .expect("the trusted app revokes the token");
     for waiter in waiters {
         let (result, returned_at) = waiter.join().unwrap();
         assert_eq!(result.expect_err("the wait ends with the grant").code, "grant_revoked");
@@ -1416,7 +1421,7 @@ fn refresh_token_rotation_keeps_receipts_and_rejects_replay() {
     };
     assert_eq!(complete().status(), 202, "the sign-in waits for the owner");
     mcp_connector::agent_connector_approve(w.handle.clone(), request_id.clone(), ControlAccess::Supervised)
-        .expect("trusted app approves the connector request");
+        .expect("the trusted app approves the OAuth request");
     let redirect = complete();
     assert_eq!(redirect.status(), 303);
     let location = url::Url::parse(redirect.headers()["location"].to_str().unwrap()).unwrap();
@@ -1503,11 +1508,16 @@ fn agent_processes_are_refused_admin_and_native_tools() {
     assert_eq!(exit_code(&marked), 0, "{}", describe(&marked));
     assert!(stdout_json(&marked)["result"]["threads"].is_array());
 
-    // The trusted app can administer connector grants after the CLI refusals.
+    // No socket peer can administer the connector, including a same-user CLI.
     let owner_label = format!("owner-{t}");
-    let issued = w.issue(&owner_label, ControlAccess::ReadOnly);
+    let refused = w.cli(&["connector", "issue", "--label", &owner_label, "--access", "read-only", "--json"], &[]);
+    assert_eq!(exit_code(&refused), 1, "{}", describe(&refused));
+    assert_eq!(stdout_json(&refused)["error"]["code"], "admin_refused");
+    let issued = mcp_connector::agent_connector_issue(w.handle.clone(), owner_label, ControlAccess::ReadOnly, None)
+        .expect("the trusted app issues a connector token");
     assert!(issued.token.starts_with("cmcp_"));
-    mcp_connector::agent_connector_revoke(w.handle.clone(), issued.client_id).expect("trusted app revokes the grant");
+    mcp_connector::agent_connector_revoke(w.handle.clone(), issued.client_id)
+        .expect("the trusted app revokes the token");
 
     #[cfg(target_os = "linux")]
     refused_by_ancestry(w, &mut owner, &workspace, &thread, &t);
